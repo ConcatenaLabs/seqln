@@ -554,9 +554,25 @@ void psbt_elements_input_set_asset(struct wally_psbt *psbt, size_t in,
 void psbt_elements_normalize_fees(struct wally_psbt *psbt)
 {
 	size_t fee_output_idx = psbt->num_outputs;
+	u8 fee_asset[33];
 
 	if (!is_elements(chainparams))
 		return;
+
+	/* Single-asset tx (asset-aware channels): the explicit fee is paid in
+	 * the same asset as the inputs, which may not be the policy asset.
+	 * Take the fee asset from the first input's witness_utxo (fall back to
+	 * the policy asset) and balance only that asset's inputs/outputs. We
+	 * never build mixed-asset txs, so a single fee output is correct. */
+	if (chainparams->fee_asset_tag)
+		memcpy(fee_asset, chainparams->fee_asset_tag, sizeof(fee_asset));
+	else
+		memset(fee_asset, 0, sizeof(fee_asset));
+	if (psbt->num_inputs > 0 && psbt->inputs[0].witness_utxo) {
+		struct amount_asset ia =
+			wally_tx_output_get_amount(psbt->inputs[0].witness_utxo);
+		memcpy(fee_asset, ia.asset, sizeof(fee_asset));
+	}
 
 	/* Elements requires that every input value is accounted for,
 	 * including the fees */
@@ -578,20 +594,22 @@ void psbt_elements_normalize_fees(struct wally_psbt *psbt)
 			psbt_rm_output(psbt, i--);
 			continue;
 		}
-		if (!amount_asset_is_main(&output_amount))
+		/* Only balance the fee asset; subtract its raw value (which may
+		 * not be the policy asset, so don't assert amount_asset_is_main). */
+		if (!amount_asset_is(&output_amount, fee_asset))
 			continue;
 
 		if (!amount_sat_sub(&total_fee, total_fee,
-				    amount_asset_to_sat(&output_amount)))
+				    amount_sat(output_amount.value)))
 			return;
 	}
 
 	if (amount_sat_eq(total_fee, AMOUNT_SAT(0)))
 		return;
 
-	/* We need to add a fee output */
+	/* We need to add a fee output (in the fee asset). */
 	if (fee_output_idx == psbt->num_outputs) {
-		psbt_append_output(psbt, NULL, total_fee);
+		psbt_append_output_asset(psbt, NULL, total_fee, fee_asset);
 	} else {
 		int ret;
 		u64 sats = total_fee.satoshis; /* Raw: wally API */

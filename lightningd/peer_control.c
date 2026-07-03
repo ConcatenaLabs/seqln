@@ -952,6 +952,17 @@ static void NON_NULL_ARGS(1, 2, 4, 5) json_add_channel(struct command *cmd,
 		json_add_bool(response, "reestablished", channel->reestablished);
 	}
 	json_add_channel_type(response, "channel_type", channel->type);
+	/* Asset-aware channels: surface the channel asset's display id (32-byte
+	 * hex, natural order) for a non-policy asset; policy-asset channels omit
+	 * it, so amounts are read as the policy asset as before. */
+	if (chainparams->is_elements && chainparams->fee_asset_tag
+	    && memcmp(channel->channel_asset, chainparams->fee_asset_tag,
+		      sizeof(channel->channel_asset)) != 0) {
+		u8 id[32];
+		for (size_t i = 0; i < sizeof(id); i++)
+			id[i] = channel->channel_asset[sizeof(id) - i];
+		json_add_hex(response, "channel_asset", id, sizeof(id));
+	}
 	if (channel->ignore_fee_limits) {
 		json_add_bool(response, "ignore_fee_limits", channel->ignore_fee_limits);
 	}

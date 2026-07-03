@@ -51,6 +51,7 @@ json_fundchannel(struct command *cmd,
 	const jsmntok_t *mindepth;
 	const jsmntok_t *reserve;
 	const jsmntok_t *channel_type;
+	const jsmntok_t *asset;
 
 	struct out_req *req;
 
@@ -68,6 +69,7 @@ json_fundchannel(struct command *cmd,
 		   p_opt("mindepth", param_tok, &mindepth),
 		   p_opt("reserve", param_tok, &reserve),
 		   p_opt("channel_type", param_tok, &channel_type),
+		   p_opt("asset", param_tok, &asset),
 		   NULL))
 		return command_param_failed();
 
@@ -102,6 +104,9 @@ json_fundchannel(struct command *cmd,
 		json_add_tok(req->js, "reserve", reserve, buf);
 	if (channel_type)
 		json_add_tok(req->js, "channel_type", channel_type, buf);
+	/* Asset-aware channels: fund this channel in an issued asset. */
+	if (asset)
+		json_add_tok(req->js, "asset", asset, buf);
 
 	json_object_end(req->js);
 	json_array_end(req->js);
