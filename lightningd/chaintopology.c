@@ -383,6 +383,14 @@ static void next_updatefee_timer(struct chain_topology *topo);
 
 bool unknown_feerates(const struct chain_topology *topo)
 {
+	/* --force-feerates provides feerates directly (the feerate getters all
+	 * check topo->ld->force_feerates first), so feerates are NOT unknown
+	 * even when the backend gave no estimate.  Without this, a node whose
+	 * backend does no fee estimation (Sequentia, or a Bitcoin testnet4 node
+	 * with sparse fee data) rejects every channel open with "Cannot accept
+	 * channel: feerates unknown" despite --force-feerates. */
+	if (topo->ld->force_feerates)
+		return false;
 	return tal_count(topo->feerates[0]) == 0;
 }
 
