@@ -76,17 +76,22 @@ Runtime status: SeqLN builds on the box (`/root/sequentia/seqln`, from GitHub) a
 RPC-responsive — `getinfo`, `newaddr` (shared `tb1` bech32, the dual-chain format), `listfunds`, and
 `getchaininfo` all work, and getchaininfo returns the correct certified frontier (blockcount ==
 node000's real tip), **verifying section 6.1 in the live daemon**. But lightningd does **not complete
-startup**: it wedges at `connectd_activate()` (lightningd.c ~1404). RPC works because `jsonrpc_listen`
-(~1379) runs *before* that; but `begin_topology()` (~1455, which starts the fee-estimate and
-ongoing block-poll timers) is *after* it and never runs — so the chain tip stays at the height reached
-during the initial `setup_topology` sync, "still loading" persists, and no channel can be funded.
-The `lightning_connectd` "zombie" is just the harmless `test_subdaemons` version-check
-(`lightning_connectd --version`, exits 0); the real connectd/gossipd/hsmd are alive and idle in their
-poll loops. So this is a connectd ACTIVATE round-trip that never completes (lightningd sits in the
-nested `io_loop(NULL,NULL)` inside connectd_activate). It reproduces on the laptop and the box, with
-and without `--offline`, and is independent of the Sequentia code (bcli/getchaininfo are fine; the
-block-sync path itself works during setup_topology). Note: CLN's log file / `getlog` stop flushing
-after ~74 startup entries here — diagnose via `getinfo`/`getchaininfo`/process `wchan`, not the log.
+startup**. A gdb backtrace of the wedged daemon is definitive:
+
+    #5 io_loop_with_timers (ld) at lightningd/io_loop_with_timers.c:22
+    #6 plugins_config (plugins) at lightningd/plugin.c:2224
+    #7 main (...) at lightningd/lightningd.c:1378
+
+So it wedges in **`plugins_config`** — the startup step that sends `init` to every plugin and blocks
+until all reach INIT_COMPLETE. RPC works because `jsonrpc_listen` runs before this; `begin_topology`
+(the ongoing fee/block-poll timers) runs *after* it and never starts, so the tip stays at the
+`setup_topology` height and "still loading" persists. Yet `lightning-cli plugin list` shows the only
+plugin, `bcli`, as `active: true`, and bcli's `init` demonstrably completed (it logs "bitcoin-cli
+initialized and connected"), and bcli sits idle in its poll loop. So bcli finished init but
+plugins_config never sees INIT_COMPLETE and never breaks its loop. The `lightning_connectd` "zombie"
+noted earlier is just the harmless `test_subdaemons` version-check; connectd is NOT the problem (the
+backtrace is nowhere near connectd_activate). Note: CLN's log/`getlog` stop flushing after ~74 startup
+entries here — diagnose via gdb/`getinfo`/`plugin list`, not the log.
 
 Stable-rebase experiment (done — ruled out a version regression): the 5 Sequentia commits were
 cherry-picked cleanly onto the **stable `v26.06.2`** point release (branch `sequentia-stable`), built
