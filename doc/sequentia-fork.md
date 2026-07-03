@@ -72,62 +72,49 @@ Live-node proof (the exit criterion — "computed block hashes match"):
   `make lightningd/lightning_{channeld,closingd,connectd,dualopend,gossipd,gossip_compactd,hsmd,
   onchaind,openingd,websocketd}` (all pure C).
 
-Runtime status: SeqLN builds on the box (`/root/sequentia/seqln`, from GitHub) and lightningd is
-RPC-responsive — `getinfo`, `newaddr` (shared `tb1` bech32, the dual-chain format), `listfunds`, and
-`getchaininfo` all work, and getchaininfo returns the correct certified frontier (blockcount ==
-node000's real tip), **verifying section 6.1 in the live daemon**. But lightningd does **not complete
-startup**. A gdb backtrace of the wedged daemon is definitive:
+Runtime status: **PHASE 1 EXIT CRITERION MET (open / route / mutual-close, live on testnet).** Two
+SeqLN nodes (built from `sequentia-stable`, bcli -> the live Sequentia node) opened a policy-asset
+(Sequence-token) channel, routed a payment, and mutually closed it:
+- **Open:** funded node A with 0.1 tSEQ from the treasury; `fundchannel` A->B for 5,000,000 sat
+  (channel_type `static_remotekey/even`, funding outputs denominated in the policy asset). Funding
+  confirmed at **certified depth-1** (minimum_depth=1) -> `CHANNELD_NORMAL`, exercising 6.1/6.2 live.
+- **Route:** node B issued a `lntsqt1...` invoice (the Sequentia lightning HRP), node A paid it
+  1,000,000 msat -> `status: complete`; balances moved (to_us 5,000,000,000 -> 4,999,000,000 msat).
+- **Close:** mutual `close` from node A -> `CLOSINGD_COMPLETE`, closing tx broadcast.
 
-    #5 io_loop_with_timers (ld) at lightningd/io_loop_with_timers.c:22
-    #6 plugins_config (plugins) at lightningd/plugin.c:2224
-    #7 main (...) at lightningd/lightningd.c:1378
+Four bugs were found and fixed along the way (all committed; the first three are the load-bearing
+ones and are general enough to matter for any minimal/Elements CLN build):
+1. **plugins_config startup wedge** (`lightningd/plugin.c`): with the bitcoin backend (`bcli`) as the
+   only plugin, it is already INIT_COMPLETE by the time `plugins_config` runs, so no init is sent, so
+   `check_plugins_initted()` (only called on an init response) never io_breaks the wait loop -> hang
+   before `begin_topology`. Fix: skip the wait loop when every plugin is already INIT_COMPLETE.
+   (gdb-confirmed root cause; earlier "connectd_activate" guesses were wrong.)
+2. **fee_asset_tag byte order** (`bitcoin/chainparams.c`): CLN stores it in INTERNAL (reversed-display)
+   order (`liquid_fee_asset` is the reverse of the displayed L-BTC id); my Phase-0 entry used display
+   order, so `amount_asset_is_main()` failed and every policy-asset output was invisible to the wallet.
+3. **no on-chain fee estimation** (`plugins/bcli.c`): a Sequentia node returns no fee estimate, so
+   `unknown_feerates()` was true and channel opens were rejected ("feerates unknown"). Fix: enable
+   bcli's existing regtest `fake_fees` path for Sequentia (open fee market -> a default rate is
+   correct); operators can still `--force-feerates`.
+4. build requirement: the minimal in-tree build only had `bcli`; `fundchannel`/`pay`/routing need the
+   C plugins (`spenderp`, `pay`, `topology`, `funder`, ...) built.
 
-So it wedges in **`plugins_config`** — the startup step that sends `init` to every plugin and blocks
-until all reach INIT_COMPLETE. RPC works because `jsonrpc_listen` runs before this; `begin_topology`
-(the ongoing fee/block-poll timers) runs *after* it and never starts, so the tip stays at the
-`setup_topology` height and "still loading" persists. Yet `lightning-cli plugin list` shows the only
-plugin, `bcli`, as `active: true`, and bcli's `init` demonstrably completed (it logs "bitcoin-cli
-initialized and connected"), and bcli sits idle in its poll loop. So bcli finished init but
-plugins_config never sees INIT_COMPLETE and never breaks its loop. The `lightning_connectd` "zombie"
-noted earlier is just the harmless `test_subdaemons` version-check; connectd is NOT the problem (the
-backtrace is nowhere near connectd_activate). Note: CLN's log/`getlog` stop flushing after ~74 startup
-entries here — diagnose via gdb/`getinfo`/`plugin list`, not the log.
+Remaining for the FULL exit criterion (a stretch beyond the core open/route/close): a **force-close**
+and a **penalty** case across an **induced tail-truncation reorg**. The reorg leg needs a way to force
+a Bitcoin(testnet4)-anchor reorg, which is hard on the shared live testnet; do it on a controlled
+regtest/anchor setup. Also note: Sequentia block production on the shared testnet is slow/bursty
+(a brief stall was observed at ~18493, self-healed), which just slows on-chain confirmations.
 
-Stable-rebase experiment (done — ruled out a version regression): the 5 Sequentia commits were
-cherry-picked cleanly onto the **stable `v26.06.2`** point release (branch `sequentia-stable`), built
-on the box, and run — and it **wedges identically** (blockheight frozen at the setup_topology height,
-"still loading" persists, no "Server started"). So the startup wedge is NOT a master-snapshot bug; it
-is environmental / config, common to both CLN versions and to laptop + box. (Branch note:
-`sequentia-stable` is the better long-term base anyway — a point release, and the changes port with no
-modification and compile clean.)
-
-Next:
-- Resolve the `plugins_config` wedge (highest priority — gates all runtime). gdb-confirmed: lightningd
-  blocks in `plugins_config` (plugin.c:2224) waiting for all plugins to reach INIT_COMPLETE; the only
-  plugin `bcli` is `active:true`, its init completes (logs "bitcoin-cli initialized and connected",
-  returns NULL) and sits idle, yet `plugin_config_cb` never marks it INIT_COMPLETE — so bcli's init
-  RESPONSE is not reaching lightningd. Ruled out: my getchaininfo clamp (bcli idle), CLN version
-  (stable v26.06.2 wedges identically), the synchronous bcli (real upstream — 4126f3b1f is in
-  upstream/master + shipped in v26.04/v26.06), and the parser (setup_topology works).
-- **THE decisive next test (set up, ready, ~30s once box SSH is healthy): run this same build against a
-  plain Bitcoin node — no Sequentia code path** — and see if it also wedges in plugins_config:
-  `lightningd --network=testnet4 --bitcoin-cli=/root/bitcoin-28.1/bin/bitcoin-cli
-  --bitcoin-rpcconnect=127.0.0.1 --bitcoin-rpcport=48332 --bitcoin-rpcuser=seq
-  --bitcoin-rpcpassword=<mainchainrpcpassword from node-gw/elements.conf>` (test node dir
-  /root/seqln-test/nodeBTC). If it wedges too -> the cause is the **in-tree build / this environment**
-  (e.g. bcli's init-response pipe under the in-tree run), NOT Sequentia -> pursue `make install` / a
-  full plugin set. If it starts fully -> the cause is the **Sequentia chainparams entry** -> bisect its
-  fields. (This run was attempted but the box SSH degraded before it returned; retry when SSH is
-  healthy.)
-- Then the 2-node channel test (open/route/close + force-close/penalty): fund node A from
-  treasury-clean (node-gw RPC :18443) once the tip advances; both SeqLN nodes' bcli -> node000 :18200.
+Other follow-ups:
+- Wallet detection of EXPLICIT (unblinded) outputs works after fix #2, matching Sequentia's
+  transparent-by-default model (node addresses are unblinded `tb1`); no blinded-address workaround
+  needed.
 - Test-harness duplicates (`contrib/pyln-testing/.../{utils,fixtures}.py`, `tests/utils.py`,
   `devtools/gossipwith.c`) need Sequentia entries before the pytest suite runs.
 - A proper `bitcoin/test/run-*.c` unit test asserting the block-1000 hash (the Python files are the
   interim regression + live-breadth checks).
-- sequentia-regtest: needs a custom-params node (con_bitcoin_anchor + a local bitcoind mainchain) to
-  exercise the anchor path locally. Confirm build against Elements Core 23.3.3 (CI pins 23.2.1).
-- Then Phase 1 (policy-asset channels) per the spec.
+- `sequentia-stable` (v26.06.2 base) is the recommended branch; the 4 fixes live there. Confirm build
+  against Elements Core 23.3.3 (CI pins 23.2.1).
 
 ## Phase 1 — policy-asset (Sequence-token) channels + anchor-aware safety layer
 
@@ -184,10 +171,9 @@ Implemented + verified this pass:
   txs. Explicit fee-in-channel-asset generalization is Phase 3 (`channel_asset`).
 
 Exit criterion (open/route/close a Sequence-token channel between two SeqLN nodes, plus a force-close
-and a penalty case across an induced tail-truncation reorg): not yet met. SeqLN is built and running
-on the box and the daemon is fully functional (§6.1 confirmed live), but the ongoing block-poll stall
-(see Runtime status above) keeps the chain tip from advancing, which blocks funding. Resolving that
-stall is the gating item; the safety-layer code is unit/logic-verified and builds green.
+and a penalty case across an induced tail-truncation reorg): **core met** — open/route/mutual-close was
+demonstrated live on testnet (see Runtime status above). The force-close + penalty + induced-reorg
+leg remains (needs a controlled anchor-reorg setup, not the shared live testnet).
 
 ## Decisions still provisional (worth Alberto's sign-off before Phase 3)
 
