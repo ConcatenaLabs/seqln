@@ -1133,6 +1133,43 @@ u32 get_block_height(const struct chain_topology *topo)
 	return topo->tip->height;
 }
 
+/* SEQUENTIA (SeqLN spec 6.2, two-stage SCID): is the block at `funding_height`
+ * buried by at least `min_anchor_depth` Bitcoin-anchor blocks?  The header's
+ * anchor_height is monotonic non-decreasing with Sequentia height, so we walk
+ * back from the tip only until the anchor has dropped by min_anchor_depth (a
+ * bounded window, ~min_anchor_depth * Bitcoin/Sequentia block-time ratio): the
+ * height at that point is the "bury line", and any funding at or below it is
+ * buried.  This keeps the check O(that window) rather than O(tip - funding),
+ * even for long-announced channels. */
+bool topo_anchor_buried(const struct chain_topology *topo,
+			u32 funding_height, u32 min_anchor_depth)
+{
+	const struct block *b = topo->tip;
+	u32 best_anchor;
+
+	if (!b || !topo->root)
+		return false;
+	/* Funding not on-chain yet from our view. */
+	if (funding_height > b->height)
+		return false;
+	/* Below our in-memory window: ancient, hence certainly buried. */
+	if (funding_height < topo->root->height)
+		return true;
+
+	best_anchor = b->hdr.anchor_height;
+	while (b->height > funding_height) {
+		/* Early out: this block is already buried by the required
+		 * depth, so the deeper funding block certainly is too. */
+		if (best_anchor - b->hdr.anchor_height >= min_anchor_depth)
+			return true;
+		if (!b->prev)
+			return false;
+		b = b->prev;
+	}
+	/* b->height == funding_height: decide directly. */
+	return best_anchor - b->hdr.anchor_height >= min_anchor_depth;
+}
+
 u32 get_network_blockheight(const struct chain_topology *topo)
 {
 	if (topo->tip->height > topo->headercount)

@@ -173,6 +173,9 @@ bitcoin_block_from_hex(const tal_t *ctx, const struct chainparams *chainparams,
 	b->hdr.timestamp = pull_le32(&p, &len);
 	sha256_le32(&shactx, b->hdr.timestamp);
 
+	/* SEQUENTIA: 0 unless this is an anchored header (set below). */
+	b->hdr.anchor_height = 0;
+
 	if (is_elements(chainparams)) {
 		/* A dynafed block is signalled by setting the MSB of the version. */
 		is_dynafed = (b->hdr.version >> 31 == 1);
@@ -192,6 +195,8 @@ bitcoin_block_from_hex(const tal_t *ctx, const struct chainparams *chainparams,
 			sha256_le32(&shactx, anchor_height);
 			pull(&p, &len, anchor_hash, sizeof(anchor_hash));
 			sha256_update(&shactx, anchor_hash, sizeof(anchor_hash));
+			/* Retain for the two-stage SCID rule (spec 6.2). */
+			b->hdr.anchor_height = anchor_height;
 		}
 
 		if (is_dynafed) {
