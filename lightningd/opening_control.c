@@ -2,6 +2,7 @@
 #include <bitcoin/psbt.h>
 #include <ccan/cast/cast.h>
 #include <ccan/mem/mem.h>
+#include <ccan/str/hex/hex.h>
 #include <ccan/tal/str/str.h>
 #include <common/addr.h>
 #include <common/blockheight_states.h>
@@ -95,7 +96,8 @@ wallet_commit_channel(struct lightningd *ld,
 		      const u8 *remote_upfront_shutdown_script,
 		      const struct channel_type *type,
 		      const struct wally_psbt *funding_psbt,
-		      bool withheld)
+		      bool withheld,
+		      const u8 *channel_asset)
 {
 	struct channel *channel;
 	struct amount_msat our_msat;
@@ -236,6 +238,13 @@ wallet_commit_channel(struct lightningd *ld,
 			      tal_arr(NULL, struct channel_state_change *, 0),
 			      funding_psbt,
 			      withheld);
+
+	/* Asset-aware channels: new_channel defaulted channel_asset to the
+	 * policy asset; stamp the negotiated asset before we persist it and
+	 * start channeld with it. */
+	if (channel_asset)
+		memcpy(channel->channel_asset, channel_asset,
+		       sizeof(channel->channel_asset));
 
 	/* Now we finally put it in the database. */
 	wallet_channel_insert(ld->wallet, channel);
@@ -384,6 +393,7 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 	struct penalty_base *pbase;
 	struct channel_type *type;
 	bool was_important;
+	u8 channel_asset[33];
 
 	/* This is a new channel_info.their_config so set its ID to 0 */
 	channel_info.their_config.id = 0;
@@ -404,7 +414,8 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 					   &feerate,
 					   &fc->uc->our_config.channel_reserve,
 					   &remote_upfront_shutdown_script,
-					   &type)) {
+					   &type,
+					   channel_asset)) {
 		log_broken(fc->uc->log,
 			   "bad OPENING_FUNDER_REPLY %s",
 			   tal_hex(resp, resp));
@@ -446,7 +457,8 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 					remote_upfront_shutdown_script,
 					type,
 					fc->funding_psbt,
-					fc->withheld);
+					fc->withheld,
+					channel_asset);
 	if (!channel) {
 		was_pending(command_fail(fc->cmd, LIGHTNINGD,
 					 "Key generation failure"));
@@ -494,6 +506,7 @@ static void opening_fundee_finished(struct subd *openingd,
 	struct peer_fd *peer_fd;
 	struct penalty_base *pbase;
 	struct channel_type *type;
+	u8 channel_asset[33];
 
 	log_debug(uc->log, "Got opening_fundee_finish_response");
 
@@ -521,7 +534,8 @@ static void opening_fundee_finished(struct subd *openingd,
 				     &uc->our_config.channel_reserve,
 				     &local_upfront_shutdown_script,
 				     &remote_upfront_shutdown_script,
-				     &type)) {
+				     &type,
+				     channel_asset)) {
 		log_broken(uc->log, "bad OPENING_FUNDEE_REPLY %s",
 			   tal_hex(reply, reply));
 		uncommitted_channel_disconnect(uc, LOG_BROKEN,
@@ -551,7 +565,8 @@ static void opening_fundee_finished(struct subd *openingd,
 					remote_upfront_shutdown_script,
 					type,
 					NULL,
-					false);
+					false,
+					channel_asset);
 	if (!channel) {
 		uncommitted_channel_disconnect(uc, LOG_BROKEN,
 					       "Commit channel failed");
@@ -1272,6 +1287,32 @@ static void fundchannel_start_after_sync(struct chain_topology *topo,
 /**
  * json_fundchannel_start - Entrypoint for funding a channel
  */
+/* Parse a display asset id (32-byte hex, "natural" order) into the 33-byte
+ * elements asset tag (0x01 || byte-reversed id). Asset-aware channels.
+ * FIXME: shared with wallet/reservation.c's copy; consolidate. */
+static struct command_result *param_asset_tag(struct command *cmd,
+					      const char *name,
+					      const char *buffer,
+					      const jsmntok_t *tok,
+					      const u8 **asset)
+{
+	u8 id[32], *tag;
+
+	if (!chainparams->is_elements)
+		return command_fail_badparam(cmd, name, buffer, tok,
+					     "assets are only supported on elements");
+	if (!hex_decode(buffer + tok->start, tok->end - tok->start,
+			id, sizeof(id)))
+		return command_fail_badparam(cmd, name, buffer, tok,
+					     "expected a 32-byte hex asset id");
+	tag = tal_arr(cmd, u8, 33);
+	tag[0] = 0x01;
+	for (size_t i = 0; i < sizeof(id); i++)
+		tag[1 + i] = id[sizeof(id) - 1 - i];
+	*asset = tag;
+	return NULL;
+}
+
 static struct command_result *json_fundchannel_start(struct command *cmd,
 						     const char *buffer,
 						     const jsmntok_t *obj UNNEEDED,
@@ -1287,6 +1328,7 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 	u32 *upfront_shutdown_script_wallet_index;
 	struct channel_id tmp_channel_id;
 	struct channel_type *ctype;
+	const u8 *asset = NULL;
 
 	fc->cmd = cmd;
 	fc->cancels = tal_arr(fc, struct command *, 0);
@@ -1304,8 +1346,18 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 			 p_opt("mindepth", param_u32, &mindepth),
 			 p_opt("reserve", param_sat, &reserve),
 			 p_opt("channel_type", param_channel_type, &ctype),
+			 p_opt("asset", param_asset_tag, &asset),
 			 NULL))
 		return command_param_failed();
+
+	/* Asset-aware channels: default to the policy asset unless the caller
+	 * asked to denominate this channel in an issued asset. */
+	if (chainparams->is_elements && !asset)
+		asset = chainparams->fee_asset_tag;
+	if (asset)
+		memcpy(fc->channel_asset, asset, sizeof(fc->channel_asset));
+	else
+		memset(fc->channel_asset, 0, sizeof(fc->channel_asset));
 
 	if (ctype) {
 		fc->channel_type = tal_steal(fc, ctype);
@@ -1471,7 +1523,8 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 			&tmp_channel_id,
 			fc->channel_flags,
 			reserve,
-			fc->channel_type);
+			fc->channel_type,
+			fc->channel_asset);
 
 	if (!topology_synced(cmd->ld->topology)) {
 		struct fundchannel_start_info *info

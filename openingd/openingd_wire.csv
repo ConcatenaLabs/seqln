@@ -77,6 +77,7 @@ msgdata,openingd_funder_reply,our_channel_reserve_satoshis,amount_sat,
 msgdata,openingd_funder_reply,shutdown_len,u16,
 msgdata,openingd_funder_reply,shutdown_scriptpubkey,u8,shutdown_len
 msgdata,openingd_funder_reply,channel_type,channel_type,
+msgdata,openingd_funder_reply,channel_asset,byte,33
 
 # master->openingd: start channel establishment for a funding tx
 msgtype,openingd_funder_start,6002
@@ -91,6 +92,7 @@ msgdata,openingd_funder_start,temporary_channel_id,channel_id,
 msgdata,openingd_funder_start,channel_flags,u8,
 msgdata,openingd_funder_start,reserve,?amount_sat,
 msgdata,openingd_funder_start,channel_type,channel_type,
+msgdata,openingd_funder_start,channel_asset,byte,33
 
 # openingd->master: send back output script for 2-of-2 funding output
 msgtype,openingd_funder_start_reply,6102
@@ -141,6 +143,7 @@ msgdata,openingd_fundee,local_shutdown_scriptpubkey,u8,local_shutdown_len
 msgdata,openingd_fundee,remote_shutdown_len,u16,
 msgdata,openingd_fundee,remote_shutdown_scriptpubkey,u8,remote_shutdown_len
 msgdata,openingd_fundee,channel_type,channel_type,
+msgdata,openingd_fundee,channel_asset,byte,33
 
 # master -> openingd: do you have a memleak?
 msgtype,openingd_dev_memleak,6033

@@ -632,8 +632,10 @@ struct amount_sat psbt_input_get_amount(const struct wally_psbt *psbt,
 	if (psbt->inputs[in].witness_utxo) {
 		struct amount_asset amt_asset =
 			wally_tx_output_get_amount(psbt->inputs[in].witness_utxo);
-		assert(amount_asset_is_main(&amt_asset));
-		val = amount_asset_to_sat(&amt_asset);
+		/* Return the raw explicit value regardless of asset (asset-aware
+		 * channels): callers balance inputs against outputs within a
+		 * single asset, so the asset identity is theirs to enforce. */
+		val = amount_sat(amt_asset.value);
 	} else if (psbt->inputs[in].utxo) {
 		int idx = psbt->inputs[in].index;
 		struct wally_tx *prev_tx = psbt->inputs[in].utxo;
