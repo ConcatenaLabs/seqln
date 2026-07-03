@@ -205,6 +205,13 @@ struct channel {
 	struct bitcoin_outpoint funding;
 	struct amount_sat funding_sats;
 
+	/* The Sequentia asset this channel is denominated in (33-byte version+tag),
+	 * for asset-aware channels. Defaults to the network policy asset (Bitcoin /
+	 * policy-asset channels); commitment/close txs and the subdaemons denominate
+	 * in it. Not yet persisted to the DB: defaults to the policy asset on reload
+	 * (fine for existing policy-asset channels). */
+	u8 channel_asset[33];
+
 	/* Watch we have on funding output. */
 	struct txowatch *funding_spend_watch;
 
