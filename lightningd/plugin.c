@@ -2217,8 +2217,16 @@ bool plugins_config(struct plugins *plugins)
 	}
 
 	/* Wait for them to configure, before continuing: large
-	 * nodes can take a while to startup! */
-	if (plugins->startup) {
+	 * nodes can take a while to startup!
+	 *
+	 * SEQUENTIA: only enter this wait loop if some plugin is not yet
+	 * INIT_COMPLETE.  The loop is broken by check_plugins_initted(), which
+	 * only runs on an init *response*; if every plugin is already
+	 * INIT_COMPLETE (e.g. the bitcoin backend was configured early and is
+	 * the only plugin, as in a minimal in-tree build), no init is sent, no
+	 * response arrives, and the loop would wait forever.  A full install
+	 * never hits this because other plugins are still initing here. */
+	if (plugins->startup && !plugins_all_in_state(plugins, INIT_COMPLETE)) {
 		/* This happens if an important plugin fails init,
 		 * or if they call shutdown now. */
 		if (io_loop_with_timers(plugins->ld) == plugins->ld)
