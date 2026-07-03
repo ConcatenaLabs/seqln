@@ -412,8 +412,9 @@ bool psbt_input_get_ecdsa_sig(const tal_t *ctx,
 	return ok;
 }
 
-void psbt_input_set_wit_utxo(struct wally_psbt *psbt, size_t in,
-			     const u8 *scriptPubkey, struct amount_sat amt)
+void psbt_input_set_wit_utxo_asset(struct wally_psbt *psbt, size_t in,
+				   const u8 *scriptPubkey, struct amount_sat amt,
+				   const u8 *asset)
 {
 	struct wally_tx_output *tx_out;
 	int wally_err;
@@ -431,7 +432,7 @@ void psbt_input_set_wit_utxo(struct wally_psbt *psbt, size_t in,
 		wally_err =
 			wally_tx_elements_output_init_alloc(scriptPubkey,
 						      tal_bytelen(scriptPubkey),
-						      chainparams->fee_asset_tag,
+						      asset,
 						      ELEMENTS_ASSET_LEN,
 						      value, sizeof(value),
 						      NULL, 0, NULL, 0,
@@ -447,6 +448,14 @@ void psbt_input_set_wit_utxo(struct wally_psbt *psbt, size_t in,
 	wally_tx_output_free(tx_out);
 	assert(wally_err == WALLY_OK);
 	tal_wally_end(psbt);
+}
+
+void psbt_input_set_wit_utxo(struct wally_psbt *psbt, size_t in,
+			     const u8 *scriptPubkey, struct amount_sat amt)
+{
+	/* Default: the network policy asset. */
+	psbt_input_set_wit_utxo_asset(psbt, in, scriptPubkey, amt,
+				      chainparams->fee_asset_tag);
 }
 
 void psbt_input_set_utxo(struct wally_psbt *psbt, size_t in,

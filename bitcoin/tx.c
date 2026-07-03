@@ -262,8 +262,11 @@ int bitcoin_tx_add_input(struct bitcoin_tx *tx,
 	}
 
 	assert(scriptPubkey);
-	psbt_input_set_wit_utxo(tx->psbt, input_num,
-				scriptPubkey, amount);
+	/* The witness_utxo (and thus the elements sighash) must carry this tx's
+	 * asset: for commitment/close/funding txs the input spends the channel
+	 * asset. Default output_asset == policy asset keeps existing txs unchanged. */
+	psbt_input_set_wit_utxo_asset(tx->psbt, input_num,
+				      scriptPubkey, amount, tx->output_asset);
 
 	tal_wally_start();
 	tx_input = wally_tx_input_from_outpoint_sequence(outpoint, sequence);
