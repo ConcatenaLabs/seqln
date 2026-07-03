@@ -27,6 +27,11 @@ struct bitcoin_block_hdr {
 	le32 target;
 	le32 nonce;
 	struct bitcoin_blkid hash;
+	/* SEQUENTIA: the Bitcoin-anchor height committed in the block header
+	 * (host order), 0 on chains without has_anchor_header.  Retained so the
+	 * two-stage SCID rule (SeqLN spec 6.2) can gate channel_announcement on
+	 * anchor burial.  See bitcoin_block_from_hex(). */
+	u32 anchor_height;
 };
 
 struct bitcoin_block {
