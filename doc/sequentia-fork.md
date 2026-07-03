@@ -90,6 +90,63 @@ Next:
   exercise the anchor path locally. Confirm build against Elements Core 23.3.3 (CI pins 23.2.1).
 - Then Phase 1 (policy-asset channels) per the spec.
 
+## Phase 1 — policy-asset (Sequence-token) channels + anchor-aware safety layer
+
+Phase 1 is the maintained CLN-on-Elements channel path pointed at Sequentia: the channel asset IS the
+policy asset (`fee_asset_tag`, already configured), so the per-channel `channel_asset` threading is
+deferred to Phase 3. The novel, load-bearing Phase-1 delta is the section-6 anchor-aware safety layer.
+
+Grounding (live testnet RPC shapes, verified):
+- `getblockheader` returns `poscertified` (bool), `poscountersigs`/`posquorum`, `anchorheight`,
+  `anchorhash`. The chain tip is certified essentially immediately (committee signs at the tip).
+- `getanchorstatus` returns `validateanchor`, `tipheight`, `anchorheight` (the tip's Bitcoin anchor,
+  ~= the node's Bitcoin-tip view), `anchorstatus`. Anchor height is monotonic across Sequentia height.
+- Measured Sequentia block time ~58s (16000-block sample): 1 day ~= 1496 blocks, 3h ~= 187, 2 weeks
+  ~= 20938.
+
+Implemented + verified this pass:
+- **6.1 certified-frontier confirmations** (`plugins/bcli.c` `getchaininfo`, guarded by
+  `chainparams->has_anchor_header`). bcli reports the *certified frontier* — the highest
+  `poscertified` height at or below the node tip — as `blockcount`/`headercount`, so every
+  `minimum_depth`/confirmation check in CLN is denominated in certified depth, not raw Sequentia
+  tip-distance. A certified block is only displaced by a Bitcoin-anchor reorg (tail truncation), which
+  CLN's normal reorg handling absorbs when the frontier retreats. Fast path is one `getblockheader`
+  (tip is normally certified); it walks down bounded by `SEQUENTIA_CERT_LOOKBACK`=144 and fails open
+  with a loud warning only if the committee has stalled that long. Verified: regression test
+  `tests/sequentia/verify_certified_frontier.py` (healthy-chain no-clamp; walk mechanics; synthetic
+  uncertified-suffix clamp — 3/3 PASS on live data) and end-to-end in the real daemon (bcli returned
+  the certified tip, lightningd anchored to it, no clamp warning / JSON error).
+- **6.2 minimum_depth = 1** and **6.3 wall-clock timelocks** (`lightningd/options.c`, guarded by
+  `has_anchor_header`, overriding the testnet/mainnet preset for any Sequentia network): a certified
+  funding block is final, so `funding_confirms = 1`; timelocks are sized in wall-clock at the measured
+  ~58s cadence and each is >= its Bitcoin-mainnet wall-clock equivalent — `locktime_blocks`
+  (to_self_delay) 1440 (~1 day), `cltv_expiry_delta` 270 (~4.3h, ample for same-chain fast finality),
+  `cltv_final` 180 (~2.9h), `max_htlc_cltv` 20160 (~2 weeks; otherwise HTLCs would cap at ~32h).
+
+Designed, deferred to a focused next pass (additive — channels are usable at certified depth-1
+without it; it only gates *public* announcement, so Phase-1 open/route/close/penalty can be exercised
+on unannounced channels first):
+- **6.2 two-stage SCID / anchor-burial announcement gate.** A certified block can still fall to tail
+  truncation until its Bitcoin anchor is buried, and a `channel_announcement` SCID
+  (height:txindex:output) must never be invalidated. So announce only once the funding block's anchor
+  is buried by k Bitcoin blocks (k small, 1-2). Exact arithmetic:
+  `anchor_depth(funding) = getanchorstatus.anchorheight − getblockheader(funding).anchorheight`;
+  announceable ⟺ `anchor_depth >= k`. Seam: `has_announce_depth()` in `lightningd/channel_gossip.c`
+  gains a Sequentia branch. Plumbing (Option B, the correct one): the backend surfaces the current
+  best anchor height (extend the interface — do NOT approximate k Bitcoin blocks as a Sequentia block
+  count, that breaks anchoring precision), the channel caches its funding block's `anchorheight` when
+  the funding first confirms, and the branch compares the two. This is correctness-critical (SCID
+  stability) and gets adversarial review, hence a dedicated pass.
+- **6.4 fee asset for penalty/claim txs.** In Phase 1 the channel asset is the policy asset, so the
+  node already holds a committee-accepted fee asset for justice/HTLC-claim txs; inherited from the
+  policy-asset path. Explicit fee-in-channel-asset generalization is Phase 3 (`channel_asset`).
+
+Exit criterion (open/route/close a Sequence-token channel between two SeqLN nodes, plus a force-close
+and a penalty case across an induced tail-truncation reorg): requires a running two-node testnet,
+which needs a non-sandboxed host (the connectd startup caveat above blocks it on this laptop). The
+safety-layer code above is unit/logic-verified and builds green; the two-node runtime is the open
+item for a normal host.
+
 ## Decisions still provisional (worth Alberto's sign-off before Phase 3)
 
 - Lightning HRPs (`sqt`/`tsqt`/`sqrt`).

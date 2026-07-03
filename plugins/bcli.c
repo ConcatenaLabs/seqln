@@ -442,6 +442,83 @@ static struct command_result *getrawblockbyheight(struct command *cmd,
 	}
 }
 
+/* SEQUENTIA (SeqLN spec section 6.1): "confirmed" for Lightning must mean
+ * quorum-certified, not raw Sequentia tip-distance.  A Sequentia block carries
+ * a `poscertified` flag in getblockheader; a certified block cannot be
+ * displaced except by a Bitcoin-anchor reorg (tail truncation).  We therefore
+ * report the *certified frontier* - the highest certified height <= the node
+ * tip - as bcli's block/header count, so every minimum_depth and confirmation
+ * check in CLN is denominated in certified depth.  When the frontier retreats
+ * (only possible on a Bitcoin reorg orphaning an anchor), CLN's normal reorg
+ * handling absorbs it.  Guarded by chainparams->has_anchor_header, so the
+ * Bitcoin path is untouched.  The anchor-burial gate (section 6.2, two-stage
+ * SCID) is a separate check at announcement time, not here. */
+#define SEQUENTIA_CERT_LOOKBACK 144
+
+/* Reads getblockheader.poscertified for a block hash.  Returns false if the
+ * header could not be read/parsed; otherwise sets *certified. */
+static bool sequentia_block_certified(struct command *cmd,
+				      const char *blockhash,
+				      bool *certified)
+{
+	struct bcli_result *res;
+	const jsmntok_t *tokens;
+	const char *err;
+
+	res = run_bitcoin_cli(cmd, cmd->plugin, "getblockheader", blockhash, NULL);
+	if (res->exitstatus != 0)
+		return false;
+	tokens = json_parse_simple(res->output, res->output, res->output_len);
+	if (!tokens)
+		return false;
+	err = json_scan(tmpctx, res->output, tokens, "{poscertified:%}",
+			JSON_SCAN(json_to_bool, certified));
+	return err == NULL;
+}
+
+/* Trim trailing whitespace/newline that elements-cli appends to a bare
+ * string result (e.g. getblockhash). */
+static char *sequentia_trim(const tal_t *ctx, const char *s, size_t len)
+{
+	while (len > 0 && (s[len-1] == '\n' || s[len-1] == '\r' || s[len-1] == ' '))
+		len--;
+	return tal_strndup(ctx, s, len);
+}
+
+/* Highest quorum-certified height at or below `tip` (whose hash is tip_hash).
+ * Fast path: the committee certifies at the tip in normal operation, so a
+ * single getblockheader suffices.  Falls back to walking down, bounded by
+ * SEQUENTIA_CERT_LOOKBACK; a gap that large means the committee has stalled,
+ * in which case we fail open (report the raw tip) but warn loudly. */
+static u32 sequentia_certified_frontier(struct command *cmd, u32 tip,
+					const char *tip_hash)
+{
+	bool certified = false;
+
+	if (sequentia_block_certified(cmd, tip_hash, &certified) && certified)
+		return tip;
+
+	for (u32 back = 1; back <= SEQUENTIA_CERT_LOOKBACK && back <= tip; back++) {
+		u32 h = tip - back;
+		struct bcli_result *res;
+		const char *hash;
+
+		res = run_bitcoin_cli(cmd, cmd->plugin, "getblockhash",
+				      tal_fmt(tmpctx, "%u", h), NULL);
+		if (res->exitstatus != 0)
+			continue;
+		hash = sequentia_trim(tmpctx, res->output, res->output_len);
+		if (sequentia_block_certified(cmd, hash, &certified) && certified)
+			return h;
+	}
+
+	plugin_log(cmd->plugin, LOG_UNUSUAL,
+		   "Sequentia: no quorum-certified block within %u of tip %u; "
+		   "reporting raw tip (committee stalled?)",
+		   SEQUENTIA_CERT_LOOKBACK, tip);
+	return tip;
+}
+
 /* Get infos about the block chain.
  * Calls `getblockchaininfo` and returns headers count, blocks count,
  * the chain id, and whether this is initialblockdownload.
@@ -461,7 +538,7 @@ static struct command_result *getchaininfo(struct command *cmd,
 	struct json_stream *response;
 	bool ibd;
 	u32 headers, blocks;
-	const char *chain, *err;
+	const char *chain, *bestblockhash, *err;
 
 	if (!param(cmd, buf, toks,
 		   p_opt("last_height", param_number, &height),
@@ -477,16 +554,35 @@ static struct command_result *getchaininfo(struct command *cmd,
 		return command_err(cmd, res, "bad JSON: cannot parse");
 
 	err = json_scan(tmpctx, res->output, tokens,
-			"{chain:%,headers:%,blocks:%,initialblockdownload:%}",
+			"{chain:%,headers:%,blocks:%,bestblockhash:%,initialblockdownload:%}",
 			JSON_SCAN_TAL(tmpctx, json_strdup, &chain),
 			JSON_SCAN(json_to_number, &headers),
 			JSON_SCAN(json_to_number, &blocks),
+			JSON_SCAN_TAL(tmpctx, json_strdup, &bestblockhash),
 			JSON_SCAN(json_to_bool, &ibd));
 	if (err)
 		return command_err(cmd, res, tal_fmt(tmpctx, "bad JSON: %s", err));
 
 	if (bitcoind->dev_ignore_ibd)
 		ibd = false;
+
+	/* SEQUENTIA (spec 6.1): clamp the reported chain tip to the certified
+	 * frontier so CLN's confirmation/minimum_depth math counts only
+	 * quorum-certified blocks.  See sequentia_certified_frontier(). */
+	if (chainparams->has_anchor_header && blocks > 0) {
+		u32 frontier = sequentia_certified_frontier(cmd, blocks,
+							    bestblockhash);
+		if (frontier < blocks) {
+			plugin_log(cmd->plugin, LOG_DBG,
+				   "Sequentia: clamping tip %u -> certified "
+				   "frontier %u", blocks, frontier);
+			blocks = frontier;
+		}
+		/* The certified chain is CLN's whole world: don't advertise
+		 * header progress past it either. */
+		if (headers > blocks)
+			headers = blocks;
+	}
 
 	response = jsonrpc_stream_success(cmd);
 	json_add_string(response, "chain", chain);
