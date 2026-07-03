@@ -502,7 +502,8 @@ struct utxo *wallet_find_utxo(const tal_t *ctx, struct wallet *w,
 			      unsigned feerate_per_kw,
 			      u32 maxheight,
 			      bool nonwrapped,
-			      const struct utxo **excludes);
+			      const struct utxo **excludes,
+			      const u8 *asset);
 
 /**
  * wallet_has_funds: do we have sufficient other UTXOs for this amount?

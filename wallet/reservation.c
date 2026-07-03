@@ -3,6 +3,7 @@
 #include <bitcoin/psbt.h>
 #include <bitcoin/script.h>
 #include <ccan/cast/cast.h>
+#include <ccan/str/hex/hex.h>
 #include <common/json_command.h>
 #include <common/psbt_open.h>
 #include <lightningd/chaintopology.h>
@@ -304,14 +305,12 @@ struct wally_psbt *psbt_using_utxos(const tal_t *ctx,
 				  this_nsequence, scriptSig,
 				  NULL, redeemscript);
 
-		psbt_input_set_wit_utxo(psbt, psbt->num_inputs-1,
-					scriptPubkey, utxos[i]->amount);
-		if (is_elements(chainparams)) {
-			/* FIXME: persist asset tags */
-			amount_sat_to_asset(&utxos[i]->amount,
-						    chainparams->fee_asset_tag);
-			/* FIXME: persist nonces */
-		}
+		/* Tag the witness utxo with the input's own asset (asset-aware
+		 * channels); on non-elements the asset is ignored.
+		 * FIXME: persist nonces */
+		psbt_input_set_wit_utxo_asset(psbt, psbt->num_inputs-1,
+					      scriptPubkey, utxos[i]->amount,
+					      utxos[i]->asset);
 
 		/* FIXME: as of 17 sept 2020, elementsd is *at most* at par
 		 * with v0.18.0 of bitcoind, which doesn't support setting
@@ -339,12 +338,19 @@ static struct command_result *finish_psbt(struct command *cmd,
 					  struct amount_sat excess,
 					  u32 reserve,
 					  u32 *locktime,
-					  struct amount_sat change)
+					  struct amount_sat change,
+					  const u8 *asset)
 {
 	struct json_stream *response;
 	struct wally_psbt *psbt;
 	ssize_t change_outnum;
 	u32 current_height = get_block_height(cmd->ld->topology);
+
+	/* The selected inputs are all one asset; denominate the change and the
+	 * (elements) fee output in it too, so the whole tx is single-asset.
+	 * A NULL @asset means the policy asset (an ordinary policy-asset fund). */
+	if (chainparams->is_elements && !asset)
+		asset = chainparams->fee_asset_tag;
 
 	if (!locktime) {
 		locktime = tal(cmd, u32);
@@ -388,7 +394,7 @@ static struct command_result *finish_psbt(struct command *cmd,
 		}
 
 		change_outnum = psbt->num_outputs;
-		psbt_append_output(psbt, b32script, change);
+		psbt_append_output_asset(psbt, b32script, change, asset);
 		/* Add additional weight of output */
 		weight += bitcoin_tx_output_weight(
 				chainparams->is_elements ? BITCOIN_SCRIPTPUBKEY_P2WPKH_LEN : BITCOIN_SCRIPTPUBKEY_P2TR_LEN);
@@ -400,7 +406,9 @@ static struct command_result *finish_psbt(struct command *cmd,
 	if (is_elements(chainparams)) {
 		struct amount_sat est_fee =
 			amount_tx_fee(feerate_per_kw, weight);
-		psbt_append_output(psbt, NULL, est_fee);
+		/* Single-asset tx: the fee is paid in the same asset as the
+		 * inputs (Sequentia's open fee market accepts any asset). */
+		psbt_append_output_asset(psbt, NULL, est_fee, asset);
 		/* Add additional weight of fee output */
 		weight += bitcoin_tx_output_weight(0);
 	} else {
@@ -485,11 +493,38 @@ static bool change_for_emergency(struct lightningd *ld,
 	return true;
 }
 
+/* Parse a display asset id (32-byte hex, "natural" order, as elements-cli
+ * shows) into the 33-byte elements asset tag (0x01 || byte-reversed id) used
+ * on the wire and stored in utxo->asset.  Asset-aware channels only. */
+static struct command_result *param_asset_tag(struct command *cmd,
+					      const char *name,
+					      const char *buffer,
+					      const jsmntok_t *tok,
+					      const u8 **asset)
+{
+	u8 id[32], *tag;
+
+	if (!chainparams->is_elements)
+		return command_fail_badparam(cmd, name, buffer, tok,
+					     "assets are only supported on elements");
+	if (!hex_decode(buffer + tok->start, tok->end - tok->start,
+			id, sizeof(id)))
+		return command_fail_badparam(cmd, name, buffer, tok,
+					     "expected a 32-byte hex asset id");
+	tag = tal_arr(cmd, u8, 33);
+	tag[0] = 0x01;
+	for (size_t i = 0; i < sizeof(id); i++)
+		tag[1 + i] = id[sizeof(id) - 1 - i];
+	*asset = tag;
+	return NULL;
+}
+
 static struct command_result *json_fundpsbt(struct command *cmd,
 					      const char *buffer,
 					      const jsmntok_t *obj UNNEEDED,
 					      const jsmntok_t *params)
 {
+	const u8 *asset = NULL;
 	struct utxo **utxos;
 	const struct utxo **excluded;
 	u32 *feerate_per_kw;
@@ -515,6 +550,7 @@ static struct command_result *json_fundpsbt(struct command *cmd,
 				   &nonwrapped, false),
 			 p_opt_def("opening_anchor_channel", param_bool,
 				   &keep_emergency_funds, false),
+			 p_opt("asset", param_asset_tag, &asset),
 			 NULL))
 		return command_param_failed();
 
@@ -547,7 +583,8 @@ static struct command_result *json_fundpsbt(struct command *cmd,
 					*feerate_per_kw,
 					maxheight,
 					*nonwrapped,
-					excluded);
+					excluded,
+					asset);
 
 		if (utxo) {
 			tal_arr_expand(&excluded, utxo);
@@ -634,7 +671,7 @@ static struct command_result *json_fundpsbt(struct command *cmd,
 		return command_check_done(cmd);
 
 	return finish_psbt(cmd, utxos, *feerate_per_kw, *weight, diff, *reserve,
-			   locktime, change);
+			   locktime, change, asset);
 }
 
 static const struct json_command fundpsbt_command = {
@@ -660,6 +697,7 @@ static struct command_result *json_addpsbtoutput(struct command *cmd,
 	bool *add_initiator_serial_ids;
 	struct wally_psbt_output *output;
 	u64 serial_id;
+	const u8 *asset = NULL;
 
 	if (!param_check(cmd, buffer, params,
 			 p_req("satoshi", param_sat, &amount),
@@ -669,8 +707,14 @@ static struct command_result *json_addpsbtoutput(struct command *cmd,
 			       &b32script),
 			 p_opt_def("add_initiator_serial_ids", param_bool,
 			 	   &add_initiator_serial_ids, false),
+			 p_opt("asset", param_asset_tag, &asset),
 			 NULL))
 		return command_param_failed();
+
+	/* Denominate the output in @asset (asset-aware channels); NULL/default
+	 * is the policy asset. */
+	if (chainparams->is_elements && !asset)
+		asset = chainparams->fee_asset_tag;
 
 	if (!psbt) {
 		if (!locktime) {
@@ -727,7 +771,7 @@ static struct command_result *json_addpsbtoutput(struct command *cmd,
 	}
 
 	outnum = psbt->num_outputs;
-	output = psbt_append_output(psbt, b32script, *amount);
+	output = psbt_append_output_asset(psbt, b32script, *amount, asset);
 
 	if (*add_initiator_serial_ids) {
 		serial_id = psbt_new_output_serial(psbt, TX_INITIATOR);
@@ -828,7 +872,7 @@ static struct command_result *json_addpsbtinput(struct command *cmd,
 		utxo = wallet_find_utxo(utxos, cmd->ld->wallet, current_height,
 					&diff, 0,
 					minconf_to_maxheight(1, cmd->ld), true,
-					excluded);
+					excluded, NULL);
 
 		if (utxo) {
 			tal_arr_expand(&excluded, utxo);
@@ -1097,7 +1141,7 @@ static struct command_result *json_utxopsbt(struct command *cmd,
 		return command_check_done(cmd);
 
 	return finish_psbt(cmd, utxos, *feerate_per_kw, *weight, excess,
-			   *reserve, locktime, change);
+			   *reserve, locktime, change, NULL);
 }
 static const struct json_command utxopsbt_command = {
 	"utxopsbt",

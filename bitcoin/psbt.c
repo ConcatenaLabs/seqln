@@ -278,13 +278,34 @@ struct wally_psbt_output *psbt_append_output(struct wally_psbt *psbt,
 	return psbt_insert_output(psbt, script, amount, psbt->num_outputs);
 }
 
+struct wally_psbt_output *psbt_append_output_asset(struct wally_psbt *psbt,
+						   const u8 *script,
+						   struct amount_sat amount,
+						   const u8 *asset)
+{
+	return psbt_insert_output_asset(psbt, script, amount, asset,
+					psbt->num_outputs);
+}
+
 struct wally_psbt_output *psbt_insert_output(struct wally_psbt *psbt,
 					     const u8 *script,
 					     struct amount_sat amount,
 					     size_t insert_at)
 {
+	/* Default: the network policy asset (a no-op / NULL on non-elements). */
+	return psbt_insert_output_asset(psbt, script, amount,
+					chainparams->fee_asset_tag, insert_at);
+}
+
+struct wally_psbt_output *psbt_insert_output_asset(struct wally_psbt *psbt,
+						   const u8 *script,
+						   struct amount_sat amount,
+						   const u8 *asset,
+						   size_t insert_at)
+{
 	struct wally_psbt_output *out;
-	struct wally_tx_output *tx_out = wally_tx_output(NULL, script, amount);
+	struct wally_tx_output *tx_out = wally_tx_output_asset(NULL, script,
+							      amount, asset);
 
 	out = psbt_add_output(psbt, tx_out, insert_at);
 	wally_tx_output_free(tx_out);

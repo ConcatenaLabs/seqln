@@ -183,10 +183,22 @@ struct wally_psbt_output *psbt_add_output(struct wally_psbt *psbt,
 struct wally_psbt_output *psbt_append_output(struct wally_psbt *psbt,
 					     const u8 *script,
 					     struct amount_sat amount);
+/* As psbt_append_output, but (on elements) denominate the output in @asset
+ * (33-byte version+tag) instead of the policy asset. @asset may be NULL /
+ * the policy tag for an ordinary output. */
+struct wally_psbt_output *psbt_append_output_asset(struct wally_psbt *psbt,
+						   const u8 *script,
+						   struct amount_sat amount,
+						   const u8 *asset);
 struct wally_psbt_output *psbt_insert_output(struct wally_psbt *psbt,
 					     const u8 *script,
 					     struct amount_sat amount,
 					     size_t insert_at);
+struct wally_psbt_output *psbt_insert_output_asset(struct wally_psbt *psbt,
+						   const u8 *script,
+						   struct amount_sat amount,
+						   const u8 *asset,
+						   size_t insert_at);
 
 void psbt_rm_output(struct wally_psbt *psbt,
 		    size_t remove_at);

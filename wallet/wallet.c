@@ -847,10 +847,17 @@ struct utxo *wallet_find_utxo(const tal_t *ctx, struct wallet *w,
 			      unsigned feerate_per_kw,
 			      u32 maxheight,
 			      bool nonwrapped,
-			      const struct utxo **excludes)
+			      const struct utxo **excludes,
+			      const u8 *asset)
 {
 	struct db_stmt *stmt;
 	struct utxo *utxo;
+	/* Coin selection must never mix assets (asset-aware channels): only
+	 * pick UTXOs of a single asset.  A NULL @asset means the caller does
+	 * not care, which on elements is the policy (fee) asset. */
+	const u8 *want_asset = asset;
+	if (chainparams->is_elements && !want_asset)
+		want_asset = chainparams->fee_asset_tag;
 
 	/* Make sure these are in order if we're trying to remove entropy! */
 	if (w->ld->developer && getenv("CLN_DEV_ENTROPY_SEED")) {
@@ -915,7 +922,9 @@ struct utxo *wallet_find_utxo(const tal_t *ctx, struct wallet *w,
 		utxo = wallet_stmt2output(ctx, stmt);
 		if (excluded(excludes, utxo)
 		    || (nonwrapped && utxo->utxotype == UTXO_P2SH_P2WPKH)
-		    || !deep_enough(maxheight, utxo, current_blockheight))
+		    || !deep_enough(maxheight, utxo, current_blockheight)
+		    || (want_asset
+			&& memcmp(utxo->asset, want_asset, sizeof(utxo->asset)) != 0))
 			utxo = tal_free(utxo);
 
 	}
