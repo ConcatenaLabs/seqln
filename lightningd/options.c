@@ -1826,6 +1826,34 @@ void handle_early_opts(struct lightningd *ld, int argc, char *argv[])
 	else
 		ld->config = mainnet_config;
 
+	/* SEQUENTIA (SeqLN spec section 6.2/6.3): the anchor-aware safety layer.
+	 * A quorum-certified block is final (see the certified-frontier clamp in
+	 * plugins/bcli.c getchaininfo), so minimum_depth is 1 on every Sequentia
+	 * network - a certified funding block cannot be displaced except by a
+	 * Bitcoin-anchor reorg.  Timelocks are sized in wall-clock and translated
+	 * to Sequentia's measured ~58s block cadence (cf. PeerSwap's CSV 1008->60
+	 * on Liquid), not copied from Bitcoin's block counts; each value is >= its
+	 * Bitcoin-mainnet wall-clock equivalent.  Overrides the testnet/mainnet
+	 * preset above for any Sequentia network.  These are defaults; operators
+	 * and per-open flags can still override.  (Cross-chain hops in later
+	 * phases must size the Bitcoin-adjacent hop's delta for Bitcoin's cadence;
+	 * that is a per-route concern, not this same-chain default.) */
+	if (chainparams->has_anchor_header) {
+		/* minimum_depth = 1: certified == final. */
+		ld->config.funding_confirms = 1;
+		/* to_self_delay ~1 day (Bitcoin mainnet 144 blocks; 1 day ~=
+		 * 1496 blocks at 58s, spec range 1000-2000). */
+		ld->config.locktime_blocks = 1440;
+		/* per-hop routing delta ~4.3h - ample given Sequentia's fast
+		 * certified finality on same-chain hops (spec ~270). */
+		ld->config.cltv_expiry_delta = 270;
+		/* terminal (final-hop) CLTV ~2.9h (Bitcoin mainnet 18 ~= 3h). */
+		ld->config.cltv_final = 180;
+		/* max HTLC CLTV ~2 weeks (Bitcoin 2016 blocks); without scaling,
+		 * an HTLC would cap at 2016 blocks ~= 32h on Sequentia. */
+		ld->config.max_htlc_cltv = 20160;
+	}
+
 	/* No anchors if we're elements */
 	if (chainparams->is_elements) {
 		feature_set_sub(ld->our_features,
