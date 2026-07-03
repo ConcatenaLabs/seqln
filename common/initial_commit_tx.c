@@ -73,6 +73,7 @@ void tx_add_anchor_output(struct bitcoin_tx *tx,
 struct bitcoin_tx *initial_commit_tx(const tal_t *ctx,
 				     const struct bitcoin_outpoint *funding,
 				     struct amount_sat funding_sats,
+				     const u8 *channel_asset,
 				     const struct pubkey funding_key[NUM_SIDES],
 				     enum side opener,
 				     u16 to_self_delay,
@@ -184,6 +185,11 @@ struct bitcoin_tx *initial_commit_tx(const tal_t *ctx,
 
 	/* Worst-case sizing: both to-local and to-remote outputs + anchors. */
 	tx = bitcoin_tx(ctx, chainparams, 1, untrimmed + 4, 0);
+
+	/* Asset-aware channels: denominate all commitment outputs (and the fee
+	 * output) in the channel asset. NULL keeps the tx's default policy asset. */
+	if (channel_asset)
+		bitcoin_tx_set_output_asset(tx, channel_asset);
 
 	/* This could be done in a single loop, but we follow the BOLT
 	 * literally to make comments in test vectors clearer. */

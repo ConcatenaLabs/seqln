@@ -95,6 +95,10 @@ static inline struct amount_sat commit_tx_base_fee(u32 feerate_per_kw,
 struct bitcoin_tx *initial_commit_tx(const tal_t *ctx,
 				     const struct bitcoin_outpoint *funding,
 				     struct amount_sat funding_sats,
+				     /* The asset (33-byte version+tag) the channel
+				      * is denominated in, or NULL for the policy
+				      * asset (asset-aware channels). */
+				     const u8 *channel_asset,
 				     const struct pubkey funding_key[NUM_SIDES],
 				     enum side opener,
 				     u16 to_self_delay,

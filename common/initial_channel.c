@@ -130,6 +130,7 @@ struct bitcoin_tx *initial_channel_tx(const tal_t *ctx,
 
 	init_tx = initial_commit_tx(ctx, &channel->funding,
 				    channel->funding_sats,
+				    channel->channel_asset,
 				    channel->funding_pubkey,
 				    channel->opener,
 				    /* They specify our to_self_delay and v.v. */
