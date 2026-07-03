@@ -47,6 +47,15 @@ struct channel *new_initial_channel(const tal_t *ctx,
 	channel->cid = *cid;
 	channel->funding = *funding;
 	channel->funding_sats = funding_sats;
+	/* Asset-aware channels (M0): default the channel asset to the network policy
+	 * asset, so policy-asset and Bitcoin channels are byte-for-byte unchanged. A
+	 * later milestone threads the negotiated asset here (openingd) + over the wire
+	 * (channeld/onchaind) and makes the commitment builders denominate in it. */
+	if (chainparams->is_elements && chainparams->fee_asset_tag)
+		memcpy(channel->channel_asset, chainparams->fee_asset_tag,
+		       sizeof(channel->channel_asset));
+	else
+		memset(channel->channel_asset, 0, sizeof(channel->channel_asset));
 	channel->minimum_depth = minimum_depth;
 	channel->lease_expiry = lease_expiry;
 	if (!amount_sat_sub_msat(&remote_msatoshi,
