@@ -908,8 +908,15 @@ static const char *init(struct command *init_cmd, const char *buffer UNUSED,
 {
 	wait_and_check_bitcoind(init_cmd->plugin);
 
-	/* Usually we fake up fees in regtest */
-	if (streq(chainparams->network_name, "regtest"))
+	/* Usually we fake up fees in regtest.  SEQUENTIA: also fake them, because
+	 * a Sequentia node does no on-chain fee estimation (open fee market: block
+	 * producers choose which asset and rate to accept), so estimatesmartfee
+	 * returns nothing.  Without a fake estimate, topo->feerates stays empty,
+	 * unknown_feerates() is true, and every channel open is rejected with
+	 * "Cannot accept channel: feerates unknown".  Operators can still override
+	 * with --force-feerates. */
+	if (streq(chainparams->network_name, "regtest")
+	    || chainparams->has_anchor_header)
 		bitcoind->fake_fees = !bitcoind->dev_no_fake_fees;
 	else
 		bitcoind->fake_fees = false;
