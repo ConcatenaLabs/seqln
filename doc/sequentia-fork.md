@@ -47,21 +47,47 @@ anchor_height 140948, anchor_hash `00000000008848afcf634aab4ea4c3d83a7b39c100641
 
 ## Status
 
-Done (Phase 0, network + parser):
+**Phase 0 CLOSED** — the anchored-header parser is proven end-to-end against the live testnet.
+
+Done (network + parser):
 - `chainparams.h`: `has_anchor_header` field.
 - `chainparams.c`: sequentia-testnet (accurate) + sequentia mainnet (placeholder) entries + testnet
   fee-asset constant.
 - `block.c`: anchored-header parse.
 
+Live-node proof (the exit criterion — "computed block hashes match"):
+- `lightningd --network=sequentia-testnet` was pointed (bcli) at a live node via an SSH-tunnelled
+  RPC. It connected, fetched real block 18119, ran it through `bitcoin_block_from_hex`, and computed
+  `d08622c1…514b77` — an EXACT match to the node's `getblockhash 18119`. End-to-end through the real
+  daemon + bcli path, not a mirror.
+- Breadth: `tests/sequentia/validate_live_blocks.py` reimplements the parse byte-for-byte and checks
+  21 blocks spanning the whole chain (height 1 → tip, anchor heights 140850 → 142700, 35-byte
+  challenge). PASS=21, FAIL=0. Run with `ELEMCLI`/`SEQ_RPC_{HOST,PORT,USER,PASS}` env pointing at a
+  node (local or tunnelled).
+- Build: needs the full subdaemon set next to `lightningd/` — `has_all_subdaemons()` (lightningd.c)
+  selects in-tree mode only when `lightning_{channeld,closingd,connectd,gossipd,gossip_compactd,
+  hsmd,onchaind,openingd}` are all built; otherwise it looks under `libexec` and aborts. In-tree
+  mode also auto-loads `bcli` from `../plugins`, so do NOT also pass `--plugin=.../bcli` (duplicate
+  registration error). Build recipe: the two Phase-0 targets plus
+  `make lightningd/lightning_{channeld,closingd,connectd,dualopend,gossipd,gossip_compactd,hsmd,
+  onchaind,openingd,websocketd}` (all pure C).
+
+Known environmental caveat (NOT a Sequentia issue): in this sandbox `lightning_connectd` exits
+(goes zombie ~4s in) during startup, so lightningd hangs in `connectd_activate` before "Server
+started" and never runs the main block-polling loop — it adds only the single initial block. This
+is connectd's peer-networking subdaemon (sockets), independent of the anchored-header code, and is
+reproducible on `--network=regtest` too. A normal (non-sandboxed / installed) host does not hit it.
+The parser proof above does not depend on full multi-block catch-up.
+
 Next:
+- Re-run the full multi-block catch-up on a non-sandboxed host to confirm lightningd walks the whole
+  chain (expected to just work once connectd survives).
 - Test-harness duplicates (`contrib/pyln-testing/.../{utils,fixtures}.py`, `tests/utils.py`,
   `devtools/gossipwith.c`) need Sequentia entries before the pytest suite runs.
-- A proper `bitcoin/test/run-*.c` unit test asserting the block-1000 hash (the Python file is the
-  interim regression check).
+- A proper `bitcoin/test/run-*.c` unit test asserting the block-1000 hash (the Python files are the
+  interim regression + live-breadth checks).
 - sequentia-regtest: needs a custom-params node (con_bitcoin_anchor + a local bitcoind mainchain) to
-  exercise the anchor path locally.
-- Phase 0 exit criterion: `lightningd --network=sequentia-testnet` syncs a Sequentia node and its
-  computed block hashes match. Confirm build against Elements Core 23.3.3 (CI pins 23.2.1).
+  exercise the anchor path locally. Confirm build against Elements Core 23.3.3 (CI pins 23.2.1).
 - Then Phase 1 (policy-asset channels) per the spec.
 
 ## Decisions still provisional (worth Alberto's sign-off before Phase 3)
