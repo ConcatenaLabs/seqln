@@ -102,17 +102,23 @@ is environmental / config, common to both CLN versions and to laptop + box. (Bra
 modification and compile clean.)
 
 Next:
-- Resolve the startup wedge (highest priority — gates all runtime). Ruled out so far: my getchaininfo
-  clamp (bcli sits idle when it wedges), the CLN version (stable v26.06.2 wedges too), the block parser
-  (setup_topology's initial sync works), and the synchronous bcli (stock in v26.06.2 — upstream ships
-  it). The wedge sits between `setup_topology` (works) and `begin_topology` (never runs), i.e.
-  lightningd.c ~1375-1455 (gossip_init / plugins_config / connectd_activate). Since upstream CLN-on-Liquid
-  is a supported/CI-tested config that starts fully, the remaining difference is the **Sequentia
-  chainparams entry / running against the Sequentia (Elements) node specifically**. Next steps: (1) a
-  **gdb backtrace of the wedged lightningd** (`gdb -p <pid>` then `bt`) to name the exact stuck function
-  — that will settle it fast; (2) diff behavior against a stock CLN pointed at a Liquid/Elements regtest
-  to see if plain CLN-on-Elements starts here at all (isolates env vs the Sequentia chainparams fields,
-  e.g. ports/features).
+- Resolve the `plugins_config` wedge (highest priority — gates all runtime). gdb-confirmed: lightningd
+  blocks in `plugins_config` (plugin.c:2224) waiting for all plugins to reach INIT_COMPLETE; the only
+  plugin `bcli` is `active:true`, its init completes (logs "bitcoin-cli initialized and connected",
+  returns NULL) and sits idle, yet `plugin_config_cb` never marks it INIT_COMPLETE — so bcli's init
+  RESPONSE is not reaching lightningd. Ruled out: my getchaininfo clamp (bcli idle), CLN version
+  (stable v26.06.2 wedges identically), the synchronous bcli (real upstream — 4126f3b1f is in
+  upstream/master + shipped in v26.04/v26.06), and the parser (setup_topology works).
+- **THE decisive next test (set up, ready, ~30s once box SSH is healthy): run this same build against a
+  plain Bitcoin node — no Sequentia code path** — and see if it also wedges in plugins_config:
+  `lightningd --network=testnet4 --bitcoin-cli=/root/bitcoin-28.1/bin/bitcoin-cli
+  --bitcoin-rpcconnect=127.0.0.1 --bitcoin-rpcport=48332 --bitcoin-rpcuser=seq
+  --bitcoin-rpcpassword=<mainchainrpcpassword from node-gw/elements.conf>` (test node dir
+  /root/seqln-test/nodeBTC). If it wedges too -> the cause is the **in-tree build / this environment**
+  (e.g. bcli's init-response pipe under the in-tree run), NOT Sequentia -> pursue `make install` / a
+  full plugin set. If it starts fully -> the cause is the **Sequentia chainparams entry** -> bisect its
+  fields. (This run was attempted but the box SSH degraded before it returned; retry when SSH is
+  healthy.)
 - Then the 2-node channel test (open/route/close + force-close/penalty): fund node A from
   treasury-clean (node-gw RPC :18443) once the tip advances; both SeqLN nodes' bcli -> node000 :18200.
 - Test-harness duplicates (`contrib/pyln-testing/.../{utils,fixtures}.py`, `tests/utils.py`,
