@@ -181,6 +181,19 @@ bitcoin_block_from_hex(const tal_t *ctx, const struct chainparams *chainparams,
 		height = pull_le32(&p, &len);
 		sha256_le32(&shactx, height);
 
+		/* SEQUENTIA: the anchored block header commits the Bitcoin
+		 * anchor (u32 height + 32-byte hash) after block_height and
+		 * before the block proof, under SER_GETHASH.  Verified against
+		 * live testnet block 1000 (see doc/sequentia-fork.md and
+		 * tests/sequentia/verify_block_parse.py). */
+		if (chainparams->has_anchor_header) {
+			u8 anchor_hash[32];
+			u32 anchor_height = pull_le32(&p, &len);
+			sha256_le32(&shactx, anchor_height);
+			pull(&p, &len, anchor_hash, sizeof(anchor_hash));
+			sha256_update(&shactx, anchor_hash, sizeof(anchor_hash));
+		}
+
 		if (is_dynafed) {
 			bitcoin_block_pull_dynafed_details(&p, &len, &shactx);
 		} else {

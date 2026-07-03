@@ -52,6 +52,10 @@ struct chainparams {
 	const struct bip32_key_version bip32_key_version;
 	const bool is_elements;
 	const u8 *fee_asset_tag;
+	/* SEQUENTIA: the block header carries a Bitcoin anchor (u32 height +
+	 * 32-byte hash) inserted after block_height, committed under
+	 * SER_GETHASH.  The block parser must pull+hash those 36 bytes. */
+	const bool has_anchor_header;
 };
 
 /**
