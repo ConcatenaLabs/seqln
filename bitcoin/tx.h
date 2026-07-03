@@ -37,6 +37,12 @@ struct bitcoin_tx {
 
 	/* psbt struct */
 	struct wally_psbt *psbt;
+
+	/* The asset (33-byte version+tag) this tx's OUTPUTS are denominated in.
+	 * Defaults to the network policy asset (chainparams->fee_asset_tag);
+	 * asset-aware channels set it to the channel asset via
+	 * bitcoin_tx_set_output_asset(). Zeroed / unused on non-elements. */
+	u8 output_asset[33];
 };
 
 struct bitcoin_tx_output {
@@ -126,10 +132,24 @@ struct wally_tx_output *wally_tx_output(const tal_t *ctx,
 					const u8 *script,
 					struct amount_sat amount);
 
+/* As wally_tx_output, but (on elements) denominate the output in @asset (a
+ * 33-byte version+tag id) instead of the network policy asset. Used by
+ * asset-aware channels; @asset == chainparams->fee_asset_tag is the default. */
+struct wally_tx_output *wally_tx_output_asset(const tal_t *ctx,
+					      const u8 *script,
+					      struct amount_sat amount,
+					      const u8 *asset);
+
 /* Add one output to tx. */
 int bitcoin_tx_add_output(struct bitcoin_tx *tx, const u8 *script,
 			  const u8 *wscript,
 			  struct amount_sat amount);
+
+/* Set the asset (33-byte version+tag) that this tx's OUTPUTS are denominated in.
+ * Defaults to the network policy asset at creation; asset-aware channels set it
+ * to the channel asset so all outputs (to_local/to_remote/HTLC/fee) and the
+ * fee-computation paths use that asset. No-op on non-elements chains. */
+void bitcoin_tx_set_output_asset(struct bitcoin_tx *tx, const u8 *asset);
 
 /* Remove one output. */
 void bitcoin_tx_remove_output(struct bitcoin_tx *tx, size_t outnum);

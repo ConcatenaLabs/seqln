@@ -20,9 +20,10 @@ struct bitcoin_tx_output *new_tx_output(const tal_t *ctx,
 	return output;
 }
 
-struct wally_tx_output *wally_tx_output(const tal_t *ctx,
-					const u8 *script,
-					struct amount_sat amount)
+struct wally_tx_output *wally_tx_output_asset(const tal_t *ctx,
+					      const u8 *script,
+					      struct amount_sat amount,
+					      const u8 *asset)
 {
 	u64 satoshis = amount.satoshis; /* Raw: wally API */
 	struct wally_tx_output *output;
@@ -35,7 +36,7 @@ struct wally_tx_output *wally_tx_output(const tal_t *ctx,
 							       sizeof(value));
 		assert(ret == WALLY_OK);
 		ret = wally_tx_elements_output_init_alloc(
-		    script, tal_bytelen(script), chainparams->fee_asset_tag, 33,
+		    script, tal_bytelen(script), asset, 33,
 		    value, sizeof(value), NULL, 0, NULL, 0, NULL, 0, &output);
 		if (ret != WALLY_OK) {
 			output = NULL;
@@ -59,6 +60,23 @@ done:
 	return output;
 }
 
+struct wally_tx_output *wally_tx_output(const tal_t *ctx,
+					const u8 *script,
+					struct amount_sat amount)
+{
+	/* Default: the network policy asset. */
+	return wally_tx_output_asset(ctx, script, amount,
+				     chainparams->fee_asset_tag);
+}
+
+void bitcoin_tx_set_output_asset(struct bitcoin_tx *tx, const u8 *asset)
+{
+	/* Only meaningful on elements; a no-op (and asset may be NULL) otherwise. */
+	if (!tx->chainparams->is_elements || !asset)
+		return;
+	memcpy(tx->output_asset, asset, sizeof(tx->output_asset));
+}
+
 int bitcoin_tx_add_output(struct bitcoin_tx *tx, const u8 *script,
 			  const u8 *wscript, struct amount_sat amount)
 {
@@ -72,7 +90,10 @@ int bitcoin_tx_add_output(struct bitcoin_tx *tx, const u8 *script,
 	assert(tx->wtx != NULL);
 	assert(chainparams);
 
-	output = wally_tx_output(NULL, script, amount);
+	/* Denominate in this tx's output asset (default = policy asset; asset
+	 * channels set it to the channel asset). Covers to_local/to_remote/HTLC
+	 * AND the explicit fee output, which is added through this same path. */
+	output = wally_tx_output_asset(NULL, script, amount, tx->output_asset);
 	assert(output);
 	tal_wally_start();
 	ret = wally_tx_add_output(tx->wtx, output);
@@ -125,7 +146,7 @@ struct amount_sat bitcoin_tx_compute_fee_w_inputs(const struct bitcoin_tx *tx,
 	for (size_t i = 0; i < tx->wtx->num_outputs; i++) {
 		asset = bitcoin_tx_output_get_amount(tx, i);
 		if (elements_tx_output_is_fee(tx, i) ||
-		    !amount_asset_is_main(&asset))
+		    !amount_asset_is(&asset, tx->output_asset))
 			continue;
 
 		ok = amount_sat_sub(&input_val, input_val,
@@ -330,7 +351,7 @@ struct amount_sat bitcoin_tx_output_get_amount_sat(const struct bitcoin_tx *tx, 
 {
 	struct amount_asset asset_amt;
 	asset_amt = bitcoin_tx_output_get_amount(tx, outnum);
-	assert(amount_asset_is_main(&asset_amt));
+	assert(amount_asset_is(&asset_amt, tx->output_asset));
 	return amount_asset_to_sat(&asset_amt);
 }
 
@@ -535,6 +556,13 @@ struct bitcoin_tx *bitcoin_tx(const tal_t *ctx,
 	tal_wally_end_onto(tx, tx->wtx, struct wally_tx);
 
 	tx->chainparams = chainparams;
+	/* Outputs default to the network policy asset; asset channels override via
+	 * bitcoin_tx_set_output_asset(). */
+	if (chainparams->is_elements && chainparams->fee_asset_tag)
+		memcpy(tx->output_asset, chainparams->fee_asset_tag,
+		       sizeof(tx->output_asset));
+	else
+		memset(tx->output_asset, 0, sizeof(tx->output_asset));
 	tx->psbt = new_psbt(tx, tx->wtx);
 
 	return tx;
