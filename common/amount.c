@@ -716,15 +716,22 @@ bool amount_feerate(u32 *feerate, struct amount_sat fee, size_t weight)
 	return assign_overflow_u32(feerate, fee.satoshis / weight);
 }
 
-bool amount_asset_is_main(struct amount_asset *amount)
+bool amount_asset_is(struct amount_asset *amount, const u8 *asset_id)
 {
 	/* If we're not on elements, there is only one asset. */
 	if (!chainparams->is_elements)
 		return true;
 
-	/* If we are on elements we better check against the chainparams. */
+	/* On elements, compare the 33-byte (version + tag) asset id. */
 	return memeq(amount->asset, sizeof(amount->asset),
-		     chainparams->fee_asset_tag, sizeof(amount->asset));
+		     asset_id, sizeof(amount->asset));
+}
+
+bool amount_asset_is_main(struct amount_asset *amount)
+{
+	/* "Main" == the network's policy (fee) asset. Asset-aware channels thread
+	 * their own channel_asset and call amount_asset_is() instead. */
+	return amount_asset_is(amount, chainparams->fee_asset_tag);
 }
 
 /* Convert from a generic asset to the fee-paying asset if possible. */
