@@ -313,7 +313,8 @@ static bool wallet_add_utxo(struct wallet *w,
 		       ", spend_height"
 		       ", scriptpubkey"
 		       ", is_in_coinbase"
-		       ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"));
+		       ", asset"
+		       ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"));
 	db_bind_txid(stmt, &utxo->outpoint.txid);
 	db_bind_int(stmt, utxo->outpoint.n);
 	db_bind_amount_sat(stmt, utxo->amount);
@@ -349,6 +350,8 @@ static bool wallet_add_utxo(struct wallet *w,
 			  tal_bytelen(utxo->scriptPubkey));
 
 	db_bind_int(stmt, utxo->is_in_coinbase);
+	/* The output's asset (asset-aware channels); 33-byte version+tag. */
+	db_bind_blob(stmt, utxo->asset, sizeof(utxo->asset));
 	db_exec_prepared_v2(take(stmt));
 	return true;
 }
@@ -363,6 +366,21 @@ static struct utxo *wallet_stmt2output(const tal_t *ctx, struct db_stmt *stmt)
 	db_col_txid(stmt, "prev_out_tx", &utxo->outpoint.txid);
 	utxo->outpoint.n = db_col_int(stmt, "prev_out_index");
 	utxo->amount = db_col_amount_sat(stmt, "value");
+	/* The asset (asset-aware channels); NULL on pre-migration rows -> policy. */
+	if (db_col_is_null(stmt, "asset")) {
+		if (chainparams->is_elements && chainparams->fee_asset_tag)
+			memcpy(utxo->asset, chainparams->fee_asset_tag,
+			       sizeof(utxo->asset));
+		else
+			memset(utxo->asset, 0, sizeof(utxo->asset));
+	} else {
+		u8 *a = db_col_arr(tmpctx, stmt, "asset", u8);
+		memset(utxo->asset, 0, sizeof(utxo->asset));
+		if (a)
+			memcpy(utxo->asset, a,
+			       tal_bytelen(a) < sizeof(utxo->asset)
+				   ? tal_bytelen(a) : sizeof(utxo->asset));
+	}
 	utxo->status = db_col_int(stmt, "status");
 	utxo->keyindex = db_col_int(stmt, "keyindex");
 
@@ -508,6 +526,7 @@ struct utxo **wallet_get_all_utxos(const tal_t *ctx, struct wallet *w)
 					", reserved_til "
 					", csv_lock "
 					", is_in_coinbase "
+					", asset "
 					"FROM outputs"));
 	return gather_utxos(ctx, stmt);
 }
@@ -533,6 +552,7 @@ static struct utxo **db_get_unspent_utxos(const tal_t *ctx, struct db *db)
 					", reserved_til "
 					", csv_lock "
 					", is_in_coinbase "
+					", asset "
 					"FROM outputs "
 					"WHERE status != ?"));
 	db_bind_int(stmt, output_status_in_db(OUTPUT_STATE_SPENT));
@@ -574,6 +594,7 @@ struct utxo **wallet_get_unconfirmed_closeinfo_utxos(const tal_t *ctx,
 					", reserved_til"
 					", csv_lock"
 					", is_in_coinbase"
+					", asset "
 					" FROM outputs"
 					" WHERE channel_id IS NOT NULL AND "
 					"confirmation_height IS NULL"));
@@ -604,6 +625,7 @@ struct utxo *wallet_utxo_get(const tal_t *ctx, struct wallet *w,
 					", reserved_til"
 					", csv_lock"
 					", is_in_coinbase"
+					", asset "
 					" FROM outputs"
 					" WHERE prev_out_tx = ?"
 					" AND prev_out_index = ?"));
@@ -849,6 +871,7 @@ struct utxo *wallet_find_utxo(const tal_t *ctx, struct wallet *w,
 						", reserved_til"
 						", csv_lock"
 						", is_in_coinbase"
+						", asset "
 						" FROM outputs"
 						" WHERE status = ?"
 						" OR (status = ? AND reserved_til <= ?)"
@@ -871,6 +894,7 @@ struct utxo *wallet_find_utxo(const tal_t *ctx, struct wallet *w,
 						", reserved_til"
 						", csv_lock"
 						", is_in_coinbase"
+						", asset "
 						" FROM outputs"
 						" WHERE status = ?"
 						" OR (status = ? AND reserved_til <= ?)"
@@ -924,6 +948,7 @@ bool wallet_has_funds(struct wallet *w,
 					", reserved_til"
 					", csv_lock"
 					", is_in_coinbase"
+					", asset "
 					" FROM outputs"
 					" WHERE status = ?"
 					" OR (status = ? AND reserved_til <= ?)"));
@@ -3304,7 +3329,11 @@ static void got_utxo(struct wallet *w,
 	abort();
 
 type_ok:
-	utxo->amount = amount_asset_to_sat(&asset);
+	/* Record the raw value in the output's own asset units (no assert that it
+	 * is the policy asset), plus which asset it is, so coin-selection can pick
+	 * UTXOs of a requested asset (asset-aware channels). */
+	utxo->amount = amount_sat(asset.value);
+	memcpy(utxo->asset, asset.asset, sizeof(utxo->asset));
 	utxo->status = OUTPUT_STATE_AVAILABLE;
 	wally_txid(wtx, &utxo->outpoint.txid);
 	utxo->outpoint.n = outnum;
@@ -3362,12 +3391,11 @@ bool wallet_extract_owned_outputs(struct wallet *w,
 	for (size_t i = 0; i < wtx->num_outputs; i++) {
 		const struct wally_tx_output *txout = &wtx->outputs[i];
 		u32 keyindex;
-		struct amount_asset asset = wally_tx_output_get_amount(txout);
 		enum addrtype addrtype;
 
-		if (!amount_asset_is_main(&asset))
-			continue;
-
+		/* Record owned outputs of ANY asset (asset-aware channels): the fee
+		 * output has an empty script so wallet_can_spend() still excludes it,
+		 * and got_utxo() records which asset each UTXO holds. */
 		if (!wallet_can_spend(w, txout->script, txout->script_len, &keyindex, &addrtype))
 			continue;
 
@@ -7688,23 +7716,43 @@ void wallet_begin_old_close_rescan(struct lightningd *ld)
 /* An existing node without accounting.  Fill in what we have so far. */
 void migrate_setup_coinmoves(struct lightningd *ld, struct db *db)
 {
-	struct utxo **utxos = db_get_unspent_utxos(tmpctx, db);
+	struct db_stmt *ustmt;
 	struct db_stmt *stmt;
 	u64 base_timestamp = clock_time().ts.tv_sec - 2;
 
-	for (size_t i = 0; i < tal_count(utxos); i++) {
+	/* NB: we deliberately do NOT use db_get_unspent_utxos() here.  This
+	 * runs mid-migration, before the asset-aware `asset` column is added
+	 * to `outputs`, so gathering full utxos (which now reads `asset`)
+	 * would fail to prepare.  Read only the columns that exist at this
+	 * migration's point; pre-asset outputs are all the policy asset. */
+	ustmt = db_prepare_v2(db, SQL("SELECT"
+				      "  prev_out_tx"
+				      ", prev_out_index"
+				      ", value"
+				      ", confirmation_height"
+				      " FROM outputs"
+				      " WHERE status != ?"
+				      " AND confirmation_height IS NOT NULL"));
+	db_bind_int(ustmt, output_status_in_db(OUTPUT_STATE_SPENT));
+	db_query_prepared(ustmt);
+	while (db_step(ustmt)) {
 		struct chain_coin_mvt *mvt;
+		struct bitcoin_outpoint outpoint;
+		struct amount_sat amount;
+		u32 blockheight;
 
-		/* Only confirmed ones */
-		if (!utxos[i]->blockheight)
-			continue;
+		db_col_txid(ustmt, "prev_out_tx", &outpoint.txid);
+		outpoint.n = db_col_int(ustmt, "prev_out_index");
+		amount = db_col_amount_sat(ustmt, "value");
+		blockheight = db_col_int(ustmt, "confirmation_height");
 		mvt = new_coin_wallet_deposit(tmpctx,
-					       &utxos[i]->outpoint,
-					       *utxos[i]->blockheight,
-					       utxos[i]->amount,
+					       &outpoint,
+					       blockheight,
+					       amount,
 					       mk_mvt_tags(MVT_DEPOSIT));
 		insert_chain_mvt(ld, db, mvt);
 	}
+	tal_free(ustmt);
 
 	/* Now channels.  We create the open event, and then pushed/leased,
 	 * the finally fixup with a journal entry. */
