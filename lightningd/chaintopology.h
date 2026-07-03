@@ -172,6 +172,17 @@ size_t get_tx_depth(const struct chain_topology *topo,
 /* Get highest block number. */
 u32 get_block_height(const struct chain_topology *topo);
 
+/* SEQUENTIA (SeqLN spec 6.2): Bitcoin-anchor blocks that must bury a funding
+ * block before its channel_announcement SCID is published (the SCID must never
+ * be invalidated by a reorg, and a certified block can still fall to tail
+ * truncation until its anchor is buried).  Small per the spec (1-2). */
+#define SEQUENTIA_ANCHOR_BURY_DEPTH 2
+
+/* True if the block at `funding_height` is buried by >= min_anchor_depth
+ * Bitcoin-anchor blocks (or is ancient / below our in-memory window). */
+bool topo_anchor_buried(const struct chain_topology *topo,
+			u32 funding_height, u32 min_anchor_depth);
+
 /* Get the highest block number in the network that we are aware of. Unlike
  * `get_block_height` this takes into consideration the block header counter
  * in the bitcoin backend as well. If an absolute time is required, rather

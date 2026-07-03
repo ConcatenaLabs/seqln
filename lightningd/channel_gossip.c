@@ -233,12 +233,27 @@ static bool has_matching_peer_sigs(const struct channel *channel)
 
 static bool has_announce_depth(const struct channel *channel)
 {
-	u32 block_height = get_block_height(channel->peer->ld->topology);
+	struct chain_topology *topo = channel->peer->ld->topology;
+	u32 block_height = get_block_height(topo);
 
 	if (!has_matching_peer_sigs(channel))
 		return false;
 
-	return is_scid_depth_announceable(*channel->scid, block_height);
+	if (!is_scid_depth_announceable(*channel->scid, block_height))
+		return false;
+
+	/* SEQUENTIA (SeqLN spec 6.2, two-stage SCID): even at certified
+	 * announce depth, hold the channel_announcement until the funding
+	 * block's Bitcoin anchor is buried.  A certified block can still fall
+	 * to tail truncation until its anchor is buried, and an announced SCID
+	 * (height:txindex:output) must never be invalidated by a reorg. */
+	if (chainparams->has_anchor_header
+	    && !topo_anchor_buried(topo,
+				   short_channel_id_blocknum(*channel->scid),
+				   SEQUENTIA_ANCHOR_BURY_DEPTH))
+		return false;
+
+	return true;
 }
 
 /* Truly dead once we've seen spend onchain */

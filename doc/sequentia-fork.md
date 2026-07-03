@@ -123,23 +123,26 @@ Implemented + verified this pass:
   (to_self_delay) 1440 (~1 day), `cltv_expiry_delta` 270 (~4.3h, ample for same-chain fast finality),
   `cltv_final` 180 (~2.9h), `max_htlc_cltv` 20160 (~2 weeks; otherwise HTLCs would cap at ~32h).
 
-Designed, deferred to a focused next pass (additive — channels are usable at certified depth-1
-without it; it only gates *public* announcement, so Phase-1 open/route/close/penalty can be exercised
-on unannounced channels first):
-- **6.2 two-stage SCID / anchor-burial announcement gate.** A certified block can still fall to tail
-  truncation until its Bitcoin anchor is buried, and a `channel_announcement` SCID
-  (height:txindex:output) must never be invalidated. So announce only once the funding block's anchor
-  is buried by k Bitcoin blocks (k small, 1-2). Exact arithmetic:
-  `anchor_depth(funding) = getanchorstatus.anchorheight − getblockheader(funding).anchorheight`;
-  announceable ⟺ `anchor_depth >= k`. Seam: `has_announce_depth()` in `lightningd/channel_gossip.c`
-  gains a Sequentia branch. Plumbing (Option B, the correct one): the backend surfaces the current
-  best anchor height (extend the interface — do NOT approximate k Bitcoin blocks as a Sequentia block
-  count, that breaks anchoring precision), the channel caches its funding block's `anchorheight` when
-  the funding first confirms, and the branch compares the two. This is correctness-critical (SCID
-  stability) and gets adversarial review, hence a dedicated pass.
-- **6.4 fee asset for penalty/claim txs.** In Phase 1 the channel asset is the policy asset, so the
-  node already holds a committee-accepted fee asset for justice/HTLC-claim txs; inherited from the
-  policy-asset path. Explicit fee-in-channel-asset generalization is Phase 3 (`channel_asset`).
+- **6.2 two-stage SCID / anchor-burial announcement gate** (implemented). A certified block can still
+  fall to tail truncation until its Bitcoin anchor is buried, and a `channel_announcement` SCID
+  (height:txindex:output) must never be invalidated. So a Sequentia channel is usable at certified
+  depth-1 but its SCID is announced only once the funding block's anchor is buried by
+  `SEQUENTIA_ANCHOR_BURY_DEPTH` (=2, spec's "k small, 1-2") Bitcoin-anchor blocks. Implementation
+  (simpler and self-contained — supersedes the "extend the backend + cache on the channel + DB
+  migration" sketch, because the anchor already rides in the block CLN parses): the parsed
+  `anchor_height` is retained in `struct bitcoin_block_hdr` (`bitcoin/block.c`), which chaintopology
+  already stores per block; `topo_anchor_buried()` (`lightningd/chaintopology.c`) answers "is the
+  funding block buried by >= k anchor blocks" with a *bounded* walk back from the tip — since
+  `anchor_height` is monotonic, it stops as soon as the anchor drops by k (an O(k·BTC/Seq-blocktime)
+  window, not O(tip − funding)), so it stays cheap even for long-announced channels; `has_announce_depth()`
+  (`lightningd/channel_gossip.c`) gains a `has_anchor_header` branch that requires it. No backend-protocol
+  change, no DB migration (the funding anchor is re-derived from the in-memory chain; ancient funding
+  below the scan root is treated as buried). Verified: `tests/sequentia/verify_anchor_burial.py`
+  mirrors the bounded walk and checks it against a brute-force oracle over real anchor heights (all
+  heights, k=1..3) plus the tip / ancient / above-tip / k-boundary cases.
+- **6.4 fee asset for penalty/claim txs** (inherited, not deferred). In Phase 1 the channel asset is
+  the policy asset, so the node already holds a committee-accepted fee asset for justice/HTLC-claim
+  txs. Explicit fee-in-channel-asset generalization is Phase 3 (`channel_asset`).
 
 Exit criterion (open/route/close a Sequence-token channel between two SeqLN nodes, plus a force-close
 and a penalty case across an induced tail-truncation reorg): requires a running two-node testnet,
