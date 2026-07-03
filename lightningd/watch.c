@@ -459,8 +459,12 @@ bool watch_check_tx_outputs(const struct chain_topology *topo,
 				bad_outnum = true;
 				continue;
 			}
-			if (!amount_asset_is_main(&outasset)
-			    || !amount_sat_eq(amount_asset_to_sat(&outasset), w->expected_amount)) {
+			/* Compare the raw value regardless of asset (asset-aware
+			 * channels): the watch is pinned to this exact
+			 * scriptpubkey + outpoint, and w->expected_amount is
+			 * stored in the output's own asset units. */
+			if (!amount_sat_eq(amount_sat(outasset.value),
+					   w->expected_amount)) {
 				bad_amount = true;
 				continue;
 			}

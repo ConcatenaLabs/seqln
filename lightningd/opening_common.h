@@ -89,6 +89,10 @@ struct funding_channel {
 	/* The scriptpubkey to pay (once started) */
 	u8 *funding_scriptpubkey;
 
+	/* The asset this channel is denominated in (33-byte version+tag);
+	 * the policy asset for an ordinary channel. Asset-aware channels. */
+	u8 channel_asset[33];
+
 	/* Whether or not this is in the middle of getting funded */
 	bool inflight;
 

@@ -76,6 +76,12 @@ struct state {
 	u32 feerate_per_kw;
 	struct bitcoin_outpoint funding;
 
+	/* The asset this channel is denominated in (33-byte version+tag).
+	 * Asset-aware channels: the funder learns it from lightningd via
+	 * openingd_funder_start; the fundee from the open_channel asset_id TLV.
+	 * Defaults to the policy asset (an ordinary policy-asset channel). */
+	u8 channel_asset[33];
+
 	/* If non-NULL, this is the scriptpubkey we/they *must* close with */
 	u8 *upfront_shutdown_script[NUM_SIDES];
 
@@ -340,6 +346,17 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags,
 	 *       negotiated.
 	 */
 	open_tlvs->channel_type = state->channel_type->features;
+
+	/* Asset-aware channels: tell the peer which asset the channel is
+	 * denominated in.  Absent TLV == the policy asset (an ordinary channel),
+	 * so policy-asset opens stay wire-identical. */
+	if (chainparams->is_elements
+	    && memcmp(state->channel_asset, chainparams->fee_asset_tag,
+		      sizeof(state->channel_asset)) != 0) {
+		open_tlvs->asset_id = tal_dup_arr(open_tlvs, u8,
+						  state->channel_asset,
+						  sizeof(state->channel_asset), 0);
+	}
 
 	msg = towire_open_channel(NULL,
 				  &chainparams->genesis_blockhash,
@@ -614,6 +631,12 @@ static bool funder_finalize_channel_setup(struct state *state,
 				&state->channel_id,
 				"could not create channel with given config");
 
+	/* Asset-aware channels: new_initial_channel defaulted channel_asset to
+	 * the policy asset; stamp the negotiated asset so the commitment tx
+	 * below is built in it. */
+	memcpy(state->channel->channel_asset, state->channel_asset,
+	       sizeof(state->channel->channel_asset));
+
 	/* BOLT #2:
 	 *
 	 * ### The `funding_created` Message
@@ -823,7 +846,8 @@ static u8 *funder_channel_complete(struct state *state)
 					   state->feerate_per_kw,
 					   state->localconf.channel_reserve,
 					   state->upfront_shutdown_script[REMOTE],
-					   state->channel_type);
+					   state->channel_type,
+					   state->channel_asset);
 }
 
 /*~ The peer sent us an `open_channel`, that means we're the fundee. */
@@ -877,6 +901,20 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 				    &state->channel_id,
 				    "Parsing open_channel %s", tal_hex(tmpctx, open_channel_msg));
 	set_remote_upfront_shutdown(state, open_tlvs->upfront_shutdown_script);
+
+	/* Asset-aware channels: adopt the asset the funder chose.  Absent TLV
+	 * leaves state->channel_asset at the policy-asset default. */
+	if (open_tlvs->asset_id) {
+		if (tal_bytelen(open_tlvs->asset_id)
+		    != sizeof(state->channel_asset)) {
+			negotiation_failed(state,
+					   "open_channel asset_id must be %zu bytes",
+					   sizeof(state->channel_asset));
+			return NULL;
+		}
+		memcpy(state->channel_asset, open_tlvs->asset_id,
+		       sizeof(state->channel_asset));
+	}
 
 	/* BOLT #2:
 	 *  - if the message doesn't include a `channel_type`:
@@ -1177,6 +1215,11 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 		peer_failed_err(state->pps, &state->channel_id,
 				"We could not create channel with given config");
 
+	/* Asset-aware channels: stamp the negotiated asset so both commitment
+	 * txs below are built in it (must match the funder's byte-for-byte). */
+	memcpy(state->channel->channel_asset, state->channel_asset,
+	       sizeof(state->channel->channel_asset));
+
 	/* BOLT #2:
 	 *
 	 * The recipient:
@@ -1302,7 +1345,8 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 				     state->localconf.channel_reserve,
 				     state->upfront_shutdown_script[LOCAL],
 				     state->upfront_shutdown_script[REMOTE],
-				     state->channel_type);
+				     state->channel_type,
+				     state->channel_asset);
 }
 
 /*~ Standard "peer sent a message, handle it" demuxer.  Though it really only
@@ -1382,7 +1426,8 @@ static u8 *handle_master_in(struct state *state)
 						    &state->channel_id,
 						    &channel_flags,
 						    &state->reserve,
-						    &ctype))
+						    &ctype,
+						    state->channel_asset))
 			master_badmsg(WIRE_OPENINGD_FUNDER_START, msg);
 		msg = funder_channel_start(state, channel_flags, nonanchor_feerate, anchor_feerate, ctype);
 		tal_free(ctype);
@@ -1462,6 +1507,14 @@ int main(int argc, char *argv[])
 				    &state->allowdustreserve,
 				    &state->dev_accept_any_channel_type))
 		master_badmsg(WIRE_OPENINGD_INIT, msg);
+
+	/* Default to the policy asset; funder_start / the open_channel TLV
+	 * override this for an asset channel. */
+	if (chainparams->is_elements && chainparams->fee_asset_tag)
+		memcpy(state->channel_asset, chainparams->fee_asset_tag,
+		       sizeof(state->channel_asset));
+	else
+		memset(state->channel_asset, 0, sizeof(state->channel_asset));
 
 	/* 3 == peer, 4 = hsmd */
 	state->pps = new_per_peer_state(state);

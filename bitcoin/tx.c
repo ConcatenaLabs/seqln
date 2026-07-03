@@ -160,8 +160,10 @@ struct amount_sat bitcoin_tx_compute_fee_w_inputs(const struct bitcoin_tx *tx,
 		    !amount_asset_is(&asset, tx->output_asset))
 			continue;
 
+		/* Raw value (asset-aware channels): the output is in
+		 * tx->output_asset, which may not be the policy asset. */
 		ok = amount_sat_sub(&input_val, input_val,
-				    amount_asset_to_sat(&asset));
+				    amount_sat(asset.value));
 		if (!ok)
 			return AMOUNT_SAT(0);
 
@@ -365,8 +367,11 @@ struct amount_sat bitcoin_tx_output_get_amount_sat(const struct bitcoin_tx *tx, 
 {
 	struct amount_asset asset_amt;
 	asset_amt = bitcoin_tx_output_get_amount(tx, outnum);
+	/* The output is denominated in tx->output_asset (the channel/policy
+	 * asset); return its raw value without asserting it is the policy
+	 * asset (asset-aware channels). */
 	assert(amount_asset_is(&asset_amt, tx->output_asset));
-	return amount_asset_to_sat(&asset_amt);
+	return amount_sat(asset_amt.value);
 }
 
 void bitcoin_tx_input_set_witness(struct bitcoin_tx *tx, int innum,
