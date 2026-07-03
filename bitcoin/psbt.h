@@ -145,6 +145,15 @@ struct wally_psbt_input *psbt_append_input(struct wally_psbt *psbt,
 void psbt_input_set_wit_utxo(struct wally_psbt *psbt, size_t in,
 			     const u8 *scriptPubkey, struct amount_sat amt);
 
+/* As psbt_input_set_wit_utxo, but (on elements) tag the witness_utxo with @asset
+ * (33-byte version+tag) instead of the policy asset. For asset channels: the
+ * funding input a commitment/close/funding tx spends is the channel asset, so its
+ * witness_utxo (and thus the elements sighash) must carry that asset. @asset ==
+ * chainparams->fee_asset_tag is the default. */
+void psbt_input_set_wit_utxo_asset(struct wally_psbt *psbt, size_t in,
+				   const u8 *scriptPubkey, struct amount_sat amt,
+				   const u8 *asset);
+
 /* psbt_input_set_utxo - Set the non-witness utxo field for this PSBT input */
 void psbt_input_set_utxo(struct wally_psbt *psbt, size_t in,
 			 const struct wally_tx *prev_tx);
