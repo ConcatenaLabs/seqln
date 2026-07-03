@@ -72,16 +72,32 @@ Live-node proof (the exit criterion — "computed block hashes match"):
   `make lightningd/lightning_{channeld,closingd,connectd,dualopend,gossipd,gossip_compactd,hsmd,
   onchaind,openingd,websocketd}` (all pure C).
 
-Known environmental caveat (NOT a Sequentia issue): in this sandbox `lightning_connectd` exits
-(goes zombie ~4s in) during startup, so lightningd hangs in `connectd_activate` before "Server
-started" and never runs the main block-polling loop — it adds only the single initial block. This
-is connectd's peer-networking subdaemon (sockets), independent of the anchored-header code, and is
-reproducible on `--network=regtest` too. A normal (non-sandboxed / installed) host does not hit it.
-The parser proof above does not depend on full multi-block catch-up.
+Runtime status: SeqLN builds on the box (`/root/sequentia/seqln`, from GitHub) and lightningd is
+RPC-responsive — `getinfo`, `newaddr` (shared `tb1` bech32, the dual-chain format), `listfunds`, and
+`getchaininfo` all work, and getchaininfo returns the correct certified frontier (blockcount ==
+node000's real tip), **verifying section 6.1 in the live daemon**. But lightningd does **not complete
+startup**: it wedges at `connectd_activate()` (lightningd.c ~1404). RPC works because `jsonrpc_listen`
+(~1379) runs *before* that; but `begin_topology()` (~1455, which starts the fee-estimate and
+ongoing block-poll timers) is *after* it and never runs — so the chain tip stays at the height reached
+during the initial `setup_topology` sync, "still loading" persists, and no channel can be funded.
+The `lightning_connectd` "zombie" is just the harmless `test_subdaemons` version-check
+(`lightning_connectd --version`, exits 0); the real connectd/gossipd/hsmd are alive and idle in their
+poll loops. So this is a connectd ACTIVATE round-trip that never completes (lightningd sits in the
+nested `io_loop(NULL,NULL)` inside connectd_activate). It reproduces on the laptop and the box, with
+and without `--offline`, and is independent of the Sequentia code (bcli/getchaininfo are fine; the
+block-sync path itself works during setup_topology). Note: CLN's log file / `getlog` stop flushing
+after ~74 startup entries here — diagnose via `getinfo`/`getchaininfo`/process `wchan`, not the log.
 
 Next:
-- Re-run the full multi-block catch-up on a non-sandboxed host to confirm lightningd walks the whole
-  chain (expected to just work once connectd survives).
+- Resolve the `connectd_activate` startup wedge (highest priority — it gates all runtime: full sync,
+  channels, everything). lightningd is in the nested `io_loop(NULL,NULL)` awaiting
+  `connect_activate_done`; connectd is alive but the ACTIVATE reply round-trip never completes.
+  Likely a CLN master-snapshot (v26.06-75) issue or an environment interaction. Strongest lead:
+  rebase the Sequentia changes onto a **stable CLN release tag** and retest — the changes are small
+  and localized (chainparams, block.c/h, bcli getchaininfo, options timelocks, chaintopology helper,
+  channel_gossip) and should port cleanly.
+- Then the 2-node channel test (open/route/close + force-close/penalty): fund node A from
+  treasury-clean (node-gw RPC :18443) once the tip advances; both SeqLN nodes' bcli -> node000 :18200.
 - Test-harness duplicates (`contrib/pyln-testing/.../{utils,fixtures}.py`, `tests/utils.py`,
   `devtools/gossipwith.c`) need Sequentia entries before the pytest suite runs.
 - A proper `bitcoin/test/run-*.c` unit test asserting the block-1000 hash (the Python files are the
@@ -145,10 +161,10 @@ Implemented + verified this pass:
   txs. Explicit fee-in-channel-asset generalization is Phase 3 (`channel_asset`).
 
 Exit criterion (open/route/close a Sequence-token channel between two SeqLN nodes, plus a force-close
-and a penalty case across an induced tail-truncation reorg): requires a running two-node testnet,
-which needs a non-sandboxed host (the connectd startup caveat above blocks it on this laptop). The
-safety-layer code above is unit/logic-verified and builds green; the two-node runtime is the open
-item for a normal host.
+and a penalty case across an induced tail-truncation reorg): not yet met. SeqLN is built and running
+on the box and the daemon is fully functional (§6.1 confirmed live), but the ongoing block-poll stall
+(see Runtime status above) keeps the chain tip from advancing, which blocks funding. Resolving that
+stall is the gating item; the safety-layer code is unit/logic-verified and builds green.
 
 ## Decisions still provisional (worth Alberto's sign-off before Phase 3)
 
