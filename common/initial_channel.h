@@ -45,6 +45,14 @@ struct channel {
 	/* satoshis in from commitment tx */
 	struct amount_sat funding_sats;
 
+	/* The Sequentia asset this channel is denominated in (33 bytes: version +
+	 * tag), for asset-aware channels. Defaults to the network policy asset
+	 * (chainparams->fee_asset_tag), which is the Bitcoin / policy-asset-channel
+	 * case and preserves upstream behavior. Commitment/HTLC/close math compares
+	 * output assets against this via amount_asset_is(), not amount_asset_is_main().
+	 * Zeroed on non-elements chains (where there is only one asset). */
+	u8 channel_asset[33];
+
 	/* confirmations needed for locking funding */
 	u32 minimum_depth;
 
