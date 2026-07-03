@@ -20,6 +20,17 @@ struct bitcoin_tx_output *new_tx_output(const tal_t *ctx,
 	return output;
 }
 
+/* Default a tx's output asset to the network policy asset. Every bitcoin_tx
+ * allocation path (including parse/clone) must set output_asset, or the
+ * asset-aware amount asserts read uninitialized memory. */
+static void set_default_output_asset(u8 asset[33])
+{
+	if (chainparams->is_elements && chainparams->fee_asset_tag)
+		memcpy(asset, chainparams->fee_asset_tag, 33);
+	else
+		memset(asset, 0, 33);
+}
+
 struct wally_tx_output *wally_tx_output_asset(const tal_t *ctx,
 					      const u8 *script,
 					      struct amount_sat amount,
@@ -561,11 +572,7 @@ struct bitcoin_tx *bitcoin_tx(const tal_t *ctx,
 	tx->chainparams = chainparams;
 	/* Outputs default to the network policy asset; asset channels override via
 	 * bitcoin_tx_set_output_asset(). */
-	if (chainparams->is_elements && chainparams->fee_asset_tag)
-		memcpy(tx->output_asset, chainparams->fee_asset_tag,
-		       sizeof(tx->output_asset));
-	else
-		memset(tx->output_asset, 0, sizeof(tx->output_asset));
+	set_default_output_asset(tx->output_asset);
 	tx->psbt = new_psbt(tx, tx->wtx);
 
 	return tx;
@@ -620,6 +627,7 @@ struct bitcoin_tx *clone_bitcoin_tx(const tal_t *ctx,
 	newtx = tal(ctx, struct bitcoin_tx);
 
 	newtx->chainparams = tx->chainparams;
+	memcpy(newtx->output_asset, tx->output_asset, sizeof(newtx->output_asset));
 
 	tal_wally_start();
 	if (wally_tx_clone_alloc(tx->wtx, 0, &newtx->wtx) != WALLY_OK)
@@ -670,6 +678,9 @@ struct bitcoin_tx *pull_bitcoin_tx_only(const tal_t *ctx, const u8 **cursor,
 
 	tal_add_destructor(tx, bitcoin_tx_destroy);
 	tx->chainparams = chainparams;
+	/* A parsed tx defaults to the policy asset (callers that know the channel
+	 * asset override it); without this the asset asserts read garbage. */
+	set_default_output_asset(tx->output_asset);
 	tx->psbt = NULL;
 
 	return tx;
