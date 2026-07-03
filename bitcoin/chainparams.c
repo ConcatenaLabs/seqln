@@ -25,6 +25,15 @@ static u8 liquid_regtest_fee_asset[] = {
     0x05, 0x71, 0x49, 0x9c, 0x03, 0x62, 0x8a, 0x38, 0x51, 0xb8, 0xce,
 };
 
+/* SEQUENTIA testnet policy (Sequence-token) asset: 0x01 explicit prefix
+ * followed by the asset id in display order, matching CLN's L-BTC convention
+ * (dumpassetlabels "bitcoin" = c8eccacf...2fae3e40 on the live testnet). */
+static u8 sequentia_testnet_fee_asset[] = {
+    0x01, 0xc8, 0xec, 0xca, 0xcf, 0x09, 0x53, 0xe1, 0x93, 0x1c, 0xd3,
+    0x1e, 0x43, 0x4d, 0x83, 0x19, 0x10, 0x1c, 0xc3, 0x6e, 0x6c, 0x38,
+    0xb0, 0xe2, 0x10, 0x4d, 0x86, 0x87, 0x55, 0x2f, 0xae, 0x3e, 0x40,
+};
+
 const struct chainparams networks[] = {
     {.network_name = "bitcoin",
      .onchain_hrp = "bc",
@@ -209,6 +218,65 @@ const struct chainparams networks[] = {
      .p2sh_version = 39,
      .testnet = false,
      .fee_asset_tag = liquid_fee_asset,
+     .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_MAIN_PUBLIC,
+			   .bip32_privkey_version = BIP32_VER_MAIN_PRIVATE},
+     .is_elements = true},
+    /* SEQUENTIA testnet (the live network).  Elements-family, transparent by
+     * default; onchain HRP shared with Bitcoin testnet (`tb`), distinct
+     * lightning HRP `tsqt` (invoices `lntsqt...`).  bip70_name "test" matches
+     * the node's getblockchaininfo.chain; selection is by the unique
+     * network_name, so the "test" collision with Bitcoin testnet3 is benign.
+     * genesis_blockhash is the live testnet genesis in internal byte order.
+     * rpc_port is the node default; override with --bitcoin-rpcport as needed. */
+    {.network_name = "sequentia-testnet",
+     .onchain_hrp = "tb",
+     .lightning_hrp = "tsqt",
+     .bip70_name = "test",
+     .genesis_blockhash = {{{.u.u8 = {0xba, 0xdf, 0xc7, 0x51, 0xdf, 0xd8, 0x91,
+				      0x5d, 0x65, 0x2d, 0xc6, 0x25, 0xec, 0xfe,
+				      0xe1, 0xa4, 0x9a, 0x53, 0x1f, 0xaf, 0x40,
+				      0x81, 0xb9, 0x23, 0x84, 0x7e, 0x30, 0x4c,
+				      0x9b, 0xa9, 0xa0, 0xc2}}}},
+     .rpc_port = 18332,
+     .ln_port = 19836,
+     .cli = "elements-cli",
+     .cli_args = "-chain=test",
+     .dust_limit = {546},
+     .max_funding = AMOUNT_SAT_INIT((1 << 24) - 1),
+     .max_payment = AMOUNT_MSAT_INIT(0xFFFFFFFFULL),
+     .max_supply = AMOUNT_SAT_INIT(2100000000000000),
+     .when_lightning_became_cool = 1,
+     .p2pkh_version = 111,
+     .p2sh_version = 196,
+     .testnet = true,
+     .fee_asset_tag = sequentia_testnet_fee_asset,
+     .has_anchor_header = true,
+     .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_TEST_PUBLIC,
+			   .bip32_privkey_version = BIP32_VER_TEST_PRIVATE},
+     .is_elements = true},
+    /* SEQUENTIA mainnet.  TODO: fill genesis_blockhash and fee_asset_tag once
+     * mainnet launches / the re-genesis fixes real values; onchain HRP `bc`,
+     * lightning HRP `sqt` (invoices `lnsqt...`).  Placeholder genesis is
+     * all-zero and MUST be replaced before use. */
+    {.network_name = "sequentia",
+     .onchain_hrp = "bc",
+     .lightning_hrp = "sqt",
+     .bip70_name = "sequentia",
+     .genesis_blockhash = {{{.u.u8 = {0}}}},
+     .rpc_port = 7040,
+     .ln_port = 9836,
+     .cli = "elements-cli",
+     .cli_args = "-chain=sequentia",
+     .dust_limit = {546},
+     .max_funding = AMOUNT_SAT_INIT((1 << 24) - 1),
+     .max_payment = AMOUNT_MSAT_INIT(0xFFFFFFFFULL),
+     .max_supply = AMOUNT_SAT_INIT(2100000000000000),
+     .when_lightning_became_cool = 1,
+     .p2pkh_version = 0,
+     .p2sh_version = 5,
+     .testnet = false,
+     .fee_asset_tag = NULL, /* TODO: mainnet policy asset */
+     .has_anchor_header = true,
      .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_MAIN_PUBLIC,
 			   .bip32_privkey_version = BIP32_VER_MAIN_PRIVATE},
      .is_elements = true},
