@@ -189,6 +189,13 @@ static inline struct amount_msat amount_msat_max(struct amount_msat a,
  * current chain. */
 bool amount_asset_is_main(struct amount_asset *asset);
 
+/* Check whether this asset is the given 33-byte (version + tag) asset id. On
+ * non-elements chains there is only one asset, so this is always true. This is
+ * the asset-aware primitive: channel/commitment code threads its own
+ * channel_asset and calls this instead of amount_asset_is_main (which assumes
+ * the network policy asset). */
+bool amount_asset_is(struct amount_asset *asset, const u8 *asset_id);
+
 /* Convert an amount_sat to an amount_asset */
 struct amount_asset amount_sat_to_asset(struct amount_sat *sat, const u8 *asset);
 
