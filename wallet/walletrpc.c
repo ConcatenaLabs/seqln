@@ -368,6 +368,18 @@ static void json_add_utxo(struct json_stream *response,
 	json_add_num(response, "output", utxo->outpoint.n);
 	json_add_amount_sat_msat(response, "amount_msat", utxo->amount);
 
+	/* Asset-aware channels: for a non-policy (issued) asset, surface its
+	 * display id (32-byte hex, natural order). Policy-asset outputs omit
+	 * this field, so they are unchanged; the amount is in the asset's atoms. */
+	if (chainparams->is_elements && chainparams->fee_asset_tag
+	    && memcmp(utxo->asset, chainparams->fee_asset_tag,
+		      sizeof(utxo->asset)) != 0) {
+		u8 id[32];
+		for (size_t i = 0; i < sizeof(id); i++)
+			id[i] = utxo->asset[sizeof(id) - i]; /* drop 0x01, reverse */
+		json_add_hex(response, "asset", id, sizeof(id));
+	}
+
 	if (utxo->utxotype == UTXO_P2SH_P2WPKH) {
 		struct pubkey key;
 		bip32_pubkey(wallet->ld, &key, utxo->keyindex);
@@ -485,6 +497,16 @@ static struct command_result *json_listfunds(struct command *cmd,
 			json_add_amount_sat_msat(response,
 						 "amount_msat",
 						 c->funding_sats);
+			/* Asset-aware channels: surface a non-policy channel
+			 * asset's display id (amounts are in its atoms). */
+			if (chainparams->is_elements && chainparams->fee_asset_tag
+			    && memcmp(c->channel_asset, chainparams->fee_asset_tag,
+				      sizeof(c->channel_asset)) != 0) {
+				u8 id[32];
+				for (size_t i = 0; i < sizeof(id); i++)
+					id[i] = c->channel_asset[sizeof(id) - i];
+				json_add_hex(response, "asset", id, sizeof(id));
+			}
 			json_add_txid(response, "funding_txid",
 				      &c->funding.txid);
 			json_add_num(response, "funding_output",

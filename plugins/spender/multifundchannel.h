@@ -157,6 +157,10 @@ struct multifundchannel_destination {
 
 	/* Channel type to ask for (NULL if default OK) */
 	struct channel_type *channel_type;
+
+	/* Asset-aware channels: display asset id (32-byte hex) to denominate
+	 * this channel in, or NULL for the policy asset. */
+	const char *asset;
 };
 
 

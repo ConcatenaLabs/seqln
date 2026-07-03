@@ -2,6 +2,7 @@
 #include <bitcoin/psbt.h>
 #include <bitcoin/script.h>
 #include <ccan/array_size/array_size.h>
+#include <ccan/str/hex/hex.h>
 #include <ccan/tal/str/str.h>
 #include <common/addr.h>
 #include <common/channel_type.h>
@@ -898,10 +899,29 @@ perform_funding_tx_finalize(struct multifundchannel_command *mfc)
 
 		/* Funding outpoint.  */
 		dest = deck[outnum];
-		(void) psbt_insert_output(mfc->psbt,
-					  dest->funding_script,
-					  dest->amount,
-					  outnum);
+		/* Asset-aware channels: the 2-of-2 funding output must hold the
+		 * channel asset, so the funding tx (GOLD inputs + GOLD change +
+		 * GOLD fee from fundpsbt) balances as a single asset. */
+		if (dest->asset) {
+			u8 tag[33], id[32];
+			if (!hex_decode(dest->asset, strlen(dest->asset),
+					id, sizeof(id)))
+				return mfc_fail(mfc, JSONRPC2_INVALID_PARAMS,
+						"invalid asset id %s",
+						dest->asset);
+			tag[0] = 0x01;
+			for (size_t k = 0; k < sizeof(id); k++)
+				tag[1 + k] = id[sizeof(id) - 1 - k];
+			(void) psbt_insert_output_asset(mfc->psbt,
+							dest->funding_script,
+							dest->amount, tag,
+							outnum);
+		} else {
+			(void) psbt_insert_output(mfc->psbt,
+						  dest->funding_script,
+						  dest->amount,
+						  outnum);
+		}
 		/* The actual output index will be based on the
 		 * serial_id if this contains any v2 outputs */
 		if (v2_dest_count == 0)
@@ -1148,6 +1168,10 @@ fundchannel_start_dest(struct multifundchannel_destination *dest)
 		json_add_string(
 		    req->js, "reserve",
 		    fmt_amount_sat(tmpctx, *dest->reserve));
+
+	/* Asset-aware channels: tell openingd which asset to open in. */
+	if (dest->asset)
+		json_add_string(req->js, "asset", dest->asset);
 
 	send_outreq(req);
 }
@@ -1428,6 +1452,24 @@ perform_fundpsbt(struct multifundchannel_command *mfc, u32 feerate)
 
 	/* Handle adding a change output if required. */
 	json_add_bool(req->js, "excess_as_change", true);
+
+	/* Asset-aware channels: fund in the destinations' asset (a single-asset
+	 * batch; all destinations in one funding tx must agree on the asset). */
+	{
+		const char *asset = NULL;
+		for (size_t i = 0; i < tal_count(mfc->destinations); i++) {
+			const char *a = mfc->destinations[i].asset;
+			if (!a)
+				continue;
+			if (asset && !streq(asset, a))
+				return mfc_fail(mfc, JSONRPC2_INVALID_PARAMS,
+						"All channels in one funding tx"
+						" must use the same asset");
+			asset = a;
+		}
+		if (asset)
+			json_add_string(req->js, "asset", asset);
+	}
 
 	return send_outreq(req);
 }
@@ -1871,6 +1913,7 @@ param_destinations_array(struct command *cmd, const char *name,
 			   p_opt("mindepth", param_u32, &dest->mindepth),
 			   p_opt("reserve", param_sat, &dest->reserve),
 			   p_opt("channel_type", param_channel_type, &dest->channel_type),
+			   p_opt("asset", param_string, &dest->asset),
 			   NULL))
 			return command_param_failed();
 
