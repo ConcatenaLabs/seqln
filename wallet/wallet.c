@@ -2220,6 +2220,16 @@ static struct channel *wallet_stmt2channel(struct wallet *w, struct db_stmt *stm
 			   funding_psbt,
 			   db_col_int(stmt, "withheld"));
 
+	/* Asset-aware channels: restore the channel asset. new_channel()
+	 * defaulted it to the policy asset, so a NULL column (pre-migration
+	 * or ordinary channel) correctly leaves it as the policy asset. */
+	if (!db_col_is_null(stmt, "channel_asset")) {
+		u8 *a = db_col_arr(tmpctx, stmt, "channel_asset", u8);
+		if (a && tal_bytelen(a) == sizeof(chan->channel_asset))
+			memcpy(chan->channel_asset, a,
+			       sizeof(chan->channel_asset));
+	}
+
 	if (!wallet_channel_load_inflights(w, chan)) {
 		tal_free(chan);
 		return NULL;
@@ -2482,6 +2492,7 @@ static bool wallet_channels_load_active(struct wallet *w)
 					", close_attempt_height"
 					", funding_psbt"
 					", withheld"
+					", channel_asset"
 					" FROM channels"
                                         " WHERE state != ?;")); //? 0
 	db_bind_int(stmt, CLOSED);
@@ -2757,7 +2768,8 @@ void wallet_channel_save(struct wallet *w, struct channel *chan)
 					"  require_confirm_inputs_remote=?,"
 					"  close_attempt_height=?,"
 					"  funding_psbt=?,"
-					"  withheld=?"
+					"  withheld=?,"
+					"  channel_asset=?"
 					" WHERE id=?"));
 	db_bind_u64(stmt, chan->their_shachain.id);
 	if (chan->scid)
@@ -2860,6 +2872,9 @@ void wallet_channel_save(struct wallet *w, struct channel *chan)
 	else
 		db_bind_null(stmt);
 	db_bind_int(stmt, chan->withheld);
+	/* Asset-aware channels: persist which asset this channel is
+	 * denominated in (the policy asset for an ordinary channel). */
+	db_bind_blob(stmt, chan->channel_asset, sizeof(chan->channel_asset));
 	db_bind_u64(stmt, chan->dbid);
 	db_exec_prepared_v2(take(stmt));
 

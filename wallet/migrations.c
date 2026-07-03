@@ -1089,6 +1089,10 @@ static const struct db_migration dbmigrations[] = {
      * version+tag). NULL on existing rows -> the policy asset at read time. */
     {SQL("ALTER TABLE outputs ADD asset BLOB DEFAULT NULL;"), NULL,
      SQL("ALTER TABLE outputs DROP COLUMN asset"), NULL},
+    /* Asset-aware channels: the asset a channel is denominated in (33-byte
+     * version+tag). NULL on existing rows -> the policy asset at load time. */
+    {SQL("ALTER TABLE channels ADD channel_asset BLOB DEFAULT NULL;"), NULL,
+     SQL("ALTER TABLE channels DROP COLUMN channel_asset"), NULL},
 };
 
 const struct db_migration *get_db_migrations(size_t *num)
