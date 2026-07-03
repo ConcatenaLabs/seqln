@@ -88,14 +88,26 @@ and without `--offline`, and is independent of the Sequentia code (bcli/getchain
 block-sync path itself works during setup_topology). Note: CLN's log file / `getlog` stop flushing
 after ~74 startup entries here — diagnose via `getinfo`/`getchaininfo`/process `wchan`, not the log.
 
+Stable-rebase experiment (done — ruled out a version regression): the 5 Sequentia commits were
+cherry-picked cleanly onto the **stable `v26.06.2`** point release (branch `sequentia-stable`), built
+on the box, and run — and it **wedges identically** (blockheight frozen at the setup_topology height,
+"still loading" persists, no "Server started"). So the startup wedge is NOT a master-snapshot bug; it
+is environmental / config, common to both CLN versions and to laptop + box. (Branch note:
+`sequentia-stable` is the better long-term base anyway — a point release, and the changes port with no
+modification and compile clean.)
+
 Next:
-- Resolve the `connectd_activate` startup wedge (highest priority — it gates all runtime: full sync,
-  channels, everything). lightningd is in the nested `io_loop(NULL,NULL)` awaiting
-  `connect_activate_done`; connectd is alive but the ACTIVATE reply round-trip never completes.
-  Likely a CLN master-snapshot (v26.06-75) issue or an environment interaction. Strongest lead:
-  rebase the Sequentia changes onto a **stable CLN release tag** and retest — the changes are small
-  and localized (chainparams, block.c/h, bcli getchaininfo, options timelocks, chaintopology helper,
-  channel_gossip) and should port cleanly.
+- Resolve the startup wedge (highest priority — gates all runtime). Ruled out so far: my getchaininfo
+  clamp (bcli sits idle when it wedges), the CLN version (stable v26.06.2 wedges too), the block parser
+  (setup_topology's initial sync works), and the synchronous bcli (stock in v26.06.2 — upstream ships
+  it). The wedge sits between `setup_topology` (works) and `begin_topology` (never runs), i.e.
+  lightningd.c ~1375-1455 (gossip_init / plugins_config / connectd_activate). Since upstream CLN-on-Liquid
+  is a supported/CI-tested config that starts fully, the remaining difference is the **Sequentia
+  chainparams entry / running against the Sequentia (Elements) node specifically**. Next steps: (1) a
+  **gdb backtrace of the wedged lightningd** (`gdb -p <pid>` then `bt`) to name the exact stuck function
+  — that will settle it fast; (2) diff behavior against a stock CLN pointed at a Liquid/Elements regtest
+  to see if plain CLN-on-Elements starts here at all (isolates env vs the Sequentia chainparams fields,
+  e.g. ports/features).
 - Then the 2-node channel test (open/route/close + force-close/penalty): fund node A from
   treasury-clean (node-gw RPC :18443) once the tip advances; both SeqLN nodes' bcli -> node000 :18200.
 - Test-harness duplicates (`contrib/pyln-testing/.../{utils,fixtures}.py`, `tests/utils.py`,
