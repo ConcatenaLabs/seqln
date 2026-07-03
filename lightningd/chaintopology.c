@@ -74,14 +74,21 @@ static void filter_block_txs(struct chain_topology *topo, struct block *b)
 					       b->height, i);
 			for (size_t k = 0; k < tal_count(our_outnums); k++) {
 				const struct wally_tx_output *txout;
-				struct amount_sat amount;
+				struct amount_asset asset_amt;
 				struct bitcoin_outpoint outpoint;
 
 				txout = &tx->wtx->outputs[our_outnums[k]];
 				outpoint.txid = txid;
 				outpoint.n = our_outnums[k];
-				amount = bitcoin_tx_output_get_amount_sat(tx, our_outnums[k]);
-				invoice_check_onchain_payment(topo->ld, txout->script, amount, &outpoint);
+				/* On-chain invoice payments are denominated in the
+				 * policy asset only; owned outputs of other (issued)
+				 * assets are recorded by the wallet above but cannot
+				 * settle an invoice, so skip the check for them. */
+				asset_amt = bitcoin_tx_output_get_amount(tx, our_outnums[k]);
+				if (amount_asset_is_main(&asset_amt)) {
+					struct amount_sat amount = amount_asset_to_sat(&asset_amt);
+					invoice_check_onchain_payment(topo->ld, txout->script, amount, &outpoint);
+				}
 			}
 
 		}

@@ -1085,6 +1085,10 @@ static const struct db_migration dbmigrations[] = {
     {SQL("ALTER TABLE offers ADD COLUMN force_paths INTEGER DEFAULT 0;"), NULL,
      SQL("ALTER TABLE offers DROP COLUMN force_paths"), NULL},
     /* ^v26.04 */
+    /* Asset-aware channels: track which asset each wallet output holds (33-byte
+     * version+tag). NULL on existing rows -> the policy asset at read time. */
+    {SQL("ALTER TABLE outputs ADD asset BLOB DEFAULT NULL;"), NULL,
+     SQL("ALTER TABLE outputs DROP COLUMN asset"), NULL},
 };
 
 const struct db_migration *get_db_migrations(size_t *num)

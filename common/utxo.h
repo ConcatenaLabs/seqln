@@ -35,7 +35,14 @@ const char *utxotype_to_str(enum utxotype utxotype);
 
 struct utxo {
 	struct bitcoin_outpoint outpoint;
+	/* The output value, in units of `asset`. For the policy asset this is
+	 * ordinary sats; for an issued (asset-channel) asset it is that asset's
+	 * atoms. */
 	struct amount_sat amount;
+	/* The Sequentia asset this output holds (33-byte version+tag). Zeroed / the
+	 * policy asset for ordinary outputs; a non-policy id for issued assets. Lets
+	 * coin-selection pick UTXOs of a requested asset (asset-aware channels). */
+	u8 asset[33];
 	u32 keyindex;
 	enum utxotype utxotype;
 	enum output_status status;
