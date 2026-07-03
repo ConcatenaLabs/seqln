@@ -339,6 +339,18 @@ void add_channel_to_dbid_map(struct lightningd *ld,
 	tal_add_destructor(channel, remove_from_dbid_map);
 }
 
+/* Default a channel's denominating asset to the network policy asset (the
+ * Bitcoin / policy-asset-channel case). Asset channels override channel_asset
+ * from the open negotiation before channeld is started. */
+static void channel_set_default_asset(struct channel *channel)
+{
+	if (chainparams->is_elements && chainparams->fee_asset_tag)
+		memcpy(channel->channel_asset, chainparams->fee_asset_tag,
+		       sizeof(channel->channel_asset));
+	else
+		memset(channel->channel_asset, 0, sizeof(channel->channel_asset));
+}
+
 struct channel *new_unsaved_channel(struct peer *peer,
 				    u32 feerate_base,
 				    u32 feerate_ppm)
@@ -367,6 +379,7 @@ struct channel *new_unsaved_channel(struct peer *peer,
 
 	channel->our_config.id = 0;
 	channel->open_attempt = NULL;
+	channel_set_default_asset(channel);
 
 	channel->last_htlc_sigs = NULL;
 	channel->remote_channel_ready = false;
@@ -613,6 +626,7 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 	channel->next_htlc_id = next_htlc_id;
 	channel->funding = *funding;
 	channel->funding_sats = funding_sats;
+	channel_set_default_asset(channel);
 	channel->funding_spend_watch = NULL;
 	channel->push = push;
 	channel->our_funds = our_funds;

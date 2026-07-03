@@ -6802,6 +6802,7 @@ static void init_channel(struct peer *peer)
 {
 	struct basepoints points[NUM_SIDES];
 	struct amount_sat funding_sats;
+	u8 channel_asset[33];
 	struct amount_msat local_msat;
 	struct pubkey funding_pubkey[NUM_SIDES];
 	struct channel_config conf[NUM_SIDES];
@@ -6831,6 +6832,7 @@ static void init_channel(struct peer *peer)
 				    &peer->channel_id,
 				    &funding,
 				    &funding_sats,
+				    channel_asset,
 				    &minimum_depth,
 				    &peer->our_blockheight,
 				    &blockheight_states,
@@ -6959,6 +6961,12 @@ static void init_channel(struct peer *peer)
 					 feature_offered(peer->their_features,
 							 OPT_LARGE_CHANNELS),
 					 opener);
+
+	/* Asset-aware channels: new_full_channel defaults channel_asset to the
+	 * policy asset; override with the negotiated asset from channeld_init so
+	 * our commitment/close math denominates in it. */
+	memcpy(peer->channel->channel_asset, channel_asset,
+	       sizeof(peer->channel->channel_asset));
 
 	if (!channel_force_htlcs(peer->channel,
 			 cast_const2(const struct existing_htlc **, htlcs)))
