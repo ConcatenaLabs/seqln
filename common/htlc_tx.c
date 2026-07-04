@@ -14,12 +14,18 @@ struct bitcoin_tx *htlc_tx(const tal_t *ctx,
 			   struct amount_sat htlc_fee,
 			   u32 locktime,
 			   bool option_anchor_outputs,
-			   bool option_anchors_zero_fee_htlc_tx)
+			   bool option_anchors_zero_fee_htlc_tx,
+			   const u8 *channel_asset)
 {
 	/* BOLT #3:
 	 * * locktime: `0` for HTLC-success, `cltv_expiry` for HTLC-timeout
 	 */
 	struct bitcoin_tx *tx = bitcoin_tx(ctx, chainparams, 1, 1, locktime);
+
+	/* Asset-aware channels: denominate this second-stage tx (its input's
+	 * witness_utxo, output, and elements fee) in the channel asset. Must be
+	 * set before the input/output are added. NULL leaves the policy asset. */
+	bitcoin_tx_set_output_asset(tx, channel_asset);
 
 	/* BOLT #3:
 	 *
@@ -77,7 +83,8 @@ struct bitcoin_tx *htlc_success_tx(const tal_t *ctx,
 				   u32 feerate_per_kw,
 				   const struct keyset *keyset,
 				   bool option_anchor_outputs,
-				   bool option_anchors_zero_fee_htlc_tx)
+				   bool option_anchors_zero_fee_htlc_tx,
+				   const u8 *channel_asset)
 {
 	const u8 *htlc_wscript;
 
@@ -97,7 +104,8 @@ struct bitcoin_tx *htlc_success_tx(const tal_t *ctx,
 					option_anchors_zero_fee_htlc_tx),
 		       0,
 		       option_anchor_outputs,
-		       option_anchors_zero_fee_htlc_tx);
+		       option_anchors_zero_fee_htlc_tx,
+		       channel_asset);
 }
 
 /* Fill in the witness for HTLC-success tx produced above. */
@@ -140,7 +148,8 @@ struct bitcoin_tx *htlc_timeout_tx(const tal_t *ctx,
 				   u32 feerate_per_kw,
 				   const struct keyset *keyset,
 				   bool option_anchor_outputs,
-				   bool option_anchors_zero_fee_htlc_tx)
+				   bool option_anchors_zero_fee_htlc_tx,
+				   const u8 *channel_asset)
 {
 	const u8 *htlc_wscript;
 
@@ -160,7 +169,8 @@ struct bitcoin_tx *htlc_timeout_tx(const tal_t *ctx,
 					option_anchors_zero_fee_htlc_tx),
 		       cltv_expiry,
 		       option_anchor_outputs,
-		       option_anchors_zero_fee_htlc_tx);
+		       option_anchors_zero_fee_htlc_tx,
+		       channel_asset);
 }
 
 /* Fill in the witness for HTLC-timeout tx produced above. */

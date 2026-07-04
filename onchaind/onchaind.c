@@ -514,6 +514,9 @@ static struct amount_sat get_htlc_success_fee(struct tracked_output *out)
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "Overflow in get_htlc_success_fee %s",
 			      fmt_amount_sat(tmpctx, out->sat));
+	/* FIXME(asset-channels M3): thread the channel asset through
+	 * onchaind_init so on-chain HTLC resolution of an asset channel builds
+	 * asset-denominated txs; NULL == policy asset for now (force-close is M3). */
 	tx = htlc_success_tx(tmpctx, chainparams,
 			     &out->outpoint,
 			     out->wscript,
@@ -522,7 +525,8 @@ static struct amount_sat get_htlc_success_fee(struct tracked_output *out)
 			     0,
 			     keyset,
 			     option_anchor_outputs,
-			     option_anchors_zero_fee_htlc_tx);
+			     option_anchors_zero_fee_htlc_tx,
+			     NULL);
 
 	/* BOLT #3:
 	 *
@@ -1853,13 +1857,15 @@ static size_t resolve_our_htlc_ourcommit(struct tracked_output *out,
 		 *    - MUST *resolve* the output by spending it using the
 		 *    HTLC-timeout transaction.
 		 */
+		/* FIXME(asset-channels M3): pass the channel asset (NULL == policy). */
 		tx = htlc_timeout_tx(tmpctx, chainparams,
 				     &out->outpoint,
 				     htlc_scripts[matches[i]], htlc_amount,
 				     htlcs[matches[i]].cltv_expiry,
 				     to_self_delay[LOCAL], 0, keyset,
 				     option_anchor_outputs,
-				     option_anchors_zero_fee_htlc_tx);
+				     option_anchors_zero_fee_htlc_tx,
+				     NULL);
 
 		if (set_htlc_timeout_fee(tx, out->remote_htlc_sig,
 					 htlc_scripts[matches[i]]))

@@ -267,7 +267,8 @@ static void add_htlcs(struct bitcoin_tx ***txs,
 					     htlc_feerate_per_kw,
 					     keyset,
 					     option_anchor_outputs,
-					     option_anchors_zero_fee_htlc_tx);
+					     option_anchors_zero_fee_htlc_tx,
+					     channel->channel_asset);
 		} else {
 			ripemd160(&ripemd, htlc->rhash.u.u8, sizeof(htlc->rhash.u.u8));
 			wscript = htlc_received_wscript(tmpctx, &ripemd,
@@ -281,7 +282,8 @@ static void add_htlcs(struct bitcoin_tx ***txs,
 					     htlc_feerate_per_kw,
 					     keyset,
 					     option_anchor_outputs,
-					     option_anchors_zero_fee_htlc_tx);
+					     option_anchors_zero_fee_htlc_tx,
+					     channel->channel_asset);
 		}
 
 		/* Append to array. */
@@ -399,7 +401,8 @@ struct bitcoin_tx **channel_txs(const tal_t *ctx,
 	    commitment_number ^ channel->commitment_number_obscurer,
 	    channel_has(channel, OPT_ANCHOR_OUTPUTS_DEPRECATED),
 	    channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX),
-	    side, other_anchor_outnum);
+	    side, other_anchor_outnum,
+	    channel->channel_asset);
 
 	/* Set the remote/local pubkeys on the commitment tx psbt */
 	psbt_input_add_pubkey(txs[0]->psbt, 0,
