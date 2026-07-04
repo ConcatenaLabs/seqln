@@ -14,8 +14,9 @@
 //! tx-sighash + `sign_*` messages can be layered on top without touching I/O.
 
 use bitcoin::bip32::{ChildNumber, Xpriv};
+use bitcoin::hashes::{hash160, Hash};
 use bitcoin::secp256k1::ecdh::SharedSecret;
-use bitcoin::secp256k1::{All, PublicKey, Secp256k1, SecretKey};
+use bitcoin::secp256k1::{ecdsa, All, Message, PublicKey, Scalar, Secp256k1, SecretKey};
 use bitcoin::NetworkKind;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256, Sha512};
@@ -73,6 +74,28 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(data);
     h.finalize().into()
+}
+
+/// SHA256d = SHA256(SHA256(x)), the `WALLY_SIGTYPE`/`sha256_double` used by the
+/// BIP-143 sighash and by `sign_hash` (which signs a `sha256_double`).
+fn sha256d(data: &[u8]) -> [u8; 32] {
+    sha256(&sha256(data))
+}
+
+/// Bitcoin/Elements compact-size varint (`varint_from_bytes` inverse).
+fn write_varint(out: &mut Vec<u8>, v: u64) {
+    if v < 0xfd {
+        out.push(v as u8);
+    } else if v <= 0xffff {
+        out.push(0xfd);
+        out.extend_from_slice(&(v as u16).to_le_bytes());
+    } else if v <= 0xffff_ffff {
+        out.push(0xfe);
+        out.extend_from_slice(&(v as u32).to_le_bytes());
+    } else {
+        out.push(0xff);
+        out.extend_from_slice(&v.to_le_bytes());
+    }
 }
 
 /// BIP39 mnemonic -> 64-byte seed, per libwally `bip39_mnemonic_to_seed`
@@ -369,4 +392,315 @@ impl Kernel {
         out[45..78].copy_from_slice(&self.pubkey(&x.private_key));
         out
     }
+
+    // ===================================================================
+    // M2b: channel signing keys, per-commitment derivation, and signing.
+    // ===================================================================
+
+    /// The five per-channel basepoint secrets + shaseed, exactly the `struct
+    /// keys { privkey f, r, h, p, d; sha256 shaseed; }` layout of the 192-byte
+    /// "c-lightning" HKDF (`common/derive_basepoints.c`).
+    pub fn channel_secrets(&self, peer_id: &[u8; 33], dbid: u64) -> ChannelSecrets {
+        let seed = self.channel_seed(peer_id, dbid);
+        let k = self.channel_keys(&seed);
+        let sk = |raw: &[u8; 32]| SecretKey::from_slice(raw).expect("valid channel secret");
+        ChannelSecrets {
+            funding: sk(&k.funding),
+            revocation: sk(&k.revocation),
+            htlc: sk(&k.htlc),
+            payment: sk(&k.payment),
+            delayed: sk(&k.delayed),
+            shaseed: k.shaseed,
+        }
+    }
+
+    /// `per_commit_point(shaseed, n)` -> compressed point.
+    pub fn per_commit_point_at(&self, shaseed: &[u8; 32], n: u64) -> [u8; 33] {
+        let secret = Self::per_commit_secret(shaseed, n);
+        self.pubkey(&SecretKey::from_slice(&secret).expect("valid per-commit secret"))
+    }
+
+    /// `per_commit_secret(shaseed, n)` -> 32-byte secret.
+    pub fn per_commit_secret_at(&self, shaseed: &[u8; 32], n: u64) -> [u8; 32] {
+        Self::per_commit_secret(shaseed, n)
+    }
+
+    /// Compressed pubkey for a secret (`pubkey_from_privkey`).
+    pub fn pubkey_of(&self, sk: &SecretKey) -> [u8; 33] {
+        self.pubkey(sk)
+    }
+
+    /// `pubkey_from_secret`: the point for a 32-byte secret, or Err if invalid.
+    pub fn point_from_secret(&self, secret: &[u8; 32]) -> Result<[u8; 33], ()> {
+        let sk = SecretKey::from_slice(secret).map_err(|_| ())?;
+        Ok(self.pubkey(&sk))
+    }
+
+    /// `derive_simple_privkey` (`common/key_derive.c`):
+    /// `privkey = base_secret + SHA256(per_commitment_point || basepoint)`,
+    /// where `basepoint = base_secret * G` (compressed).
+    pub fn derive_simple_privkey(
+        &self,
+        base_secret: &SecretKey,
+        per_commitment_point: &[u8; 33],
+    ) -> SecretKey {
+        let basepoint = self.pubkey(base_secret);
+        let mut buf = [0u8; 66];
+        buf[..33].copy_from_slice(per_commitment_point);
+        buf[33..].copy_from_slice(&basepoint);
+        let tweak = Scalar::from_be_bytes(sha256(&buf)).expect("tweak in range");
+        base_secret.add_tweak(&tweak).expect("valid derived privkey")
+    }
+
+    /// `derive_revocation_privkey` (`common/key_derive.c`):
+    /// `base_secret * SHA256(basepoint || P) + per_commitment_secret * SHA256(P || basepoint)`,
+    /// where `basepoint = revocation_basepoint_secret * G` and `P` is the
+    /// `per_commitment_point` (= `per_commitment_secret * G`).
+    pub fn derive_revocation_privkey(
+        &self,
+        base_secret: &SecretKey,
+        per_commitment_secret: &SecretKey,
+        per_commitment_point: &[u8; 33],
+    ) -> SecretKey {
+        let basepoint = self.pubkey(base_secret);
+        // sha1 = SHA256(basepoint || per_commitment_point)
+        let mut b1 = [0u8; 66];
+        b1[..33].copy_from_slice(&basepoint);
+        b1[33..].copy_from_slice(per_commitment_point);
+        let s1 = Scalar::from_be_bytes(sha256(&b1)).expect("tweak in range");
+        let part1 = base_secret.mul_tweak(&s1).expect("valid mul");
+        // sha2 = SHA256(per_commitment_point || basepoint)
+        let mut b2 = [0u8; 66];
+        b2[..33].copy_from_slice(per_commitment_point);
+        b2[33..].copy_from_slice(&basepoint);
+        let s2 = Scalar::from_be_bytes(sha256(&b2)).expect("tweak in range");
+        let part2 = per_commitment_secret.mul_tweak(&s2).expect("valid mul");
+        let part2_scalar =
+            Scalar::from_be_bytes(part2.secret_bytes()).expect("part2 in range");
+        part1.add_tweak(&part2_scalar).expect("valid revocation privkey")
+    }
+
+    /// The BOLT-3 funding `witnessScript`: `OP_2 <lo> <hi> OP_2 OP_CHECKMULTISIG`,
+    /// keys sorted by their compressed serialization (`bitcoin_redeem_2of2`).
+    pub fn funding_wscript(&self, local_funding: &[u8; 33], remote_funding: &[u8; 33]) -> Vec<u8> {
+        let (a, b) = if local_funding[..] < remote_funding[..] {
+            (local_funding, remote_funding)
+        } else {
+            (remote_funding, local_funding)
+        };
+        let mut s = Vec::with_capacity(71);
+        s.push(0x52); // OP_2
+        s.push(0x21); // push 33
+        s.extend_from_slice(a);
+        s.push(0x21);
+        s.extend_from_slice(b);
+        s.push(0x52); // OP_2
+        s.push(0xae); // OP_CHECKMULTISIG
+        s
+    }
+
+    /// `scriptpubkey_p2wpkh`: `OP_0 <20-byte HASH160(compressed pubkey)>`.
+    pub fn p2wpkh_scriptpubkey(&self, pubkey: &[u8; 33]) -> Vec<u8> {
+        let h = hash160::Hash::hash(pubkey);
+        let mut s = Vec::with_capacity(22);
+        s.push(0x00); // OP_0
+        s.push(0x14); // push 20
+        s.extend_from_slice(&h[..]);
+        s
+    }
+
+    /// `sign_hash` (`bitcoin/signature.c`): ECDSA with low-R grinding, matching
+    /// libhsmd BYTE-FOR-BYTE. libhsmd calls `secp256k1_ecdsa_sign(.., NULL,
+    /// extra_entropy)` where `extra_entropy` starts at 32 zero bytes and the
+    /// first u32 (host-endian = little on x86) increments each grind round,
+    /// looping until the compact signature's first byte is `< 0x80` (low R).
+    /// rust-secp's own `sign_ecdsa_low_r` passes `noncedata = NULL` on the FIRST
+    /// round (not 32 zeros), so it does NOT reproduce these bytes — we must
+    /// drive `sign_ecdsa_with_noncedata` ourselves. Returns the 64-byte compact
+    /// signature (low-S, low-R), as `towire_secp256k1_ecdsa_signature` emits.
+    pub fn sign_hash_low_r(&self, hash: &[u8; 32], sk: &SecretKey) -> [u8; 64] {
+        let msg = Message::from_digest(*hash);
+        let mut extra = [0u8; 32];
+        loop {
+            let sig: ecdsa::Signature = self.secp.sign_ecdsa_with_noncedata(&msg, sk, &extra);
+            let compact = sig.serialize_compact();
+            // Increment first u32 (little-endian) BEFORE the low-R test, exactly
+            // as `sign_hash` does `((u32*)extra_entropy)[0]++` then `while(...)`.
+            let c = u32::from_le_bytes([extra[0], extra[1], extra[2], extra[3]]).wrapping_add(1);
+            extra[..4].copy_from_slice(&c.to_le_bytes());
+            if compact[0] < 0x80 {
+                return compact;
+            }
+        }
+    }
+
+    /// `secp256k1_ecdsa_sign_recoverable` (RFC6979, no grind) over `hash` with
+    /// the node key, serialized as `towire_secp256k1_ecdsa_recoverable_signature`
+    /// does: 64-byte compact || recid(u8). Used by `handle_sign_invoice`.
+    pub fn node_sign_recoverable(&self, hash: &[u8; 32]) -> [u8; 65] {
+        let msg = Message::from_digest(*hash);
+        let sk = self.node_privkey();
+        let rsig = self.secp.sign_ecdsa_recoverable(&msg, &sk);
+        let (recid, compact) = rsig.serialize_compact();
+        let mut out = [0u8; 65];
+        out[..64].copy_from_slice(&compact);
+        out[64] = recid.to_i32() as u8;
+        out
+    }
+}
+
+/// The five per-channel basepoint secrets + the shaseed.
+pub struct ChannelSecrets {
+    pub funding: SecretKey,
+    pub revocation: SecretKey,
+    pub htlc: SecretKey,
+    pub payment: SecretKey,
+    pub delayed: SecretKey,
+    pub shaseed: [u8; 32],
+}
+
+/// A parsed input of a linearized Elements tx, only the fields the BIP-143
+/// sighash needs (`bitcoin/signature.c` -> `wally_tx_get_elements_signature_hash`).
+pub struct TxInput {
+    pub txhash: [u8; 32],
+    pub index: u32,
+    pub sequence: u32,
+    pub is_issuance: bool,
+}
+
+/// A parsed output: the raw confidential-commitment bytes (asset/value/nonce, as
+/// serialized, so `hash_commmitment` reproduces them verbatim) and the script.
+pub struct TxOutput {
+    pub asset: Vec<u8>,
+    pub value: Vec<u8>,
+    pub nonce: Vec<u8>,
+    pub script: Vec<u8>,
+}
+
+pub struct ElementsTx {
+    pub version: u32,
+    pub inputs: Vec<TxInput>,
+    pub outputs: Vec<TxOutput>,
+    pub locktime: u32,
+}
+
+fn hash_output_elements(out: &mut Vec<u8>, o: &TxOutput) {
+    // asset/value/nonce commitments are hashed verbatim (a null field is its
+    // single 0x00 byte, which equals libwally's `hash_u8(0)`); script is varbuff.
+    out.extend_from_slice(&o.asset);
+    out.extend_from_slice(&o.value);
+    out.extend_from_slice(&o.nonce);
+    write_varint(out, o.script.len() as u64);
+    out.extend_from_slice(&o.script);
+}
+
+/// The Elements segwit-v0 (BIP-143) signature hash, a faithful port of
+/// `bip143_signature_hash` (`external/libwally-core/src/tx_io.c`) for the
+/// `WALLY_SIGTYPE_SW_V0` + Elements path. `value` is the 9-byte confidential
+/// value of the input being signed (`0x01 || uint64_be(amount)`). Returns the
+/// 32-byte `sha256_double` preimage hash that `sign_hash` then signs.
+pub fn elements_sighash_sw_v0(
+    tx: &ElementsTx,
+    index: usize,
+    scriptcode: &[u8],
+    value: &[u8],
+    sighash: u32,
+) -> [u8; 32] {
+    let acp = sighash & 0x80 != 0;
+    let base = sighash & 0x1f; // WALLY_SIGHASH_MASK
+    let none = base == 0x02;
+    let single = base == 0x03;
+    let zero = [0u8; 32];
+
+    let mut m: Vec<u8> = Vec::new();
+    m.extend_from_slice(&tx.version.to_le_bytes());
+
+    // hashPrevouts
+    if acp {
+        m.extend_from_slice(&zero);
+    } else {
+        let mut b = Vec::new();
+        for i in &tx.inputs {
+            b.extend_from_slice(&i.txhash);
+            b.extend_from_slice(&i.index.to_le_bytes());
+        }
+        m.extend_from_slice(&sha256d(&b));
+    }
+
+    // hashSequence
+    if acp || single || none {
+        m.extend_from_slice(&zero);
+    } else {
+        let mut b = Vec::new();
+        for i in &tx.inputs {
+            b.extend_from_slice(&i.sequence.to_le_bytes());
+        }
+        m.extend_from_slice(&sha256d(&b));
+    }
+
+    // hashIssuances (Elements). Our txs carry no issuances -> 0x00 per input.
+    if acp {
+        m.extend_from_slice(&zero);
+    } else {
+        let mut b = Vec::new();
+        for i in &tx.inputs {
+            assert!(!i.is_issuance, "issuance inputs not supported in M2b sighash");
+            b.push(0u8);
+        }
+        m.extend_from_slice(&sha256d(&b));
+    }
+
+    // Input being signed: outpoint || scriptCode(varbuff) || value(9) || sequence.
+    let inp = &tx.inputs[index];
+    m.extend_from_slice(&inp.txhash);
+    m.extend_from_slice(&inp.index.to_le_bytes());
+    write_varint(&mut m, scriptcode.len() as u64);
+    m.extend_from_slice(scriptcode);
+    m.extend_from_slice(value);
+    m.extend_from_slice(&inp.sequence.to_le_bytes());
+
+    // hashOutputs
+    if none || (single && index >= tx.outputs.len()) {
+        m.extend_from_slice(&zero);
+    } else if single {
+        let mut b = Vec::new();
+        hash_output_elements(&mut b, &tx.outputs[index]);
+        m.extend_from_slice(&sha256d(&b));
+    } else {
+        let mut b = Vec::new();
+        for o in &tx.outputs {
+            hash_output_elements(&mut b, o);
+        }
+        m.extend_from_slice(&sha256d(&b));
+    }
+
+    m.extend_from_slice(&tx.locktime.to_le_bytes());
+    m.extend_from_slice(&sighash.to_le_bytes());
+    sha256d(&m)
+}
+
+/// `sha256_double` over a byte range (BOLT-7 gossip-message signing hash).
+pub fn double_sha256(data: &[u8]) -> [u8; 32] {
+    sha256d(data)
+}
+
+/// BOLT-11 `hash_u5` (`common/hash_u5.c`): the SHA256 over `hrp` followed by the
+/// 5-bit-per-byte data, packed MSB-first. Used by `handle_sign_invoice`.
+pub fn hash_u5(hrp: &[u8], u5: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(hrp);
+    let mut buf: u64 = 0;
+    let mut num_bits: usize = 0;
+    for &b in u5 {
+        buf = (buf << 5) | (b as u64 & 0x1f);
+        num_bits += 5;
+        if num_bits >= 8 {
+            num_bits -= 8;
+            h.update([((buf >> num_bits) & 0xff) as u8]);
+        }
+    }
+    if num_bits > 0 {
+        h.update([((buf << (8 - num_bits)) & 0xff) as u8]);
+    }
+    h.finalize().into()
 }

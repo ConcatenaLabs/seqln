@@ -136,6 +136,16 @@ fn main() {
     eprintln!("oracle: {oracle}");
     eprintln!("proxy : {proxy}");
 
+    // M2b: offline replay of a captured corpus (SEQLN_CORPUS = a stream of
+    // signer frames from a real channel; SEQLN_HSM_SECRET = that node's secret).
+    // Replays every real request to BOTH signers and byte-compares the replies.
+    if let Ok(corpus) = std::env::var("SEQLN_CORPUS") {
+        let secret_path = std::env::var("SEQLN_HSM_SECRET")
+            .expect("SEQLN_HSM_SECRET (the captured node's hsm_secret) is required for corpus replay");
+        replay_corpus(&oracle, &proxy, &corpus, &secret_path);
+        return;
+    }
+
     // Fixed hsm_secret (mnemonic, no passphrase): 32 zero bytes || mnemonic.
     let mut hsm_secret = vec![0u8; 32];
     hsm_secret.extend_from_slice(MNEMONIC.as_bytes());
@@ -209,6 +219,70 @@ fn opt(v: &Option<Vec<u8>>) -> String {
     match v {
         Some(v) => hex(v),
         None => "<EOF: signer died / closed transport>".to_string(),
+    }
+}
+
+/// M2b: replay a captured corpus of real signer frames to the oracle and to
+/// seqln-signer, byte-comparing every reply. The corpus is a stream of frames
+/// exactly as `signer_frame.h` / `frame::write_request` serializes them.
+fn replay_corpus(oracle: &str, proxy: &str, corpus_path: &str, secret_path: &str) {
+    let secret = std::fs::read(secret_path).expect("read hsm_secret");
+    let base = std::env::temp_dir().join(format!("seqln-corpus-{}", std::process::id()));
+    let oracle_dir = base.join("oracle");
+    let proxy_dir = base.join("proxy");
+    for d in [&oracle_dir, &proxy_dir] {
+        std::fs::create_dir_all(d).expect("mkdir");
+        std::fs::write(d.join("hsm_secret"), &secret).expect("write hsm_secret");
+    }
+
+    let mut oracle_proc = spawn(oracle, &oracle_dir);
+    let mut proxy_proc = spawn(proxy, &proxy_dir);
+
+    let mut file = std::fs::File::open(corpus_path).expect("open corpus");
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+    let mut per_type: std::collections::BTreeMap<u16, (usize, usize)> = std::collections::BTreeMap::new();
+
+    println!("\n== SeqLN device-signer M2b corpus replay ==\n");
+    loop {
+        let req = match frame::read_request(&mut file) {
+            Ok(Some(r)) => r,
+            Ok(None) => break,
+            Err(e) => {
+                eprintln!("corpus read error: {e}");
+                break;
+            }
+        };
+        let t = seqln_signer::wire::peektype(&req.hsmd_msg).unwrap_or(0);
+        let a = oracle_proc.roundtrip(req.is_main, &req.node_id, req.dbid, req.capabilities, &req.hsmd_msg);
+        let b = proxy_proc.roundtrip(req.is_main, &req.node_id, req.dbid, req.capabilities, &req.hsmd_msg);
+        let e = per_type.entry(t).or_insert((0, 0));
+        if a == b {
+            passed += 1;
+            e.0 += 1;
+        } else {
+            failed += 1;
+            e.1 += 1;
+            println!("  FAIL type={t}");
+            println!("        oracle: {}", opt(&a));
+            println!("        proxy : {}", opt(&b));
+        }
+    }
+
+    drop(oracle_proc.stream);
+    drop(proxy_proc.stream);
+    let _ = oracle_proc.child.wait();
+    let _ = proxy_proc.child.wait();
+    let _ = std::fs::remove_dir_all(&base);
+
+    println!("\n  per hsmd message type (type: pass/fail):");
+    for (t, (p, f)) in &per_type {
+        println!("    {t:>4}: {p} pass, {f} fail");
+    }
+    println!("\n== {passed} passed, {failed} failed ==");
+    std::io::stdout().flush().ok();
+    if failed != 0 {
+        std::process::exit(1);
     }
 }
 
