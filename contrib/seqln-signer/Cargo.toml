@@ -1,0 +1,38 @@
+# Standalone crate: keep it out of the seqln root Cargo workspace.
+[workspace]
+
+[package]
+name = "seqln-signer"
+version = "0.1.0"
+edition = "2021"
+description = "SeqLN Tier-2 device signer: a Rust reimplementation of the libhsmd crypto kernel and the pure-derivation hsmd message subset (milestone M2a). Byte-for-byte conformance-tested against the reference libhsmd via the signerd oracle."
+license = "MIT"
+
+# The library is the reusable, I/O-free crypto kernel + wire codec, factored so
+# the M2b tx-sighash / sign_* messages and a later wasm32 build slot in cleanly.
+[lib]
+name = "seqln_signer"
+path = "src/lib.rs"
+
+# The native device-signer binary (matches signerd's CLI: fd as argv[1]).
+[[bin]]
+name = "seqln-signer"
+path = "src/bin/seqln-signer.rs"
+
+# The byte-for-byte conformance harness (drives both signerd and seqln-signer).
+[[bin]]
+name = "conformance"
+path = "src/bin/conformance.rs"
+
+[dependencies]
+# rust-bitcoin brings secp256k1 (+ ecdh), BIP32, hashes — pinned to the same
+# 0.32 line the rest of the Sequentia Rust ecosystem (SWK/ambra_core) uses.
+bitcoin = { version = "0.32", default-features = false, features = ["std"] }
+hmac = "0.12"
+sha2 = "0.10"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+
+# libc is used ONLY by the native conformance harness (socketpair + fd passing);
+# gated to unix so a future wasm build of the lib does not pull it in.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
