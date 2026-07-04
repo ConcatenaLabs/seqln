@@ -907,6 +907,10 @@ static bool map_catchup(struct gossmap *map,
 		} else if (type == WIRE_GOSSIP_STORE_CHANNEL_AMOUNT) {
 			/* We absorbed this in add_channel; ignore */
 			continue;
+		} else if (type == WIRE_GOSSIP_STORE_CHANNEL_ASSET) {
+			/* Sequentia: read on-demand via gossmap_chan_get_asset;
+			 * ignore here. */
+			continue;
 		} else if (type == WIRE_GOSSIP_STORE_CHAN_DYING) {
 			if (dyingcb && !report_dying_cb(map, off, msglen, dyingcb, cb_arg))
 				return false;
@@ -1505,6 +1509,42 @@ get_amount:
 		errx(1, "invalid capacity %s", fmt_amount_sat(tmpctx, sat));
 
 	return msat;
+}
+
+/* Sequentia: read a channel's denominating asset (33-byte version+tag), learned
+ * on-chain and stored as a gossip_store_channel_asset record immediately after
+ * the channel_amount record.  Returns false (leaving asset untouched) for a
+ * channel with no asset record, i.e. the policy asset. */
+bool gossmap_chan_get_asset(const struct gossmap *map,
+			    const struct gossmap_chan *c,
+			    u8 asset[33])
+{
+	struct gossip_hdr ghdr;
+	u64 off;
+
+	/* Local mods (unannounced/local-only channels) carry no store record. */
+	if (gossmap_chan_is_localmod(map, c))
+		return false;
+
+	/* Skip over the channel_announcement record. */
+	off = c->cann_off - sizeof(ghdr);
+	map_copy(map, off, &ghdr, sizeof(ghdr));
+	off += sizeof(ghdr) + be16_to_cpu(ghdr.len);
+
+	/* Next is the channel_amount record (guaranteed present); skip it. */
+	if (map_be16(map, off + sizeof(ghdr)) != WIRE_GOSSIP_STORE_CHANNEL_AMOUNT)
+		return false;
+	map_copy(map, off, &ghdr, sizeof(ghdr));
+	off += sizeof(ghdr) + be16_to_cpu(ghdr.len);
+
+	/* The asset record, if any, immediately follows the amount record. */
+	if (off + sizeof(ghdr) + sizeof(be16) + 33 > map->map_size)
+		return false;
+	if (map_be16(map, off + sizeof(ghdr)) != WIRE_GOSSIP_STORE_CHANNEL_ASSET)
+		return false;
+
+	map_copy(map, off + sizeof(ghdr) + sizeof(be16), asset, 33);
+	return true;
 }
 
 struct gossmap_chan *gossmap_nth_chan(const struct gossmap *map,

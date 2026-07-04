@@ -399,6 +399,9 @@ struct outpoint {
 	struct amount_sat sat;
 	u8 *scriptpubkey;
 	u32 spendheight;
+	/* Sequentia: 33-byte version+tag of the output's asset, or NULL for the
+	 * policy asset.  Lets gossip learn a remote channel's denominating asset. */
+	u8 *asset;
 };
 
 struct channeltx {
@@ -1228,7 +1231,9 @@ void wallet_utxoset_add(struct wallet *w,
 			const struct bitcoin_outpoint *outpoint,
 			const u32 blockheight, const u32 txindex,
 			const u8 *scriptpubkey, size_t scriptpubkey_len,
-			struct amount_sat sat);
+			struct amount_sat sat,
+			/* Sequentia: 33-byte asset version+tag, or NULL for policy */
+			const u8 *asset);
 
 /**
  * Retrieve all UTXO entries that were spent by the given blockheight.

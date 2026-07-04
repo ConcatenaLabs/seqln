@@ -414,6 +414,8 @@ static void addgossip_reply(struct subd *gossipd,
 static void broadcast_new_gossip(struct lightningd *ld,
 				 const u8 *msg TAKES,
 				 struct amount_sat *known_channel,
+				 /* Sequentia: 33-byte channel asset, or NULL */
+				 const u8 *known_asset,
 				 const char *desc)
 {
 	struct peer *peer;
@@ -426,9 +428,14 @@ static void broadcast_new_gossip(struct lightningd *ld,
 	if (!ld->gossip)
 		return;
 
-	/* Tell gossipd about it */
+	/* Tell gossipd about it (known_asset accompanies a channel_announcement,
+	 * so gossipd can record the channel's denominating asset).  The wire
+	 * field is a fixed 33 bytes; use all-zeros for gossip that carries no
+	 * asset (channel_update / node_announcement), which gossipd ignores. */
+	static const u8 zero_asset[33];
 	subd_req(ld->gossip, ld->gossip,
-		 take(towire_gossipd_addgossip(NULL, msg, known_channel)),
+		 take(towire_gossipd_addgossip(NULL, msg, known_channel,
+					       known_asset ? known_asset : zero_asset)),
 		 -1, 0, addgossip_reply, cast_const(char *, desc));
 
 	/* Don't tell them if we're supposed to be suppressing gossip for tests */
@@ -642,7 +649,7 @@ static void cupdate_timer_refresh(struct channel *channel)
 	cg->cupdate = tal_free(cg->cupdate);
 	update_channel_update(channel, channel_should_enable(channel, true));
 
-	broadcast_new_gossip(ld, cg->cupdate, NULL, "channel update");
+	broadcast_new_gossip(ld, cg->cupdate, NULL, NULL, "channel update");
 	arm_refresh_timer(channel);
 }
 
@@ -790,8 +797,10 @@ static void send_channel_announcement(struct channel *channel)
 					 &cg->remote_sigs->node_sig,
 					 &cg->remote_sigs->bitcoin_sig);
 
-	/* Send everyone our new channel announcement */
-	broadcast_new_gossip(ld, ca, &channel->funding_sats, "channel announcement");
+	/* Send everyone our new channel announcement (with our asset, so gossipd
+	 * records the channel's denominating asset for asset-aware routing). */
+	broadcast_new_gossip(ld, ca, &channel->funding_sats,
+			     channel->channel_asset, "channel announcement");
 }
 
 static void set_gossip_state(struct channel *channel,
@@ -868,7 +877,7 @@ static void set_gossip_state(struct channel *channel,
 
 		/* Any private cupdate will be different from this, so will force a refresh. */
 		update_channel_update(channel, channel_should_enable(channel, true));
-		broadcast_new_gossip(channel->peer->ld, cg->cupdate, NULL, "channel update");
+		broadcast_new_gossip(channel->peer->ld, cg->cupdate, NULL, NULL, "channel update");
 
 		/* We need to refresh channel update every 13 days */
 		arm_refresh_timer(channel);
@@ -884,7 +893,7 @@ static void set_gossip_state(struct channel *channel,
 			 * gossipd about us now, so it doesn't complain. */
 			send_channel_announcement(channel);
 			/* And tell the world */
-			broadcast_new_gossip(channel->peer->ld, cg->cupdate, NULL,
+			broadcast_new_gossip(channel->peer->ld, cg->cupdate, NULL, NULL,
 					     "channel update");
 		}
 		return;
@@ -931,7 +940,7 @@ static void update_gossip_state(struct channel *channel)
 	case CGOSSIP_ANNOUNCED:
 		/* If a channel parameter has changed, send new update */
 		if (update_channel_update(channel, channel_should_enable(channel, true)))
-			broadcast_new_gossip(channel->peer->ld, cg->cupdate, NULL,
+			broadcast_new_gossip(channel->peer->ld, cg->cupdate, NULL, NULL,
 					     "channel update");
 		return;
 	}
@@ -1155,7 +1164,7 @@ void channel_gossip_update_from_gossipd(struct channel *channel,
 	cg->cupdate = tal_dup_talarr(cg, u8, channel_update);
 	if (cg->state == CGOSSIP_ANNOUNCED) {
 		broadcast_new_gossip(channel->peer->ld,
-				     cg->cupdate, NULL, "channel update");
+				     cg->cupdate, NULL, NULL, "channel update");
 		arm_refresh_timer(channel);
 	}
 	check_channel_gossip(channel);
@@ -1205,7 +1214,7 @@ void channel_gossip_init_done(struct lightningd *ld)
 			check_channel_gossip(channel);
 			send_channel_announcement(channel);
 			update_channel_update(channel, channel_should_enable(channel, true));
-			broadcast_new_gossip(ld, channel->channel_gossip->cupdate, NULL, "channel update");
+			broadcast_new_gossip(ld, channel->channel_gossip->cupdate, NULL, NULL, "channel update");
 
 			/* We need to refresh channel update every 13 days */
 			arm_refresh_timer(channel);
@@ -1309,7 +1318,7 @@ const u8 *channel_gossip_update_for_error(const tal_t *ctx,
 		/* At this point we actually disable disconnected peers. */
 		if (update_channel_update(channel, channel_should_enable(channel, false))) {
 			broadcast_new_gossip(channel->peer->ld,
-					     cg->cupdate, NULL,
+					     cg->cupdate, NULL, NULL,
 					     "channel update");
 		}
 		check_channel_gossip(channel);
@@ -1467,5 +1476,5 @@ void channel_gossip_node_announce(struct lightningd *ld)
 	ld->node_announcement = tal_steal(ld, nannounce);
 
 	/* Tell gossipd and peers. */
-	broadcast_new_gossip(ld, nannounce, NULL, "node announcement");
+	broadcast_new_gossip(ld, nannounce, NULL, NULL, "node announcement");
 }
