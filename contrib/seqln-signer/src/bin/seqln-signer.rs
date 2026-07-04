@@ -132,6 +132,10 @@ fn main() {
 /// local `UnixStream` (fd mode) or a remote `TcpStream` (listen mode); both are
 /// `Read + Write` and the signer frame protocol is identical over either.
 fn serve<S: Read + Write>(stream: &mut S, signer: &mut Signer, log: &mut Option<File>) {
+    // Optional per-request message-type trace (SEQLN_SIGNER_TRACE=1). Bin-only,
+    // never touched by the WASM kernel; used to observe which sweep sign a
+    // recovery/force-close actually drives through the device signer.
+    let trace = std::env::var("SEQLN_SIGNER_TRACE").is_ok();
     loop {
         let req = match frame::read_request(stream) {
             Ok(Some(r)) => r,
@@ -141,6 +145,20 @@ fn serve<S: Read + Write>(stream: &mut S, signer: &mut Signer, log: &mut Option<
                 break;
             }
         };
+
+        if trace {
+            let t = seqln_signer::wire::peektype(&req.hsmd_msg);
+            logline(
+                log,
+                &format!(
+                    "seqln-signer: TRACE req type={:?} is_main={} dbid={} msglen={}",
+                    t,
+                    req.is_main,
+                    req.dbid,
+                    req.hsmd_msg.len()
+                ),
+            );
+        }
 
         let reply: Vec<u8> = match signer.handle(&req) {
             Outcome::Reply(bytes) => bytes,
