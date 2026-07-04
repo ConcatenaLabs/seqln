@@ -9,6 +9,7 @@
 use crate::frame::Request;
 use crate::hsm_secret::HsmSecret;
 use crate::kernel::{self, Kernel};
+use crate::policy::{self, ChannelState, ChannelStore, Htlc, Policy, Side};
 use crate::wire::{self, msg, BitcoinTx, Writer};
 use bitcoin::secp256k1::SecretKey;
 
@@ -46,6 +47,10 @@ pub enum Outcome {
     Reply(Vec<u8>),
     /// Zero-length error sentinel (unimplemented / malformed request).
     Sentinel,
+    /// The M4 validating policy REFUSED to sign (enforce mode). On the wire this
+    /// is the same zero-length sentinel as `Sentinel`; the reason is logged so a
+    /// theft attempt is visible. This is the security payoff of the signer split.
+    Reject(String),
     /// The reference libhsmd would `hsmd_status_failed` here; exit and close.
     Fatal(String),
 }
@@ -54,14 +59,28 @@ pub struct Signer {
     secret: HsmSecret,
     kernel: Option<Kernel>,
     hsm_version: u32,
+    /// M4: per-channel state (from setup_channel), for validating signing.
+    store: ChannelStore,
+    /// M4: enforce | permissive (default permissive = pre-M4 behaviour).
+    policy: Policy,
 }
 
 impl Signer {
+    /// Construct a signer, reading the policy from `SEQLN_SIGNER_POLICY`
+    /// (default permissive, so nothing regresses).
     pub fn new(secret: HsmSecret) -> Self {
+        Self::with_policy(secret, Policy::from_env())
+    }
+
+    /// Construct a signer with an explicit policy (used by the tamper test to
+    /// force enforce without touching the environment).
+    pub fn with_policy(secret: HsmSecret, policy: Policy) -> Self {
         Signer {
             secret,
             kernel: None,
             hsm_version: 0,
+            store: ChannelStore::new(),
+            policy,
         }
     }
 
@@ -95,8 +114,10 @@ impl Signer {
             msg::HSMD_CHECK_BIP86_PUBKEY => self.handle_check_bip86_pubkey(&req.hsmd_msg),
 
             // ---- M2b: transaction-signing subset (§4 pure-LN hosted channel) ----
-            msg::HSMD_SIGN_COMMITMENT_TX => opt(self.h_sign_commitment_tx(&req.hsmd_msg)),
-            msg::HSMD_SIGN_REMOTE_COMMITMENT_TX => opt(self.h_sign_remote_commitment_tx(req)),
+            // M4: commitment signs are the theft vector, so in enforce mode the
+            // policy validates every output before signing.
+            msg::HSMD_SIGN_COMMITMENT_TX => self.sign_commitment_tx_checked(req),
+            msg::HSMD_SIGN_REMOTE_COMMITMENT_TX => self.sign_remote_commitment_tx_checked(req),
             msg::HSMD_SIGN_MUTUAL_CLOSE_TX => opt(self.h_sign_mutual_close_tx(req)),
             msg::HSMD_SIGN_REMOTE_HTLC_TX => opt(self.h_sign_remote_htlc_tx(req)),
             msg::HSMD_SIGN_ANY_LOCAL_HTLC_TX => opt(self.h_sign_any_local_htlc_tx(&req.hsmd_msg)),
@@ -110,7 +131,7 @@ impl Signer {
             }
             msg::HSMD_SIGN_PENALTY_TO_US => opt(self.h_sign_penalty_to_us(req)),
             msg::HSMD_SIGN_ANY_PENALTY_TO_US => opt(self.h_sign_any_penalty_to_us(&req.hsmd_msg)),
-            msg::HSMD_VALIDATE_COMMITMENT_TX => opt(self.h_validate_commitment_tx(req)),
+            msg::HSMD_VALIDATE_COMMITMENT_TX => self.validate_commitment_tx_checked(req),
             msg::HSMD_REVOKE_COMMITMENT_TX => opt(self.h_revoke_commitment_tx(req)),
             msg::HSMD_VALIDATE_REVOCATION => {
                 Outcome::Reply(empty_reply(msg::HSMD_VALIDATE_REVOCATION_REPLY))
@@ -138,7 +159,12 @@ impl Signer {
             // stubs in libhsmd.c). We deliberately do not deep-parse; a
             // well-formed request yields the identical constant reply.
             msg::HSMD_NEW_CHANNEL => Outcome::Reply(empty_reply(msg::HSMD_NEW_CHANNEL_REPLY)),
-            msg::HSMD_SETUP_CHANNEL => Outcome::Reply(empty_reply(msg::HSMD_SETUP_CHANNEL_REPLY)),
+            msg::HSMD_SETUP_CHANNEL => {
+                // M4: record the channel's parameters for later validation, then
+                // return the identical constant reply (bytes unchanged).
+                self.record_setup_channel(req);
+                Outcome::Reply(empty_reply(msg::HSMD_SETUP_CHANNEL_REPLY))
+            }
             msg::HSMD_FORGET_CHANNEL => Outcome::Reply(empty_reply(msg::HSMD_FORGET_CHANNEL_REPLY)),
             msg::HSMD_LOCK_OUTPOINT => Outcome::Reply(empty_reply(msg::HSMD_LOCK_OUTPOINT_REPLY)),
             msg::HSMD_CHECK_OUTPOINT => {
@@ -288,6 +314,115 @@ impl Signer {
         let mut w = Writer::new(msg::HSMD_CHECK_BIP86_PUBKEY_REPLY);
         w.bool(true);
         Outcome::Reply(w.into_vec())
+    }
+
+    // =================================================================
+    // M4 validating policy: record channel state, and check commitment
+    // signs against it before signing (enforce mode only).
+    // =================================================================
+
+    /// Record a channel's parameters from `setup_channel` (keyed by the frame's
+    /// peer node_id + dbid), so later commitment signs can be validated.
+    fn record_setup_channel(&mut self, req: &Request) {
+        // Best-effort: a parse failure leaves the channel untracked, and in
+        // enforce mode its commitment signs are then refused (the safe default).
+        if let Some(st) = parse_setup_channel(&req.hsmd_msg) {
+            self.store.insert(req.node_id, req.dbid, st);
+        }
+    }
+
+    /// SIGN_COMMITMENT_TX (5): OUR own commitment. Validate (no-HTLC subset)
+    /// then sign. Reply bytes are unchanged from M2b on accept.
+    fn sign_commitment_tx_checked(&mut self, req: &Request) -> Outcome {
+        if self.policy.is_enforce() {
+            if let Err(reason) = self.check_own_commitment(&req.hsmd_msg) {
+                return Outcome::Reject(format!("SIGN_COMMITMENT_TX refused: {reason}"));
+            }
+        }
+        opt(self.h_sign_commitment_tx(&req.hsmd_msg))
+    }
+
+    /// SIGN_REMOTE_COMMITMENT_TX (19): the PEER's commitment (the pure-LN
+    /// fundee's theft vector). Full validation, then sign.
+    fn sign_remote_commitment_tx_checked(&mut self, req: &Request) -> Outcome {
+        if self.policy.is_enforce() {
+            if let Err(reason) = self.check_remote_commitment(req) {
+                return Outcome::Reject(format!("SIGN_REMOTE_COMMITMENT_TX refused: {reason}"));
+            }
+        }
+        opt(self.h_sign_remote_commitment_tx(req))
+    }
+
+    /// VALIDATE_COMMITMENT_TX (35): OUR own local commitment (carries the HTLC
+    /// set). Full validation, then return the usual next-per-commitment reply.
+    fn validate_commitment_tx_checked(&mut self, req: &Request) -> Outcome {
+        if self.policy.is_enforce() {
+            if let Err(reason) = self.check_local_commitment(req) {
+                return Outcome::Reject(format!("VALIDATE_COMMITMENT_TX refused: {reason}"));
+            }
+        }
+        opt(self.h_validate_commitment_tx(req))
+    }
+
+    /// Full validation of a peer commitment (`side = REMOTE`).
+    fn check_remote_commitment(&self, req: &Request) -> Result<(), String> {
+        let st = self
+            .store
+            .get(&req.node_id, req.dbid)
+            .ok_or_else(|| "no tracked channel (setup_channel not seen)".to_string())?;
+        let (bt, remote_funding, remote_per_commit, htlcs) =
+            parse_remote_commitment(&req.hsmd_msg)
+                .ok_or_else(|| "malformed request".to_string())?;
+        if remote_funding != st.remote_funding {
+            return Err("remote_funding_key differs from setup_channel".to_string());
+        }
+        policy::validate_commitment(
+            self.kernel(),
+            &req.node_id,
+            req.dbid,
+            st,
+            Side::Remote,
+            &remote_per_commit,
+            &htlcs,
+            &bt.tx,
+        )
+    }
+
+    /// Full validation of our local commitment (`side = LOCAL`); the point is
+    /// OUR per-commitment point at `commit_num`, derived from our shaseed.
+    fn check_local_commitment(&self, req: &Request) -> Result<(), String> {
+        let st = self
+            .store
+            .get(&req.node_id, req.dbid)
+            .ok_or_else(|| "no tracked channel (setup_channel not seen)".to_string())?;
+        let (bt, htlcs, commit_num) =
+            parse_local_commitment(&req.hsmd_msg).ok_or_else(|| "malformed request".to_string())?;
+        let s = self.kernel().channel_secrets(&req.node_id, req.dbid);
+        let point = self.kernel().per_commit_point_at(&s.shaseed, commit_num);
+        policy::validate_commitment(
+            self.kernel(),
+            &req.node_id,
+            req.dbid,
+            st,
+            Side::Local,
+            &point,
+            &htlcs,
+            &bt.tx,
+        )
+    }
+
+    /// No-HTLC-subset validation of our own commitment (msg 5, which carries no
+    /// HTLC list); peer_id + dbid come from the MESSAGE.
+    fn check_own_commitment(&self, m: &[u8]) -> Result<(), String> {
+        let (peer_id, dbid, bt, commit_num) =
+            parse_own_commitment(m).ok_or_else(|| "malformed request".to_string())?;
+        let st = self
+            .store
+            .get(&peer_id, dbid)
+            .ok_or_else(|| "no tracked channel (setup_channel not seen)".to_string())?;
+        let s = self.kernel().channel_secrets(&peer_id, dbid);
+        let point = self.kernel().per_commit_point_at(&s.shaseed, commit_num);
+        policy::validate_local_commitment_no_htlcs(self.kernel(), &peer_id, dbid, st, &point, &bt.tx)
     }
 
     // =================================================================
@@ -640,6 +775,109 @@ fn opt(o: Option<Vec<u8>>) -> Outcome {
         Some(b) => Outcome::Reply(b),
         None => Outcome::Sentinel,
     }
+}
+
+// ---- M4 request parsers (for the validating policy) ----
+
+/// Parse `hsmd_setup_channel` into a [`ChannelState`]. Layout from
+/// `hsmd/hsmd_wire.csv` (`basepoints` = revocation, payment, htlc, delayed;
+/// `channel_type` = u16 len + feature bytes).
+fn parse_setup_channel(m: &[u8]) -> Option<ChannelState> {
+    let mut r = wire::Reader::new(m);
+    if r.u16()? != msg::HSMD_SETUP_CHANNEL {
+        return None;
+    }
+    let _is_outbound = r.bool()?;
+    let funding_sats = r.u64()?; // amount_sat
+    let _push_msat = r.u64()?; // amount_msat
+    let funding_txid = r.arr32()?;
+    let funding_txout = r.u16()?;
+    let local_to_self_delay = r.u16()?;
+    let lsl = r.u16()? as usize;
+    r.skip(lsl)?; // local_shutdown_script
+    if r.bool()? {
+        r.u32()?; // local_shutdown_wallet_index (?u32)
+    }
+    let remote_revocation = r.arr33()?;
+    let remote_payment = r.arr33()?;
+    let remote_htlc = r.arr33()?;
+    let remote_delayed = r.arr33()?;
+    let remote_funding = r.arr33()?;
+    let remote_to_self_delay = r.u16()?;
+    let rsl = r.u16()? as usize;
+    r.skip(rsl)?; // remote_shutdown_script
+    let ctlen = r.u16()? as usize;
+    let features = r.take_bytes(ctlen)?;
+    let (option_static_remotekey, option_anchors) = policy::parse_channel_type(&features);
+    Some(ChannelState {
+        funding_sats,
+        funding_txid,
+        funding_txout,
+        local_to_self_delay,
+        remote_to_self_delay,
+        remote_revocation,
+        remote_payment,
+        remote_htlc,
+        remote_delayed,
+        remote_funding,
+        option_static_remotekey,
+        option_anchors,
+    })
+}
+
+/// Read `n` `hsm_htlc` subtypes: side(u8) || amount(u64) || hash(32) || cltv(u32).
+fn read_htlcs(r: &mut wire::Reader, n: usize) -> Option<Vec<Htlc>> {
+    let mut v = Vec::with_capacity(n);
+    for _ in 0..n {
+        let side = r.u8()?;
+        let amount_msat = r.u64()?;
+        let payment_hash = r.arr32()?;
+        let cltv_expiry = r.u32()?;
+        v.push(Htlc {
+            side,
+            amount_msat,
+            payment_hash,
+            cltv_expiry,
+        });
+    }
+    Some(v)
+}
+
+/// Parse `hsmd_sign_remote_commitment_tx` -> (tx, remote_funding, remote_per_commit, htlcs).
+fn parse_remote_commitment(m: &[u8]) -> Option<(BitcoinTx, [u8; 33], [u8; 33], Vec<Htlc>)> {
+    let mut r = wire::Reader::new(m);
+    r.u16()?;
+    let bt = wire::read_bitcoin_tx(&mut r)?;
+    let remote_funding = r.arr33()?;
+    let remote_per_commit = r.arr33()?;
+    let _static_remotekey = r.bool()?;
+    let _commit_num = r.u64()?;
+    let num_htlcs = r.u16()? as usize;
+    let htlcs = read_htlcs(&mut r, num_htlcs)?;
+    Some((bt, remote_funding, remote_per_commit, htlcs))
+}
+
+/// Parse `hsmd_validate_commitment_tx` -> (tx, htlcs, commit_num).
+fn parse_local_commitment(m: &[u8]) -> Option<(BitcoinTx, Vec<Htlc>, u64)> {
+    let mut r = wire::Reader::new(m);
+    r.u16()?;
+    let bt = wire::read_bitcoin_tx(&mut r)?;
+    let num_htlcs = r.u16()? as usize;
+    let htlcs = read_htlcs(&mut r, num_htlcs)?;
+    let commit_num = r.u64()?;
+    Some((bt, htlcs, commit_num))
+}
+
+/// Parse `hsmd_sign_commitment_tx` -> (peer_id, dbid, tx, commit_num).
+fn parse_own_commitment(m: &[u8]) -> Option<([u8; 33], u64, BitcoinTx, u64)> {
+    let mut r = wire::Reader::new(m);
+    r.u16()?;
+    let peer_id = r.arr33()?;
+    let dbid = r.u64()?;
+    let bt = wire::read_bitcoin_tx(&mut r)?;
+    let _remote_funding = r.arr33()?;
+    let commit_num = r.u64()?;
+    Some((peer_id, dbid, bt, commit_num))
 }
 
 fn approve_reply(reply_type: u16) -> Vec<u8> {

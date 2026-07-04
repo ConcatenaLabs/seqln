@@ -145,6 +145,14 @@ fn serve<S: Read + Write>(stream: &mut S, signer: &mut Signer, log: &mut Option<
         let reply: Vec<u8> = match signer.handle(&req) {
             Outcome::Reply(bytes) => bytes,
             Outcome::Sentinel => Vec::new(), // zero-length error sentinel
+            Outcome::Reject(reason) => {
+                // M4 validating policy refused to sign: log the reason and send
+                // the zero-length sentinel (lightningd treats it as a signer
+                // failure and does not get a theft-shaped signature).
+                logline(log, &format!("seqln-signer: POLICY REJECT: {reason}"));
+                eprintln!("seqln-signer: POLICY REJECT: {reason}");
+                Vec::new()
+            }
             Outcome::Fatal(m) => {
                 logline(log, &format!("seqln-signer: FATAL: {m}"));
                 eprintln!("seqln-signer: FATAL: {m}");

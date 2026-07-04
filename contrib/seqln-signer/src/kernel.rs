@@ -452,6 +452,54 @@ impl Kernel {
         base_secret.add_tweak(&tweak).expect("valid derived privkey")
     }
 
+    /// PUBLIC-key `derive_simple_key` (`common/key_derive.c`), the validation
+    /// counterpart of `derive_simple_privkey`:
+    /// `key = basepoint + SHA256(per_commitment_point || basepoint) * G`.
+    /// Used by the M4 validating policy to reconstruct the delayed/htlc/payment
+    /// pubkeys a legitimate commitment output must pay to, WITHOUT any secret.
+    pub fn derive_simple_key_pub(
+        &self,
+        basepoint: &[u8; 33],
+        per_commitment_point: &[u8; 33],
+    ) -> Result<[u8; 33], ()> {
+        let bp = PublicKey::from_slice(basepoint).map_err(|_| ())?;
+        let mut buf = [0u8; 66];
+        buf[..33].copy_from_slice(per_commitment_point);
+        buf[33..].copy_from_slice(basepoint);
+        let tweak = Scalar::from_be_bytes(sha256(&buf)).map_err(|_| ())?;
+        let key = bp.add_exp_tweak(&self.secp, &tweak).map_err(|_| ())?;
+        Ok(key.serialize())
+    }
+
+    /// PUBLIC-key `derive_revocation_key` (`common/key_derive.c`):
+    /// `revocationpubkey = basepoint * SHA256(basepoint || P)
+    ///                   + P * SHA256(P || basepoint)`,
+    /// where `basepoint` is the OTHER party's revocation basepoint and `P` the
+    /// per-commitment point. Reconstructs the revocation pubkey the to_local /
+    /// HTLC scripts must reference, WITHOUT any secret.
+    pub fn derive_revocation_key_pub(
+        &self,
+        basepoint: &[u8; 33],
+        per_commitment_point: &[u8; 33],
+    ) -> Result<[u8; 33], ()> {
+        let bp = PublicKey::from_slice(basepoint).map_err(|_| ())?;
+        let pp = PublicKey::from_slice(per_commitment_point).map_err(|_| ())?;
+        // add0 = basepoint * SHA256(basepoint || P)
+        let mut b1 = [0u8; 66];
+        b1[..33].copy_from_slice(basepoint);
+        b1[33..].copy_from_slice(per_commitment_point);
+        let s1 = Scalar::from_be_bytes(sha256(&b1)).map_err(|_| ())?;
+        let add0 = bp.mul_tweak(&self.secp, &s1).map_err(|_| ())?;
+        // add1 = P * SHA256(P || basepoint)
+        let mut b2 = [0u8; 66];
+        b2[..33].copy_from_slice(per_commitment_point);
+        b2[33..].copy_from_slice(basepoint);
+        let s2 = Scalar::from_be_bytes(sha256(&b2)).map_err(|_| ())?;
+        let add1 = pp.mul_tweak(&self.secp, &s2).map_err(|_| ())?;
+        let key = add0.combine(&add1).map_err(|_| ())?;
+        Ok(key.serialize())
+    }
+
     /// `derive_revocation_privkey` (`common/key_derive.c`):
     /// `base_secret * SHA256(basepoint || P) + per_commitment_secret * SHA256(P || basepoint)`,
     /// where `basepoint = revocation_basepoint_secret * G` and `P` is the

@@ -94,6 +94,10 @@ fn main() {
         let ours = match signer.handle(&req) {
             Outcome::Reply(b) => b,
             Outcome::Sentinel => Vec::new(),
+            Outcome::Reject(reason) => {
+                logln(&mut log, &format!("shadow: OUR POLICY REJECT on type {t}: {reason}"));
+                Vec::new()
+            }
             Outcome::Fatal(m) => {
                 logln(&mut log, &format!("shadow: OUR FATAL on type {t}: {m}"));
                 Vec::new()
