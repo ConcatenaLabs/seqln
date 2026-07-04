@@ -107,6 +107,9 @@ struct payment *payment_new(tal_t *ctx, struct command *cmd,
 	p->on_payment_success = NULL;
 	p->on_payment_failure = NULL;
 	p->errorcode = 0;
+	/* Sequentia: asset filter; the root payment's value is authoritative
+	 * (payment_route_check reads it via payment_root). */
+	p->asset = parent ? parent->asset : NULL;
 
 	/* Copy over the relevant pieces of information. */
 	if (parent != NULL) {
@@ -675,6 +678,17 @@ static bool payment_route_check(const struct gossmap *gossmap,
 {
 	struct short_channel_id_dir scidd;
 	const struct channel_hint *hint;
+
+	/* Sequentia: only route over channels denominated in the payment's
+	 * asset, so `pay asset=<id>` never builds a cross-asset route (which the
+	 * forwarding node would refuse anyway). */
+	if (payment_root(p)->asset) {
+		u8 chan_asset[33];
+		if (!gossmap_chan_get_asset(gossmap, c, chan_asset)
+		    || memcmp(chan_asset, payment_root(p)->asset,
+			      sizeof(chan_asset)) != 0)
+			return false;
+	}
 
 	if (dst_is_excluded(gossmap, c, dir, payment_root(p)->excluded_nodes))
 		return false;

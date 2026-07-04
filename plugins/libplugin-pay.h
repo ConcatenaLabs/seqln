@@ -148,6 +148,10 @@ struct payment {
 	struct plugin *plugin;
 	struct node_id *local_id;
 
+	/* Sequentia: if set (on the root payment), the 33-byte asset this payment
+	 * must be routed in; routing skips channels of any other asset. */
+	const u8 *asset;
+
 	/* The current phase we are in. */
 	enum payment_step step;
 
