@@ -668,11 +668,19 @@ struct utxo **wallet_utxo_boost(const tal_t *ctx,
 				struct amount_sat output_sats_required,
 				u32 feerate_target,
 				size_t *weight,
-				bool *insufficient)
+				bool *insufficient,
+				const u8 *asset)
 {
 	struct utxo **all_utxos = wallet_get_unspent_utxos(tmpctx, w);
 	struct utxo **utxos = tal_arr(ctx, struct utxo *, 0);
 	u32 feerate;
+	/* Asset-aware channels: only fund the fee-bump with the requested asset,
+	 * so a single-asset (e.g. GOLD) resolution tx stays single-asset -- and a
+	 * policy-asset tx never accidentally grabs an issued-asset UTXO.  NULL ->
+	 * the policy asset on elements. */
+	const u8 *want_asset = asset;
+	if (chainparams->is_elements && !want_asset)
+		want_asset = chainparams->fee_asset_tag;
 
 	/* Select in random order */
 	tal_arr_randomize(all_utxos, struct utxo *);
@@ -685,6 +693,11 @@ struct utxo **wallet_utxo_boost(const tal_t *ctx,
 		struct amount_sat new_excess_sats;
 		/* Convenience var */
 		struct utxo *utxo = all_utxos[i];
+
+		/* Only the fee-bump asset (asset-aware channels). */
+		if (want_asset
+		    && memcmp(utxo->asset, want_asset, sizeof(utxo->asset)) != 0)
+			continue;
 
 		/* Are we already happy? */
 		if (feerate >= feerate_target) {

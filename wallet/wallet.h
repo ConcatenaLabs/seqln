@@ -589,7 +589,8 @@ struct utxo **wallet_utxo_boost(const tal_t *ctx,
 				struct amount_sat output_sats_required,
 				u32 feerate_target,
 				size_t *weight,
-				bool *insufficient);
+				bool *insufficient,
+				const u8 *asset);
 
 /**
  * wallet_can_spend - Do we have the private key matching this scriptpubkey?
