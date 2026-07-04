@@ -493,6 +493,100 @@ static void connect_remote_signer(const char *addr)
 		       fmt_pubkey(tmpctx, &pinned_signer));
 }
 
+/*~ SeqLN Tier-2 BROWSER topology (the role flip).  A browser device signer
+ * cannot listen() for an inbound connection, so it connects OUT and plays the
+ * Noise INITIATOR; the hosted proxy therefore BINDS a TCP listener, accepts ONE
+ * incoming device connection, and runs the Noise_XK RESPONDER over it.  The
+ * resulting SECURED channel is used as the signer link exactly like the
+ * connect() path — everything downstream (forward_to_signer) is UNCHANGED.
+ *
+ * Same fail-closed contract + same pinned keys as connect mode (SEQLN_HOST_PRIVKEY
+ * = the proxy's own static priv, SEQLN_SIGNER_PEER_PUBKEY = the pinned device
+ * pubkey); a connector that does not present the pinned key is REJECTED at the
+ * handshake and served zero frames, and we keep listening for the real device.
+ * contrib/seqln-signer/src/noise.rs's `Initiator` is the byte-compatible peer.
+ */
+static void listen_remote_signer(const char *addr)
+{
+	char *host, *port, *colon;
+	struct addrinfo hints, *res, *ai;
+	struct privkey my_priv;
+	struct pubkey pinned_signer, my_pub;
+	int lfd = -1, cfd, gai, one = 1;
+
+	/* Load + validate the pinned keys BEFORE we touch the network. */
+	load_host_privkey(&my_priv.secret);
+	load_pinned_signer_pubkey(&pinned_signer);
+	pubkey_from_privkey(&my_priv, &my_pub);
+
+	colon = strrchr(addr, ':');
+	if (!colon || colon == addr)
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "SEQLN_SIGNER_LISTEN must be host:port, got '%s'",
+			      addr);
+	host = tal_strndup(tmpctx, addr, colon - addr);
+	port = tal_strdup(tmpctx, colon + 1);
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_flags = AI_PASSIVE;
+	gai = getaddrinfo(host[0] ? host : NULL, port, &hints, &res);
+	if (gai != 0)
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "signer listen resolve %s:%s: %s",
+			      host, port, gai_strerror(gai));
+
+	for (ai = res; ai; ai = ai->ai_next) {
+		lfd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+		if (lfd < 0)
+			continue;
+		setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+		if (bind(lfd, ai->ai_addr, ai->ai_addrlen) == 0
+		    && listen(lfd, 1) == 0)
+			break;
+		close(lfd);
+		lfd = -1;
+	}
+	freeaddrinfo(res);
+	if (lfd < 0)
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "signer listen bind %s:%s failed: %s",
+			      host, port, strerror(errno));
+
+	status_unusual("hsmd-proxy: LISTENING (BOLT-8 Noise_XK RESPONDER,"
+		       " mutual-auth) on %s:%s for the device signer; my static"
+		       " pubkey %s, pinned device %s", host, port,
+		       fmt_pubkey(tmpctx, &my_pub),
+		       fmt_pubkey(tmpctx, &pinned_signer));
+
+	/* Accept exactly ONE authenticated device.  A rejected connector (wrong
+	 * key / no handshake / tampering) is dropped and we keep listening. */
+	for (;;) {
+		cfd = accept(lfd, NULL, NULL);
+		if (cfd < 0) {
+			if (errno == EINTR)
+				continue;
+			status_failed(STATUS_FAIL_INTERNAL_ERROR,
+				      "signer listen accept failed: %s",
+				      strerror(errno));
+		}
+		setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+		signer_noise = signer_noise_accept(NULL, cfd, &my_priv.secret,
+						   &pinned_signer);
+		if (signer_noise) {
+			close(lfd);
+			status_unusual("hsmd-proxy: device signer AUTHENTICATED"
+				       " (Noise_XK responder); serving");
+			return;
+		}
+		close(cfd);
+		status_unusual("hsmd-proxy: REJECTED a connector (Noise_XK"
+			       " handshake failed / not the pinned device key);"
+			       " still listening on %s:%s", host, port);
+	}
+}
+
 /*~ Forward one request to signerd and relay its reply to the client.  This is
  * the drop-in replacement for the monolithic hsmd's
  * `req_reply(..., hsmd_handle_client_message(...))`.  It is a synchronous
@@ -847,13 +941,19 @@ int main(int argc, char *argv[])
 	uintmap_init(&clients);
 
 	/*~ Bring up the signer before we start serving lightningd, so it is
-	 * ready for the very first request (WIRE_HSMD_INIT).  Two transports:
-	 *  - SEQLN_SIGNER_ADDR="host:port" set => connect() to a REMOTE signer
-	 *    over TCP (Tier-2 "the device signs remotely" topology).
-	 *  - otherwise (default/fallback) => fork+exec a LOCAL signerd. */
+	 * ready for the very first request (WIRE_HSMD_INIT).  Three transports:
+	 *  - SEQLN_SIGNER_LISTEN="host:port" set => BIND + accept ONE inbound
+	 *    device connection and run the Noise_XK RESPONDER (the BROWSER
+	 *    topology: the device can't listen, so it connects OUT to us).
+	 *  - else SEQLN_SIGNER_ADDR="host:port" => connect() OUT to a REMOTE
+	 *    signer over TCP as the Noise INITIATOR (the phone/desktop topology).
+	 *  - otherwise (default) => fork+exec a LOCAL signerd (trusted socket). */
 	{
+		const char *listen_addr = getenv("SEQLN_SIGNER_LISTEN");
 		const char *remote_addr = getenv("SEQLN_SIGNER_ADDR");
-		if (remote_addr && remote_addr[0] != '\0')
+		if (listen_addr && listen_addr[0] != '\0')
+			listen_remote_signer(listen_addr);
+		else if (remote_addr && remote_addr[0] != '\0')
 			connect_remote_signer(remote_addr);
 		else
 			start_signerd(argv[0]);

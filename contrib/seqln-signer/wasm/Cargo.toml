@@ -1,0 +1,37 @@
+# SeqLN Tier-2 device signer — WASM/browser binding.
+#
+# A THIN wasm-bindgen wrapper around the (already I/O-free) `seqln-signer`
+# library, exposing a small JS API for a browser/Node device signer:
+#   * `Signer.new(hsm_secret)` + `process_frame(bytes) -> reply` — drive one
+#     hsmd request->reply exactly like the native serve loop, but pure (no
+#     socket): this is what proves the browser can sign byte-identically to
+#     libhsmd.
+#   * `NoiseSession` — the BOLT-8 Noise_XK INITIATOR the browser device plays
+#     when it connects OUT to a hosted proxy-responder (JS injects the ephemeral
+#     entropy from crypto.getRandomValues, since wasm has no RNG).
+#
+# Standalone workspace so it never perturbs the parent crate's NATIVE build; it
+# depends on the same `seqln-signer` sources by path.
+[workspace]
+
+[package]
+name = "seqln-signer-wasm"
+version = "0.1.0"
+edition = "2021"
+description = "WASM/browser binding for the SeqLN Tier-2 device signer (wasm-bindgen)."
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+seqln-signer = { path = ".." }
+wasm-bindgen = "0.2"
+
+[profile.release]
+# Byte-exactness (not size) is the point of this artifact, and skipping the
+# wasm-opt pass keeps the build fully offline / toolchain-light.
+opt-level = "s"
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
