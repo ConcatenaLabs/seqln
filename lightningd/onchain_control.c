@@ -1489,8 +1489,9 @@ static void handle_onchaind_spend_htlc_success(struct channel *channel,
 	/* BOLT #3:
 	 * * locktime: `0` for HTLC-success, `cltv_expiry` for HTLC-timeout
 	 */
+	/* FIXME(asset-channels M3): pass the channel asset (NULL == policy). */
 	tx = htlc_tx(NULL, chainparams, &out, info->wscript, out_sats, htlc_wscript, fee,
-		     0, option_anchor_outputs, option_anchors_zero_fee_htlc_tx);
+		     0, option_anchor_outputs, option_anchors_zero_fee_htlc_tx, NULL);
 	tal_free(htlc_wscript);
 	if (!tx) {
 		/* Can only happen if fee > out_sats */
@@ -1569,8 +1570,9 @@ static void handle_onchaind_spend_htlc_timeout(struct channel *channel,
 	/* BOLT #3:
 	 * * locktime: `0` for HTLC-success, `cltv_expiry` for HTLC-timeout
 	 */
+	/* FIXME(asset-channels M3): pass the channel asset (NULL == policy). */
 	tx = htlc_tx(NULL, chainparams, &out, info->wscript, out_sats, htlc_wscript, fee,
-		     cltv_expiry, option_anchor_outputs, option_anchors_zero_fee_htlc_tx);
+		     cltv_expiry, option_anchor_outputs, option_anchors_zero_fee_htlc_tx, NULL);
 	tal_free(htlc_wscript);
 	if (!tx) {
 		/* Can only happen if fee > out_sats */

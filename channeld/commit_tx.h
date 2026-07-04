@@ -92,6 +92,7 @@ struct bitcoin_tx *commit_tx(const tal_t *ctx,
 			     bool option_anchor_outputs,
 			     bool option_anchors_zero_fee_htlc_tx,
 			     enum side side,
-			     int *anchor_outnum);
+			     int *anchor_outnum,
+			     const u8 *channel_asset);
 
 #endif /* LIGHTNING_CHANNELD_COMMIT_TX_H */

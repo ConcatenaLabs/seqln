@@ -556,7 +556,8 @@ int main(int argc, const char *argv[])
 			   to_remote,
 			   NULL, &htlc_map, NULL, 0x2bb038521914 ^ 42,
 			   option_anchor_outputs, option_anchors_zero_fee_htlc_tx,
-			   LOCAL, &local_anchor);
+			   LOCAL, &local_anchor,
+		       NULL);
 
 	txs = channel_txs(tmpctx, &funding, funding_amount,
 			  &htlc_map, NULL, &funding_wscript_alt,
@@ -695,7 +696,8 @@ int main(int argc, const char *argv[])
 		    to_local, to_remote, htlcs, &htlc_map, NULL,
 		    0x2bb038521914 ^ 42,
 		    option_anchor_outputs, option_anchors_zero_fee_htlc_tx,
-		    LOCAL, &local_anchor);
+		    LOCAL, &local_anchor,
+		       NULL);
 
 		txs = channel_txs(tmpctx, &funding, funding_amount,
 				  &htlc_map, NULL, &funding_wscript,

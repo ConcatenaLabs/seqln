@@ -129,7 +129,8 @@ struct bitcoin_tx *commit_tx(const tal_t *ctx,
 			     bool option_anchor_outputs,
 			     bool option_anchors_zero_fee_htlc_tx,
 			     enum side side,
-			     int *anchor_outnum)
+			     int *anchor_outnum,
+			     const u8 *channel_asset)
 {
 	struct amount_sat base_fee;
 	struct amount_msat total_pay;
@@ -217,6 +218,11 @@ struct bitcoin_tx *commit_tx(const tal_t *ctx,
 
 	/* Worst-case sizing: both to-local and to-remote outputs, and anchors. */
 	tx = bitcoin_tx(ctx, chainparams, 1, untrimmed + 2 + 2, 0);
+
+	/* Asset-aware channels: denominate every output of this commitment tx
+	 * (to_local, to_remote, HTLCs, anchors, and the elements fee) in the
+	 * channel asset.  Must precede the output adds.  NULL -> policy asset. */
+	bitcoin_tx_set_output_asset(tx, channel_asset);
 
 	/* We keep track of which outputs have which HTLCs */
 	*htlcmap = tal_arr(tx, const struct htlc *, tx->wtx->outputs_allocation_len);
