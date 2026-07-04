@@ -1,6 +1,7 @@
 #include "config.h"
 #include <ccan/array_size/array_size.h>
 #include <ccan/cast/cast.h>
+#include <ccan/str/hex/hex.h>
 #include <ccan/tal/str/str.h>
 #include <common/bolt12_merkle.h>
 #include <common/clock_time.h>
@@ -865,11 +866,35 @@ preapproveinvoice_succeed(struct command *cmd,
 
 	return start_payment(cmd, p);
 }
+/* Sequentia: parse a 32-byte hex asset id into its 33-byte on-chain tag
+ * (0x01 || reversed), matching fundchannel's `asset` param and a channel's
+ * gossip-recorded asset, so `pay asset=<id>` routes only over that asset. */
+static struct command_result *param_asset_tag(struct command *cmd,
+					      const char *name,
+					      const char *buffer,
+					      const jsmntok_t *tok,
+					      const u8 **asset)
+{
+	u8 id[32], *tag;
+
+	if (!hex_decode(buffer + tok->start, tok->end - tok->start,
+			id, sizeof(id)))
+		return command_fail_badparam(cmd, name, buffer, tok,
+					     "expected a 32-byte hex asset id");
+	tag = tal_arr(cmd, u8, 33);
+	tag[0] = 0x01;
+	for (size_t i = 0; i < sizeof(id); i++)
+		tag[1 + i] = id[sizeof(id) - 1 - i];
+	*asset = tag;
+	return NULL;
+}
+
 static struct command_result *json_pay(struct command *cmd,
 				       const char *buf,
 				       const jsmntok_t *params)
 {
 	struct payment *p;
+	const u8 *asset;
 	const char *b11str;
 	struct bolt11 *b11;
 	const char *b11_fail, *b12_fail;
@@ -918,6 +943,7 @@ static struct command_result *json_pay(struct command *cmd,
 		   p_opt("maxfee", param_msat, &maxfee),
 		   p_opt("description", param_escaped_string, &description),
 		   p_opt("partial_msat", param_msat, &partial),
+		   p_opt("asset", param_asset_tag, &asset),
 		   p_opt_dev("dev_use_shadow", param_bool, &dev_use_shadow, true),
 		      NULL))
 		return command_param_failed();
@@ -931,6 +957,8 @@ static struct command_result *json_pay(struct command *cmd,
 	p = payment_new(cmd, cmd, NULL /* No parent */, global_hints, paymod_mods);
 	p->invstring = tal_steal(p, b11str);
 	p->description = tal_steal(p, description);
+	/* Sequentia: route this payment only over channels of the given asset. */
+	p->asset = asset ? tal_steal(p, asset) : NULL;
 	/* Overridded by bolt12 if present */
 	p->blindedpath = NULL;
 	p->blindedpay = NULL;
