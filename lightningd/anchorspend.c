@@ -251,9 +251,14 @@ static struct wally_psbt *anchor_psbt(const tal_t *ctx,
 	 */
 	psbt_append_input(psbt, &anch->info.anchor_point, BITCOIN_TX_RBF_SEQUENCE,
 			  NULL, anch->adet->anchor_wscript, NULL);
-	psbt_input_set_wit_utxo(psbt, psbt->num_inputs - 1,
+	/* Asset-aware channels: the anchor output is denominated in the channel
+	 * asset (the commitment tx is single-asset), so the witness_utxo must be
+	 * too or the elements sighash (which commits to the input asset) won't
+	 * match the HSM signature. channel_asset == fee_asset_tag for a normal
+	 * channel, so this is a no-op there. */
+	psbt_input_set_wit_utxo_asset(psbt, psbt->num_inputs - 1,
 				scriptpubkey_p2wsh(tmpctx, anch->adet->anchor_wscript),
-				AMOUNT_SAT(330));
+				AMOUNT_SAT(330), channel->channel_asset);
 	psbt_input_add_pubkey(psbt, psbt->num_inputs - 1, &channel->local_funding_pubkey, false);
 
 	/* Calculate fee we need, given rate and weight */
@@ -282,6 +287,16 @@ static struct wally_psbt *anchor_psbt(const tal_t *ctx,
 	} else {
 		bip32_pubkey(ld, &final_key, channel->final_key_idx);
 	}
+	/* FIXME(asset-channels): for a non-policy channel asset this CPFP tx is
+	 * inherently MIXED-asset -- the 330-atom anchor input is the channel
+	 * asset (e.g. GOLD) while the wallet fee UTXOs + this change output are
+	 * the policy asset. As-is the GOLD side is unbalanced (330 in, 0 out) so
+	 * the tx is network-rejected: a GOLD *anchor* channel cannot currently be
+	 * CPFP-fee-bumped on force-close (funds-at-risk if the commitment must
+	 * confirm before an HTLC deadline). WORKAROUND: use non-anchor
+	 * (static_remotekey) channel types for asset channels. Full fix needs a
+	 * separate channel-asset change output for the 330 atoms + psbt_compute_fee
+	 * to sum only fee-asset inputs. See the M3 audit finding. */
 	psbt_append_output(psbt,
 			   scriptpubkey_p2tr(tmpctx, &final_key),
 			   change);
