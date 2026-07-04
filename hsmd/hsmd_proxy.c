@@ -17,11 +17,15 @@
  * helper (and the dev flag globals); no secret is ever loaded in this process.
  */
 #include "config.h"
+#include <bitcoin/privkey.h>
+#include <bitcoin/pubkey.h>
 #include <ccan/array_size/array_size.h>
 #include <ccan/intmap/intmap.h>
 #include <ccan/io/fdpass/fdpass.h>
 #include <ccan/noerr/noerr.h>
 #include <ccan/read_write_all/read_write_all.h>
+#include <ccan/str/hex/hex.h>
+#include <ccan/tal/grab_file/grab_file.h>
 #include <ccan/tal/path/path.h>
 #include <ccan/tal/str/str.h>
 #include <common/daemon_conn.h>
@@ -43,6 +47,7 @@
 #include <hsmd/libhsmd.h>
 #include <hsmd/permissions.h>
 #include <hsmd/signer_frame.h>
+#include <hsmd/signer_noise.h>
 #include <wire/wire_io.h>
 #include <wire/wire_sync.h>
 
@@ -55,6 +60,12 @@
 /*~ The single transport to our out-of-process signerd (set up in main before
  * the io_loop).  All secret-bearing requests are forwarded over this fd. */
 static int signer_fd = -1;
+
+/*~ Set (non-NULL) ONLY in the remote/network mode: the BOLT-8 Noise_XK secured
+ * channel to the device signer.  When set, requests are tunneled through it
+ * (encrypted + mutually authenticated) instead of over the raw `signer_fd`.
+ * NULL in the default local fork+socketpair mode (trusted local UNIX socket). */
+static struct signer_noise *signer_noise;
 
 /*~ We keep track of clients, but there's not much to keep. */
 struct client {
@@ -334,30 +345,94 @@ static void start_signerd(const char *proxy_argv0)
 		       (int)pid, signer_fd, signerd_path);
 }
 
+/*~ Load a hex value from an env var, or (failing that) from the file named by a
+ * second env var.  Returns a NUL-terminated tal string off `ctx`, or NULL. */
+static char *hex_from_env_or_file(const tal_t *ctx, const char *env_key,
+				  const char *file_key)
+{
+	const char *v = getenv(env_key);
+	const char *path;
+	char *s;
+
+	if (v && v[0] != '\0')
+		return tal_strdup(ctx, v);
+
+	path = getenv(file_key);
+	if (!path || path[0] == '\0')
+		return NULL;
+	s = grab_file_str(ctx, path);
+	if (!s)
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "could not read %s (%s)", file_key, path);
+	/* Trim trailing whitespace/newline. */
+	for (size_t n = strlen(s); n > 0; n--) {
+		if (s[n - 1] == '\n' || s[n - 1] == '\r'
+		    || s[n - 1] == ' ' || s[n - 1] == '\t')
+			s[n - 1] = '\0';
+		else
+			break;
+	}
+	return s;
+}
+
+/*~ Load the proxy's own transport static privkey (SEQLN_HOST_PRIVKEY[_FILE]). */
+static void load_host_privkey(struct secret *priv)
+{
+	char *h = hex_from_env_or_file(tmpctx, "SEQLN_HOST_PRIVKEY",
+				       "SEQLN_HOST_PRIVKEY_FILE");
+	if (!h)
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "remote signer mode requires SEQLN_HOST_PRIVKEY"
+			      " (or SEQLN_HOST_PRIVKEY_FILE): the proxy's own"
+			      " transport static privkey");
+	if (!hex_decode(h, strlen(h), priv->data, sizeof(priv->data)))
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "SEQLN_HOST_PRIVKEY must be 32 bytes (64 hex chars)");
+}
+
+/*~ Load the pinned device-signer static pubkey (SEQLN_SIGNER_PEER_PUBKEY): the
+ * ONLY signer identity this proxy will authenticate + talk to. */
+static void load_pinned_signer_pubkey(struct pubkey *pub)
+{
+	const char *h = getenv("SEQLN_SIGNER_PEER_PUBKEY");
+	u8 der[PUBKEY_CMPR_LEN];
+	if (!h || h[0] == '\0')
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "remote signer mode requires SEQLN_SIGNER_PEER_PUBKEY"
+			      " (the pinned device-signer static pubkey)");
+	if (!hex_decode(h, strlen(h), der, sizeof(der))
+	    || !pubkey_from_der(der, sizeof(der), pub))
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "SEQLN_SIGNER_PEER_PUBKEY must be a 33-byte"
+			      " compressed pubkey (66 hex chars)");
+}
+
 /*~ SeqLN Tier-2 NETWORK transport.  Instead of fork/exec'ing a local signerd,
- * connect() over TCP to a REMOTE signer at `addr` ("host:port") and use that
- * socket as `signer_fd`.  Everything downstream (forward_to_signer) is unchanged
- * because it only ever sees a framed request/response fd — the transport under
- * it (local UNIX socketpair vs. this TCP socket) is invisible to it.  This is
- * what makes the "we host the node, the device signs remotely" topology real:
- * lightningd + this proxy run on our box, the signer (and the hsm_secret) live
- * on the user's device, reachable at `addr`.
+ * connect() over TCP to a REMOTE signer at `addr` ("host:port"), then run a
+ * BOLT-8 Noise_XK handshake over it and tunnel every framed request through the
+ * resulting SECURED channel (`signer_noise`).  This is what makes the "we host
+ * the node, the device signs remotely" topology real AND safe: lightningd + this
+ * proxy run on our box, the signer (and the hsm_secret) live on the user's
+ * device, and the link between them is encrypted + mutually authenticated.
  *
- * ============================= SECURITY (READ ME) =========================
- * This dev transport is RAW TCP: UNAUTHENTICATED and UNENCRYPTED.  The peer at
- * the other end of `signer_fd` fully drives the signer, and the frames carry
- * signing requests for the node's funds.  Anyone who can reach the remote
- * listener (or MITM this connection) can request signatures.  This proves the
- * topology ONLY.  Production MUST wrap this in an authenticated, encrypted
- * channel (Noise/TLS) with per-wallet auth before it touches real keys or a
- * public network.  Mirrored in contrib/seqln-signer/src/bin/seqln-signer.rs.
- * ==========================================================================
+ * Fail-closed: remote mode REQUIRES the pinned keys (SEQLN_HOST_PRIVKEY[_FILE] +
+ * SEQLN_SIGNER_PEER_PUBKEY).  There is no unauthenticated remote fallback; the
+ * only cleartext path is the local fork+socketpair (a trusted local UNIX
+ * socket), which is unchanged.  Mirrored in
+ * contrib/seqln-signer/src/bin/seqln-signer.rs (the responder).
  */
 static void connect_remote_signer(const char *addr)
 {
 	char *host, *port, *colon;
 	struct addrinfo hints, *res, *ai;
+	struct privkey my_priv;
+	struct pubkey pinned_signer, my_pub;
 	int fd = -1, gai, one = 1;
+
+	/* Load + validate the pinned keys BEFORE we touch the network, so a
+	 * misprovisioned node fails loudly at boot rather than in the clear. */
+	load_host_privkey(&my_priv.secret);
+	load_pinned_signer_pubkey(&pinned_signer);
 
 	/* Split "host:port" on the LAST colon (so bracketless IPv6 literals
 	 * still misparse loudly rather than silently; use host:port for demo). */
@@ -397,10 +472,25 @@ static void connect_remote_signer(const char *addr)
 	/* Low latency for the synchronous per-sign round-trips. */
 	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
-	signer_fd = fd;
-	status_unusual("hsmd-proxy: connected to REMOTE signer at %s:%s on fd %d"
-		       " (raw TCP, UNAUTHENTICATED dev transport)",
-		       host, port, signer_fd);
+	/* Run the Noise_XK initiator handshake.  On success we have an
+	 * encrypted, mutually-authenticated channel; on failure (wrong/absent
+	 * device key, tampering, I/O) we abort — the node will not boot. */
+	signer_noise = signer_noise_connect(NULL, fd, &my_priv.secret,
+					    &pinned_signer);
+	if (!signer_noise) {
+		close(fd);
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "remote signer %s:%s: Noise_XK handshake FAILED"
+			      " (device did not present the pinned key, or"
+			      " tampering) — refusing to run", host, port);
+	}
+
+	pubkey_from_privkey(&my_priv, &my_pub);
+	status_unusual("hsmd-proxy: SECURED (BOLT-8 Noise_XK, mutual-auth) to"
+		       " REMOTE signer at %s:%s; my static pubkey %s, pinned"
+		       " device %s", host, port,
+		       fmt_pubkey(tmpctx, &my_pub),
+		       fmt_pubkey(tmpctx, &pinned_signer));
 }
 
 /*~ Forward one request to signerd and relay its reply to the client.  This is
@@ -416,13 +506,24 @@ static struct io_plan *forward_to_signer(struct io_conn *conn,
 	enum hsmd_wire reqt = fromwire_peektype(msg_in);
 	u8 *reply;
 
-	if (!signer_write_request(signer_fd, is_main, &c->id, c->dbid,
-				  c->capabilities, msg_in))
-		status_failed(STATUS_FAIL_INTERNAL_ERROR,
-			      "signerd write (%s) failed: %s",
-			      hsmd_wire_name(reqt), strerror(errno));
-
-	reply = signer_read_reply(tmpctx, signer_fd);
+	/* Remote mode: tunnel through the Noise-secured channel; local mode:
+	 * raw framed write over the trusted socketpair fd. */
+	if (signer_noise) {
+		if (!signer_noise_write_request(signer_noise, is_main, &c->id,
+						c->dbid, c->capabilities,
+						msg_in))
+			status_failed(STATUS_FAIL_INTERNAL_ERROR,
+				      "secure signer write (%s) failed",
+				      hsmd_wire_name(reqt));
+		reply = signer_noise_read_reply(tmpctx, signer_noise);
+	} else {
+		if (!signer_write_request(signer_fd, is_main, &c->id, c->dbid,
+					  c->capabilities, msg_in))
+			status_failed(STATUS_FAIL_INTERNAL_ERROR,
+				      "signerd write (%s) failed: %s",
+				      hsmd_wire_name(reqt), strerror(errno));
+		reply = signer_read_reply(tmpctx, signer_fd);
+	}
 	if (!reply)
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "signerd closed connection on %s",

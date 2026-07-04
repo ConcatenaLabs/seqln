@@ -21,5 +21,9 @@ pub mod dispatch;
 pub mod frame;
 pub mod hsm_secret;
 pub mod kernel;
+// `noise` — the BOLT-8 Noise_XK secure transport for the remote signer link
+// (encryption + integrity + mutual static-key auth). Pure state machine; the
+// socket adapter lives in the binary (`bin/seqln-signer.rs`).
+pub mod noise;
 pub mod policy;
 pub mod wire;

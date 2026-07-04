@@ -47,6 +47,11 @@ secp256k1 = { version = "0.29", default-features = false, features = ["std", "re
 hmac = "0.12"
 sha2 = "0.10"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+# ChaCha20-Poly1305 (IETF, 96-bit nonce) for the BOLT-8 Noise_XK secure transport
+# on the remote signer link — the RustCrypto peer of libsodium's
+# crypto_aead_chacha20poly1305_ietf used by common/cryptomsg.c on the C proxy.
+# default-features off to avoid pulling getrandom/rand_core (we inject entropy).
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 
 # libc is used ONLY by the native conformance harness (socketpair + fd passing);
 # gated to unix so a future wasm build of the lib does not pull it in.

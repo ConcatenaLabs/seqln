@@ -75,18 +75,20 @@ static inline u64 sframe_get_u64(const u8 buf[8])
 	return v;
 }
 
-/* PROXY side: send a framed request.  Returns false on write error. */
-static inline bool signer_write_request(int fd, bool is_main,
-					const struct node_id *id,
-					u64 dbid, u64 capabilities,
-					const u8 *hsmd_msg)
+/* PROXY side: build the full framed request buffer (4-byte len prefix +
+ * payload) into a fresh tal array off `ctx`.  Factored out so both the raw-fd
+ * path (signer_write_request) and the Noise-secured remote path
+ * (signer_noise.c) emit byte-identical frames. */
+static inline u8 *signer_frame_build_request(const tal_t *ctx, bool is_main,
+					     const struct node_id *id,
+					     u64 dbid, u64 capabilities,
+					     const u8 *hsmd_msg)
 {
 	size_t msglen = tal_bytelen(hsmd_msg);
 	size_t idlen = is_main ? 0 : PUBKEY_CMPR_LEN;
 	size_t payload_len = 1 + idlen + 8 + 8 + msglen;
-	u8 *frame = tal_arr(NULL, u8, 4 + payload_len);
+	u8 *frame = tal_arr(ctx, u8, 4 + payload_len);
 	size_t off = 0;
-	bool ok;
 
 	sframe_put_u32(frame + off, payload_len);
 	off += 4;
@@ -101,9 +103,18 @@ static inline bool signer_write_request(int fd, bool is_main,
 	off += 8;
 	if (msglen)
 		memcpy(frame + off, hsmd_msg, msglen);
-	off += msglen;
+	return frame;
+}
 
-	ok = write_all(fd, frame, off);
+/* PROXY side: send a framed request.  Returns false on write error. */
+static inline bool signer_write_request(int fd, bool is_main,
+					const struct node_id *id,
+					u64 dbid, u64 capabilities,
+					const u8 *hsmd_msg)
+{
+	u8 *frame = signer_frame_build_request(NULL, is_main, id, dbid,
+					       capabilities, hsmd_msg);
+	bool ok = write_all(fd, frame, tal_bytelen(frame));
 	tal_free(frame);
 	return ok;
 }
