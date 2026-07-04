@@ -287,22 +287,18 @@ static struct wally_psbt *anchor_psbt(const tal_t *ctx,
 	} else {
 		bip32_pubkey(ld, &final_key, channel->final_key_idx);
 	}
-	/* FIXME(asset-channels): make this CPFP single-asset. The 330-atom anchor
-	 * input is the channel asset (e.g. GOLD), and the bump fee should be paid
-	 * in the SAME asset (open fee market -- NO privileged coin, NOT the policy
-	 * asset). But wallet_utxo_boost() (the fee-funding utxo selection) is not
-	 * asset-aware, and this change output goes through psbt_append_output()
-	 * which defaults to the policy asset, so as-is a GOLD anchor's bump is
-	 * funded with policy utxos -> an accidental unbalanced two-asset tx that
-	 * is rejected: a GOLD *anchor* channel cannot yet be CPFP-fee-bumped
-	 * on force-close (funds-at-risk before an HTLC deadline). Fix: select
-	 * channel-asset utxos (asset-aware coin selection, as fundpsbt does) and
-	 * emit the fee + change in channel_asset -> a clean single-asset GOLD
-	 * child. WORKAROUND meanwhile: use non-anchor channel types for asset
-	 * channels. See the M3 audit finding. */
-	psbt_append_output(psbt,
+	/* Asset-aware channels: single-asset CPFP.  The 330-atom anchor input is
+	 * the channel asset, the fee-bump UTXOs above are selected in the same
+	 * asset (wallet_utxo_boost(channel_asset)), and this change goes back in
+	 * that asset -- so the whole child is single-asset and the bump fee is
+	 * paid in the channel asset (open fee market; NO privileged coin).
+	 * channel_asset == fee_asset_tag for a normal channel, so this is a no-op
+	 * there. NB: bumping needs a free channel-asset UTXO on hand (the channel
+	 * balance is CSV-locked in to_local right after close) -- same emergency-
+	 * reserve requirement as a Bitcoin anchor bump. */
+	psbt_append_output_asset(psbt,
 			   scriptpubkey_p2tr(tmpctx, &final_key),
-			   change);
+			   change, channel->channel_asset);
 	return psbt;
 }
 
@@ -331,7 +327,8 @@ static struct wally_psbt *try_anchor_psbt(const tal_t *ctx,
 				   anch->info.commitment_fee,
 				   chainparams->dust_limit,
 				   feerate_target,
-				   total_weight, &insufficient_funds);
+				   total_weight, &insufficient_funds,
+				   channel->channel_asset);
 
 	/* Create a new candidate PSBT */
 	psbt = anchor_psbt(ctx, channel, anch, *utxos, feerate_target,

@@ -1140,7 +1140,9 @@ static bool consider_onchain_htlc_tx_rebroadcast(struct channel *channel,
 				  AMOUNT_SAT(0),
 				  bitcoin_tx_compute_fee(newtx),
 				  feerate,
-				  &weight, NULL);
+				  &weight, NULL,
+				  /* Asset-aware: bump a GOLD HTLC-tx with GOLD utxos. */
+				  channel->channel_asset);
 
 	/* Add those to create a new PSBT */
 	psbt = psbt_using_utxos(tmpctx, ld->wallet, utxos, locktime,
