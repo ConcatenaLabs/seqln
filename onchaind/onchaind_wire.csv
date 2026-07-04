@@ -13,6 +13,9 @@ msgdata,onchaind_init,shachain,shachain,
 # transaction that we need to parse correctly.
 msgdata,onchaind_init,chainparams,chainparams,
 msgdata,onchaind_init,funding_amount_satoshi,amount_sat,
+# Asset-aware channels: the asset this channel (and its on-chain resolution
+# txs) is denominated in; the policy asset for an ordinary channel.
+msgdata,onchaind_init,channel_asset,byte,33
 # Our current balance (of funding amount, not counting any pending htlcs)
 msgdata,onchaind_init,our_msat,amount_msat,
 # Remote per commit point for committed tx.

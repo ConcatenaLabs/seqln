@@ -73,6 +73,11 @@ static bool option_anchor_outputs;
 /* Does option_anchors_zero_fee_htlc_tx apply to this commitment tx? */
 static bool option_anchors_zero_fee_htlc_tx;
 
+/* Asset-aware channels: the asset this channel is denominated in (33-byte
+ * version+tag); the policy asset for an ordinary channel. All resolution/HTLC
+ * txs we build (or the amounts we read off the commitment tx) are in it. */
+static u8 channel_asset[33];
+
 /* The minimum relay feerate acceptable to the fullnode.  */
 static u32 min_relay_feerate;
 
@@ -446,8 +451,8 @@ static bool set_htlc_timeout_fee(struct bitcoin_tx *tx,
 	struct amount_asset asset = bitcoin_tx_output_get_amount(tx, 0);
 	size_t weight;
 
-	amount = amount_asset_to_sat(&asset);
-	assert(amount_asset_is_main(&asset));
+	amount = amount_sat(asset.value);
+	assert(amount_asset_is(&asset, channel_asset));
 
 	/* BOLT #3:
 	 *
@@ -514,9 +519,8 @@ static struct amount_sat get_htlc_success_fee(struct tracked_output *out)
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "Overflow in get_htlc_success_fee %s",
 			      fmt_amount_sat(tmpctx, out->sat));
-	/* FIXME(asset-channels M3): thread the channel asset through
-	 * onchaind_init so on-chain HTLC resolution of an asset channel builds
-	 * asset-denominated txs; NULL == policy asset for now (force-close is M3). */
+	/* Asset-aware channels: build the grind/verify htlc tx in the channel
+	 * asset so its elements sighash matches the peer's signature. */
 	tx = htlc_success_tx(tmpctx, chainparams,
 			     &out->outpoint,
 			     out->wscript,
@@ -526,7 +530,7 @@ static struct amount_sat get_htlc_success_fee(struct tracked_output *out)
 			     keyset,
 			     option_anchor_outputs,
 			     option_anchors_zero_fee_htlc_tx,
-			     NULL);
+			     channel_asset);
 
 	/* BOLT #3:
 	 *
@@ -1092,8 +1096,8 @@ static void resolve_htlc_tx(struct tracked_output ***outs,
 	outpoint.n = input_num;
 
 	asset = wally_tx_output_get_amount(htlc_tx->outputs[outpoint.n]);
-	assert(amount_asset_is_main(&asset));
-	amt = amount_asset_to_sat(&asset);
+	assert(amount_asset_is(&asset, channel_asset));
+	amt = amount_sat(asset.value);
 	out = new_tracked_output(outs, &outpoint,
  				 tx_blockheight,
  				 (*outs)[out_index]->resolved->tx_type,
@@ -1136,8 +1140,8 @@ static void steal_htlc_tx(struct tracked_output *out,
 					      &keyset->self_delayed_payment_key);
 
 	asset = wally_tx_output_get_amount(htlc_tx->outputs[htlc_outpoint->n]);
-	assert(amount_asset_is_main(&asset));
-	htlc_out_amt = amount_asset_to_sat(&asset);
+	assert(amount_asset_is(&asset, channel_asset));
+	htlc_out_amt = amount_sat(asset.value);
 
 	htlc_out = new_tracked_output(outs,
 				      htlc_outpoint, htlc_tx_blockheight,
@@ -1857,7 +1861,6 @@ static size_t resolve_our_htlc_ourcommit(struct tracked_output *out,
 		 *    - MUST *resolve* the output by spending it using the
 		 *    HTLC-timeout transaction.
 		 */
-		/* FIXME(asset-channels M3): pass the channel asset (NULL == policy). */
 		tx = htlc_timeout_tx(tmpctx, chainparams,
 				     &out->outpoint,
 				     htlc_scripts[matches[i]], htlc_amount,
@@ -1865,7 +1868,7 @@ static size_t resolve_our_htlc_ourcommit(struct tracked_output *out,
 				     to_self_delay[LOCAL], 0, keyset,
 				     option_anchor_outputs,
 				     option_anchors_zero_fee_htlc_tx,
-				     NULL);
+				     channel_asset);
 
 		if (set_htlc_timeout_fee(tx, out->remote_htlc_sig,
 					 htlc_scripts[matches[i]]))
@@ -2267,8 +2270,8 @@ static void handle_our_unilateral(const struct tx_parts *tx,
 		outpoint.txid = tx->txid;
 		outpoint.n = i;
 
-		assert(amount_asset_is_main(&asset));
-		amt = amount_asset_to_sat(&asset);
+		assert(amount_asset_is(&asset, channel_asset));
+		amt = amount_sat(asset.value);
 
 		if (chainparams->is_elements
 		    && tx->outputs[i]->script_len == 0) {
@@ -2552,8 +2555,8 @@ static void tell_wallet_to_remote(const struct tx_parts *tx,
 	struct amount_asset asset = wally_tx_output_get_amount(tx->outputs[outpoint->n]);
 	struct amount_sat amt;
 
-	assert(amount_asset_is_main(&asset));
-	amt = amount_asset_to_sat(&asset);
+	assert(amount_asset_is(&asset, channel_asset));
+	amt = amount_sat(asset.value);
 
 	/* A NULL per_commit_point is how we indicate the pubkey doesn't need
 	 * changing. */
@@ -2753,8 +2756,8 @@ static void handle_their_cheat(const struct tx_parts *tx,
 		outpoint.txid = tx->txid;
 		outpoint.n = i;
 
-		assert(amount_asset_is_main(&asset));
-		amt = amount_asset_to_sat(&asset);
+		assert(amount_asset_is(&asset, channel_asset));
+		amt = amount_sat(asset.value);
 
 		if (chainparams->is_elements
 		    && tx->outputs[i]->script_len == 0) {
@@ -3073,8 +3076,8 @@ static void handle_their_unilateral(const struct tx_parts *tx,
 		struct amount_sat amt;
 		struct bitcoin_outpoint outpoint;
 
-		assert(amount_asset_is_main(&asset));
-		amt = amount_asset_to_sat(&asset);
+		assert(amount_asset_is(&asset, channel_asset));
+		amt = amount_sat(asset.value);
 
 		outpoint.txid = tx->txid;
 		outpoint.n = i;
@@ -3310,8 +3313,8 @@ static void handle_unknown_commitment(const struct tx_parts *tx,
 				continue;
 
 			asset = wally_tx_output_get_amount(tx->outputs[i]);
-			assert(amount_asset_is_main(&asset));
-			amt = amount_asset_to_sat(&asset);
+			assert(amount_asset_is(&asset, channel_asset));
+			amt = amount_sat(asset.value);
 
 			outpoint.txid = tx->txid;
 			outpoint.n = i;
@@ -3354,8 +3357,8 @@ found:
 			continue;
 
 		asset = wally_tx_output_get_amount(tx->outputs[i]);
-		assert(amount_asset_is_main(&asset));
-		amt = amount_asset_to_sat(&asset);
+		assert(amount_asset_is(&asset, channel_asset));
+		amt = amount_sat(asset.value);
 
 		outpoint.txid = tx->txid;
 		outpoint.n = i;
@@ -3423,6 +3426,7 @@ int main(int argc, char *argv[])
 				   &shachain,
 				   &chainparams,
 				   &funding_sats,
+				   channel_asset,
 				   &our_msat,
 				   &old_remote_per_commit_point,
 				   &remote_per_commit_point,

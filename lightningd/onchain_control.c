@@ -912,6 +912,11 @@ static struct bitcoin_tx *onchaind_tx_unsigned(const tal_t *ctx,
 	}
 
 	tx = bitcoin_tx(ctx, chainparams, 1, 1, info->locktime);
+	/* Asset-aware channels: this sweeps a commitment/HTLC output (in the
+	 * channel asset) to our wallet, so the sweep output + elements fee must
+	 * be in that asset too.  Must precede the input/output adds.  NULL ==
+	 * policy asset. */
+	bitcoin_tx_set_output_asset(tx, channel->channel_asset);
 	bitcoin_tx_add_input(tx, &info->out, info->to_self_delay,
 			     NULL, info->out_sats, NULL, info->wscript);
 
@@ -1489,9 +1494,9 @@ static void handle_onchaind_spend_htlc_success(struct channel *channel,
 	/* BOLT #3:
 	 * * locktime: `0` for HTLC-success, `cltv_expiry` for HTLC-timeout
 	 */
-	/* FIXME(asset-channels M3): pass the channel asset (NULL == policy). */
 	tx = htlc_tx(NULL, chainparams, &out, info->wscript, out_sats, htlc_wscript, fee,
-		     0, option_anchor_outputs, option_anchors_zero_fee_htlc_tx, NULL);
+		     0, option_anchor_outputs, option_anchors_zero_fee_htlc_tx,
+		     info->channel->channel_asset);
 	tal_free(htlc_wscript);
 	if (!tx) {
 		/* Can only happen if fee > out_sats */
@@ -1570,9 +1575,9 @@ static void handle_onchaind_spend_htlc_timeout(struct channel *channel,
 	/* BOLT #3:
 	 * * locktime: `0` for HTLC-success, `cltv_expiry` for HTLC-timeout
 	 */
-	/* FIXME(asset-channels M3): pass the channel asset (NULL == policy). */
 	tx = htlc_tx(NULL, chainparams, &out, info->wscript, out_sats, htlc_wscript, fee,
-		     cltv_expiry, option_anchor_outputs, option_anchors_zero_fee_htlc_tx, NULL);
+		     cltv_expiry, option_anchor_outputs, option_anchors_zero_fee_htlc_tx,
+		     info->channel->channel_asset);
 	tal_free(htlc_wscript);
 	if (!tx) {
 		/* Can only happen if fee > out_sats */
@@ -1866,6 +1871,7 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 				  &channel->their_shachain.chain,
 				  chainparams,
 				  channel->funding_sats,
+				  channel->channel_asset,
 				  channel->our_msat,
 				  &channel->channel_info.old_remote_per_commit,
 				  &channel->channel_info.remote_per_commit,

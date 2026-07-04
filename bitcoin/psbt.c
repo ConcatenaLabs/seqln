@@ -710,8 +710,10 @@ struct amount_sat psbt_output_get_amount(const struct wally_psbt *psbt,
 	struct amount_asset asset;
 	assert(out < psbt->num_outputs);
 	asset = wally_psbt_output_get_amount(&psbt->outputs[out]);
-	assert(amount_asset_is_main(&asset));
-	return amount_asset_to_sat(&asset);
+	/* Return the raw explicit value regardless of asset (asset-aware
+	 * channels): an issued-asset output is not the policy asset, so don't
+	 * assert amount_asset_is_main. */
+	return amount_sat(asset.value);
 }
 
 size_t psbt_output_get_weight(const struct wally_psbt *psbt,
@@ -1061,6 +1063,22 @@ struct amount_sat psbt_compute_fee(const struct wally_psbt *psbt)
 	struct amount_sat fee, input_amt;
 	struct amount_asset asset;
 	bool ok;
+	u8 fee_asset[33];
+
+	/* Single-asset tx (asset-aware channels): the fee is paid in the same
+	 * asset as the inputs, which may not be the policy asset. Take the fee
+	 * asset from the first input's witness_utxo (fall back to the policy
+	 * asset) and balance only that asset's outputs. Mirrors
+	 * psbt_elements_normalize_fees(). */
+	if (chainparams->is_elements && chainparams->fee_asset_tag)
+		memcpy(fee_asset, chainparams->fee_asset_tag, sizeof(fee_asset));
+	else
+		memset(fee_asset, 0, sizeof(fee_asset));
+	if (psbt->num_inputs > 0 && psbt->inputs[0].witness_utxo) {
+		struct amount_asset ia =
+			wally_tx_output_get_amount(psbt->inputs[0].witness_utxo);
+		memcpy(fee_asset, ia.asset, sizeof(fee_asset));
+	}
 
 	fee = AMOUNT_SAT(0);
 	for (size_t i = 0; i < psbt->num_inputs; i++) {
@@ -1071,11 +1089,14 @@ struct amount_sat psbt_compute_fee(const struct wally_psbt *psbt)
 
 	for (size_t i = 0; i < psbt->num_outputs; i++) {
 		asset = wally_psbt_output_get_amount(&psbt->outputs[i]);
-		if (!amount_asset_is_main(&asset)
-		    || elements_psbt_output_is_fee(psbt, i))
+		/* Only balance the fee asset; use its raw value (it may not be
+		 * the policy asset, so don't assert amount_asset_is_main). */
+		if (elements_psbt_output_is_fee(psbt, i)
+		    || (chainparams->is_elements
+			&& !amount_asset_is(&asset, fee_asset)))
 			continue;
 
-		ok = amount_sat_sub(&fee, fee, amount_asset_to_sat(&asset));
+		ok = amount_sat_sub(&fee, fee, amount_sat(asset.value));
 		if (!ok)
 			return AMOUNT_SAT(0);
 	}
