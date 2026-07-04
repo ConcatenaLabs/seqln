@@ -23,21 +23,23 @@ ALL_PROGRAMS += lightningd/lightning_hsmd
 lightningd/lightning_hsmd: $(HSMD_OBJS) libcommon.a
 
 # SeqLN Tier-2 signer split (M1): hsmd-proxy + out-of-process signerd.
-HSMD_PROXY_SRC := hsmd/hsmd_proxy.c
+# Tier-2 secure transport: hsmd/signer_noise.c (BOLT-8 Noise_XK, remote link).
+HSMD_PROXY_SRC := hsmd/hsmd_proxy.c hsmd/signer_noise.c
 SIGNERD_SRC := hsmd/signerd.c
-HSMD_SPLIT_HEADERS := hsmd/signer_frame.h
+HSMD_SPLIT_HEADERS := hsmd/signer_frame.h hsmd/signer_noise.h
 
 ALL_C_SOURCES += $(HSMD_PROXY_SRC) $(SIGNERD_SRC)
 ALL_C_HEADERS += $(HSMD_SPLIT_HEADERS)
 ALL_PROGRAMS += lightningd/lightning_hsmd_proxy lightningd/lightning_signerd
 
 # Both new objects need the wiregen/permissions headers and the frame header.
-hsmd/hsmd_proxy.o hsmd/signerd.o: $(HSMD_HEADERS) $(HSMD_SPLIT_HEADERS)
+hsmd/hsmd_proxy.o hsmd/signerd.o hsmd/signer_noise.o: $(HSMD_HEADERS) $(HSMD_SPLIT_HEADERS)
 
-# hsmd-proxy = the hsmd objects minus hsmd.o, plus our proxy object.  It links
-# libhsmd.o only for the pure hsmd_check_client_capabilities helper (+ dev flag
-# globals); it never loads a secret.
-lightningd/lightning_hsmd_proxy: hsmd/hsmd_proxy.o hsmd/hsmd_wiregen.o hsmd/hsm_utxo.o hsmd/libhsmd.o libcommon.a
+# hsmd-proxy = the hsmd objects minus hsmd.o, plus our proxy + noise-transport
+# objects.  It links libhsmd.o only for the pure hsmd_check_client_capabilities
+# helper (+ dev flag globals); it never loads a secret.  The Noise transport
+# reuses common/cryptomsg.c (libcommon.a) + libsodium (EXTERNAL_LDLIBS).
+lightningd/lightning_hsmd_proxy: hsmd/hsmd_proxy.o hsmd/signer_noise.o hsmd/hsmd_wiregen.o hsmd/hsm_utxo.o hsmd/libhsmd.o libcommon.a
 
 # signerd links libhsmd (the real crypto), the wiregen (de)serializers and the
 # utxo helper, over libcommon.
