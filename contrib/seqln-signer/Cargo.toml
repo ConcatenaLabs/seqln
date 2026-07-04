@@ -30,6 +30,12 @@ path = "src/bin/conformance.rs"
 name = "shadow"
 path = "src/bin/shadow.rs"
 
+# M4 ECDH hot-path latency probe (in-process crypto vs localhost-TCP transport
+# round-trip), to inform the ECDH session-key vs per-round-trip decision.
+[[bin]]
+name = "ecdh_latency"
+path = "src/bin/ecdh_latency.rs"
+
 [dependencies]
 # rust-bitcoin brings secp256k1 (+ ecdh), BIP32, hashes — pinned to the same
 # 0.32 line the rest of the Sequentia Rust ecosystem (SWK/ambra_core) uses.

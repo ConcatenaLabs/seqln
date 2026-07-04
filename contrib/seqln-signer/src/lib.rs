@@ -21,4 +21,5 @@ pub mod dispatch;
 pub mod frame;
 pub mod hsm_secret;
 pub mod kernel;
+pub mod policy;
 pub mod wire;
