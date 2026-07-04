@@ -37,6 +37,21 @@ struct signer_noise *signer_noise_connect(const tal_t *ctx, int fd,
 					  const struct secret *my_privkey,
 					  const struct pubkey *their_pinned_pub);
 
+/*~ Run the RESPONDER handshake over an already-accepted socket `fd` — the SeqLN
+ * Tier-2 BROWSER topology.  A browser device can't listen(), so it connects OUT
+ * as the initiator and the hosted proxy accepts + plays the responder.
+ *
+ *   my_privkey        : the proxy's own 32-byte transport static privkey.
+ *   their_pinned_pub  : the device signer's pinned static pubkey (the ONLY one
+ *                       we will authenticate + serve).
+ *
+ * Returns an opaque secure-channel handle (owning `fd`), or NULL if the
+ * handshake fails (wrong/absent device key, tampering, I/O error) — in which
+ * case the caller must serve NO frames on this connection. */
+struct signer_noise *signer_noise_accept(const tal_t *ctx, int fd,
+					 const struct secret *my_privkey,
+					 const struct pubkey *their_pinned_pub);
+
 /*~ Send a framed signer request through the secure channel (byte-identical to
  * signer_write_request, but encrypted).  Returns false on error. */
 bool signer_noise_write_request(struct signer_noise *n, bool is_main,

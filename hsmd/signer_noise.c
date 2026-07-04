@@ -221,6 +221,128 @@ struct signer_noise *signer_noise_connect(const tal_t *ctx, int fd,
 	return n;
 }
 
+/*~ Run the Noise_XK RESPONDER handshake synchronously — the SeqLN Tier-2
+ * BROWSER topology.  A browser device cannot listen(), so it connects OUT and is
+ * the initiator; the hosted proxy therefore BINDS/accepts and plays the
+ * responder here.  This is the exact mirror of initiator_handshake (same
+ * primitives), only the roles are swapped: we mix in OUR OWN static key as the
+ * "responder static", answer Act One, send Act Two with a fresh ephemeral, and
+ * in Act Three recover + PIN-CHECK the initiator's (device's) static key.  The
+ * transport-key split is the responder one (rk=okm[0], sk=okm[1]), matching the
+ * initiator's (sk=okm[0], rk=okm[1]) so the two directions line up.
+ * contrib/seqln-signer/src/noise.rs's `Initiator` is the byte-compatible peer. */
+static bool responder_handshake(int fd,
+				const struct secret *my_privkey,
+				const struct pubkey *their_pinned_pub,
+				struct crypto_state *cs)
+{
+	struct sha256 h;
+	struct secret ck, temp_k, ss;
+	struct privkey e_priv;
+	struct pubkey e_pub, my_pub, re, rs;
+	u8 act1[50], act2[50], act3[66];
+	u8 rs_der[PUBKEY_CMPR_LEN], pinned_der[PUBKEY_CMPR_LEN];
+	size_t len;
+
+	/* Our own static pubkey (the "responder static" mixed into the hash). */
+	if (!secp256k1_ec_pubkey_create(secp256k1_ctx, &my_pub.pubkey,
+					my_privkey->data))
+		return false;
+
+	sha256(&h, "Noise_XK_secp256k1_ChaChaPoly_SHA256",
+	       strlen("Noise_XK_secp256k1_ChaChaPoly_SHA256"));
+	memcpy(&ck, &h, sizeof(ck));
+	sha_mix_in(&h, "lightning", strlen("lightning"));
+	sha_mix_in_key(&h, &my_pub);
+
+	/* --- Act One (receive) --- */
+	if (!read_all(fd, act1, sizeof(act1)))
+		return false;
+	if (act1[0] != 0)
+		return false;
+	if (secp256k1_ec_pubkey_parse(secp256k1_ctx, &re.pubkey, act1 + 1,
+				      PUBKEY_CMPR_LEN) != 1)
+		return false;
+	sha_mix_in_key(&h, &re);
+	/* es = ECDH(s.priv, re) */
+	if (!secp256k1_ecdh(secp256k1_ctx, ss.data, &re.pubkey,
+			    my_privkey->data, NULL, NULL))
+		return false;
+	hkdf_two_keys(&ck, &temp_k, &ck, ss.data, sizeof(ss));
+	/* Authenticates: fails unless the initiator knew our static key. */
+	if (!decrypt(&temp_k, 0, &h, sizeof(h), act1 + 34, 16, NULL, 0))
+		return false;
+	sha_mix_in(&h, act1 + 34, 16);
+
+	/* --- Act Two (send our ephemeral + authenticating tag) --- */
+	do {
+		randbytes(e_priv.secret.data, sizeof(e_priv.secret.data));
+	} while (!secp256k1_ec_pubkey_create(secp256k1_ctx, &e_pub.pubkey,
+					     e_priv.secret.data));
+	sha_mix_in_key(&h, &e_pub);
+	/* ee = ECDH(e.priv, re) */
+	if (!secp256k1_ecdh(secp256k1_ctx, ss.data, &re.pubkey,
+			    e_priv.secret.data, NULL, NULL))
+		return false;
+	hkdf_two_keys(&ck, &temp_k, &ck, ss.data, sizeof(ss));
+	act2[0] = 0;
+	len = PUBKEY_CMPR_LEN;
+	secp256k1_ec_pubkey_serialize(secp256k1_ctx, act2 + 1, &len,
+				      &e_pub.pubkey, SECP256K1_EC_COMPRESSED);
+	encrypt_ad(&temp_k, 0, &h, sizeof(h), NULL, 0, act2 + 34, 16);
+	sha_mix_in(&h, act2 + 34, 16);
+	if (!write_all(fd, act2, sizeof(act2)))
+		return false;
+
+	/* --- Act Three (receive the initiator's static key, then pin-check) --- */
+	if (!read_all(fd, act3, sizeof(act3)))
+		return false;
+	if (act3[0] != 0)
+		return false;
+	/* rs = decrypt(c) — the initiator's (device's) static pubkey. */
+	if (!decrypt(&temp_k, 1, &h, sizeof(h), act3 + 1, 49, rs_der, sizeof(rs_der)))
+		return false;
+	if (secp256k1_ec_pubkey_parse(secp256k1_ctx, &rs.pubkey, rs_der,
+				      sizeof(rs_der)) != 1)
+		return false;
+	/* PIN CHECK: this is where the responder authenticates WHICH device.
+	 * Reject any static key that is not the pinned device signer. */
+	len = sizeof(pinned_der);
+	secp256k1_ec_pubkey_serialize(secp256k1_ctx, pinned_der, &len,
+				      &their_pinned_pub->pubkey,
+				      SECP256K1_EC_COMPRESSED);
+	if (memcmp(rs_der, pinned_der, sizeof(rs_der)) != 0)
+		return false;
+	sha_mix_in(&h, act3 + 1, 49);
+	/* se = ECDH(e.priv, rs) */
+	if (!secp256k1_ecdh(secp256k1_ctx, ss.data, &rs.pubkey,
+			    e_priv.secret.data, NULL, NULL))
+		return false;
+	hkdf_two_keys(&ck, &temp_k, &ck, ss.data, sizeof(ss));
+	if (!decrypt(&temp_k, 0, &h, sizeof(h), act3 + 50, 16, NULL, 0))
+		return false;
+
+	/* Final transport keys (responder split: rk=okm[0], sk=okm[1]). */
+	hkdf_two_keys(&cs->rk, &cs->sk, &ck, NULL, 0);
+	cs->rn = cs->sn = 0;
+	cs->r_ck = cs->s_ck = ck;
+	return true;
+}
+
+struct signer_noise *signer_noise_accept(const tal_t *ctx, int fd,
+					 const struct secret *my_privkey,
+					 const struct pubkey *their_pinned_pub)
+{
+	struct signer_noise *n = tal(ctx, struct signer_noise);
+	n->fd = fd;
+	n->rbuf = NULL;
+	n->roff = 0;
+
+	if (!responder_handshake(fd, my_privkey, their_pinned_pub, &n->cs))
+		return tal_free(n);
+	return n;
+}
+
 /* Encrypt+send arbitrary bytes as one or more BOLT-8 transport messages. */
 static bool noise_stream_write_all(struct signer_noise *n,
 				   const u8 *data, size_t len)

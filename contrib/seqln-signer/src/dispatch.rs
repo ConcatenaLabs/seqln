@@ -84,6 +84,12 @@ impl Signer {
         }
     }
 
+    /// Switch the signing policy at runtime. The browser build has no env, so
+    /// the WASM binding calls this to select enforce vs permissive.
+    pub fn set_policy(&mut self, policy: Policy) {
+        self.policy = policy;
+    }
+
     pub fn handle(&mut self, req: &Request) -> Outcome {
         let t = match wire::peektype(&req.hsmd_msg) {
             Some(t) => t,

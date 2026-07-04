@@ -239,6 +239,15 @@ fn replay_corpus(oracle: &str, proxy: &str, corpus_path: &str, secret_path: &str
     let mut proxy_proc = spawn(proxy, &proxy_dir);
 
     let mut file = std::fs::File::open(corpus_path).expect("open corpus");
+    // Optional: dump the ORACLE's framed replies (u32-LE len || reply bytes, in
+    // corpus order) to this path, so an out-of-process harness (e.g. the wasm
+    // Node conformance runner) can byte-compare against libhsmd's own replies
+    // without re-spawning the oracle. The oracle-vs-native check below still
+    // runs, so one invocation both anchors native==oracle AND emits the
+    // reference the wasm proof consumes.
+    let mut dump = std::env::var("SEQLN_DUMP_REPLIES")
+        .ok()
+        .map(|p| std::io::BufWriter::new(std::fs::File::create(p).expect("create dump")));
     let mut passed = 0usize;
     let mut failed = 0usize;
     let mut per_type: std::collections::BTreeMap<u16, (usize, usize)> = std::collections::BTreeMap::new();
@@ -256,6 +265,9 @@ fn replay_corpus(oracle: &str, proxy: &str, corpus_path: &str, secret_path: &str
         let t = seqln_signer::wire::peektype(&req.hsmd_msg).unwrap_or(0);
         let a = oracle_proc.roundtrip(req.is_main, &req.node_id, req.dbid, req.capabilities, &req.hsmd_msg);
         let b = proxy_proc.roundtrip(req.is_main, &req.node_id, req.dbid, req.capabilities, &req.hsmd_msg);
+        if let Some(w) = dump.as_mut() {
+            frame::write_reply(w, a.as_deref().unwrap_or(&[])).expect("dump reply");
+        }
         let e = per_type.entry(t).or_insert((0, 0));
         if a == b {
             passed += 1;
