@@ -232,6 +232,7 @@ dependencies = [
  "hmac",
  "libc",
  "pbkdf2",
+ "secp256k1",
  "sha2",
 ]
 

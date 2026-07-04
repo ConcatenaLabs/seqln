@@ -24,10 +24,20 @@ path = "src/bin/seqln-signer.rs"
 name = "conformance"
 path = "src/bin/conformance.rs"
 
+# M2b live shadow: signerd drop-in that byte-compares our signer against the
+# oracle on real channel traffic and captures a replay corpus.
+[[bin]]
+name = "shadow"
+path = "src/bin/shadow.rs"
+
 [dependencies]
 # rust-bitcoin brings secp256k1 (+ ecdh), BIP32, hashes — pinned to the same
 # 0.32 line the rest of the Sequentia Rust ecosystem (SWK/ambra_core) uses.
 bitcoin = { version = "0.32", default-features = false, features = ["std"] }
+# Pulled in directly ONLY to turn on the `recovery` feature of the exact same
+# secp256k1 (0.29) that `bitcoin` re-exports, so `sign_ecdsa_recoverable` (BOLT-11
+# invoice signing) is available. Cargo unifies this with bitcoin's copy.
+secp256k1 = { version = "0.29", default-features = false, features = ["std", "recovery"] }
 hmac = "0.12"
 sha2 = "0.10"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
