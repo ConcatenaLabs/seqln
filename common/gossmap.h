@@ -177,6 +177,13 @@ static inline bool gossmap_chan_set(const struct gossmap_chan *chan, int dir)
 struct amount_msat gossmap_chan_get_capacity(const struct gossmap *map,
 					     const struct gossmap_chan *c);
 
+/* Sequentia: fill in the channel's 33-byte denominating asset (version+tag).
+ * Returns false (asset untouched) if the channel has no asset record, i.e. it
+ * is the policy asset. */
+bool gossmap_chan_get_asset(const struct gossmap *map,
+			    const struct gossmap_chan *c,
+			    u8 asset[33]);
+
 /* Get the announcement msg which created this chan (NULL for localmods) */
 u8 *gossmap_chan_get_announce(const tal_t *ctx,
 			      const struct gossmap *map,

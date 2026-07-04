@@ -35,6 +35,7 @@ msgdata,gossipd_get_txout,short_channel_id,short_channel_id,
 msgtype,gossipd_get_txout_reply,3118
 msgdata,gossipd_get_txout_reply,short_channel_id,short_channel_id,
 msgdata,gossipd_get_txout_reply,satoshis,amount_sat,
+msgdata,gossipd_get_txout_reply,asset,byte,33
 msgdata,gossipd_get_txout_reply,len,u16,
 msgdata,gossipd_get_txout_reply,outscript,u8,len
 
@@ -69,6 +70,7 @@ msgtype,gossipd_addgossip,3044
 msgdata,gossipd_addgossip,len,u16,
 msgdata,gossipd_addgossip,msg,u8,len
 msgdata,gossipd_addgossip,known_channel,?amount_sat,
+msgdata,gossipd_addgossip,known_asset,byte,33
 
 # Empty string means no problem.
 msgtype,gossipd_addgossip_reply,3144

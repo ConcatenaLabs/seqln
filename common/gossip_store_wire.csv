@@ -8,6 +8,12 @@
 msgtype,gossip_store_channel_amount,4101
 msgdata,gossip_store_channel_amount,satoshis,amount_sat,
 
+# Sequentia: the channel's denominating asset (33-byte version+tag).  Written
+# immediately AFTER gossip_store_channel_amount (so capacity's "record after the
+# announcement" invariant is preserved); absent -> the policy asset.
+msgtype,gossip_store_channel_asset,4108
+msgdata,gossip_store_channel_asset,asset,byte,33
+
 # Mimics a channel_announce, except signatures are all-zero
 msgtype,gossip_store_private_channel_obs,4104
 msgdata,gossip_store_private_channel_obs,satoshis,amount_sat,

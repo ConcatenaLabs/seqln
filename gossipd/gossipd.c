@@ -197,7 +197,8 @@ static void handle_recv_gossip(struct daemon *daemon, const u8 *outermsg)
 	case WIRE_CHANNEL_ANNOUNCEMENT:
 		errmsg = gossmap_manage_channel_announcement(tmpctx,
 							     daemon->gm,
-							     msg, &source, NULL);
+							     msg, &source, NULL,
+							     NULL);
 		goto handled_msg_errmsg;
 	case WIRE_CHANNEL_UPDATE:
 		errmsg = gossmap_manage_channel_update(tmpctx,
@@ -463,8 +464,10 @@ static void inject_gossip(struct daemon *daemon, const u8 *msg)
 	u8 *goss;
 	const char *err;
 	struct amount_sat *known_amount;
+	u8 known_asset[33];
 
-	if (!fromwire_gossipd_addgossip(msg, msg, &goss, &known_amount))
+	if (!fromwire_gossipd_addgossip(msg, msg, &goss, &known_amount,
+					known_asset))
 		master_badmsg(WIRE_GOSSIPD_ADDGOSSIP, msg);
 
 	status_debug("inject_gossip: %s", peer_wire_name(fromwire_peektype(goss)));
@@ -473,7 +476,8 @@ static void inject_gossip(struct daemon *daemon, const u8 *msg)
 		err = gossmap_manage_channel_announcement(tmpctx,
 							  daemon->gm,
 							  take(goss), NULL,
-							  known_amount);
+							  known_amount,
+							  known_asset);
 		break;
 	case WIRE_NODE_ANNOUNCEMENT:
 		err = gossmap_manage_node_announcement(tmpctx,

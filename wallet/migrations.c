@@ -1093,6 +1093,11 @@ static const struct db_migration dbmigrations[] = {
      * version+tag). NULL on existing rows -> the policy asset at load time. */
     {SQL("ALTER TABLE channels ADD channel_asset BLOB DEFAULT NULL;"), NULL,
      SQL("ALTER TABLE channels DROP COLUMN channel_asset"), NULL},
+    /* Asset-aware channels: the asset of each utxoset funding output (33-byte
+     * version+tag). Used to learn a remote channel's asset when verifying its
+     * channel_announcement. NULL on existing rows -> the policy asset. */
+    {SQL("ALTER TABLE utxoset ADD asset BLOB DEFAULT NULL;"), NULL,
+     SQL("ALTER TABLE utxoset DROP COLUMN asset"), NULL},
 };
 
 const struct db_migration *get_db_migrations(size_t *num)

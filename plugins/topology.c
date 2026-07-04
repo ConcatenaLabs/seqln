@@ -1,6 +1,7 @@
 #include "config.h"
 #include <ccan/array_size/array_size.h>
 #include <ccan/json_escape/json_escape.h>
+#include <ccan/str/hex/hex.h>
 #include <ccan/tal/str/str.h>
 #include <common/dijkstra.h>
 #include <common/gossmap.h>
@@ -26,17 +27,58 @@ static struct gossmap *get_gossmap(void)
 	return global_gossmap;
 }
 
+/* Sequentia: the route filter passed through dijkstra: node/channel exclusions
+ * plus the asset the payment must be routed in (NULL = no asset filtering). */
+struct route_filter {
+	struct route_exclusion **excludes;
+	const u8 *asset; /* 33-byte version+tag, or NULL */
+};
+
+/* Parse a 32-byte hex asset id into its 33-byte on-chain tag (0x01 || reversed
+ * bytes), matching fundchannel's `asset` param and hence a channel's
+ * gossip-recorded asset. */
+static struct command_result *param_asset_tag(struct command *cmd,
+					      const char *name,
+					      const char *buffer,
+					      const jsmntok_t *tok,
+					      const u8 **asset)
+{
+	u8 id[32], *tag;
+
+	if (!hex_decode(buffer + tok->start, tok->end - tok->start,
+			id, sizeof(id)))
+		return command_fail_badparam(cmd, name, buffer, tok,
+					     "expected a 32-byte hex asset id");
+	tag = tal_arr(cmd, u8, 33);
+	tag[0] = 0x01;
+	for (size_t i = 0; i < sizeof(id); i++)
+		tag[1 + i] = id[sizeof(id) - 1 - i];
+	*asset = tag;
+	return NULL;
+}
+
 static bool can_carry(const struct gossmap *map,
 		      const struct gossmap_chan *c,
 		      int dir,
 		      struct amount_msat amount,
-		      struct route_exclusion **excludes)
+		      struct route_filter *filter)
 {
 	struct node_id dstid;
+	struct route_exclusion **excludes = filter->excludes;
 
 	/* First do generic check */
 	if (!route_can_carry(map, c, dir, amount, NULL)) {
 		return false;
+	}
+
+	/* Sequentia: only route over channels denominated in the payment's
+	 * asset, so we never build a cross-asset route (which the forwarding
+	 * node would refuse anyway). */
+	if (filter->asset) {
+		u8 chan_asset[33];
+		if (!gossmap_chan_get_asset(map, c, chan_asset)
+		    || memcmp(chan_asset, filter->asset, sizeof(chan_asset)) != 0)
+			return false;
 	}
 
 	/* Now check exclusions.  Premature optimization: */
@@ -93,6 +135,8 @@ struct getroute_info {
 	u64 *riskfactor_millionths;
 	struct route_exclusion **excluded;
 	u32 *max_hops;
+	/* Sequentia: the asset to route in (33-byte tag), or NULL for no filter. */
+	const u8 *asset;
 };
 
 static struct command_result *try_route(struct command *cmd,
@@ -115,9 +159,12 @@ static struct command_result *try_route(struct command *cmd,
 				    "%s: unknown destination node_id (no public channels?)",
 				    fmt_node_id(tmpctx, info->destination));
 
+	/* Sequentia: filter routes to the payment's asset (if given). */
+	struct route_filter filter = { info->excluded, info->asset };
+
 	dij = dijkstra(tmpctx, gossmap, dst, *info->msat,
 		       *info->riskfactor_millionths / 1000000.0,
-		       can_carry, route_score_cheaper, info->excluded);
+		       can_carry, route_score_cheaper, &filter);
 	route = route_from_dijkstra(dij, gossmap, dij, src,
 				    *info->msat, *info->cltv);
 	if (!route)
@@ -129,7 +176,7 @@ static struct command_result *try_route(struct command *cmd,
 				      tal_count(route));
 		dij = dijkstra(tmpctx, gossmap, dst, *info->msat,
 			       *info->riskfactor_millionths / 1000000.0,
-			       can_carry, route_score_shorter, info->excluded);
+			       can_carry, route_score_shorter, &filter);
 		route = route_from_dijkstra(dij, gossmap, dij, src, *info->msat, *info->cltv);
 		if (tal_count(route) > *info->max_hops)
 			return command_fail(cmd, PAY_ROUTE_NOT_FOUND, "Shortest route was %zu",
@@ -188,6 +235,7 @@ static struct command_result *json_getroute(struct command *cmd,
 		   p_opt("fuzzpercent", param_millionths, &fuzz_ignored),
 		   p_opt("exclude", param_route_exclusion_array, &info->excluded),
 		   p_opt_def("maxhops", param_number, &info->max_hops, ROUTING_MAX_HOPS),
+		   p_opt("asset", param_asset_tag, &info->asset),
 		   NULL))
 		return command_param_failed();
 

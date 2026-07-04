@@ -16,6 +16,8 @@ struct gossmap_manage *gossmap_manage_new(const tal_t *ctx,
  * @announce: the channel_announcement message
  * @source_peer: peer who sent this (NULL if it's from lightningd)
  * @known_amount: if non-NULL, do not ask lightningd to look up UTXO.
+ * @known_asset: Sequentia: if non-NULL (accompanies known_amount for a local
+ *               announcement), the channel's 33-byte denominating asset.
  *
  * Returns an error string if it wasn't redundant or included.  Lightningd
  * suppresses lookups if it generated the announcement, partially because it's
@@ -26,7 +28,8 @@ const char *gossmap_manage_channel_announcement(const tal_t *ctx,
 						struct gossmap_manage *gm,
 						const u8 *announce TAKES,
 						const struct node_id *source_peer TAKES,
-						const struct amount_sat *known_amount);
+						const struct amount_sat *known_amount,
+						const u8 *known_asset);
 
 
 /**

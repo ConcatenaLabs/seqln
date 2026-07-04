@@ -621,7 +621,8 @@ const char *gossmap_manage_channel_announcement(const tal_t *ctx,
 						struct gossmap_manage *gm,
 						const u8 *announce TAKES,
 						const struct node_id *source_peer TAKES,
-						const struct amount_sat *known_amount)
+						const struct amount_sat *known_amount,
+						const u8 *known_asset)
 {
 	secp256k1_ecdsa_signature node_signature_1, node_signature_2;
 	secp256k1_ecdsa_signature bitcoin_signature_1, bitcoin_signature_2;
@@ -710,6 +711,12 @@ const char *gossmap_manage_channel_announcement(const tal_t *ctx,
 		gossip_store_add(gm->gs, announce, 0);
 		gossip_store_add(gm->gs,
 				 towire_gossip_store_channel_amount(tmpctx, *known_amount), 0);
+		/* Sequentia: record the channel's asset (immediately after the
+		 * amount record) so asset-aware pathfinding can filter on it.
+		 * Local announcements always carry known_asset; absence -> policy. */
+		if (known_asset)
+			gossip_store_add(gm->gs,
+					 towire_gossip_store_channel_asset(tmpctx, known_asset), 0);
 
 		node_announcements_not_dying(gm, gossmap, pca);
 		tal_free(pca);
@@ -759,10 +766,11 @@ void gossmap_manage_handle_get_txout_reply(struct gossmap_manage *gm, const u8 *
 	struct short_channel_id scid;
 	u8 *outscript;
 	struct amount_sat sat;
+	u8 asset[33];
 	struct pending_cannounce *pca;
 	struct gossmap *gossmap;
 
-	if (!fromwire_gossipd_get_txout_reply(msg, msg, &scid, &sat, &outscript))
+	if (!fromwire_gossipd_get_txout_reply(msg, msg, &scid, &sat, asset, &outscript))
 		master_badmsg(WIRE_GOSSIPD_GET_TXOUT_REPLY, msg);
 
 	status_trace("channel_announcement: got reply for %s...",
@@ -850,6 +858,11 @@ void gossmap_manage_handle_get_txout_reply(struct gossmap_manage *gm, const u8 *
 	gossip_store_add(gm->gs, pca->channel_announcement, 0);
 	gossip_store_add(gm->gs,
 			 towire_gossip_store_channel_amount(tmpctx, sat), 0);
+	/* Sequentia: record the channel's asset (from the on-chain funding
+	 * output, via lightningd's utxoset) immediately after the amount record,
+	 * so asset-aware pathfinding can filter routes to a single asset. */
+	gossip_store_add(gm->gs,
+			 towire_gossip_store_channel_asset(tmpctx, asset), 0);
 
 	/* If we looking specifically for this, we no longer are. */
 	remove_unknown_scid(gm->daemon->seeker, &scid, true);

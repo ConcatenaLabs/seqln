@@ -1007,10 +1007,16 @@ static void topo_add_utxos(struct chain_topology *topo, struct block *b)
 				amt_sat = amount_sat(amt.value);
 
 			struct bitcoin_outpoint outpoint = { b->txids[i], n };
+			/* Sequentia: record the funding output's asset (33-byte
+			 * version+tag), so a remote node can learn an asset
+			 * channel's asset when verifying its channel_announcement.
+			 * amt.asset equals the channel's channel_asset (the funding
+			 * output asset was set from it), so gossip and the forward
+			 * guard compare consistently. */
 			wallet_utxoset_add(topo->ld->wallet, &outpoint,
 					   b->height, i,
 					   output->script, output->script_len,
-					   amt_sat);
+					   amt_sat, amt.asset);
 		}
 	}
 }

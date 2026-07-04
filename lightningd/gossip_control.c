@@ -14,6 +14,19 @@
 #include <lightningd/lightningd.h>
 #include <lightningd/subd.h>
 
+/* Sequentia: the 33-byte asset to report for a channel funding output.  A NULL
+ * per-output asset means the policy asset, so fall back to the network's
+ * fee_asset_tag (or all-zeros on a non-elements chain, which has no assets). */
+static const u8 *txout_reply_asset(const u8 *asset)
+{
+	static const u8 zero_asset[33];
+	if (asset)
+		return asset;
+	if (chainparams->fee_asset_tag)
+		return chainparams->fee_asset_tag;
+	return zero_asset;
+}
+
 static void got_txout(struct bitcoind *bitcoind,
 		      const struct bitcoin_tx_output *output,
 		      struct short_channel_id scid)
@@ -30,9 +43,13 @@ static void got_txout(struct bitcoind *bitcoind,
 		sat = AMOUNT_SAT(0);
 	}
 
+	/* The filtered-block path carries no asset info; report the policy asset.
+	 * Asset channels are recorded with their asset via topo_add_utxos, and
+	 * so are answered from the utxoset path in get_txout() below. */
 	subd_send_msg(
 	    bitcoind->ld->gossip,
-	    take(towire_gossipd_get_txout_reply(NULL, scid, sat, script)));
+	    take(towire_gossipd_get_txout_reply(NULL, scid, sat,
+						txout_reply_asset(NULL), script)));
 }
 
 static void got_filteredblock(struct bitcoind *bitcoind,
@@ -93,14 +110,17 @@ static void get_txout(struct subd *gossip, const u8 *msg)
 	if (op) {
 		subd_send_msg(gossip,
 			      take(towire_gossipd_get_txout_reply(
-					   NULL, scid, op->sat, op->scriptpubkey)));
+					   NULL, scid, op->sat,
+					   txout_reply_asset(op->asset),
+					   op->scriptpubkey)));
 	} else if (wallet_have_block(gossip->ld->wallet, blockheight)) {
 		/* We should have known about this outpoint since its header
 		 * is in the DB. The fact that we don't means that this is
 		 * either a spent outpoint or an invalid one. Return a
 		 * failure. */
 		subd_send_msg(gossip, take(towire_gossipd_get_txout_reply(
-						   NULL, scid, AMOUNT_SAT(0), NULL)));
+						   NULL, scid, AMOUNT_SAT(0),
+						   txout_reply_asset(NULL), NULL)));
 	} else {
 		/* If we're shutting down, don't ask plugins */
 		if (gossip->ld->state == LD_STATE_SHUTDOWN)
@@ -450,7 +470,10 @@ static struct command_result *json_addgossip(struct command *cmd,
 		   NULL))
 		return command_param_failed();
 
-	req = towire_gossipd_addgossip(cmd, gossip_msg, NULL);
+	/* Sequentia: the RPC-injected gossip carries no asset (channel asset is
+	 * learned on-chain via get_txout); pass an all-zero placeholder. */
+	static const u8 zero_asset[33];
+	req = towire_gossipd_addgossip(cmd, gossip_msg, NULL, zero_asset);
 	subd_req(cmd->ld->gossip, cmd->ld->gossip,
 		 req, -1, 0, json_addgossip_reply, cmd);
 
