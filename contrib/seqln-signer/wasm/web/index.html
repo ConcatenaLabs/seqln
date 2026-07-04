@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SeqLN device signer</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    background: #0e1116; color: #d7dce3;
+  }
+  header { padding: 20px 24px 8px; border-bottom: 1px solid #1e2530; }
+  header h1 { margin: 0; font-size: 18px; font-weight: 650; color: #f2c14e; letter-spacing: .2px; }
+  header p { margin: 4px 0 0; color: #8b94a3; font-size: 12.5px; max-width: 70ch; }
+  main { display: grid; grid-template-columns: minmax(340px, 460px) 1fr; gap: 0; height: calc(100vh - 74px); }
+  @media (max-width: 820px) { main { grid-template-columns: 1fr; height: auto; } }
+  .panel { padding: 20px 24px; overflow: auto; }
+  .panel.form { border-right: 1px solid #1e2530; }
+  label { display: block; margin: 14px 0 4px; font-size: 12px; color: #9aa4b2; font-weight: 600; text-transform: uppercase; letter-spacing: .4px; }
+  input, textarea, select {
+    width: 100%; background: #151b24; border: 1px solid #26303d; color: #e6ebf1;
+    border-radius: 7px; padding: 8px 10px; font: inherit; font-size: 13px;
+  }
+  input:focus, textarea:focus, select:focus { outline: none; border-color: #f2c14e; }
+  textarea { resize: vertical; min-height: 54px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  .row { display: flex; gap: 8px; align-items: end; }
+  .row > * { flex: 1; }
+  button {
+    background: #f2c14e; color: #11151c; border: 0; border-radius: 7px; padding: 9px 14px;
+    font: inherit; font-weight: 650; cursor: pointer;
+  }
+  button.secondary { background: #1c2431; color: #cdd5df; border: 1px solid #2b3543; font-weight: 500; }
+  button:disabled { opacity: .45; cursor: default; }
+  .btns { display: flex; gap: 10px; margin-top: 18px; }
+  .kv { margin-top: 16px; }
+  .kv div { display: flex; gap: 10px; padding: 5px 0; border-top: 1px solid #171d26; }
+  .kv .k { color: #8b94a3; min-width: 92px; }
+  .kv .v { color: #e6ebf1; word-break: break-all; }
+  .pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .s-idle { background:#232b36; color:#9aa4b2; } .s-connecting,.s-handshaking { background:#2a2f1e; color:#e2c96a; }
+  .s-authenticated,.s-node_id,.s-serving { background:#16301f; color:#63d68a; }
+  .s-error { background:#3a1c1c; color:#ff8a8a; } .s-closed { background:#232b36; color:#9aa4b2; }
+  .panel.log h2 { margin: 0 0 10px; font-size: 13px; color: #9aa4b2; text-transform: uppercase; letter-spacing: .4px; }
+  #log { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  #log .line { padding: 3px 0; border-bottom: 1px solid #141a22; display: flex; gap: 10px; }
+  #log .seq { color: #5b6472; min-width: 42px; text-align: right; }
+  #log .name { color: #cdd5df; min-width: 220px; }
+  #log .ok { color: #63d68a; } #log .rej { color: #ff8a8a; }
+  #log .status { color: #e2c96a; }
+  .hint { color:#6a7482; font-size:11.5px; margin-top:6px; }
+  code { background:#151b24; padding:1px 5px; border-radius:4px; color:#cbd3dd; }
+</style>
+</head>
+<body>
+<header>
+  <h1>SeqLN device signer &mdash; hosted-node co-signer</h1>
+  <p>Your keys stay on this device. This page holds the mnemonic in a wasm signer, connects out over a WebSocket
+     to a hosted SeqLN node&rsquo;s Noise_XK responder (through the WS&harr;TCP relay), and co-signs the node&rsquo;s
+     sign requests. The host can never move your funds.</p>
+</header>
+<main>
+  <section class="panel form">
+    <label for="mnemonic">Device mnemonic (BIP-39, stays on device)</label>
+    <textarea id="mnemonic" spellcheck="false" placeholder="twelve words ..."></textarea>
+
+    <label for="wsUrl">Hosted relay WebSocket URL</label>
+    <input id="wsUrl" class="mono" value="ws://127.0.0.1:18081" />
+
+    <label for="hostPub">Host static pubkey (pin, 33-byte hex)</label>
+    <input id="hostPub" class="mono" placeholder="02..." />
+
+    <label for="devPriv">Device transport privkey (32-byte hex)</label>
+    <div class="row">
+      <input id="devPriv" class="mono" placeholder="hex, or Generate" />
+      <button class="secondary" id="gen" style="flex:0 0 auto">Generate</button>
+    </div>
+    <div class="hint">Derived device pubkey (the host must pin this): <span id="devPub" class="mono">&mdash;</span></div>
+
+    <label for="policy">Signer policy</label>
+    <select id="policy">
+      <option value="permissive">permissive (sign on request)</option>
+      <option value="enforce">enforce (refuse theft-shaped sigs)</option>
+    </select>
+
+    <div class="btns">
+      <button id="connect">Connect &amp; serve</button>
+      <button id="disconnect" class="secondary" disabled>Disconnect</button>
+    </div>
+
+    <div class="kv">
+      <div><span class="k">Status</span><span class="v"><span id="status" class="pill s-idle">idle</span></span></div>
+      <div><span class="k">Node id</span><span class="v mono" id="nodeId">&mdash;</span></div>
+      <div><span class="k">Served</span><span class="v" id="served">0 requests</span></div>
+    </div>
+    <div class="hint" style="margin-top:14px">
+      Run the relay: <code>node relay/seqln-ws-relay.mjs --ws-port 18081 --tcp 127.0.0.1:&lt;proxy-listen-port&gt;</code>,
+      and boot the hosted node with <code>SEQLN_SIGNER_LISTEN</code> + the pinned keys. Serve this page over HTTP
+      (e.g. <code>python3 -m http.server</code> from the <code>wasm/</code> dir).
+    </div>
+  </section>
+
+  <section class="panel log">
+    <h2>Live sign-request log</h2>
+    <div id="log"></div>
+  </section>
+</main>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>
