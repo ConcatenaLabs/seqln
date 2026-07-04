@@ -847,6 +847,29 @@ static void forward_htlc(struct htlc_in *hin,
 		return;
 	}
 
+	/* Sequentia: refuse to forward across an asset boundary.  Every channel
+	 * denominates a single asset (channel_asset); an HTLC received on a
+	 * channel of one asset must be forwarded on a channel of the SAME asset.
+	 * Otherwise we would swap one asset for another at par (e.g. receive
+	 * 0.1 GOLD and pay out 0.1 of a different asset), silently corrupting
+	 * value.  BOLT has no asset concept, so we report "no next peer" for this
+	 * route; asset-aware pathfinding will not build such routes, and this is
+	 * the backstop against a hand-crafted or buggy cross-asset route. */
+	if (memcmp(hin->key.channel->channel_asset, next->channel_asset,
+		   sizeof(next->channel_asset)) != 0) {
+		log_unusual(hin->key.channel->log,
+			    "Refusing to forward HTLC across an asset boundary:"
+			    " incoming and outgoing channels denominate"
+			    " different assets");
+		local_fail_in_htlc(hin, take(towire_unknown_next_peer(NULL)));
+		wallet_forwarded_payment_add(hin->key.channel->peer->ld->wallet,
+					 hin, FORWARD_STYLE_TLV,
+					 forward_scid, NULL,
+					 FORWARD_LOCAL_FAILED,
+					 WIRE_UNKNOWN_NEXT_PEER);
+		return;
+	}
+
 	/* BOLT #7:
 	 *
 	 * The origin node:

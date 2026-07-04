@@ -994,14 +994,23 @@ static void topo_add_utxos(struct chain_topology *topo, struct block *b)
 				continue; /* We only care about p2wsh utxos */
 
 			struct amount_asset amt = bitcoin_tx_output_get_amount(tx, n);
-			if (!amount_asset_is_main(&amt))
-				continue; /* Ignore non-policy asset outputs */
+			/* Sequentia: asset (issued-asset) Lightning channels have a
+			 * non-policy funding output.  We must record these too, or a
+			 * remote node cannot verify the channel_announcement of an
+			 * asset channel (the funding output is looked up here) and
+			 * silently drops it.  Record the raw output value; the channel
+			 * asset itself is learned separately (see wallet_utxoset). */
+			struct amount_sat amt_sat;
+			if (amount_asset_is_main(&amt))
+				amt_sat = amount_asset_to_sat(&amt);
+			else
+				amt_sat = amount_sat(amt.value);
 
 			struct bitcoin_outpoint outpoint = { b->txids[i], n };
 			wallet_utxoset_add(topo->ld->wallet, &outpoint,
 					   b->height, i,
 					   output->script, output->script_len,
-					   amount_asset_to_sat(&amt));
+					   amt_sat);
 		}
 	}
 }
