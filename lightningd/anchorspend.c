@@ -287,16 +287,19 @@ static struct wally_psbt *anchor_psbt(const tal_t *ctx,
 	} else {
 		bip32_pubkey(ld, &final_key, channel->final_key_idx);
 	}
-	/* FIXME(asset-channels): for a non-policy channel asset this CPFP tx is
-	 * inherently MIXED-asset -- the 330-atom anchor input is the channel
-	 * asset (e.g. GOLD) while the wallet fee UTXOs + this change output are
-	 * the policy asset. As-is the GOLD side is unbalanced (330 in, 0 out) so
-	 * the tx is network-rejected: a GOLD *anchor* channel cannot currently be
-	 * CPFP-fee-bumped on force-close (funds-at-risk if the commitment must
-	 * confirm before an HTLC deadline). WORKAROUND: use non-anchor
-	 * (static_remotekey) channel types for asset channels. Full fix needs a
-	 * separate channel-asset change output for the 330 atoms + psbt_compute_fee
-	 * to sum only fee-asset inputs. See the M3 audit finding. */
+	/* FIXME(asset-channels): make this CPFP single-asset. The 330-atom anchor
+	 * input is the channel asset (e.g. GOLD), and the bump fee should be paid
+	 * in the SAME asset (open fee market -- NO privileged coin, NOT the policy
+	 * asset). But wallet_utxo_boost() (the fee-funding utxo selection) is not
+	 * asset-aware, and this change output goes through psbt_append_output()
+	 * which defaults to the policy asset, so as-is a GOLD anchor's bump is
+	 * funded with policy utxos -> an accidental unbalanced two-asset tx that
+	 * is rejected: a GOLD *anchor* channel cannot yet be CPFP-fee-bumped
+	 * on force-close (funds-at-risk before an HTLC deadline). Fix: select
+	 * channel-asset utxos (asset-aware coin selection, as fundpsbt does) and
+	 * emit the fee + change in channel_asset -> a clean single-asset GOLD
+	 * child. WORKAROUND meanwhile: use non-anchor channel types for asset
+	 * channels. See the M3 audit finding. */
 	psbt_append_output(psbt,
 			   scriptpubkey_p2tr(tmpctx, &final_key),
 			   change);
