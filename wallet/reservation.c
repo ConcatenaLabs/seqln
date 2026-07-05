@@ -222,11 +222,42 @@ static const struct json_command unreserveinputs_command = {
 AUTODATA(json_command, &unreserveinputs_command);
 
 /**
+ * asset_tx_fee - the on-chain fee for @weight, denominated in the funding asset.
+ * @feerate_per_kw: feerate we have to pay (policy-asset feerate).
+ * @weight: weight of transaction so far.
+ * @rate: the funding asset's exchange rate R (atoms of the asset worth
+ *        EXCHANGE_RATE_SCALE reference/policy fee atoms); EXCHANGE_RATE_SCALE
+ *        for the policy asset itself.
+ *
+ * The policy fee (in policy atoms) is amount_tx_fee(feerate, weight).  For a
+ * non-policy funding asset we convert it into asset atoms preserving fee VALUE,
+ * exactly as the node does in ConvertValueToAmount:
+ *   asset_fee_atoms = ceil(policy_fee_atoms * EXCHANGE_RATE_SCALE / R).
+ * Using the same integer R and the same ceil guarantees the node's re-valuation
+ * of the fee agrees with ours by construction (first principle #4).
+ */
+static struct amount_sat asset_tx_fee(u32 feerate_per_kw, size_t weight,
+				      u64 rate)
+{
+	struct amount_sat pol = amount_tx_fee(feerate_per_kw, weight);
+
+	/* Policy asset (or non-elements): identity, byte-for-byte the old path. */
+	if (rate == EXCHANGE_RATE_SCALE)
+		return pol;
+
+	return (struct amount_sat){
+		(u64)(((__uint128_t)pol.satoshis * EXCHANGE_RATE_SCALE
+		       + rate - 1) / rate)
+	};
+}
+
+/**
  * inputs_sufficient - are we there yet?
  * @input: total input amount
  * @amount: required output amount
  * @feerate_per_kw: feerate we have to pay
  * @weight: weight of transaction so far.
+ * @rate: funding-asset exchange rate (see asset_tx_fee).
  * @diff: (output) set to amount over or under requirements.
  *
  * Returns true if inputs >= fees + amount, otherwise false.  diff is
@@ -236,11 +267,12 @@ static bool inputs_sufficient(struct amount_sat input,
 			      struct amount_sat amount,
 			      u32 feerate_per_kw,
 			      size_t weight,
+			      u64 rate,
 			      struct amount_sat *diff)
 {
 	struct amount_sat fee;
 
-	fee = amount_tx_fee(feerate_per_kw, weight);
+	fee = asset_tx_fee(feerate_per_kw, weight, rate);
 
 	/* If we can't add fees, amount is huge (e.g. "all") */
 	if (!amount_sat_add(&amount, amount, fee))
@@ -339,7 +371,10 @@ static struct command_result *finish_psbt(struct command *cmd,
 					  u32 reserve,
 					  u32 *locktime,
 					  struct amount_sat change,
-					  const u8 *asset)
+					  const u8 *asset,
+					  u64 rate,
+					  struct amount_sat input_sum,
+					  struct amount_sat funding_amount)
 {
 	struct json_stream *response;
 	struct wally_psbt *psbt;
@@ -362,8 +397,31 @@ static struct command_result *finish_psbt(struct command *cmd,
 				NULL);
 	assert(psbt->version == 2);
 
+	/* Non-policy funding asset: the fee is sized via the per-asset exchange
+	 * rate, and change is derived by SUBTRACTION (Sinputs - funding - fee),
+	 * so the single-asset elements tx balances exactly with no multi-site
+	 * ceil drift.  The policy asset keeps the original change_amount path
+	 * byte-for-byte (rate == EXCHANGE_RATE_SCALE, or non-elements). */
+	bool nonpolicy = is_elements(chainparams) && rate != EXCHANGE_RATE_SCALE;
+
 	/* Should we add a change output?  (Iff it can pay for itself!) */
-	change = change_amount(change, feerate_per_kw, weight);
+	if (nonpolicy) {
+		/* Fee we'd pay if we DO add a change output, in asset atoms. */
+		size_t w_change = bitcoin_tx_output_weight(
+					BITCOIN_SCRIPTPUBKEY_P2WPKH_LEN);
+		struct amount_sat fee_wc = asset_tx_fee(feerate_per_kw,
+							weight + w_change, rate);
+		struct amount_sat chg;
+
+		if (amount_sat_sub(&chg, input_sum, funding_amount)
+		    && amount_sat_sub(&chg, chg, fee_wc)
+		    && amount_sat_greater_eq(chg, chainparams->dust_limit))
+			change = chg;
+		else
+			change = AMOUNT_SAT(0);
+	} else {
+		change = change_amount(change, feerate_per_kw, weight);
+	}
 	if (amount_sat_greater(change, AMOUNT_SAT(0))) {
 		s64 keyidx;
 		u8 *b32script;
@@ -404,10 +462,27 @@ static struct command_result *finish_psbt(struct command *cmd,
 
 	/* Add a fee output if this is elements */
 	if (is_elements(chainparams)) {
-		struct amount_sat est_fee =
-			amount_tx_fee(feerate_per_kw, weight);
+		struct amount_sat est_fee;
 		/* Single-asset tx: the fee is paid in the same asset as the
 		 * inputs (Sequentia's open fee market accepts any asset). */
+		if (nonpolicy) {
+			/* fee = Sinputs - funding - change, so the tx balances.
+			 * With change derived above this equals the rate-
+			 * converted policy fee (a few asset atoms); it also
+			 * matches what psbt_elements_normalize_fees() will
+			 * recompute once the funding output is added. */
+			if (!amount_sat_sub(&est_fee, input_sum, funding_amount)
+			    || !amount_sat_sub(&est_fee, est_fee, change))
+				return command_fail(cmd, LIGHTNINGD,
+						    "asset fee underflow"
+						    " (inputs %s, funding %s,"
+						    " change %s)",
+						    fmt_amount_sat(tmpctx, input_sum),
+						    fmt_amount_sat(tmpctx, funding_amount),
+						    fmt_amount_sat(tmpctx, change));
+		} else {
+			est_fee = amount_tx_fee(feerate_per_kw, weight);
+		}
 		psbt_append_output_asset(psbt, NULL, est_fee, asset);
 		/* Add additional weight of fee output */
 		weight += bitcoin_tx_output_weight(0);
@@ -559,6 +634,26 @@ static struct command_result *json_fundpsbt(struct command *cmd,
 	if (have_anchor_channel(cmd->ld))
 		*keep_emergency_funds = true;
 
+	/* Resolve the funding-asset fee exchange rate up front: the policy
+	 * asset (or non-elements) is 1:1 (EXCHANGE_RATE_SCALE); a whitelisted
+	 * asset uses the rate the backend advertises; anything else cannot pay
+	 * fees.  We size every on-chain fee below via this rate so the node's
+	 * re-valuation of the fee agrees with ours (first principle #4). */
+	bool is_policy = !is_elements(chainparams) || asset == NULL
+			 || memcmp(asset, chainparams->fee_asset_tag, 33) == 0;
+	u64 rate = is_policy ? EXCHANGE_RATE_SCALE
+			     : topo_asset_fee_rate(cmd->ld->topology, asset);
+	if (!is_policy && rate == 0) {
+		/* Recover the display id from the 33-byte tag for the message. */
+		u8 id[32];
+		for (size_t i = 0; i < sizeof(id); i++)
+			id[i] = asset[sizeof(id) - i];
+		return command_fail(cmd, FUND_CANNOT_AFFORD,
+				    "asset %s is not accepted for fees by the"
+				    " backend",
+				    tal_hexstr(tmpctx, id, sizeof(id)));
+	}
+
 	all = amount_sat_eq(*amount, AMOUNT_SAT(-1ULL));
 	maxheight = minconf_to_maxheight(*minconf, cmd->ld);
 
@@ -572,7 +667,7 @@ static struct command_result *json_fundpsbt(struct command *cmd,
 
 	input = AMOUNT_SAT(0);
 	while (!inputs_sufficient(input, *amount, *feerate_per_kw, *weight,
-				  &diff)) {
+				  rate, &diff)) {
 		struct utxo *utxo;
 		struct amount_sat fee;
 		u32 utxo_weight;
@@ -590,7 +685,7 @@ static struct command_result *json_fundpsbt(struct command *cmd,
 			tal_arr_expand(&excluded, utxo);
 			utxo_weight = utxo_spend_weight(utxo,
 							*min_witness_weight);
-			fee = amount_tx_fee(*feerate_per_kw, utxo_weight);
+			fee = asset_tx_fee(*feerate_per_kw, utxo_weight, rate);
 
 			/* Uneconomic to add this utxo, skip it */
 			if (!all && amount_sat_greater_eq(fee, utxo->amount))
@@ -634,7 +729,7 @@ static struct command_result *json_fundpsbt(struct command *cmd,
 		/* We need to afford one non-dust output, at least. */
 		if (!inputs_sufficient(input, AMOUNT_SAT(0),
 				       *feerate_per_kw, *weight,
-				       &diff)
+				       rate, &diff)
 		    || amount_sat_less(diff, chainparams->dust_limit)) {
 			if (!topology_synced(cmd->ld->topology))
 				return command_fail(cmd,
@@ -671,7 +766,7 @@ static struct command_result *json_fundpsbt(struct command *cmd,
 		return command_check_done(cmd);
 
 	return finish_psbt(cmd, utxos, *feerate_per_kw, *weight, diff, *reserve,
-			   locktime, change, asset);
+			   locktime, change, asset, rate, input, *amount);
 }
 
 static const struct json_command fundpsbt_command = {
@@ -864,7 +959,8 @@ static struct command_result *json_addpsbtinput(struct command *cmd,
 
 	input = AMOUNT_SAT(0);
 	weight = 0;
-	while (!inputs_sufficient(input, *req_amount, 0, 0, &diff)) {
+	while (!inputs_sufficient(input, *req_amount, 0, 0,
+				  EXCHANGE_RATE_SCALE, &diff)) {
 		struct utxo *utxo;
 		struct amount_sat fee;
 		u32 utxo_weight;
@@ -1101,7 +1197,7 @@ static struct command_result *json_utxopsbt(struct command *cmd,
 		/* We need to afford one non-dust output, at least. */
 		if (!inputs_sufficient(input, AMOUNT_SAT(0),
 				       *feerate_per_kw, *weight,
-				       &excess)
+				       EXCHANGE_RATE_SCALE, &excess)
 		    || amount_sat_less(excess, chainparams->dust_limit)) {
 			return command_fail(cmd, FUND_CANNOT_AFFORD,
 					    "Could not afford anything using UTXOs totalling %s with weight %u at feerate %u",
@@ -1111,7 +1207,8 @@ static struct command_result *json_utxopsbt(struct command *cmd,
 		*excess_as_change = false;
 	} else {
 		if (!inputs_sufficient(input, *amount,
-				       *feerate_per_kw, *weight, &excess)) {
+				       *feerate_per_kw, *weight,
+				       EXCHANGE_RATE_SCALE, &excess)) {
 			return command_fail(cmd, FUND_CANNOT_AFFORD,
 				    "Could not afford %s using UTXOs totalling %s with weight %u at feerate %u",
 					    fmt_amount_sat(tmpctx, *amount),
@@ -1141,7 +1238,8 @@ static struct command_result *json_utxopsbt(struct command *cmd,
 		return command_check_done(cmd);
 
 	return finish_psbt(cmd, utxos, *feerate_per_kw, *weight, excess,
-			   *reserve, locktime, change, NULL);
+			   *reserve, locktime, change, NULL,
+			   EXCHANGE_RATE_SCALE, input, *amount);
 }
 static const struct json_command utxopsbt_command = {
 	"utxopsbt",

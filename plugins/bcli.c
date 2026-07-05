@@ -822,6 +822,44 @@ static struct command_result *getutxout(struct command *cmd,
 	return command_finished(cmd, response);
 }
 
+/* Fetch the any-asset fee whitelist from the node and return it verbatim.
+ * A thin passthrough of the node's `getfeeexchangerates` RPC: the node returns
+ * an object mapping each accepted asset (display-hex id, or the policy asset's
+ * label) to its exchange rate.  We wrap it as {"rates": <verbatim object>}.
+ * A backend that doesn't support any-asset fees (e.g. plain bitcoind) yields an
+ * empty whitelist rather than an error. */
+static struct command_result *getfeeexchangerates(struct command *cmd,
+						  const char *buf UNUSED,
+						  const jsmntok_t *toks UNUSED)
+{
+	struct bcli_result *res;
+	struct json_stream *response;
+	const jsmntok_t *tokens;
+
+	if (!param(cmd, buf, toks, NULL))
+		return command_param_failed();
+
+	res = run_bitcoin_cli(cmd, cmd->plugin, "getfeeexchangerates", NULL);
+
+	if (res->exitstatus != 0 || res->output_len == 0) {
+		response = jsonrpc_stream_success(cmd);
+		json_object_start(response, "rates");
+		json_object_end(response);
+		return command_finished(cmd, response);
+	}
+
+	/* Verify it parses, then re-emit the object verbatim. */
+	tokens = json_parse_simple(res->output, res->output, res->output_len);
+	if (!tokens || tokens[0].type != JSMN_OBJECT)
+		return command_err(cmd, res, "bad JSON: cannot parse rates");
+
+	strip_trailing_whitespace(res->output, res->output_len);
+
+	response = jsonrpc_stream_success(cmd);
+	json_add_jsonstr(response, "rates", res->output, strlen(res->output));
+	return command_finished(cmd, response);
+}
+
 static void bitcoind_failure(struct plugin *p, const char *error_message)
 {
 	const char **cmd = gather_args(bitcoind, NULL, "echo", NULL);
@@ -948,6 +986,10 @@ static const struct plugin_command commands[] = {
 	{
 		"getutxout",
 		getutxout
+	},
+	{
+		"getfeeexchangerates",
+		getfeeexchangerates
 	},
 };
 
