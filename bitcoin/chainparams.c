@@ -231,17 +231,15 @@ const struct chainparams networks[] = {
      * lightning HRP `tsqt` (invoices `lntsqt...`).  bip70_name "test" matches
      * the node's getblockchaininfo.chain; selection is by the unique
      * network_name, so the "test" collision with Bitcoin testnet3 is benign.
-     * genesis_blockhash is the live testnet genesis in internal byte order.
+     * genesis_blockhash is the live testnet genesis in internal byte order
+     * (display ddd11d54c87a2bd94400fd31ce05d8e1110bb4b78e7103f738342086fc4ea92e,
+     * re-genesis 2026-07-05 with the finality-split-fix consensus rules).
      * rpc_port is the node default; override with --bitcoin-rpcport as needed. */
     {.network_name = "sequentia-testnet",
      .onchain_hrp = "tb",
      .lightning_hrp = "tsqt",
      .bip70_name = "test",
-     .genesis_blockhash = {{{.u.u8 = {0xba, 0xdf, 0xc7, 0x51, 0xdf, 0xd8, 0x91,
-				      0x5d, 0x65, 0x2d, 0xc6, 0x25, 0xec, 0xfe,
-				      0xe1, 0xa4, 0x9a, 0x53, 0x1f, 0xaf, 0x40,
-				      0x81, 0xb9, 0x23, 0x84, 0x7e, 0x30, 0x4c,
-				      0x9b, 0xa9, 0xa0, 0xc2}}}},
+     .genesis_blockhash = {{{.u.u8 = {0x2e, 0xa9, 0x4e, 0xfc, 0x86, 0x20, 0x34, 0x38, 0xf7, 0x03, 0x71, 0x8e, 0xb7, 0xb4, 0x0b, 0x11, 0xe1, 0xd8, 0x05, 0xce, 0x31, 0xfd, 0x00, 0x44, 0xd9, 0x2b, 0x7a, 0xc8, 0x54, 0x1d, 0xd1, 0xdd}}}},
      .rpc_port = 18332,
      .ln_port = 19836,
      .cli = "elements-cli",
