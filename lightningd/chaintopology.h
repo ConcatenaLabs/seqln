@@ -15,6 +15,20 @@ struct wallet;
 /* We keep the last three in case there are outliers (for min/max) */
 #define FEE_HISTORY_NUM 3
 
+/* Fixed-point scale for the any-asset fee exchange rates (must match the
+ * node's `exchange_rate_scale`, i.e. COIN = 1e8).  A rate R for an asset means
+ * R atoms of that asset are worth EXCHANGE_RATE_SCALE reference (policy) fee
+ * atoms; the policy asset itself is always 1:1 (R == EXCHANGE_RATE_SCALE). */
+#define EXCHANGE_RATE_SCALE ((u64)100000000)
+
+/* One entry of the fee-asset whitelist, keyed by the 33-byte elements asset
+ * tag (0x01 || byte-reversed display id).  Fed by the node's
+ * `getfeeexchangerates` RPC, refreshed on the feerate poll timer. */
+struct asset_fee_rate {
+	u8 asset[33];
+	u64 scaled_value;
+};
+
 /* Off topology->outgoing_txs */
 struct outgoing_tx {
 	struct channel *channel;
@@ -114,6 +128,12 @@ struct chain_topology {
 	 * suggest feerates / check feerates from our peers. */
 	struct feerate_est *smoothed_feerates;
 
+	/* Any-asset fee exchange rates (tal_arr), refreshed on the same poll
+	 * timer as feerates.  The policy asset is NOT stored here (it is always
+	 * EXCHANGE_RATE_SCALE); a NULL/empty array means the backend has no
+	 * whitelist (or we haven't polled yet). */
+	struct asset_fee_rate *asset_fee_rates;
+
 	/* Where to log things. */
 	struct logger *log;
 
@@ -163,6 +183,12 @@ struct txlocator {
 
 /* Get the minimum feerate that bitcoind will accept */
 u32 get_feerate_floor(const struct chain_topology *topo);
+
+/* The any-asset fee exchange rate for @asset_tag (the 33-byte elements asset
+ * tag).  Returns EXCHANGE_RATE_SCALE for the policy asset (1:1), the cached
+ * rate R for a whitelisted asset, or 0 if the asset is unknown / not
+ * whitelisted / the cache has not been populated yet. */
+u64 topo_asset_fee_rate(const struct chain_topology *topo, const u8 *asset_tag);
 
 /* This is the number of blocks which would have to be mined to invalidate
  * the tx */

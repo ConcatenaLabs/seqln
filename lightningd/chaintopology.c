@@ -604,11 +604,43 @@ static void update_feerates_repeat(struct lightningd *ld,
 	next_updatefee_timer(ld->topology);
 }
 
+/* Refresh the any-asset fee exchange rates on the same poll as feerates. */
+static void update_feeexchangerates(struct lightningd *ld,
+				    const struct asset_fee_rate *rates,
+				    void *arg UNUSED)
+{
+	struct chain_topology *topo = ld->topology;
+
+	tal_free(topo->asset_fee_rates);
+	topo->asset_fee_rates = tal_dup_talarr(topo, struct asset_fee_rate,
+					       rates);
+}
+
 static void start_fee_estimate(struct chain_topology *topo)
 {
 	topo->updatefee_timer = NULL;
 	/* Based on timer, update fee estimates. */
 	bitcoind_estimate_fees(topo->request_ctx, topo->bitcoind, update_feerates_repeat, NULL);
+	/* ... and the any-asset fee exchange rates (used to size on-chain
+	 * funding fees denominated in a non-policy asset). */
+	bitcoind_get_feeexchangerates(topo->request_ctx, topo->bitcoind,
+				      update_feeexchangerates, NULL);
+}
+
+u64 topo_asset_fee_rate(const struct chain_topology *topo, const u8 *asset_tag)
+{
+	/* Policy asset is always 1:1 (never stored in the whitelist). */
+	if (chainparams->fee_asset_tag
+	    && memcmp(asset_tag, chainparams->fee_asset_tag, 33) == 0)
+		return EXCHANGE_RATE_SCALE;
+
+	for (size_t i = 0; i < tal_count(topo->asset_fee_rates); i++) {
+		if (memcmp(asset_tag, topo->asset_fee_rates[i].asset, 33) == 0)
+			return topo->asset_fee_rates[i].scaled_value;
+	}
+
+	/* Unknown / not whitelisted / cache not yet populated. */
+	return 0;
 }
 
 struct rate_conversion {
@@ -1326,6 +1358,7 @@ struct chain_topology *new_topology(struct lightningd *ld, struct logger *log)
 	topo->poll_seconds = 30;
 	memset(topo->feerates, 0, sizeof(topo->feerates));
 	topo->smoothed_feerates = NULL;
+	topo->asset_fee_rates = NULL;
 	topo->root = NULL;
 	topo->sync_waiters = tal(topo, struct list_head);
 	topo->extend_timer = NULL;

@@ -5,6 +5,7 @@
 #include <ccan/list/list.h>
 #include <ccan/strmap/strmap.h>
 
+struct asset_fee_rate;
 struct bitcoin_blkid;
 struct bitcoin_tx_output;
 struct block;
@@ -70,6 +71,24 @@ void bitcoind_estimate_fees_(const tal_t *ctx,
 					const struct feerate_est *feerates,
 					void *arg),
 			     void *cb_arg);
+
+/* Fetch the any-asset fee exchange rates from the Bitcoin backend
+ * (`getfeeexchangerates` passthrough).  @rates is a tal_arr of
+ * struct asset_fee_rate, owned by the call and freed once @cb returns. */
+#define bitcoind_get_feeexchangerates(ctx, bitcoind_, cb, arg)		\
+	bitcoind_get_feeexchangerates_((ctx), (bitcoind_),		\
+				       typesafe_cb_preargs(void, void *,	\
+							   (cb), (arg),	\
+							   struct lightningd *, \
+							   const struct asset_fee_rate *), \
+				       (arg))
+
+void bitcoind_get_feeexchangerates_(const tal_t *ctx,
+				    struct bitcoind *bitcoind,
+				    void (*cb)(struct lightningd *ld,
+					       const struct asset_fee_rate *rates,
+					       void *arg),
+				    void *cb_arg);
 
 /* If ctx is freed, cb won't be called! */
 void bitcoind_sendrawtx_(const tal_t *ctx,
