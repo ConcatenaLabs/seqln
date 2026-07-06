@@ -607,8 +607,21 @@ pub struct ChannelSecrets {
     pub shaseed: [u8; 32],
 }
 
-/// A parsed input of a linearized Elements tx, only the fields the BIP-143
-/// sighash needs (`bitcoin/signature.c` -> `wally_tx_get_elements_signature_hash`).
+/// Which parent chain a `bitcoin_tx` wire object (and thus its sighash preimage
+/// and witness_utxo encoding) belongs to. The C reference selects the SAME two
+/// paths at runtime via `is_elements(chainparams)` in
+/// `bitcoin_tx_hash_for_sig()` (`bitcoin/signature.c`): the Elements path uses
+/// the 9-byte confidential value + issuance hashing, the Bitcoin path the plain
+/// 8-byte value and no issuance section. Everything else (fees, ECDSA low-R
+/// signing, key derivation) is identical.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Network {
+    Bitcoin,
+    Elements,
+}
+
+/// A parsed input of a linearized tx, only the fields the BIP-143 sighash needs
+/// (`bitcoin/signature.c` -> `wally_tx_get_{btc,elements}_signature_hash`).
 pub struct TxInput {
     pub txhash: [u8; 32],
     pub index: u32,
@@ -616,8 +629,13 @@ pub struct TxInput {
     pub is_issuance: bool,
 }
 
-/// A parsed output: the raw confidential-commitment bytes (asset/value/nonce, as
-/// serialized, so `hash_commmitment` reproduces them verbatim) and the script.
+/// A parsed output.
+///
+/// * Elements: `asset`/`value`/`nonce` hold the raw confidential-commitment
+///   bytes (as serialized, so `hash_commmitment` reproduces them verbatim) and
+///   `script` the scriptPubKey.
+/// * Bitcoin:  `value` holds the plain 8-byte little-endian satoshi amount (as
+///   it appears in the tx), `asset`/`nonce` are empty, `script` the scriptPubKey.
 pub struct TxOutput {
     pub asset: Vec<u8>,
     pub value: Vec<u8>,
@@ -625,11 +643,15 @@ pub struct TxOutput {
     pub script: Vec<u8>,
 }
 
+/// A parsed transaction. Despite the historical name it carries EITHER a Bitcoin
+/// or an Elements tx; `network` says which, and drives the sighash preimage
+/// format (`elements_sighash_sw_v0` vs `bitcoin_sighash_sw_v0`).
 pub struct ElementsTx {
     pub version: u32,
     pub inputs: Vec<TxInput>,
     pub outputs: Vec<TxOutput>,
     pub locktime: u32,
+    pub network: Network,
 }
 
 fn hash_output_elements(out: &mut Vec<u8>, o: &TxOutput) {
@@ -727,6 +749,103 @@ pub fn elements_sighash_sw_v0(
     sha256d(&m)
 }
 
+/// A Bitcoin (non-Elements) output for the BIP-143 hashOutputs: the plain 8-byte
+/// LE satoshi value (stored verbatim in `o.value`) followed by the varbuff
+/// script. Mirrors `hash_output` (`external/libwally-core/src/tx_io.c`), which
+/// does `hash_le64(satoshi)` then `hash_varbuff(script)`.
+fn hash_output_bitcoin(out: &mut Vec<u8>, o: &TxOutput) {
+    out.extend_from_slice(&o.value); // 8 raw LE bytes == hash_le64(satoshi)
+    write_varint(out, o.script.len() as u64);
+    out.extend_from_slice(&o.script);
+}
+
+/// The Bitcoin segwit-v0 (BIP-143) signature hash, the non-Elements sibling of
+/// [`elements_sighash_sw_v0`]. A faithful port of `bip143_signature_hash`
+/// (`external/libwally-core/src/tx_io.c`) for the `WALLY_SIGTYPE_SW_V0` path with
+/// `is_elements == false`. It differs from the Elements variant in exactly two
+/// places, matching the `#ifdef BUILD_ELEMENTS` / `if (is_elements)` guards in
+/// the C:
+///
+///   * NO `hashIssuances` field between hashSequence and the input's outpoint
+///     (that block is Elements-only);
+///   * the input's amount and every output's amount are the plain 8-byte LE
+///     satoshi value (`hash_le64`), not the 9-byte confidential value.
+///
+/// `value` is the 8-byte little-endian satoshi amount of the input being signed
+/// (from the PSBT witness_utxo). Everything else — version, hashPrevouts,
+/// hashSequence, outpoint, scriptCode, sequence, hashOutputs, locktime, sighash,
+/// and the final `sha256_double` — is byte-for-byte identical in shape to the
+/// Elements path, so the two share the low-R signer downstream unchanged.
+pub fn bitcoin_sighash_sw_v0(
+    tx: &ElementsTx,
+    index: usize,
+    scriptcode: &[u8],
+    value: &[u8],
+    sighash: u32,
+) -> [u8; 32] {
+    let acp = sighash & 0x80 != 0;
+    let base = sighash & 0x1f; // WALLY_SIGHASH_MASK
+    let none = base == 0x02;
+    let single = base == 0x03;
+    let zero = [0u8; 32];
+
+    let mut m: Vec<u8> = Vec::new();
+    m.extend_from_slice(&tx.version.to_le_bytes());
+
+    // hashPrevouts
+    if acp {
+        m.extend_from_slice(&zero);
+    } else {
+        let mut b = Vec::new();
+        for i in &tx.inputs {
+            b.extend_from_slice(&i.txhash);
+            b.extend_from_slice(&i.index.to_le_bytes());
+        }
+        m.extend_from_slice(&sha256d(&b));
+    }
+
+    // hashSequence
+    if acp || single || none {
+        m.extend_from_slice(&zero);
+    } else {
+        let mut b = Vec::new();
+        for i in &tx.inputs {
+            b.extend_from_slice(&i.sequence.to_le_bytes());
+        }
+        m.extend_from_slice(&sha256d(&b));
+    }
+
+    // NOTE: no hashIssuances here — that field is Elements-only.
+
+    // Input being signed: outpoint || scriptCode(varbuff) || value(8 LE) || sequence.
+    let inp = &tx.inputs[index];
+    m.extend_from_slice(&inp.txhash);
+    m.extend_from_slice(&inp.index.to_le_bytes());
+    write_varint(&mut m, scriptcode.len() as u64);
+    m.extend_from_slice(scriptcode);
+    m.extend_from_slice(value); // 8-byte LE satoshi
+    m.extend_from_slice(&inp.sequence.to_le_bytes());
+
+    // hashOutputs
+    if none || (single && index >= tx.outputs.len()) {
+        m.extend_from_slice(&zero);
+    } else if single {
+        let mut b = Vec::new();
+        hash_output_bitcoin(&mut b, &tx.outputs[index]);
+        m.extend_from_slice(&sha256d(&b));
+    } else {
+        let mut b = Vec::new();
+        for o in &tx.outputs {
+            hash_output_bitcoin(&mut b, o);
+        }
+        m.extend_from_slice(&sha256d(&b));
+    }
+
+    m.extend_from_slice(&tx.locktime.to_le_bytes());
+    m.extend_from_slice(&sighash.to_le_bytes());
+    sha256d(&m)
+}
+
 /// `sha256_double` over a byte range (BOLT-7 gossip-message signing hash).
 pub fn double_sha256(data: &[u8]) -> [u8; 32] {
     sha256d(data)
@@ -751,4 +870,91 @@ pub fn hash_u5(hrp: &[u8], u5: &[u8]) -> [u8; 32] {
         h.update([((buf << (8 - num_bits)) & 0xff) as u8]);
     }
     h.finalize().into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// The canonical BIP-143 native-P2WPKH worked example (BIP-143 "Native
+    /// P2WPKH"): the 6-BTC second input of the given tx, signed SIGHASH_ALL,
+    /// must double-SHA256 to the published sigHash. This anchors
+    /// `bitcoin_sighash_sw_v0` (and, via [`crate::wire::parse_bitcoin_tx`], the
+    /// linearized-tx decode) against a spec vector — independent of libhsmd.
+    #[test]
+    fn bip143_native_p2wpkh_vector() {
+        // The unsigned tx from the BIP-143 example (no witnesses, empty scriptSigs).
+        let lin = unhex(
+            "0100000002fff7f7881a8099afa6940d42d1e7f6362bec38171ea3edf433541db4e4ad969f\
+             0000000000eeffffffef51e1b804cc89d182d279655c3aa89e815b1b309fe287d9b2b55d57\
+             b90ec68a0100000000ffffffff02202cb206000000001976a9148280b37df378db99f66f85\
+             c95a783a76ac7a6d5988ac9093510d000000001976a9143bde42dbee7e4dbe6a21b2d50ce2\
+             f0167faa815988ac11000000",
+        );
+        let tx = crate::wire::parse_bitcoin_tx(&lin).expect("parse bitcoin tx");
+        assert_eq!(tx.network, Network::Bitcoin);
+        assert_eq!(tx.version, 1);
+        assert_eq!(tx.inputs.len(), 2);
+        assert_eq!(tx.outputs.len(), 2);
+        assert_eq!(tx.locktime, 0x11);
+        assert_eq!(tx.inputs[0].sequence, 0xffff_ffee);
+        assert_eq!(tx.inputs[1].index, 1);
+        // Output values are stored as the raw 8-byte LE satoshi.
+        assert_eq!(tx.outputs[0].value, unhex("202cb20600000000"));
+        assert_eq!(tx.outputs[1].value, unhex("9093510d00000000"));
+
+        // scriptCode = the P2PKH template of the input's pubkey hash (no length
+        // prefix — the sighash's varbuff adds it), amount = 6 BTC, input #1.
+        let scriptcode = unhex("76a9141d0f172a0ecb48aee1be1f2687d2963ae33f71a188ac");
+        let value8 = 600_000_000u64.to_le_bytes();
+        let got = bitcoin_sighash_sw_v0(&tx, 1, &scriptcode, &value8, 0x01);
+        let want = unhex("c37af31116d1b27caf68aae9e3ac82f1477929014d5b917657d0eb49478cb670");
+        assert_eq!(got.to_vec(), want, "BIP-143 sigHash mismatch");
+    }
+
+    /// The Bitcoin and Elements sighashes must diverge (different preimage), so a
+    /// misrouted format is loud, not silent. Same logical tx, both codecs.
+    #[test]
+    fn bitcoin_and_elements_sighash_differ() {
+        let mut tx = ElementsTx {
+            version: 2,
+            inputs: vec![TxInput {
+                txhash: [7u8; 32],
+                index: 0,
+                sequence: 0xffff_ffff,
+                is_issuance: false,
+            }],
+            outputs: vec![TxOutput {
+                asset: Vec::new(),
+                value: 50_000u64.to_le_bytes().to_vec(),
+                nonce: Vec::new(),
+                script: unhex("0014deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+            }],
+            locktime: 0,
+            network: Network::Bitcoin,
+        };
+        let sc = unhex("0014deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+        let btc = bitcoin_sighash_sw_v0(&tx, 0, &sc, &50_000u64.to_le_bytes(), 0x01);
+        // Re-shape the single output as an Elements explicit value for the other
+        // codec (asset explicit || value(0x01||u64_be) || null nonce).
+        tx.network = Network::Elements;
+        let mut val9 = vec![0x01u8];
+        val9.extend_from_slice(&50_000u64.to_be_bytes());
+        tx.outputs[0].asset = {
+            let mut a = vec![0x01u8];
+            a.extend_from_slice(&[0u8; 32]);
+            a
+        };
+        tx.outputs[0].value = val9.clone();
+        tx.outputs[0].nonce = vec![0x00];
+        let ele = elements_sighash_sw_v0(&tx, 0, &sc, &val9, 0x01);
+        assert_ne!(btc, ele);
+    }
 }
