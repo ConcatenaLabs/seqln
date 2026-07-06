@@ -124,6 +124,10 @@ impl Signer {
             // policy validates every output before signing.
             msg::HSMD_SIGN_COMMITMENT_TX => self.sign_commitment_tx_checked(req),
             msg::HSMD_SIGN_REMOTE_COMMITMENT_TX => self.sign_remote_commitment_tx_checked(req),
+            // SIGN_WITHDRAWAL (7): the node signs its OWN wallet inputs of a
+            // withdrawal / channel-funding tx (the funder role). Not a theft
+            // vector for the fundee split, so no policy gate.
+            msg::HSMD_SIGN_WITHDRAWAL => opt(self.h_sign_withdrawal(&req.hsmd_msg)),
             msg::HSMD_SIGN_MUTUAL_CLOSE_TX => opt(self.h_sign_mutual_close_tx(req)),
             msg::HSMD_SIGN_REMOTE_HTLC_TX => opt(self.h_sign_remote_htlc_tx(req)),
             msg::HSMD_SIGN_ANY_LOCAL_HTLC_TX => opt(self.h_sign_any_local_htlc_tx(&req.hsmd_msg)),
@@ -644,6 +648,108 @@ impl Signer {
         self.sig_reply(bt, 0, wscript, &privkey, SIGHASH_ALL, msg::HSMD_SIGN_TX_REPLY)
     }
 
+    /// SIGN_WITHDRAWAL (7): sign the node's OWN wallet inputs of a withdrawal /
+    /// channel-funding PSBT and return the PSBT with a `PSBT_IN_PARTIAL_SIG` per
+    /// signed input, mirroring `handle_sign_withdrawal_tx` -> `sign_our_inputs`
+    /// (`hsmd/libhsmd.c`). lightningd `combine_psbt`s the reply back into its own
+    /// PSBT and finalizes/broadcasts it, so ANY valid signature suffices (unlike
+    /// the byte-exact commitment path); we keep every other PSBT byte untouched so
+    /// the outpoints line up and the combine merges cleanly.
+    ///
+    /// The wallet key is the SAME one `hsm_key_for_utxo` would pick: a mnemonic
+    /// (BIP86) node signs even its P2WPKH wallet inputs with the m/86'/0'/0'/0/idx
+    /// key (whose HASH160 is the address), a legacy node with m/0/0/idx. We
+    /// resolve which by reproducing the input's scriptPubkey from the candidate
+    /// key, which also covers native-P2WPKH and P2SH-P2WPKH transparently.
+    fn h_sign_withdrawal(&self, m: &[u8]) -> Option<Vec<u8>> {
+        let (utxos, psbt) = wire::parse_sign_withdrawal(m)?;
+        let network = wire::detect_network(&psbt);
+        // The tx being signed is the PSBT's global unsigned tx (v0 on the Bitcoin
+        // path, which lightningd downgrades to before sending).
+        let lin = wire::psbt_global_unsigned_tx(&psbt)?;
+        let tx = match network {
+            kernel::Network::Bitcoin => wire::parse_bitcoin_tx(lin)?,
+            kernel::Network::Elements => wire::parse_elements_tx(lin)?,
+        };
+
+        let mut out = psbt;
+        for utxo in &utxos {
+            // The HD wallet path only; a their-close sweep needs channel keys and
+            // is never part of a channel-funding withdrawal.
+            if utxo.is_unilateral_close {
+                continue;
+            }
+            // Match the utxo to its PSBT/tx input by outpoint (`wally_psbt_input_spends`).
+            let Some(j) = tx
+                .inputs
+                .iter()
+                .position(|i| i.txhash == utxo.txid && i.index == utxo.vout)
+            else {
+                continue;
+            };
+            // Resolve the signing key + its pubkey by reproducing the scriptPubkey.
+            let Some((sk, pubkey, keyhash)) =
+                self.wallet_key_for_spk(utxo.keyindex, &utxo.script_pubkey)
+            else {
+                continue;
+            };
+            // BIP-143 scriptCode for a P2WPKH / P2SH-P2WPKH input = the P2PKH template.
+            let scriptcode = p2pkh_scriptcode(&keyhash);
+            let hash = match network {
+                kernel::Network::Bitcoin => {
+                    let v8 = utxo.amount.to_le_bytes();
+                    kernel::bitcoin_sighash_sw_v0(&tx, j, &scriptcode, &v8, SIGHASH_ALL)
+                }
+                kernel::Network::Elements => {
+                    // Explicit 9-byte confidential value: 0x01 || uint64_be(amount).
+                    let mut v9 = [0u8; 9];
+                    v9[0] = 0x01;
+                    v9[1..].copy_from_slice(&utxo.amount.to_be_bytes());
+                    kernel::elements_sighash_sw_v0(&tx, j, &scriptcode, &v9, SIGHASH_ALL)
+                }
+            };
+            // Low-R ECDSA, self-checked against the derived pubkey, DER-encoded.
+            let der = self.kernel().sign_low_r_der_checked(&hash, &sk, &pubkey)?;
+            // Splice a PSBT_IN_PARTIAL_SIG record (key 0x02||pubkey, value DER||sighash)
+            // into input j's map. Re-navigate each time: earlier inserts shift offsets.
+            let rec = partial_sig_record(&pubkey, &der, SIGHASH_ALL as u8);
+            let term = wire::psbt_input_map_terminator(&out, j)?;
+            let mut next = Vec::with_capacity(out.len() + rec.len());
+            next.extend_from_slice(&out[..term]);
+            next.extend_from_slice(&rec);
+            next.extend_from_slice(&out[term..]);
+            out = next;
+        }
+
+        let mut w = Writer::new(msg::HSMD_SIGN_WITHDRAWAL_REPLY);
+        w.u32(out.len() as u32);
+        w.bytes(&out);
+        Some(w.into_vec())
+    }
+
+    /// Find the wallet privkey (+ its pubkey + HASH160) that produces `spk`,
+    /// trying BIP86 (m/86'/0'/0'/0/idx) then legacy (m/0/0/idx) and matching
+    /// against native-P2WPKH (`0014<h160>`) and P2SH-P2WPKH (`a914<H160>87`).
+    fn wallet_key_for_spk(
+        &self,
+        keyindex: u32,
+        spk: &[u8],
+    ) -> Option<(SecretKey, [u8; 33], [u8; 20])> {
+        for use_bip86 in [true, false] {
+            let sk = if use_bip86 {
+                self.kernel().bip86_child_privkey(keyindex)
+            } else {
+                self.kernel().bitcoin_wallet_privkey(keyindex)
+            };
+            let pubkey = self.kernel().pubkey_of(&sk);
+            let keyhash = kernel::hash160(&pubkey);
+            if spk_matches_keyhash(spk, &keyhash) {
+                return Some((sk, pubkey, keyhash));
+            }
+        }
+        None
+    }
+
     /// VALIDATE_COMMITMENT_TX (35): return the next per-commitment point (the
     /// old_secret is never returned in this stub). seed from FRAME.
     fn h_validate_commitment_tx(&self, req: &Request) -> Option<Vec<u8>> {
@@ -796,6 +902,53 @@ fn opt(o: Option<Vec<u8>>) -> Outcome {
     }
 }
 
+/// The BIP-143 scriptCode for a P2WPKH / P2SH-P2WPKH input: the P2PKH template
+/// `OP_DUP OP_HASH160 <20-byte keyhash> OP_EQUALVERIFY OP_CHECKSIG` (25 bytes, no
+/// length prefix — the sighash's varbuff adds it).
+fn p2pkh_scriptcode(keyhash: &[u8; 20]) -> Vec<u8> {
+    let mut s = Vec::with_capacity(25);
+    s.push(0x76); // OP_DUP
+    s.push(0xa9); // OP_HASH160
+    s.push(0x14); // push 20
+    s.extend_from_slice(keyhash);
+    s.push(0x88); // OP_EQUALVERIFY
+    s.push(0xac); // OP_CHECKSIG
+    s
+}
+
+/// Does `spk` pay to `keyhash` as native P2WPKH (`0014<h160>`) or wrapped
+/// P2SH-P2WPKH (`a914 HASH160(0014<h160>) 87`)?
+fn spk_matches_keyhash(spk: &[u8], keyhash: &[u8; 20]) -> bool {
+    // Native P2WPKH: OP_0 push20 <keyhash>.
+    if spk.len() == 22 && spk[0] == 0x00 && spk[1] == 0x14 && &spk[2..22] == keyhash {
+        return true;
+    }
+    // P2SH-P2WPKH: OP_HASH160 push20 HASH160(redeemscript) OP_EQUAL,
+    // redeemscript = OP_0 push20 <keyhash>.
+    if spk.len() == 23 && spk[0] == 0xa9 && spk[1] == 0x14 && spk[22] == 0x87 {
+        let mut redeem = Vec::with_capacity(22);
+        redeem.push(0x00);
+        redeem.push(0x14);
+        redeem.extend_from_slice(keyhash);
+        return spk[2..22] == kernel::hash160(&redeem);
+    }
+    false
+}
+
+/// One `PSBT_IN_PARTIAL_SIG` key-value record: keylen || 0x02 || pubkey(33) ||
+/// vallen || DER-sig || sighash-byte. keylen (34) and vallen (< 0x4d) are always
+/// single-byte compact sizes.
+fn partial_sig_record(pubkey: &[u8; 33], der: &[u8], sighash: u8) -> Vec<u8> {
+    let mut rec = Vec::with_capacity(1 + 34 + 1 + der.len() + 1);
+    rec.push(34); // keylen = 1 (type) + 33 (pubkey)
+    rec.push(0x02); // PSBT_IN_PARTIAL_SIG
+    rec.extend_from_slice(pubkey);
+    rec.push((der.len() + 1) as u8); // vallen = DER + sighash byte
+    rec.extend_from_slice(der);
+    rec.push(sighash);
+    rec
+}
+
 // ---- M4 request parsers (for the validating policy) ----
 
 /// Parse `hsmd_setup_channel` into a [`ChannelState`]. Layout from
@@ -907,4 +1060,148 @@ fn approve_reply(reply_type: u16) -> Vec<u8> {
 
 fn empty_reply(msgtype: u16) -> Vec<u8> {
     Writer::new(msgtype).into_vec()
+}
+
+#[cfg(test)]
+mod withdrawal_tests {
+    use super::*;
+    use crate::hsm_secret::HsmSecret;
+    use crate::kernel::{Kernel, BIP32_VER_TEST_PRIVATE, BIP32_VER_TEST_PUBLIC};
+
+    fn compact(n: usize) -> Vec<u8> {
+        assert!(n < 0xfd, "test lengths stay single-byte compact");
+        vec![n as u8]
+    }
+
+    /// Build a minimal unsigned Bitcoin tx: 1 input (outpoint `txid:0`), 1 output.
+    fn unsigned_tx(txid: &[u8; 32], out_value: u64) -> Vec<u8> {
+        let mut t = Vec::new();
+        t.extend_from_slice(&2u32.to_le_bytes()); // version
+        t.push(0x01); // vin count
+        t.extend_from_slice(txid);
+        t.extend_from_slice(&0u32.to_le_bytes()); // vout
+        t.push(0x00); // empty scriptSig
+        t.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // sequence
+        t.push(0x01); // vout count
+        t.extend_from_slice(&out_value.to_le_bytes());
+        let out_spk = [0x00u8, 0x14].iter().copied().chain([9u8; 20]).collect::<Vec<u8>>();
+        t.extend_from_slice(&compact(out_spk.len()));
+        t.extend_from_slice(&out_spk);
+        t.extend_from_slice(&0u32.to_le_bytes()); // locktime
+        t
+    }
+
+    /// Assemble a v0 PSBT: magic || global{0x00: tx} || input0{0x01: witness_utxo} || output0{}.
+    fn v0_psbt(tx: &[u8], input_amount: u64, input_spk: &[u8]) -> Vec<u8> {
+        let mut wu = input_amount.to_le_bytes().to_vec(); // TxOut value(8 LE)
+        wu.extend_from_slice(&compact(input_spk.len()));
+        wu.extend_from_slice(input_spk);
+
+        let mut p = Vec::new();
+        p.extend_from_slice(b"psbt\xff");
+        // global map: PSBT_GLOBAL_UNSIGNED_TX
+        p.extend_from_slice(&[0x01, 0x00]); // keylen 1, key 0x00
+        p.extend_from_slice(&compact(tx.len()));
+        p.extend_from_slice(tx);
+        p.push(0x00); // global terminator
+        // input-0 map: PSBT_IN_WITNESS_UTXO
+        p.extend_from_slice(&[0x01, 0x01]); // keylen 1, key 0x01
+        p.extend_from_slice(&compact(wu.len()));
+        p.extend_from_slice(&wu);
+        p.push(0x00); // input-0 terminator
+        // output-0 map: empty
+        p.push(0x00);
+        p
+    }
+
+    /// End-to-end validity self-check: a mnemonic (BIP86) node signs its own
+    /// P2WPKH funding input; the returned PSBT carries a `PSBT_IN_PARTIAL_SIG`
+    /// whose pubkey is the wallet key and whose signature validates against the
+    /// BIP-143 sighash. Proves the funder path produces an on-chain-valid sig.
+    #[test]
+    fn signs_own_p2wpkh_funding_input() {
+        // The Elements env override would force the wrong sighash format; skip.
+        if matches!(
+            std::env::var("SEQLN_SIGNER_NETWORK").ok().as_deref(),
+            Some("elements") | Some("liquid")
+        ) {
+            eprintln!("SKIP: SEQLN_SIGNER_NETWORK forces Elements");
+            return;
+        }
+
+        let seed = crate::kernel::bip39_seed(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            "",
+        );
+        let kernel = Kernel::new(seed.to_vec(), BIP32_VER_TEST_PUBLIC, BIP32_VER_TEST_PRIVATE);
+
+        // The wallet key + P2WPKH scriptPubkey the node would fund into (bip86).
+        let keyindex = 7u32;
+        let pubkey = kernel.bip86_child_pubkey(keyindex);
+        let keyhash = kernel::hash160(&pubkey);
+        let spk: Vec<u8> = [0x00u8, 0x14].iter().copied().chain(keyhash).collect();
+
+        let txid = [0x11u8; 32];
+        let amount = 80_000u64;
+        let tx_bytes = unsigned_tx(&txid, 79_000);
+        let psbt = v0_psbt(&tx_bytes, amount, &spk);
+
+        // Build the SIGN_WITHDRAWAL request (hsmd wire is big-endian).
+        let mut w = Writer::new(msg::HSMD_SIGN_WITHDRAWAL);
+        w.u16(1); // num_inputs
+        w.bytes(&txid);
+        w.u32(0); // vout
+        w.u64(amount);
+        w.u32(keyindex);
+        w.bool(false); // legacy is_p2sh
+        w.u16(spk.len() as u16);
+        w.bytes(&spk);
+        w.bool(false); // is_unilateral_close
+        w.bool(false); // legacy is_in_coinbase
+        w.u32(psbt.len() as u32);
+        w.bytes(&psbt);
+        let req_msg = w.into_vec();
+
+        // Drive the handler with an initialized signer.
+        let secret = HsmSecret { seed, secret_type: 2, mnemonic: String::new() };
+        let mut signer = Signer::new(secret);
+        signer.kernel = Some(kernel);
+        signer.hsm_version = 6;
+
+        let reply = signer.h_sign_withdrawal(&req_msg).expect("withdrawal reply");
+
+        // reply = type(107) || u32(len) || psbt
+        assert_eq!(u16::from_be_bytes([reply[0], reply[1]]), msg::HSMD_SIGN_WITHDRAWAL_REPLY);
+        let rlen = u32::from_be_bytes([reply[2], reply[3], reply[4], reply[5]]) as usize;
+        let rpsbt = &reply[6..6 + rlen];
+
+        // The reply must be the request PSBT plus exactly one partial_sig record.
+        assert!(rpsbt.len() > psbt.len(), "partial_sig not added");
+
+        // Locate the partial_sig: key = 0x22, 0x02, <33 pubkey>; value = DER || 0x01.
+        let mut key = vec![34u8, 0x02];
+        key.extend_from_slice(&pubkey);
+        let pos = rpsbt
+            .windows(key.len())
+            .position(|win| win == key.as_slice())
+            .expect("partial_sig record for our pubkey present");
+        let vp = pos + key.len();
+        let vallen = rpsbt[vp] as usize;
+        let value = &rpsbt[vp + 1..vp + 1 + vallen];
+        let (der, sighash_byte) = value.split_at(value.len() - 1);
+        assert_eq!(sighash_byte, &[SIGHASH_ALL as u8]);
+
+        // Independently recompute the sighash + sig and compare (low-R is
+        // deterministic, so a correct handler reproduces these exact bytes).
+        let tx = wire::parse_bitcoin_tx(&tx_bytes).unwrap();
+        let scriptcode = p2pkh_scriptcode(&keyhash);
+        let hash =
+            kernel::bitcoin_sighash_sw_v0(&tx, 0, &scriptcode, &amount.to_le_bytes(), SIGHASH_ALL);
+        let sk = signer.kernel().bip86_child_privkey(keyindex);
+        let expected = signer
+            .kernel()
+            .sign_low_r_der_checked(&hash, &sk, &pubkey)
+            .expect("sig self-verifies");
+        assert_eq!(der, expected.as_slice(), "signature is over the wrong sighash");
+    }
 }

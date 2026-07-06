@@ -557,6 +557,52 @@ impl Kernel {
         s
     }
 
+    /// `bip86_key()` PRIVATE key for a wallet output at `index`:
+    /// m/86'/0'/0'/0/index. This is the key `hsm_key_for_utxo()` uses for EVERY
+    /// wallet UTXO on a mnemonic (BIP86) node — note the OUTPUT can still be a
+    /// P2WPKH (`newaddr bech32` hashes THIS key with HASH160), so a mnemonic
+    /// node's segwit-v0 wallet inputs are signed with the BIP86 key, not the
+    /// legacy m/0/0/index key.
+    pub fn bip86_child_privkey(&self, index: u32) -> SecretKey {
+        assert!(index < HARDENED, "index too great");
+        self.bip86_base
+            .derive_priv(
+                &self.secp,
+                &[ChildNumber::Normal { index: 0 }, ChildNumber::Normal { index }],
+            )
+            .expect("m/86'/0'/0'/0/index derivation")
+            .private_key
+    }
+
+    /// `bitcoin_key()` PRIVATE key for a legacy (non-mnemonic) wallet output at
+    /// `index`: m/0/0/index. The counterpart of [`Self::bip32_child_pubkey`].
+    pub fn bitcoin_wallet_privkey(&self, index: u32) -> SecretKey {
+        assert!(index < HARDENED, "index too great");
+        self.bip32
+            .derive_priv(&self.secp, &[ChildNumber::Normal { index }])
+            .expect("m/0/0/index derivation")
+            .private_key
+    }
+
+    /// Low-R ECDSA over `hash` with `sk`, self-checked against `pubkey` and
+    /// returned DER-encoded (the `partial_sig` value format BIP-174 expects, sans
+    /// the trailing sighash byte). Returns None if the produced signature does not
+    /// verify against `pubkey` — a belt-and-braces guard that we derived the right
+    /// wallet key before we hand a signature to lightningd to broadcast.
+    pub fn sign_low_r_der_checked(
+        &self,
+        hash: &[u8; 32],
+        sk: &SecretKey,
+        pubkey: &[u8; 33],
+    ) -> Option<Vec<u8>> {
+        let compact = self.sign_hash_low_r(hash, sk);
+        let msg = Message::from_digest(*hash);
+        let sig = ecdsa::Signature::from_compact(&compact).ok()?;
+        let pk = PublicKey::from_slice(pubkey).ok()?;
+        self.secp.verify_ecdsa(&msg, &sig, &pk).ok()?;
+        Some(sig.serialize_der().to_vec())
+    }
+
     /// `sign_hash` (`bitcoin/signature.c`): ECDSA with low-R grinding, matching
     /// libhsmd BYTE-FOR-BYTE. libhsmd calls `secp256k1_ecdsa_sign(.., NULL,
     /// extra_entropy)` where `extra_entropy` starts at 32 zero bytes and the
@@ -849,6 +895,15 @@ pub fn bitcoin_sighash_sw_v0(
 /// `sha256_double` over a byte range (BOLT-7 gossip-message signing hash).
 pub fn double_sha256(data: &[u8]) -> [u8; 32] {
     sha256d(data)
+}
+
+/// `HASH160(x) = RIPEMD160(SHA256(x))`, the 20-byte pubkey/​script hash used by
+/// P2WPKH / P2SH-P2WPKH scriptPubkeys (`pubkey_to_hash160`, `hash160`).
+pub fn hash160(data: &[u8]) -> [u8; 20] {
+    let h = hash160::Hash::hash(data);
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&h[..]);
+    out
 }
 
 /// BOLT-11 `hash_u5` (`common/hash_u5.c`): the SHA256 over `hrp` followed by the
