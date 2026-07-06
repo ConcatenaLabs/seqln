@@ -31,12 +31,14 @@
 use std::error::Error;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::FromRawFd;
 use std::os::unix::net::UnixStream;
 
 use seqln_signer::dispatch::{Outcome, Signer};
-use seqln_signer::noise::{self, Responder, Transport, ACT_ONE_SIZE, ACT_THREE_SIZE};
+use seqln_signer::noise::{
+    self, Initiator, Responder, Transport, ACT_ONE_SIZE, ACT_THREE_SIZE, ACT_TWO_SIZE,
+};
 use seqln_signer::{frame, hsm_secret};
 
 fn main() {
@@ -57,9 +59,16 @@ fn main() {
         return;
     }
 
-    // Transport selection: --listen <addr> / SEQLN_SIGNER_LISTEN => TCP listen
-    // mode; otherwise argv[1] is the pre-connected socket fd (fork mode).
+    // Transport selection:
+    //   --listen <addr>  / SEQLN_SIGNER_LISTEN   => TCP listen (responder).
+    //   --connect <addr> / SEQLN_SIGNER_CONNECT  => TCP connect OUT (initiator),
+    //       the BROWSER role: the hosted proxy is in SEQLN_SIGNER_LISTEN mode and
+    //       we play the Noise_XK initiator, exactly as the browser WASM signer
+    //       does over the WS relay — but native, so it can drive/verify the
+    //       proxy's listen socket directly (incl. its reconnect handling).
+    //   otherwise argv[1] is the pre-connected socket fd (fork mode).
     let mut listen_addr: Option<String> = std::env::var("SEQLN_SIGNER_LISTEN").ok();
+    let mut connect_addr: Option<String> = std::env::var("SEQLN_SIGNER_CONNECT").ok();
     let mut fd_arg: Option<String> = None;
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
@@ -71,6 +80,14 @@ fn main() {
             );
         } else if let Some(v) = a.strip_prefix("--listen=") {
             listen_addr = Some(v.to_string());
+        } else if a == "--connect" {
+            connect_addr = Some(
+                it.next()
+                    .cloned()
+                    .unwrap_or_else(|| fatal("--connect requires a <host:port> argument")),
+            );
+        } else if let Some(v) = a.strip_prefix("--connect=") {
+            connect_addr = Some(v.to_string());
         } else if fd_arg.is_none() {
             fd_arg = Some(a.clone());
         }
@@ -91,9 +108,11 @@ fn main() {
         .open("seqln-signer.log")
         .ok();
 
-    match listen_addr {
-        Some(addr) => serve_listen(&addr, &mut signer, &mut log),
-        None => {
+    match (listen_addr, connect_addr) {
+        (Some(_), Some(_)) => fatal("choose one of --listen or --connect, not both"),
+        (Some(addr), None) => serve_listen(&addr, &mut signer, &mut log),
+        (None, Some(addr)) => serve_connect(&addr, &mut signer, &mut log),
+        (None, None) => {
             // fd mode (fork+socketpair): argv[1] is the connected socket fd.
             let fd_str = fd_arg.unwrap_or_else(|| {
                 fatal(&format!("usage: {} <socket-fd> | --listen <host:port>", args[0]))
@@ -220,6 +239,76 @@ fn responder_handshake<S: Read + Write>(
     let mut act3 = [0u8; ACT_THREE_SIZE];
     inner.read_exact(&mut act3)?;
     let transport = res.read_act_three(&act3)?;
+    Ok(transport)
+}
+
+/// connect mode: dial the hosted proxy's Noise-responder listener and play the
+/// Noise_XK INITIATOR (the browser role, native). SECURE the link, then serve
+/// until it closes. Fail closed: no keys => refuse to run, wrong host key =>
+/// Act Two fails and we abort. Serves one session per process, like listen mode.
+fn serve_connect(addr: &str, signer: &mut Signer, log: &mut Option<File>) {
+    let static_priv = load_static_priv().unwrap_or_else(|e| {
+        fatal(&format!(
+            "connect mode requires the device transport privkey: {e}"
+        ))
+    });
+    let pinned_host = load_pinned_host().unwrap_or_else(|e| {
+        fatal(&format!(
+            "connect mode requires the pinned host static pubkey (SEQLN_HOST_PEER_PUBKEY): {e}"
+        ))
+    });
+    let my_static = noise::static_pubkey(&static_priv)
+        .unwrap_or_else(|_| fatal("SEQLN_SIGNER_PRIVKEY is not a valid secp256k1 key"));
+
+    let mut tcp = TcpStream::connect(addr)
+        .unwrap_or_else(|e| fatal(&format!("could not connect {addr}: {e}")));
+    let _ = tcp.set_nodelay(true);
+    eprintln!(
+        "seqln-signer: connecting {addr} (Noise_XK initiator); my pubkey {}",
+        hex(&my_static)
+    );
+
+    let transport = match initiator_handshake(&mut tcp, &static_priv, pinned_host) {
+        Ok(t) => t,
+        Err(e) => fatal(&format!("Noise_XK initiator handshake to {addr} failed: {e}")),
+    };
+    logline(
+        log,
+        &format!(
+            "seqln-signer: hosted proxy {addr} AUTHENTICATED (Noise_XK initiator); serving, pid {}",
+            std::process::id()
+        ),
+    );
+    eprintln!("seqln-signer: proxy {addr} authenticated; serving");
+    let mut secure = NoiseStream::new(tcp, transport);
+    serve(&mut secure, signer, log);
+    logline(log, "seqln-signer: session closed; exiting");
+}
+
+/// Drive the Noise_XK initiator over a raw stream. Returns the ready transport
+/// or an error (in which case no frames may be served). The responder is
+/// authenticated intrinsically: Act Two only decrypts if the proxy holds the
+/// private key for `pinned_host`.
+fn initiator_handshake<S: Read + Write>(
+    inner: &mut S,
+    static_priv: &[u8; 32],
+    pinned_host: [u8; 33],
+) -> Result<Transport, Box<dyn Error>> {
+    let mut init = loop {
+        let eph = rand32();
+        match Initiator::new(static_priv, &eph, pinned_host) {
+            Ok(i) => break i,
+            Err(_) => continue,
+        }
+    };
+    let act1 = init.write_act_one();
+    inner.write_all(&act1)?;
+    inner.flush()?;
+    let mut act2 = [0u8; ACT_TWO_SIZE];
+    inner.read_exact(&mut act2)?;
+    let (act3, transport) = init.read_act_two_write_act_three(&act2)?;
+    inner.write_all(&act3)?;
+    inner.flush()?;
     Ok(transport)
 }
 
