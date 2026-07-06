@@ -647,6 +647,20 @@ pub fn psbt_input_value_sats_le(psbt: &[u8], input_index: usize) -> Option<[u8; 
     Some(out)
 }
 
+/// Decode a Bitcoin input's `PSBT_IN_WITNESS_UTXO` into `(amount_sat,
+/// scriptPubkey)`. The value is a plain `TxOut` (`value(8 LE) || varbuff(script)`).
+/// Needed to build the taproot BIP-341 sighash, which commits to the amount and
+/// scriptPubkey of EVERY input (sha_amounts / sha_scriptpubkeys). Returns None if
+/// there is no witness_utxo or it is malformed.
+pub fn psbt_input_btc_prevout(psbt: &[u8], input_index: usize) -> Option<(u64, Vec<u8>)> {
+    let val = psbt_witness_utxo_raw(psbt, input_index)?;
+    let sats = u64::from_le_bytes(val.get(0..8)?.try_into().ok()?);
+    let mut p = 8usize;
+    let slen = read_compact(val, &mut p)? as usize;
+    let script = val.get(p..p + slen)?.to_vec();
+    Some((sats, script))
+}
+
 /// Return the raw `PSBT_IN_WITNESS_UTXO` (key `0x01`) value bytes for
 /// `input_index`, WITHOUT decoding — used by the Bitcoin amount decode and by
 /// [`detect_network`]. Mirrors the map navigation in [`psbt_input_value9`].
