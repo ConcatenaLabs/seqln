@@ -41,6 +41,19 @@ struct signer_noise {
 	size_t roff; /* bytes already consumed from rbuf */
 };
 
+/*~ The secure channel OWNS its socket: freeing it closes the fd.  This is what
+ * lets the LISTEN-mode proxy tear down a dropped device connection cleanly
+ * (`tal_free(signer_noise)`) instead of leaking it in CLOSE-WAIT, then loop
+ * back to accept() a fresh device.  Callers must therefore NOT close the fd
+ * themselves, even on handshake failure (we still own it and close it here). */
+static void destroy_signer_noise(struct signer_noise *n)
+{
+	if (n->fd >= 0) {
+		close(n->fd);
+		n->fd = -1;
+	}
+}
+
 /* h = SHA-256(h || data) */
 static void sha_mix_in(struct sha256 *h, const void *data, size_t len)
 {
@@ -215,6 +228,7 @@ struct signer_noise *signer_noise_connect(const tal_t *ctx, int fd,
 	n->fd = fd;
 	n->rbuf = NULL;
 	n->roff = 0;
+	tal_add_destructor(n, destroy_signer_noise);
 
 	if (!initiator_handshake(fd, my_privkey, their_pinned_pub, &n->cs))
 		return tal_free(n);
@@ -337,6 +351,7 @@ struct signer_noise *signer_noise_accept(const tal_t *ctx, int fd,
 	n->fd = fd;
 	n->rbuf = NULL;
 	n->roff = 0;
+	tal_add_destructor(n, destroy_signer_noise);
 
 	if (!responder_handshake(fd, my_privkey, their_pinned_pub, &n->cs))
 		return tal_free(n);
