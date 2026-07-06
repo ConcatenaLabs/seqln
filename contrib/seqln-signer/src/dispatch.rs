@@ -437,9 +437,15 @@ impl Signer {
     // real captured requests are always well-formed and produce a reply).
     // =================================================================
 
-    /// The shared final step: BIP-143 Elements sighash over `scriptcode` with
-    /// the input `sign_index` amount (from the PSBT), low-R sign, and frame the
-    /// `bitcoin_signature` reply (compact 64 || sighash byte).
+    /// The shared final step: the BIP-143 segwit-v0 sighash over `scriptcode`
+    /// with the input `sign_index` amount (from the PSBT witness_utxo), low-R
+    /// sign, and frame the `bitcoin_signature` reply (compact 64 || sighash byte).
+    ///
+    /// The sighash preimage format is chosen from the tx's network (mirroring the
+    /// C `is_elements(chainparams)` branch in `bitcoin_tx_hash_for_sig`): Elements
+    /// uses the 9-byte confidential value + `elements_sighash_sw_v0`; Bitcoin uses
+    /// the plain 8-byte LE value + `bitcoin_sighash_sw_v0`. The ECDSA low-R
+    /// signing below is byte-identical either way — only the hashed bytes differ.
     fn sig_reply(
         &self,
         bt: &BitcoinTx,
@@ -449,9 +455,16 @@ impl Signer {
         sighash: u32,
         reply_type: u16,
     ) -> Option<Vec<u8>> {
-        let value9 = wire::psbt_input_value9(&bt.psbt, sign_index)?;
-        let hash =
-            kernel::elements_sighash_sw_v0(&bt.tx, sign_index, scriptcode, &value9, sighash);
+        let hash = match bt.tx.network {
+            kernel::Network::Elements => {
+                let value9 = wire::psbt_input_value9(&bt.psbt, sign_index)?;
+                kernel::elements_sighash_sw_v0(&bt.tx, sign_index, scriptcode, &value9, sighash)
+            }
+            kernel::Network::Bitcoin => {
+                let value8 = wire::psbt_input_value_sats_le(&bt.psbt, sign_index)?;
+                kernel::bitcoin_sighash_sw_v0(&bt.tx, sign_index, scriptcode, &value8, sighash)
+            }
+        };
         let compact = self.kernel().sign_hash_low_r(&hash, privkey);
         let mut w = Writer::new(reply_type);
         w.bytes(&compact);

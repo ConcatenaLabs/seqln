@@ -43,7 +43,7 @@
 //! onchain sweep signs (`sign_*_to_us`, penalties — these pay to keys we own),
 //! rate-limiting, and per-state velocity checks.
 
-use crate::kernel::{ElementsTx, Kernel};
+use crate::kernel::{ElementsTx, Kernel, Network, TxOutput};
 use bitcoin::hashes::{hash160, ripemd160, sha256, Hash};
 
 /// Signing policy. DEFAULT is `Permissive` (= the pre-M4 sign-on-request
@@ -372,6 +372,21 @@ fn explicit_value(value: &[u8]) -> Option<u64> {
     }
 }
 
+/// Decode an output's explicit satoshi value for either network: Elements uses
+/// the 9-byte confidential value above; Bitcoin the plain 8-byte LE satoshi
+/// stored verbatim in `o.value`. Keeps the value-conservation check correct for
+/// a Bitcoin commitment when the validating policy is enabled (enforce mode);
+/// the Elements decode is unchanged.
+fn output_value(o: &TxOutput, network: Network) -> Option<u64> {
+    match network {
+        Network::Elements => explicit_value(&o.value),
+        Network::Bitcoin => {
+            let b: [u8; 8] = o.value.as_slice().try_into().ok()?;
+            Some(u64::from_le_bytes(b))
+        }
+    }
+}
+
 /// The reconstructed commitment keyset (public keys only — a validating signer
 /// needs no secrets to know what the outputs MUST look like).
 struct Keyset {
@@ -550,7 +565,7 @@ pub fn validate_commitment(
     // Every output pays to an expected script; total value is conserved.
     let mut total: u128 = 0;
     for (i, o) in tx.outputs.iter().enumerate() {
-        let v = explicit_value(&o.value)
+        let v = output_value(o, tx.network)
             .ok_or_else(|| format!("output {i} has a non-explicit (blinded) value"))?;
         total += v as u128;
         if o.script.is_empty() {
@@ -608,7 +623,7 @@ pub fn validate_local_commitment_no_htlcs(
     }
     let mut total: u128 = 0;
     for (i, o) in tx.outputs.iter().enumerate() {
-        let v = explicit_value(&o.value)
+        let v = output_value(o, tx.network)
             .ok_or_else(|| format!("output {i} has a non-explicit value"))?;
         total += v as u128;
         if o.script.is_empty() {

@@ -319,7 +319,7 @@ fn read_u64(r: &mut Reader) -> Option<u64> {
 // sighash, and pull the input amount from the PSBT's witness_utxo.
 // =====================================================================
 
-use crate::kernel::{ElementsTx, TxInput, TxOutput};
+use crate::kernel::{ElementsTx, Network, TxInput, TxOutput};
 
 /// `WALLY_TX_ISSUANCE_FLAG` / `WALLY_TX_PEGIN_FLAG` set in an input's index.
 const WALLY_TX_ISSUANCE_FLAG: u32 = 0x8000_0000;
@@ -433,17 +433,184 @@ pub fn parse_elements_tx(d: &[u8]) -> Option<ElementsTx> {
         inputs,
         outputs,
         locktime,
+        network: Network::Elements,
+    })
+}
+
+/// Parse a linearized Bitcoin (non-Elements) transaction far enough for the
+/// BIP-143 sighash. Mirrors `tx_from_bytes` (`external/libwally-core`) for the
+/// `is_elements == false` path.
+///
+/// Bitcoin serialization (from `wally_tx_to_bytes`, non-Elements):
+/// `version(4 LE) || [marker(0x00) flag(0x01) IF witnessed] || nin || inputs ||
+/// nout || outputs || [witnesses IF witnessed] || locktime(4 LE)`. Note the
+/// witness marker/flag are TWO bytes (vs Elements' single flag byte) and, when
+/// present, the witness stacks sit BETWEEN the outputs and the locktime (Elements
+/// puts them after the locktime). CLN's `linearize_wtx` only emits the flag when
+/// `uses_witness(wtx)`, so the unsigned commitment/HTLC txs handed to the signer
+/// have none; we still detect + skip witnesses so a witnessed tx locates its
+/// locktime correctly. Inputs: `txhash(32) || index(4 LE) || scriptSig(varbuff)
+/// || sequence(4 LE)` (no issuance/pegin on Bitcoin). Outputs:
+/// `value(8 LE) || script(varbuff)`.
+pub fn parse_bitcoin_tx(d: &[u8]) -> Option<ElementsTx> {
+    let version = u32::from_le_bytes(d.get(0..4)?.try_into().ok()?);
+    let mut p = 4usize;
+    // BIP-144 marker/flag: only present when the tx carries witnesses. A real tx
+    // has >=1 input, so a 0x00 here can only be the marker (never a 0-input count).
+    let witnessed = *d.get(p)? == 0x00;
+    if witnessed {
+        // marker(0x00) already peeked; require flag(0x01) after it.
+        if *d.get(p + 1)? != 0x01 {
+            return None;
+        }
+        p += 2;
+    }
+
+    let nin = read_compact(d, &mut p)? as usize;
+    let mut inputs = Vec::with_capacity(nin);
+    for _ in 0..nin {
+        let txhash: [u8; 32] = d.get(p..p + 32)?.try_into().ok()?;
+        p += 32;
+        let index = u32::from_le_bytes(d.get(p..p + 4)?.try_into().ok()?);
+        p += 4;
+        let slen = read_compact(d, &mut p)? as usize; // scriptSig
+        p += slen;
+        let sequence = u32::from_le_bytes(d.get(p..p + 4)?.try_into().ok()?);
+        p += 4;
+        inputs.push(TxInput {
+            txhash,
+            index,
+            sequence,
+            is_issuance: false,
+        });
+    }
+
+    let nout = read_compact(d, &mut p)? as usize;
+    let mut outputs = Vec::with_capacity(nout);
+    for _ in 0..nout {
+        let value = d.get(p..p + 8)?.to_vec(); // 8-byte LE satoshi, verbatim
+        p += 8;
+        let slen = read_compact(d, &mut p)? as usize;
+        let script = d.get(p..p + slen)?.to_vec();
+        p += slen;
+        outputs.push(TxOutput {
+            asset: Vec::new(),
+            value,
+            nonce: Vec::new(),
+            script,
+        });
+    }
+
+    // Skip the witness stacks (present only when `witnessed`), which sit before
+    // the locktime, so we land on the locktime. Each input: num_items(varint)
+    // then that many varbuff items.
+    if witnessed {
+        for _ in 0..nin {
+            let items = read_compact(d, &mut p)? as usize;
+            for _ in 0..items {
+                let wlen = read_compact(d, &mut p)? as usize;
+                p += wlen;
+            }
+        }
+    }
+
+    let locktime = u32::from_le_bytes(d.get(p..p + 4)?.try_into().ok()?);
+    Some(ElementsTx {
+        version,
+        inputs,
+        outputs,
+        locktime,
+        network: Network::Bitcoin,
     })
 }
 
 /// Read a `bitcoin_tx` wire object from the reader (`fromwire_bitcoin_tx`).
+///
+/// The linearized tx comes first, then the PSBT. We read both raw, decide the
+/// network (see [`detect_network`]) — which needs the PSBT's witness_utxo shape —
+/// and only THEN parse the linearized tx with the right codec, since the two
+/// serializations diverge (Elements' flag byte + confidential outputs vs
+/// Bitcoin's plain 8-byte-value outputs).
 pub fn read_bitcoin_tx(r: &mut Reader) -> Option<BitcoinTx> {
     let len = r.u32()? as usize; // big-endian tx byte length
     let lin = r.take_slice(len)?;
-    let tx = parse_elements_tx(lin)?;
     let plen = r.u32()? as usize; // big-endian psbt byte length
     let psbt = r.take_bytes(plen)?;
+    let network = detect_network(&psbt);
+    let tx = match network {
+        Network::Bitcoin => parse_bitcoin_tx(lin)?,
+        Network::Elements => parse_elements_tx(lin)?,
+    };
     Some(BitcoinTx { tx, psbt })
+}
+
+/// Decide whether a `bitcoin_tx` wire object is a Bitcoin or an Elements tx.
+///
+/// FORMAT SELECTION (documented mechanism). One `seqln-signer` process serves
+/// one hosted node, but the SAME binary serves both an Elements asset node and a
+/// Bitcoin BTC node (different instances/ports), so the network must be resolved
+/// per request without changing the Elements path. Resolution order:
+///
+///   1. `SEQLN_SIGNER_NETWORK` env (`bitcoin`/`btc` or `elements`/`liquid`) — an
+///      explicit, per-instance override. This is what the box's BTC device
+///      signer sets (`=bitcoin`); the asset signer leaves it unset. Authoritative
+///      when present, so a deployment never depends on the sniff below.
+///   2. Structural sniff of the input-0 witness_utxo: an Elements output starts
+///      with a 33-byte asset commitment (first byte 0x01/0x0a/0x0b) and consumes
+///      the whole value buffer as `asset||value||nonce||varbuff(script)`; a
+///      Bitcoin TxOut consumes it as `value(8 LE)||varbuff(script)`. If exactly
+///      one interpretation consumes the buffer, that wins.
+///   3. Default `Elements` — byte-identical to the pre-Bitcoin behaviour, so an
+///      unrecognised/absent witness_utxo never disturbs the Elements path.
+pub fn detect_network(psbt: &[u8]) -> Network {
+    if let Ok(v) = std::env::var("SEQLN_SIGNER_NETWORK") {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "bitcoin" | "btc" => return Network::Bitcoin,
+            "elements" | "liquid" => return Network::Elements,
+            _ => {}
+        }
+    }
+    if let Some(val) = psbt_witness_utxo_raw(psbt, 0) {
+        let btc = witness_utxo_is_bitcoin(val);
+        let ele = witness_utxo_is_elements(val);
+        match (btc, ele) {
+            (true, false) => return Network::Bitcoin,
+            (false, true) => return Network::Elements,
+            _ => {} // ambiguous or unrecognised -> fall through to the default
+        }
+    }
+    Network::Elements
+}
+
+/// Does `val` parse EXACTLY as a Bitcoin TxOut (`value(8 LE) || varbuff(script)`)?
+fn witness_utxo_is_bitcoin(val: &[u8]) -> bool {
+    if val.len() < 9 {
+        return false;
+    }
+    let mut p = 8usize;
+    let Some(slen) = read_compact(val, &mut p) else {
+        return false;
+    };
+    p + (slen as usize) == val.len()
+}
+
+/// Does `val` parse EXACTLY as an Elements output
+/// (`asset(commit) || value(commit) || nonce(commit) || varbuff(script)`)?
+fn witness_utxo_is_elements(val: &[u8]) -> bool {
+    let mut p = 0usize;
+    if commit_field(val, &mut p, false).is_none() {
+        return false;
+    }
+    if commit_field(val, &mut p, true).is_none() {
+        return false;
+    }
+    if commit_field(val, &mut p, false).is_none() {
+        return false;
+    }
+    let Some(slen) = read_compact(val, &mut p) else {
+        return false;
+    };
+    p + (slen as usize) == val.len()
 }
 
 /// Extract the 9-byte confidential value (`0x01 || uint64_be`) of the
@@ -463,6 +630,58 @@ pub fn psbt_input_value9(psbt: &[u8], input_index: usize) -> Option<[u8; 9]> {
         skip_psbt_map(psbt, &mut p)?;
     }
     None
+}
+
+/// Extract the input `input_index` Bitcoin witness_utxo amount as a raw 8-byte
+/// little-endian value (the input to [`crate::kernel::bitcoin_sighash_sw_v0`]).
+/// The witness_utxo value for a Bitcoin channel is a plain `TxOut`
+/// (`value(8 LE) || varbuff(script)`), so the amount is its first 8 bytes,
+/// re-emitted verbatim (`hash_le64`). Returns None if there is no witness_utxo.
+pub fn psbt_input_value_sats_le(psbt: &[u8], input_index: usize) -> Option<[u8; 8]> {
+    let val = psbt_witness_utxo_raw(psbt, input_index)?;
+    let bytes = val.get(0..8)?;
+    let mut out = [0u8; 8];
+    out.copy_from_slice(bytes);
+    Some(out)
+}
+
+/// Return the raw `PSBT_IN_WITNESS_UTXO` (key `0x01`) value bytes for
+/// `input_index`, WITHOUT decoding — used by the Bitcoin amount decode and by
+/// [`detect_network`]. Mirrors the map navigation in [`psbt_input_value9`].
+fn psbt_witness_utxo_raw(psbt: &[u8], input_index: usize) -> Option<&[u8]> {
+    if psbt.len() < 5 {
+        return None;
+    }
+    let mut p = 5usize; // skip magic "psbt\xff" / "pset\xff"
+    skip_psbt_map(psbt, &mut p)?; // global map
+    for i in 0..=input_index {
+        if i == input_index {
+            return find_witness_utxo_raw(psbt, &mut p);
+        }
+        skip_psbt_map(psbt, &mut p)?;
+    }
+    None
+}
+
+/// Within one input map, return the raw value bytes of `PSBT_IN_WITNESS_UTXO`
+/// (key `0x01`), or None if absent.
+fn find_witness_utxo_raw<'a>(d: &'a [u8], p: &mut usize) -> Option<&'a [u8]> {
+    let mut result = None;
+    loop {
+        let keylen = read_compact(d, p)? as usize;
+        if keylen == 0 {
+            break;
+        }
+        let key = d.get(*p..*p + keylen)?;
+        *p += keylen;
+        let vallen = read_compact(d, p)? as usize;
+        let val = d.get(*p..*p + vallen)?;
+        *p += vallen;
+        if keylen == 1 && key[0] == 0x01 {
+            result = Some(val);
+        }
+    }
+    result
 }
 
 /// Skip one PSBT key-value map (terminated by a zero-length key).
@@ -506,4 +725,134 @@ fn find_witness_utxo_value(d: &[u8], p: &mut usize) -> Option<[u8; 9]> {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Build a minimal single-input PSBT whose input-0 witness_utxo (key 0x01)
+    /// holds `wu`, enough for the navigation in `psbt_witness_utxo_raw`:
+    /// magic(5) || empty global map (0x00) || input-0 map { 0x01: wu } || 0x00.
+    fn psbt_with_wu(wu: &[u8]) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(b"psbt\xff");
+        p.push(0x00); // global map terminator (empty)
+        p.push(0x01); // keylen
+        p.push(0x01); // key = PSBT_IN_WITNESS_UTXO
+        assert!(wu.len() < 0xfd);
+        p.push(wu.len() as u8); // vallen (compact, small)
+        p.extend_from_slice(wu);
+        p.push(0x00); // input-0 map terminator
+        p
+    }
+
+    /// A Bitcoin TxOut witness_utxo: value(8 LE) || varbuff(P2WSH script).
+    fn btc_wu(sats: u64) -> Vec<u8> {
+        let mut v = sats.to_le_bytes().to_vec();
+        let script = unhex("00200101010101010101010101010101010101010101010101010101010101010101");
+        v.push(script.len() as u8); // 0x22
+        v.extend_from_slice(&script);
+        v
+    }
+
+    /// An Elements output witness_utxo: asset(0x01||32) || value(0x01||u64_be) ||
+    /// nonce(0x00) || varbuff(P2WSH script).
+    fn elements_wu(sats: u64) -> Vec<u8> {
+        let mut v = vec![0x01u8];
+        v.extend_from_slice(&[0u8; 32]); // asset id
+        v.push(0x01);
+        v.extend_from_slice(&sats.to_be_bytes()); // value (0x01 || u64_be)
+        v.push(0x00); // null nonce
+        let script = unhex("00200101010101010101010101010101010101010101010101010101010101010101");
+        v.push(script.len() as u8);
+        v.extend_from_slice(&script);
+        v
+    }
+
+    #[test]
+    fn sniff_bitcoin_witness_utxo() {
+        let wu = btc_wu(60_000);
+        assert!(witness_utxo_is_bitcoin(&wu));
+        assert!(!witness_utxo_is_elements(&wu));
+        let psbt = psbt_with_wu(&wu);
+        assert_eq!(psbt_input_value_sats_le(&psbt, 0), Some(60_000u64.to_le_bytes()));
+    }
+
+    #[test]
+    fn sniff_elements_witness_utxo() {
+        let wu = elements_wu(60_000);
+        assert!(witness_utxo_is_elements(&wu));
+        assert!(!witness_utxo_is_bitcoin(&wu));
+        let psbt = psbt_with_wu(&wu);
+        // The Elements 9-byte decode still works and holds the same amount.
+        let v9 = psbt_input_value9(&psbt, 0).unwrap();
+        assert_eq!(v9[0], 0x01);
+        assert_eq!(u64::from_be_bytes(v9[1..9].try_into().unwrap()), 60_000);
+    }
+
+    /// The REAL `WIRE_HSMD_SIGN_REMOTE_COMMITMENT_TX` that the box's BTC hosted
+    /// node sent (and the old, Elements-only signer rejected with "Bad
+    /// sign_tx_reply"): a testnet4 anchor commitment, funding 60000 sat. Confirms
+    /// the wire object decodes as Bitcoin end-to-end (tx + PSBT witness_utxo) with
+    /// the right amount, so the sighash path is fed correct bytes. Public testnet
+    /// tx data — no secret. hsmd_msg = type(0013) || u32(txlen) || tx || u32(psbtlen) || psbt.
+    #[test]
+    fn real_btc_sign_remote_commitment_request() {
+        let msg = unhex(
+            "0013000000890200000001b48df211ed41d16672b6f7eb863dc8f5b741abbfa9a8b826f3d22b5d88f26857\
+             0000000000d662d180024a01000000000000220020d0dcdb317af356f0a66f1575887639d1b9e4406ffa63\
+             d963468b284767462fa768e30000000000002200208aab7752ea60afd4060572793021d496f8ccab2a3d32\
+             9e27e945b4342716255f1ceef720000001b870736274ff0100890200000001b48df211ed41d16672b6f7eb\
+             863dc8f5b741abbfa9a8b826f3d22b5d88f268570000000000d662d180024a010000000000002200 20d0dc\
+             db317af356f0a66f1575887639d1b9e4406ffa63d963468b284767462fa768e300000000000022002 08aab\
+             7752ea60afd4060572793021d496f8ccab2a3d329e27e945b4342716255f1ceef7200001012b60ea0000000\
+             000002200204e0cd2d0be1d96450ac86deca0cec865d64af25c378e40a9b97dea712de0b54e01054752210\
+             34a8f59e0d673e1c655442244a80e5eafe7cde78397095c53c722e815232961a92103c5e01a4141bc87b5a1\
+             5e2852f4c6235deb5fab673fe2f7eb13c1e07104416fb252ae2206034a8f59e0d673e1c655442244a80e5ea\
+             fe7cde78397095c53c722e815232961a90800aedc6100000000220603c5e01a4141bc87b5a15e2852f4c623\
+             5deb5fab673fe2f7eb13c1e07104416fb2088fee292800000000000101282103c5e01a4141bc87b5a15e285\
+             2f4c6235deb5fab673fe2f7eb13c1e07104416fb2ac736460b268000101252103e0e01f17a1c26ac15fc5fd\
+             0e17e6601a694aea98f13952a08b6ca21491cefadfad51b200034a8f59e0d673e1c655442244a80e5eafe7c\
+             de78397095c53c722e815232961a9032bfe69d9b28c8c9e9f93538c76da23999b96c7f2f4ff8939c449832d\
+             40ad3ef3010000000000000000000000000000"
+                .replace(' ', "")
+                .as_str(),
+        );
+        let mut r = Reader::new(&msg);
+        assert_eq!(r.u16().unwrap(), msg::HSMD_SIGN_REMOTE_COMMITMENT_TX);
+        let bt = read_bitcoin_tx(&mut r).expect("decode bitcoin_tx");
+        assert_eq!(bt.tx.network, Network::Bitcoin);
+        assert_eq!(bt.tx.version, 2);
+        assert_eq!(bt.tx.inputs.len(), 1);
+        assert_eq!(bt.tx.outputs.len(), 2);
+        // Anchor (330 sat) + to_local (58216 sat).
+        assert_eq!(u64::from_le_bytes(bt.tx.outputs[0].value[..].try_into().unwrap()), 330);
+        assert_eq!(u64::from_le_bytes(bt.tx.outputs[1].value[..].try_into().unwrap()), 58216);
+        // The funding witness_utxo amount decodes to 60000 sat.
+        let v8 = psbt_input_value_sats_le(&bt.psbt, 0).expect("witness_utxo amount");
+        assert_eq!(u64::from_le_bytes(v8), 60_000);
+        // And the remote_funding pubkey trails the wire object (33 bytes).
+        assert!(r.arr33().is_some());
+    }
+
+    #[test]
+    fn detect_network_env_and_sniff() {
+        // With no env set, the sniff decides per witness_utxo shape.
+        // (Guard: only assert the env-free path if the box hasn't exported it.)
+        if std::env::var("SEQLN_SIGNER_NETWORK").is_err() {
+            assert_eq!(detect_network(&psbt_with_wu(&btc_wu(50_000))), Network::Bitcoin);
+            assert_eq!(detect_network(&psbt_with_wu(&elements_wu(50_000))), Network::Elements);
+            // An unrecognised / absent witness_utxo defaults to Elements (the
+            // pre-Bitcoin behaviour), never disturbing the Elements path.
+            assert_eq!(detect_network(b"psbt\xff\x00\x00"), Network::Elements);
+        }
+    }
 }
