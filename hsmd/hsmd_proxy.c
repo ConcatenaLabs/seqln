@@ -64,8 +64,48 @@ static int signer_fd = -1;
 /*~ Set (non-NULL) ONLY in the remote/network mode: the BOLT-8 Noise_XK secured
  * channel to the device signer.  When set, requests are tunneled through it
  * (encrypted + mutually authenticated) instead of over the raw `signer_fd`.
- * NULL in the default local fork+socketpair mode (trusted local UNIX socket). */
+ * NULL in the default local fork+socketpair mode (trusted local UNIX socket).
+ * In LISTEN mode it may transiently be NULL while a dropped device reconnects. */
 static struct signer_noise *signer_noise;
+
+/*~ LISTEN mode (BROWSER topology) is RECONNECTABLE: a browser device can close
+ * (tab close/reopen, network blip) and come back, so we keep the listen socket
+ * open for the proxy's lifetime and re-accept + re-authenticate a fresh device
+ * whenever the current one drops.  These hold what we need to do that without
+ * re-reading the environment.  `signer_listen_mode` is false in ADDR/connect
+ * mode and local-fork mode, whose behaviour is unchanged. */
+static bool signer_listen_mode;
+static int signer_listen_fd = -1;
+static struct secret signer_listen_priv;   /* our transport static privkey */
+static struct pubkey signer_listen_pinned; /* the pinned device static pubkey */
+
+/*~ Session priming (LISTEN mode).  The device derives every key from its
+ * hsm_secret per-request, BUT two pieces of in-memory state are set up by
+ * earlier requests that lightningd sends only ONCE (at boot), never again:
+ *
+ *   - WIRE_HSMD_INIT builds the device's signing kernel (node key + the
+ *     network-specific BIP32 versions).  Without it EVERY later request is
+ *     refused by the device ("not initialized").
+ *   - WIRE_HSMD_SETUP_CHANNEL records a channel's parameters; without it an
+ *     enforce-policy device refuses that channel's commitment signatures.
+ *
+ * So a freshly-reconnected device is NOT ready to serve until we replay these.
+ * We cache the INIT (with its reply, for an identity guard) plus the latest
+ * SETUP_CHANNEL per channel dbid, and replay them right after every fresh
+ * device handshake, discarding the (deterministic) replies.  This is why the
+ * reconnect resumes serving ALL of lightningd's multiplexed clients, not just
+ * the one whose request was in flight. */
+struct primed_req {
+	bool is_main;
+	struct node_id id;
+	u64 dbid;
+	u64 capabilities;
+	const u8 *msg; /* raw hsmd wire message, tal child of this struct */
+};
+static const tal_t *prime_ctx;
+static struct primed_req *primed_init;
+static u8 *primed_init_reply;
+static UINTMAP(struct primed_req *) primed_setup; /* dbid -> setup_channel */
 
 /*~ We keep track of clients, but there's not much to keep. */
 struct client {
@@ -478,7 +518,7 @@ static void connect_remote_signer(const char *addr)
 	signer_noise = signer_noise_connect(NULL, fd, &my_priv.secret,
 					    &pinned_signer);
 	if (!signer_noise) {
-		close(fd);
+		/* The noise channel owns `fd` and closed it already. */
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "remote signer %s:%s: Noise_XK handshake FAILED"
 			      " (device did not present the pinned key, or"
@@ -493,12 +533,177 @@ static void connect_remote_signer(const char *addr)
 		       fmt_pubkey(tmpctx, &pinned_signer));
 }
 
+/*~ Remember a state-establishing request so a reconnecting device can be
+ * re-primed with it.  We tal-dup the raw message off `prime_ctx` (long-lived);
+ * `msg_in` itself is the client's transient buffer and must not be retained. */
+static struct primed_req *new_primed_req(const tal_t *ctx, bool is_main,
+					 const struct node_id *id, u64 dbid,
+					 u64 capabilities, const u8 *msg_in)
+{
+	struct primed_req *p = tal(ctx, struct primed_req);
+	p->is_main = is_main;
+	p->id = *id;
+	p->dbid = dbid;
+	p->capabilities = capabilities;
+	p->msg = tal_dup_talarr(p, u8, msg_in);
+	return p;
+}
+
+/*~ Called on the way through forward_to_signer (LISTEN mode only), after a
+ * request was ACCEPTED by the device, to cache the ones a reconnecting device
+ * would need replayed: the (single) INIT and the latest SETUP_CHANNEL per
+ * channel; FORGET_CHANNEL drops a channel's cache. */
+static void remember_priming(bool is_main, const struct node_id *id, u64 dbid,
+			     u64 capabilities, enum hsmd_wire reqt,
+			     const u8 *msg_in, const u8 *reply)
+{
+	struct primed_req *old;
+
+	switch (reqt) {
+	case WIRE_HSMD_INIT:
+		tal_free(primed_init);
+		tal_free(primed_init_reply);
+		primed_init = new_primed_req(prime_ctx, is_main, id, dbid,
+					     capabilities, msg_in);
+		primed_init_reply = tal_dup_talarr(prime_ctx, u8, reply);
+		break;
+	case WIRE_HSMD_SETUP_CHANNEL:
+		old = uintmap_get(&primed_setup, dbid);
+		if (old) {
+			uintmap_del(&primed_setup, dbid);
+			tal_free(old);
+		}
+		uintmap_add(&primed_setup, dbid,
+			    new_primed_req(prime_ctx, is_main, id, dbid,
+					   capabilities, msg_in));
+		break;
+	case WIRE_HSMD_FORGET_CHANNEL:
+		old = uintmap_get(&primed_setup, dbid);
+		if (old) {
+			uintmap_del(&primed_setup, dbid);
+			tal_free(old);
+		}
+		break;
+	default:
+		break;
+	}
+}
+
+/*~ Replay one cached priming request to the (freshly reconnected) device and
+ * discard the reply.  Returns false if the device dropped again mid-replay (so
+ * the caller re-accepts), or — for INIT — if the reply DIFFERS from the one the
+ * original device gave: that means a different node secret behind the pinned
+ * transport key, which we refuse (fail-closed identity guard). */
+static bool replay_priming(const struct primed_req *p, const u8 *expect_reply)
+{
+	u8 *reply;
+
+	if (!signer_noise_write_request(signer_noise, p->is_main, &p->id,
+					p->dbid, p->capabilities, p->msg))
+		return false;
+	reply = signer_noise_read_reply(tmpctx, signer_noise);
+	if (!reply)
+		return false;
+
+	if (expect_reply
+	    && (tal_bytelen(reply) != tal_bytelen(expect_reply)
+		|| memcmp(reply, expect_reply, tal_bytelen(reply)) != 0)) {
+		status_broken("hsmd-proxy: reconnected device INIT reply MISMATCH"
+			      " — a different node identity behind the pinned"
+			      " transport key; refusing this device");
+		return false;
+	}
+	return true;
+}
+
+/*~ Re-establish the device's in-memory session state after a fresh handshake:
+ * replay INIT, then every live channel's SETUP_CHANNEL.  Returns false if the
+ * device dropped (or failed the INIT identity guard) so the caller re-accepts;
+ * true once the device is ready to serve live requests again. */
+static bool prime_device(void)
+{
+	struct primed_req *p;
+	u64 dbid;
+
+	/* Device dropped before it was ever INIT'd: nothing to replay; the live
+	 * request that follows (the INIT itself) will prime it. */
+	if (!primed_init)
+		return true;
+
+	if (!replay_priming(primed_init, primed_init_reply))
+		return false;
+
+	for (p = uintmap_first(&primed_setup, &dbid); p;
+	     p = uintmap_after(&primed_setup, &dbid)) {
+		if (!replay_priming(p, NULL))
+			return false;
+	}
+
+	status_unusual("hsmd-proxy: reconnected device re-primed (INIT +"
+		       " tracked channels); resuming service");
+	return true;
+}
+
+/*~ Block on the LISTEN socket until an authenticated device connects, running a
+ * FRESH Noise_XK responder handshake (new ephemeral keys) against the SAME
+ * pinned device static key.  A connector that fails the handshake (wrong key /
+ * no handshake / tampering) is rejected — its fd is closed by the noise channel
+ * destructor — and we keep listening (fail-closed).  Sets `signer_noise`. */
+static void accept_one_device(void)
+{
+	int cfd, one = 1;
+
+	for (;;) {
+		cfd = accept(signer_listen_fd, NULL, NULL);
+		if (cfd < 0) {
+			if (errno == EINTR)
+				continue;
+			status_failed(STATUS_FAIL_INTERNAL_ERROR,
+				      "signer listen accept failed: %s",
+				      strerror(errno));
+		}
+		setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+		signer_noise = signer_noise_accept(NULL, cfd,
+						   &signer_listen_priv,
+						   &signer_listen_pinned);
+		if (signer_noise) {
+			status_unusual("hsmd-proxy: device signer AUTHENTICATED"
+				       " (Noise_XK responder); serving");
+			return;
+		}
+		/* Rejected: the noise channel already closed `cfd`. */
+		status_unusual("hsmd-proxy: REJECTED a connector (Noise_XK"
+			       " handshake failed / not the pinned device key);"
+			       " still listening");
+	}
+}
+
+/*~ LISTEN mode reconnect: accept a fresh device and re-prime it, retrying if it
+ * drops mid-priming, until we have a device ready to serve.  On return
+ * `signer_noise` is a live, primed secure channel. */
+static void reconnect_device(void)
+{
+	for (;;) {
+		accept_one_device();
+		if (prime_device())
+			return;
+		status_unusual("hsmd-proxy: device dropped/refused during session"
+			       " priming; awaiting another device");
+		signer_noise = tal_free(signer_noise);
+	}
+}
+
 /*~ SeqLN Tier-2 BROWSER topology (the role flip).  A browser device signer
  * cannot listen() for an inbound connection, so it connects OUT and plays the
- * Noise INITIATOR; the hosted proxy therefore BINDS a TCP listener, accepts ONE
- * incoming device connection, and runs the Noise_XK RESPONDER over it.  The
- * resulting SECURED channel is used as the signer link exactly like the
- * connect() path — everything downstream (forward_to_signer) is UNCHANGED.
+ * Noise INITIATOR; the hosted proxy therefore BINDS a TCP listener, accepts a
+ * device connection, and runs the Noise_XK RESPONDER over it.  The resulting
+ * SECURED channel is used as the signer link exactly like the connect() path.
+ *
+ * RECONNECTABLE: a browser device can disconnect (tab close/reopen, network
+ * blip) and come back.  We therefore keep the listen socket open for the whole
+ * lifetime of the proxy; when the current device drops, forward_to_signer loops
+ * back through reconnect_device() to accept + re-authenticate + re-prime a fresh
+ * device WITHOUT restarting the node or dropping lightningd's fd-3.
  *
  * Same fail-closed contract + same pinned keys as connect mode (SEQLN_HOST_PRIVKEY
  * = the proxy's own static priv, SEQLN_SIGNER_PEER_PUBKEY = the pinned device
@@ -511,12 +716,15 @@ static void listen_remote_signer(const char *addr)
 	char *host, *port, *colon;
 	struct addrinfo hints, *res, *ai;
 	struct privkey my_priv;
-	struct pubkey pinned_signer, my_pub;
-	int lfd = -1, cfd, gai, one = 1;
+	struct pubkey my_pub;
+	int lfd = -1, gai, one = 1;
 
-	/* Load + validate the pinned keys BEFORE we touch the network. */
-	load_host_privkey(&my_priv.secret);
-	load_pinned_signer_pubkey(&pinned_signer);
+	/* Load + validate the pinned keys BEFORE we touch the network, and keep
+	 * them (plus the listen fd) for the lifetime of the proxy so we can
+	 * re-accept a reconnecting device later. */
+	load_host_privkey(&signer_listen_priv);
+	load_pinned_signer_pubkey(&signer_listen_pinned);
+	my_priv.secret = signer_listen_priv;
 	pubkey_from_privkey(&my_priv, &my_pub);
 
 	colon = strrchr(addr, ':');
@@ -542,8 +750,9 @@ static void listen_remote_signer(const char *addr)
 		if (lfd < 0)
 			continue;
 		setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+		/* backlog > 1: tolerate a reconnect racing the old fd's close. */
 		if (bind(lfd, ai->ai_addr, ai->ai_addrlen) == 0
-		    && listen(lfd, 1) == 0)
+		    && listen(lfd, 5) == 0)
 			break;
 		close(lfd);
 		lfd = -1;
@@ -554,37 +763,19 @@ static void listen_remote_signer(const char *addr)
 			      "signer listen bind %s:%s failed: %s",
 			      host, port, strerror(errno));
 
+	/* Latch reconnect mode + keep the listen socket open for our lifetime. */
+	signer_listen_fd = lfd;
+	signer_listen_mode = true;
+
 	status_unusual("hsmd-proxy: LISTENING (BOLT-8 Noise_XK RESPONDER,"
 		       " mutual-auth) on %s:%s for the device signer; my static"
-		       " pubkey %s, pinned device %s", host, port,
-		       fmt_pubkey(tmpctx, &my_pub),
-		       fmt_pubkey(tmpctx, &pinned_signer));
+		       " pubkey %s, pinned device %s; reconnect-tolerant",
+		       host, port, fmt_pubkey(tmpctx, &my_pub),
+		       fmt_pubkey(tmpctx, &signer_listen_pinned));
 
-	/* Accept exactly ONE authenticated device.  A rejected connector (wrong
-	 * key / no handshake / tampering) is dropped and we keep listening. */
-	for (;;) {
-		cfd = accept(lfd, NULL, NULL);
-		if (cfd < 0) {
-			if (errno == EINTR)
-				continue;
-			status_failed(STATUS_FAIL_INTERNAL_ERROR,
-				      "signer listen accept failed: %s",
-				      strerror(errno));
-		}
-		setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-		signer_noise = signer_noise_accept(NULL, cfd, &my_priv.secret,
-						   &pinned_signer);
-		if (signer_noise) {
-			close(lfd);
-			status_unusual("hsmd-proxy: device signer AUTHENTICATED"
-				       " (Noise_XK responder); serving");
-			return;
-		}
-		close(cfd);
-		status_unusual("hsmd-proxy: REJECTED a connector (Noise_XK"
-			       " handshake failed / not the pinned device key);"
-			       " still listening on %s:%s", host, port);
-	}
+	/* Bring up the first device (blocks until one authenticates).  Nothing
+	 * is cached yet, so prime_device() is a no-op; the incoming INIT primes. */
+	accept_one_device();
 }
 
 /*~ Forward one request to signerd and relay its reply to the client.  This is
@@ -592,6 +783,44 @@ static void listen_remote_signer(const char *addr)
  * `req_reply(..., hsmd_handle_client_message(...))`.  It is a synchronous
  * round-trip; the whole hsmd protocol is request/response so blocking the io
  * loop here is exactly the monolithic behaviour. */
+/*~ LISTEN mode round-trip: write the request + read the reply over the secure
+ * device channel, transparently surviving a device disconnect.  If the device
+ * drops (write or read fails / EOF), we close the dead channel and block in
+ * reconnect_device() until a fresh device authenticates and is re-primed, then
+ * RETRY the same request — so no lightningd request is lost and fd-3 is never
+ * touched.  Always returns a non-NULL reply (a zero-length array is the device's
+ * error sentinel, handled by the caller). */
+static u8 *listen_roundtrip(const tal_t *ctx, bool is_main,
+			    const struct node_id *id, u64 dbid,
+			    u64 capabilities, const u8 *msg_in,
+			    enum hsmd_wire reqt)
+{
+	for (;;) {
+		u8 *reply;
+
+		if (!signer_noise)
+			reconnect_device();
+
+		if (!signer_noise_write_request(signer_noise, is_main, id, dbid,
+						capabilities, msg_in)) {
+			status_unusual("hsmd-proxy: device link WRITE failed on"
+				       " %s; device disconnected, awaiting"
+				       " reconnect", hsmd_wire_name(reqt));
+			signer_noise = tal_free(signer_noise);
+			continue;
+		}
+		reply = signer_noise_read_reply(ctx, signer_noise);
+		if (!reply) {
+			status_unusual("hsmd-proxy: device link READ failed on"
+				       " %s; device disconnected, awaiting"
+				       " reconnect", hsmd_wire_name(reqt));
+			signer_noise = tal_free(signer_noise);
+			continue;
+		}
+		return reply;
+	}
+}
+
 static struct io_plan *forward_to_signer(struct io_conn *conn,
 					 struct client *c,
 					 const u8 *msg_in)
@@ -600,9 +829,14 @@ static struct io_plan *forward_to_signer(struct io_conn *conn,
 	enum hsmd_wire reqt = fromwire_peektype(msg_in);
 	u8 *reply;
 
-	/* Remote mode: tunnel through the Noise-secured channel; local mode:
-	 * raw framed write over the trusted socketpair fd. */
-	if (signer_noise) {
+	/* Three transports:
+	 *  - LISTEN (browser) mode: Noise-secured + reconnect-tolerant.
+	 *  - ADDR (connect) mode: Noise-secured, single-shot (unchanged).
+	 *  - local fork mode: raw framed write over the trusted socketpair fd. */
+	if (signer_listen_mode) {
+		reply = listen_roundtrip(tmpctx, is_main, &c->id, c->dbid,
+					 c->capabilities, msg_in, reqt);
+	} else if (signer_noise) {
 		if (!signer_noise_write_request(signer_noise, is_main, &c->id,
 						c->dbid, c->capabilities,
 						msg_in))
@@ -628,6 +862,12 @@ static struct io_plan *forward_to_signer(struct io_conn *conn,
 		return bad_req_fmt(conn, c, msg_in,
 				   "signerd rejected request %s",
 				   hsmd_wire_name(reqt));
+
+	/* LISTEN mode: cache the state-establishing requests so a reconnecting
+	 * device can be re-primed to serve this client again. */
+	if (signer_listen_mode)
+		remember_priming(is_main, &c->id, c->dbid, c->capabilities,
+				 reqt, msg_in, reply);
 
 	status_debug("hsmd-proxy: %s (dbid=%"PRIu64") -> signerd -> %s",
 		     hsmd_wire_name(reqt), c->dbid,
@@ -739,6 +979,11 @@ static struct io_plan *handle_memleak(struct io_conn *conn,
 	memleak_scan_region(memtable, dbid_zero_clients, sizeof(dbid_zero_clients));
 	memleak_scan_uintmap(memtable, &clients);
 	memleak_scan_obj(memtable, status_conn);
+
+	/* The LISTEN-mode reconnect priming cache is intentionally retained. */
+	if (prime_ctx)
+		memleak_scan_obj(memtable, prime_ctx);
+	memleak_scan_uintmap(memtable, &primed_setup);
 
 	memleak_ptr(memtable, dev_force_privkey);
 	memleak_ptr(memtable, dev_force_bip32_seed);
@@ -939,6 +1184,9 @@ int main(int argc, char *argv[])
 	status_conn = daemon_conn_new(NULL, STDIN_FILENO, NULL, NULL, NULL);
 	status_setup_async(status_conn);
 	uintmap_init(&clients);
+	uintmap_init(&primed_setup);
+	/* Long-lived home for the LISTEN-mode reconnect priming cache. */
+	prime_ctx = tal(NULL, char);
 
 	/*~ Bring up the signer before we start serving lightningd, so it is
 	 * ready for the very first request (WIRE_HSMD_INIT).  Three transports:
