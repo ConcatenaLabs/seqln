@@ -14,6 +14,7 @@ pub mod msg {
     pub const HSMD_SIGN_ANY_CANNOUNCEMENT_REQ: u16 = 4;
     pub const HSMD_SIGN_COMMITMENT_TX: u16 = 5;
     pub const HSMD_NODE_ANNOUNCEMENT_SIG_REQ: u16 = 6;
+    pub const HSMD_SIGN_WITHDRAWAL: u16 = 7;
     pub const HSMD_SIGN_INVOICE: u16 = 8;
     pub const HSMD_GET_CHANNEL_BASEPOINTS: u16 = 10;
     pub const HSMD_INIT: u16 = 11;
@@ -51,6 +52,7 @@ pub mod msg {
     pub const HSMD_SIGN_ANY_CANNOUNCEMENT_REPLY: u16 = 104;
     pub const HSMD_SIGN_COMMITMENT_TX_REPLY: u16 = 105;
     pub const HSMD_NODE_ANNOUNCEMENT_SIG_REPLY: u16 = 106;
+    pub const HSMD_SIGN_WITHDRAWAL_REPLY: u16 = 107;
     pub const HSMD_SIGN_INVOICE_REPLY: u16 = 108;
     pub const HSMD_GET_CHANNEL_BASEPOINTS_REPLY: u16 = 110;
     pub const HSMD_SIGN_TX_REPLY: u16 = 112;
@@ -727,6 +729,133 @@ fn find_witness_utxo_value(d: &[u8], p: &mut usize) -> Option<[u8; 9]> {
     result
 }
 
+// =====================================================================
+// SIGN_WITHDRAWAL (msg 7): num_inputs(u16) || inputs(hsm_utxo)* || wally_psbt.
+// The signer funds its OWN wallet inputs of the withdrawal/funding tx. Unlike
+// the commitment messages there is NO separate linearized `bitcoin_tx`; the tx
+// being signed is the PSBT's global unsigned tx (v0), so we parse that for the
+// BIP-143 sighash and add a PSBT_IN_PARTIAL_SIG per input we control.
+// =====================================================================
+
+/// A parsed `hsm_utxo` (`fromwire_hsm_utxo`, `hsmd/hsm_utxo.c`). We keep the
+/// fields needed to locate + sign a wallet input; `close_info` (a
+/// their-unilateral-close to-us output being swept) is decoded to keep the byte
+/// layout exact but is not part of the funding-open path.
+pub struct HsmUtxo {
+    /// Outpoint txid, raw 32 bytes (internal order, matches the tx's txhash).
+    pub txid: [u8; 32],
+    pub vout: u32,
+    /// `amount_sat` of the UTXO (the segwit-v0 sighash `value`).
+    pub amount: u64,
+    /// The wallet key index (m/86'/0'/0'/0/index on a mnemonic node, else m/0/0/index).
+    pub keyindex: u32,
+    pub script_pubkey: Vec<u8>,
+    /// True for a their-unilateral-close to-us input (needs channel-key derivation,
+    /// not the HD wallet path); never present in a channel-funding withdrawal.
+    pub is_unilateral_close: bool,
+}
+
+/// Read one `hsm_utxo` subtype (see `fromwire_hsm_utxo`):
+/// outpoint(txid32 || vout u32) || amount_sat(u64) || keyindex(u32) ||
+/// bool(legacy is_p2sh) || u16-prefixed scriptPubkey || bool is_unilateral_close
+/// [ || channel_id(u64) || node_id(33) || ?commitment_point(33) ||
+/// bool option_anchors || csv(u32) ] || bool(legacy is_in_coinbase).
+pub fn read_hsm_utxo(r: &mut Reader) -> Option<HsmUtxo> {
+    let txid = r.arr32()?;
+    let vout = r.u32()?;
+    let amount = r.u64()?;
+    let keyindex = r.u32()?;
+    let _is_p2sh_legacy = r.bool()?; // always emitted false; type comes from scriptPubkey
+    let script_pubkey = r.u16_prefixed()?;
+    let is_unilateral_close = r.bool()?;
+    if is_unilateral_close {
+        r.u64()?; // channel_id
+        r.arr33()?; // peer node_id
+        if r.bool()? {
+            r.arr33()?; // commitment_point (?)
+        }
+        r.bool()?; // option_anchors
+        r.u32()?; // csv
+    }
+    let _is_in_coinbase = r.bool()?;
+    Some(HsmUtxo {
+        txid,
+        vout,
+        amount,
+        keyindex,
+        script_pubkey,
+        is_unilateral_close,
+    })
+}
+
+/// Parse a `hsmd_sign_withdrawal` request into (utxos, raw psbt bytes).
+pub fn parse_sign_withdrawal(m: &[u8]) -> Option<(Vec<HsmUtxo>, Vec<u8>)> {
+    let mut r = Reader::new(m);
+    if r.u16()? != msg::HSMD_SIGN_WITHDRAWAL {
+        return None;
+    }
+    let num_inputs = r.u16()? as usize;
+    let mut utxos = Vec::with_capacity(num_inputs);
+    for _ in 0..num_inputs {
+        utxos.push(read_hsm_utxo(&mut r)?);
+    }
+    // wally_psbt: u32 byte length + bytes (`fromwire_wally_psbt`).
+    let plen = r.u32()? as usize;
+    let psbt = r.take_bytes(plen)?;
+    Some((utxos, psbt))
+}
+
+/// Return the raw value of the v0 `PSBT_GLOBAL_UNSIGNED_TX` (global map key 0x00)
+/// = the linearized unsigned tx. Present on the Bitcoin path (lightningd
+/// downgrades to v0 for non-Elements before sending); absent on a v2 PSET.
+pub fn psbt_global_unsigned_tx(psbt: &[u8]) -> Option<&[u8]> {
+    if psbt.len() < 5 {
+        return None;
+    }
+    let mut p = 5usize; // skip magic "psbt\xff"
+    loop {
+        let keylen = read_compact(psbt, &mut p)? as usize;
+        if keylen == 0 {
+            return None; // end of global map, no unsigned tx (v2)
+        }
+        let key = psbt.get(p..p + keylen)?;
+        p += keylen;
+        let vallen = read_compact(psbt, &mut p)? as usize;
+        let val = psbt.get(p..p + vallen)?;
+        p += vallen;
+        if keylen == 1 && key[0] == 0x00 {
+            return Some(val);
+        }
+    }
+}
+
+/// Byte offset of the 0x00 terminator of input map `idx` (0-based), i.e. the
+/// splice point at which to insert a new record into that input's key-value map.
+/// Mirrors the map navigation of [`psbt_witness_utxo_raw`].
+pub fn psbt_input_map_terminator(psbt: &[u8], idx: usize) -> Option<usize> {
+    if psbt.len() < 5 {
+        return None;
+    }
+    let mut p = 5usize; // skip magic
+    skip_psbt_map(psbt, &mut p)?; // global map
+    for i in 0..=idx {
+        loop {
+            let term = p; // offset of this record's keylen byte
+            let keylen = read_compact(psbt, &mut p)? as usize;
+            if keylen == 0 {
+                if i == idx {
+                    return Some(term);
+                }
+                break; // advance to the next input map
+            }
+            p += keylen;
+            let vallen = read_compact(psbt, &mut p)? as usize;
+            p += vallen;
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -841,6 +970,57 @@ mod tests {
         assert_eq!(u64::from_le_bytes(v8), 60_000);
         // And the remote_funding pubkey trails the wire object (33 bytes).
         assert!(r.arr33().is_some());
+    }
+
+    /// The REAL `WIRE_HSMD_SIGN_WITHDRAWAL` the box's BTC hosted node sent for its
+    /// channel-funding tx (and the old signer rejected with "Error parsing 7"):
+    /// one P2WPKH wallet input (80000 sat, bip86 keyindex 1) funding a 60000-sat
+    /// channel with p2tr change. Public testnet data — no secret. Proves the
+    /// request + v0-PSBT decode and the partial-sig splice work on the real bytes.
+    const REAL_WITHDRAWAL: &str = "0007000142cd59f23fe5fc46dae740eadf21b8436ada95b2f1eee888ecb805abb82d70c40000000000000000000138800000000100001600148dacd6af53b24ede66b06ab6e018a0451933d52c0000000001e570736274ff010089020000000142cd59f23fe5fc46dae740eadf21b8436ada95b2f1eee888ecb805abb82d70c40000000000fdffffff0260ea000000000000220020a10d8e03d2cb7fa7acbb942b07a37475766c59846eeb0ac436cb4cb7c36297228f4b0000000000002251206929e08209d2fcac61aada3f7c20f566f18bcf589749cc43f58b4bb45fb320bf0b2f0200000100c30200000003df95ea936d7194002e5ba394b546d616755c38699af5e4b2b3ea110f054c49f40000000000fdffffff994e1ab706c206afb7812e023fede7c47b1e84a8f6ad910592ac7c3ef9b8be6e0100000000fdffffff92ac0f2c6ec867179576e381d8d4068101c8cc7e9c5d2592882973f7f29ca5db0000000000fdffffff0280380100000000001600148dacd6af53b24ede66b06ab6e018a0451933d52c9ac60000000000001600147460dcbcf5d2997d166bb4bbf77a6a4c83cd49a3002f020001011f80380100000000001600148dacd6af53b24ede66b06ab6e018a0451933d52c0cfc096c696768746e696e67020200010cfc096c696768746e696e670108fccef1173bb126c40000210776cfb07e3d50463fcd1af2b6cea85a8ab07f6e7910ce771d96f6d7e3de15b3690900f6ca4640030000000cfc096c696768746e696e67010869ddcf9667cf9c7400";
+
+    #[test]
+    fn real_sign_withdrawal_parses_and_splices() {
+        let msg = unhex(REAL_WITHDRAWAL);
+        let (utxos, psbt) = parse_sign_withdrawal(&msg).expect("parse withdrawal");
+        assert_eq!(utxos.len(), 1);
+        let u = &utxos[0];
+        assert_eq!(u.amount, 80_000);
+        assert_eq!(u.vout, 0);
+        assert_eq!(u.keyindex, 1);
+        assert!(!u.is_unilateral_close);
+        // Native P2WPKH scriptPubkey (OP_0 push20 <keyhash>).
+        assert_eq!(u.script_pubkey.len(), 22);
+        assert_eq!(&u.script_pubkey[..2], &[0x00, 0x14]);
+        // The outpoint txid is the funding UTXO in internal (LE) byte order.
+        assert_eq!(&u.txid[..4], &unhex("42cd59f2")[..]);
+
+        // Reads as a v0 PSBT with a global unsigned tx.
+        assert_eq!(&psbt[..5], b"psbt\xff");
+        let lin = psbt_global_unsigned_tx(&psbt).expect("global unsigned tx");
+        let tx = parse_bitcoin_tx(lin).expect("parse unsigned tx");
+        assert_eq!(tx.network, Network::Bitcoin);
+        assert_eq!(tx.inputs.len(), 1);
+        assert_eq!(tx.outputs.len(), 2);
+        assert_eq!(tx.inputs[0].txhash, u.txid);
+        // Funding output 60000 sat + p2tr change 19343 sat.
+        assert_eq!(u64::from_le_bytes(tx.outputs[0].value[..].try_into().unwrap()), 60_000);
+        assert_eq!(u64::from_le_bytes(tx.outputs[1].value[..].try_into().unwrap()), 19_343);
+        // The witness_utxo amount for input 0 decodes to 80000 sat.
+        assert_eq!(psbt_input_value_sats_le(&psbt, 0), Some(80_000u64.to_le_bytes()));
+
+        // Splice a dummy partial_sig into input 0's map; the PSBT must still
+        // navigate (witness_utxo still readable, terminator shifted correctly).
+        let term = psbt_input_map_terminator(&psbt, 0).expect("input-0 terminator");
+        let mut rec = vec![34u8, 0x02];
+        rec.extend_from_slice(&[3u8; 33]); // dummy 33-byte "pubkey"
+        rec.push(2); // vallen
+        rec.extend_from_slice(&[0x30, 0x01]); // dummy value
+        let mut spliced = psbt[..term].to_vec();
+        spliced.extend_from_slice(&rec);
+        spliced.extend_from_slice(&psbt[term..]);
+        assert_eq!(spliced.len(), psbt.len() + rec.len());
+        assert_eq!(psbt_input_value_sats_le(&spliced, 0), Some(80_000u64.to_le_bytes()));
     }
 
     #[test]
