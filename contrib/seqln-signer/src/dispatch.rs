@@ -671,8 +671,20 @@ impl Signer {
             kernel::Network::Bitcoin => wire::parse_bitcoin_tx(lin)?,
             kernel::Network::Elements => wire::parse_elements_tx(lin)?,
         };
+        // Own copy of the unsigned tx bytes: the taproot sighash path needs them
+        // inside the loop, past the `psbt` move below.
+        let tx_bytes = lin.to_vec();
 
         let mut out = psbt;
+        // Every input's (amount, scriptPubkey) from the PSBT witness_utxos, in tx
+        // order — the BIP-341 taproot sighash commits to all of them. Computed once
+        // from the untouched PSBT (our splices only APPEND records, never disturb a
+        // witness_utxo, so this stays valid across iterations). Empty if any input
+        // lacks a Bitcoin witness_utxo (then the taproot path simply skips).
+        let all_prevouts: Vec<(u64, Vec<u8>)> = (0..tx.inputs.len())
+            .map(|i| wire::psbt_input_btc_prevout(&out, i))
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default();
         for utxo in &utxos {
             // The HD wallet path only; a their-close sweep needs channel keys and
             // is never part of a channel-funding withdrawal.
@@ -687,6 +699,35 @@ impl Signer {
             else {
                 continue;
             };
+            // Taproot (BIP-86 KEY PATH) wallet input `OP_1 <32-byte x-only>`: the
+            // real form a modern mnemonic node's funds sit on. Schnorr-sign the
+            // BIP-341 key-spend sighash and splice a PSBT_IN_TAP_KEY_SIG record;
+            // libwally's finalizer builds the P2TR witness from it. (Bitcoin only.)
+            if network == kernel::Network::Bitcoin && is_p2tr(&utxo.script_pubkey) {
+                if all_prevouts.len() != tx.inputs.len() {
+                    continue; // missing a witness_utxo: can't build the taproot sighash
+                }
+                let mut xonly = [0u8; 32];
+                xonly.copy_from_slice(&utxo.script_pubkey[2..34]);
+                let internal_sk = self.kernel().bip86_child_privkey(utxo.keyindex);
+                let Some(sig) = self.kernel().taproot_keyspend_sign(
+                    &tx_bytes,
+                    j,
+                    &all_prevouts,
+                    &internal_sk,
+                    &xonly,
+                ) else {
+                    continue;
+                };
+                let rec = tap_key_sig_record(&sig);
+                let term = wire::psbt_input_map_terminator(&out, j)?;
+                let mut next = Vec::with_capacity(out.len() + rec.len());
+                next.extend_from_slice(&out[..term]);
+                next.extend_from_slice(&rec);
+                next.extend_from_slice(&out[term..]);
+                out = next;
+                continue;
+            }
             // Resolve the signing key + its pubkey by reproducing the scriptPubkey.
             let Some((sk, pubkey, keyhash)) =
                 self.wallet_key_for_spk(utxo.keyindex, &utxo.script_pubkey)
@@ -949,6 +990,25 @@ fn partial_sig_record(pubkey: &[u8; 33], der: &[u8], sighash: u8) -> Vec<u8> {
     rec
 }
 
+/// True for a native witness-v1 taproot scriptPubkey `OP_1 <32-byte program>`
+/// (`5120` || 32 bytes) — a BIP-86 key-path output.
+fn is_p2tr(spk: &[u8]) -> bool {
+    spk.len() == 34 && spk[0] == 0x51 && spk[1] == 0x20
+}
+
+/// One keyless `PSBT_IN_TAP_KEY_SIG` record: keylen(1) || 0x13 || vallen(0x40) ||
+/// 64-byte BIP-340 Schnorr signature (SIGHASH_DEFAULT, so no trailing hash byte).
+/// libwally's `finalize_p2tr` reads this field to build the taproot key-spend
+/// witness `[sig]`.
+fn tap_key_sig_record(sig: &[u8; 64]) -> Vec<u8> {
+    let mut rec = Vec::with_capacity(1 + 1 + 1 + 64);
+    rec.push(0x01); // keylen = 1 (type only, no keydata)
+    rec.push(0x13); // PSBT_IN_TAP_KEY_SIG
+    rec.push(0x40); // vallen = 64
+    rec.extend_from_slice(sig);
+    rec
+}
+
 // ---- M4 request parsers (for the validating policy) ----
 
 /// Parse `hsmd_setup_channel` into a [`ChannelState`]. Layout from
@@ -1203,5 +1263,133 @@ mod withdrawal_tests {
             .sign_low_r_der_checked(&hash, &sk, &pubkey)
             .expect("sig self-verifies");
         assert_eq!(der, expected.as_slice(), "signature is over the wrong sighash");
+    }
+
+    /// The taproot fix: a mnemonic (bip86) node self-funds a channel spending its
+    /// OWN native P2TR (BIP-86 key-path) wallet UTXO — the real on-chain form the
+    /// hosted node's funds take. Asserts the handler splices a PSBT_IN_TAP_KEY_SIG
+    /// whose 64-byte Schnorr signature VERIFIES against the tweaked output key and
+    /// the BIP-341 key-spend sighash (i.e. bitcoind will accept it), and prints the
+    /// reply hex for the external libwally finalizer check.
+    #[test]
+    fn signs_own_p2tr_funding_input() {
+        use bitcoin::hashes::Hash;
+        use bitcoin::key::{Keypair, TapTweak};
+        use bitcoin::secp256k1::{Message, Secp256k1};
+        use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+        use bitcoin::{Amount, ScriptBuf, Transaction, TxOut};
+
+        if matches!(
+            std::env::var("SEQLN_SIGNER_NETWORK").ok().as_deref(),
+            Some("elements") | Some("liquid")
+        ) {
+            eprintln!("SKIP: SEQLN_SIGNER_NETWORK forces Elements");
+            return;
+        }
+
+        let seed = crate::kernel::bip39_seed(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            "",
+        );
+        let kernel = Kernel::new(seed.to_vec(), BIP32_VER_TEST_PUBLIC, BIP32_VER_TEST_PRIVATE);
+        let secp = Secp256k1::new();
+
+        // The node's own P2TR wallet output = BIP-86 tweak of the internal key.
+        let keyindex = 3u32;
+        let internal_sk = kernel.bip86_child_privkey(keyindex);
+        let tweaked = Keypair::from_secret_key(&secp, &internal_sk)
+            .tap_tweak(&secp, None)
+            .to_keypair();
+        let (out_xonly, _) = tweaked.x_only_public_key();
+        let spk: Vec<u8> = [0x51u8, 0x20].iter().copied().chain(out_xonly.serialize()).collect();
+
+        let txid = [0x22u8; 32];
+        let amount = 200_000u64;
+
+        // Unsigned tx: spend the P2TR input into a P2WSH funding output + change.
+        let mut t = Vec::new();
+        t.extend_from_slice(&2u32.to_le_bytes());
+        t.push(0x01);
+        t.extend_from_slice(&txid);
+        t.extend_from_slice(&0u32.to_le_bytes());
+        t.push(0x00);
+        t.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+        t.push(0x02);
+        t.extend_from_slice(&150_000u64.to_le_bytes());
+        let fund_spk: Vec<u8> = [0x00u8, 0x20].iter().copied().chain([7u8; 32]).collect();
+        t.push(fund_spk.len() as u8);
+        t.extend_from_slice(&fund_spk);
+        t.extend_from_slice(&49_000u64.to_le_bytes());
+        t.push(spk.len() as u8);
+        t.extend_from_slice(&spk); // change back to a P2TR of ours
+        t.extend_from_slice(&0u32.to_le_bytes());
+        let tx_bytes = t;
+
+        // v0 PSBT: global{tx} || input0{witness_utxo=P2TR} || out0{} || out1{}.
+        let mut wu = amount.to_le_bytes().to_vec();
+        wu.push(spk.len() as u8);
+        wu.extend_from_slice(&spk);
+        let mut p = Vec::new();
+        p.extend_from_slice(b"psbt\xff");
+        p.extend_from_slice(&[0x01, 0x00]);
+        assert!(tx_bytes.len() < 0xfd);
+        p.push(tx_bytes.len() as u8);
+        p.extend_from_slice(&tx_bytes);
+        p.push(0x00);
+        p.extend_from_slice(&[0x01, 0x01]);
+        p.push(wu.len() as u8);
+        p.extend_from_slice(&wu);
+        p.push(0x00); // input0 terminator
+        p.push(0x00); // out0
+        p.push(0x00); // out1
+        let psbt = p;
+
+        let mut w = Writer::new(msg::HSMD_SIGN_WITHDRAWAL);
+        w.u16(1);
+        w.bytes(&txid);
+        w.u32(0);
+        w.u64(amount);
+        w.u32(keyindex);
+        w.bool(false);
+        w.u16(spk.len() as u16);
+        w.bytes(&spk);
+        w.bool(false);
+        w.bool(false);
+        w.u32(psbt.len() as u32);
+        w.bytes(&psbt);
+        let req_msg = w.into_vec();
+
+        let secret = HsmSecret { seed, secret_type: 2, mnemonic: String::new() };
+        let mut signer = Signer::new(secret);
+        signer.kernel = Some(kernel);
+        signer.hsm_version = 6;
+
+        let reply = signer.h_sign_withdrawal(&req_msg).expect("withdrawal reply");
+        let rlen = u32::from_be_bytes([reply[2], reply[3], reply[4], reply[5]]) as usize;
+        let rpsbt = &reply[6..6 + rlen];
+        assert!(rpsbt.len() > psbt.len(), "tap_key_sig not added");
+
+        // Locate the PSBT_IN_TAP_KEY_SIG record: keylen(01) 0x13 vallen(0x40) sig(64).
+        let key = [0x01u8, 0x13, 0x40];
+        let pos = rpsbt
+            .windows(3)
+            .position(|win| win == key)
+            .expect("PSBT_IN_TAP_KEY_SIG record present");
+        let sig_bytes = &rpsbt[pos + 3..pos + 3 + 64];
+        let sig = bitcoin::secp256k1::schnorr::Signature::from_slice(sig_bytes).unwrap();
+
+        // Independently recompute the BIP-341 key-spend sighash and VERIFY the sig
+        // against the output key — exactly what bitcoind checks on broadcast.
+        let tx: Transaction = bitcoin::consensus::encode::deserialize(&tx_bytes).unwrap();
+        let txouts = vec![TxOut {
+            value: Amount::from_sat(amount),
+            script_pubkey: ScriptBuf::from_bytes(spk.clone()),
+        }];
+        let sighash = SighashCache::new(&tx)
+            .taproot_key_spend_signature_hash(0, &Prevouts::All(&txouts), TapSighashType::Default)
+            .unwrap();
+        let msg = Message::from_digest(sighash.to_byte_array());
+        secp.verify_schnorr(&sig, &msg, &out_xonly)
+            .expect("taproot key-spend signature must verify against the output key");
     }
 }

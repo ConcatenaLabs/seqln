@@ -603,6 +603,70 @@ impl Kernel {
         Some(sig.serialize_der().to_vec())
     }
 
+    /// Taproot BIP-86 KEY-PATH withdrawal signing — the Schnorr sibling of
+    /// [`sign_low_r_der_checked`] for a native P2TR (`OP_1 <32-byte x-only>`)
+    /// wallet input. This is the path a MODERN mnemonic (bip86) node's on-chain
+    /// funds actually live on: `bip86_key` (`hsmd/libhsmd.c`) derives the taproot
+    /// INTERNAL key at `m/86'/0'/0'/0/index`, and the address is its BIP-86
+    /// key-path output (empty script tree). The reference libhsmd signs these via
+    /// `wally_psbt_sign`, which, for a taproot input, BIP-341-key-tweaks the key,
+    /// computes the BIP-341 key-spend sighash and BIP-340 Schnorr-signs it; we
+    /// reproduce exactly that here (rust-bitcoin drives the BIP-341 sighash so the
+    /// bytes bitcoind verifies on broadcast are the reference ones).
+    ///
+    /// `tx_bytes` is the PSBT's global unsigned tx (legacy serialization);
+    /// `prevouts` gives `(amount_sat, scriptPubkey)` for EVERY input in tx order
+    /// (taproot commits to all of them via sha_amounts/sha_scriptpubkeys);
+    /// `internal_sk` is the untweaked m/86'/0'/0'/0/index key; and
+    /// `expected_output_xonly` is the 32-byte program from the input's
+    /// scriptPubkey. Returns the 64-byte SIGHASH_DEFAULT Schnorr signature, or
+    /// None if the BIP-86-tweaked output key does NOT reproduce
+    /// `expected_output_xonly` (i.e. this is not our key / wrong derivation) — the
+    /// same belt-and-braces guard the ECDSA path applies before we hand lightningd
+    /// a signature to broadcast.
+    pub fn taproot_keyspend_sign(
+        &self,
+        tx_bytes: &[u8],
+        input_index: usize,
+        prevouts: &[(u64, Vec<u8>)],
+        internal_sk: &SecretKey,
+        expected_output_xonly: &[u8; 32],
+    ) -> Option<[u8; 64]> {
+        use bitcoin::key::{Keypair, TapTweak};
+        use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+        use bitcoin::{Amount, ScriptBuf, Transaction, TxOut};
+
+        let tx: Transaction = bitcoin::consensus::encode::deserialize(tx_bytes).ok()?;
+        if input_index >= tx.input.len() || prevouts.len() != tx.input.len() {
+            return None;
+        }
+        let txouts: Vec<TxOut> = prevouts
+            .iter()
+            .map(|(v, spk)| TxOut {
+                value: Amount::from_sat(*v),
+                script_pubkey: ScriptBuf::from_bytes(spk.clone()),
+            })
+            .collect();
+        let prevs = Prevouts::All(&txouts);
+        let sighash = SighashCache::new(&tx)
+            .taproot_key_spend_signature_hash(input_index, &prevs, TapSighashType::Default)
+            .ok()?;
+
+        // BIP-86 key-path tweak (empty script tree) on the internal key; the
+        // tweaked x-only output key MUST equal the input's program or we refuse.
+        let kp = Keypair::from_secret_key(&self.secp, internal_sk);
+        let tweaked = kp.tap_tweak(&self.secp, None).to_keypair();
+        let (out_xonly, _parity) = tweaked.x_only_public_key();
+        if out_xonly.serialize() != *expected_output_xonly {
+            return None;
+        }
+        let msg = Message::from_digest(sighash.to_byte_array());
+        let sig = self.secp.sign_schnorr_no_aux_rand(&msg, &tweaked);
+        // Self-verify against the exact output key we matched (belt and braces).
+        self.secp.verify_schnorr(&sig, &msg, &out_xonly).ok()?;
+        Some(sig.serialize())
+    }
+
     /// `sign_hash` (`bitcoin/signature.c`): ECDSA with low-R grinding, matching
     /// libhsmd BYTE-FOR-BYTE. libhsmd calls `secp256k1_ecdsa_sign(.., NULL,
     /// extra_entropy)` where `extra_entropy` starts at 32 zero bytes and the
