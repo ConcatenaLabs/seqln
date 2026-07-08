@@ -1,229 +1,182 @@
-# Core Lightning (CLN): A specification compliant Lightning Network implementation in C
+# SeqLN: Core Lightning for Sequentia (and Bitcoin, same binary)
 
-Core Lightning (previously c-lightning) is a lightweight, highly customizable and [standard compliant][std] implementation of the Lightning Network protocol.
+SeqLN is a fork of [Core Lightning](https://github.com/ElementsProject/lightning) (CLN, base
+version v26.06.2) that adds the Sequentia network to `lightningd`. One binary runs Lightning on
+Bitcoin (mainnet, testnet4, regtest, signet), on Liquid, and on Sequentia: the network is chosen
+with `--network`. On Sequentia it adds what the chain makes possible: channels denominated in any
+issued asset, asset-aware routing and payments, and an anchor-aware safety layer that turns
+Sequentia's Bitcoin-anchored finality into fast, honest confirmation counting.
 
-* [Getting Started](#getting-started)
-    * [Installation](#installation)
-    * [Starting lightningd](#starting-lightningd)
-    * [Using the JSON-RPC Interface](#using-the-json-rpc-interface)
-    * [Care And Feeding Of Your New Lightning Node](#care-and-feeding-of-your-new-lightning-node)
-    * [Opening A Channel](#opening-a-channel)
-	* [Sending and Receiving Payments](#sending-and-receiving-payments)
-	* [Configuration File](#configuration-file)
-* [Further Information](#further-information)
-    * [FAQ](doc/FAQ.md)
-    * [Pruning](#pruning)
-    * [HD wallet encryption](#hd-wallet-encryption)
-	* [Developers](#developers)
-* [Documentation](https://docs.corelightning.org/docs)
+Sequentia is a Bitcoin sidechain for asset tokenization and decentralized exchange, built as a
+fork of Blockstream Elements. Every Sequentia block references a Bitcoin block header, and if
+Bitcoin reorganizes away an anchor, Sequentia reorganizes with it, in real time. That real-time
+reorg-following is what makes Lightning on a sidechain safe, and SeqLN is built around it.
 
-## Project Status
+**This is testnet software.** The Sequentia network runs as a public testnet (parent chain:
+Bitcoin testnet4). There is no Sequentia mainnet; the `sequentia` mainnet entry in
+`bitcoin/chainparams.c` is an explicit placeholder that must not be used.
 
-[![Continuous Integration][actions-badge]][actions]
-[![Pull Requests Welcome][prs-badge]][prs]
-[![Documentation Status][docs-badge]][docs]
-[![Telegram][telegram-badge]][telegram]
-[![Discord][discord-badge]][discord]
-[![Irc][IRC-badge]][IRC]
+## Where SeqLN fits in the Sequentia ecosystem
 
-This implementation has been in production use on the Bitcoin mainnet since early 2018, with the launch of the [Blockstream Store][blockstream-store-blog].
-We recommend getting started by experimenting on `testnet` (`testnet4` or `regtest`), but the implementation is considered stable and can be safely used on mainnet.
+| Repo | One-liner |
+|---|---|
+| [Sequentia](https://github.com/GracedEternalKingCabbageMan/Sequentia) | The Sequentia node (`elementsd` fork of Elements 23.3.3): consensus, anchoring, proof of stake, open fee market, plus the canonical protocol documentation in `doc/sequentia/`. |
+| [seqln](https://github.com/GracedEternalKingCabbageMan/seqln) | SeqLN: a Core Lightning fork that runs on Sequentia and Bitcoin from the same binary — asset channels, any-asset payments, pure-Lightning swaps. |
+| [seqdex](https://github.com/GracedEternalKingCabbageMan/seqdex) | SeqDEX: non-custodial atomic-swap DEX — P2P order book (seqob), same-chain swaps, and cross-chain BTC↔asset swaps made safe by Bitcoin anchoring. |
+| [fulmen](https://github.com/GracedEternalKingCabbageMan/fulmen) | Fulmen: desktop (Electron) wallet for SeqLN with a bundled Lightning node. |
+| [libwally-core](https://github.com/GracedEternalKingCabbageMan/libwally-core) | libwally fork with the Sequentia transaction-parsing patch (issuance denomination byte) used by SeqLN. |
 
-## Reach Out to Us
+Protocol-level documentation (anchoring, proof of stake, fees, the SeqLN design spec) lives in the
+node repo under
+[doc/sequentia/](https://github.com/GracedEternalKingCabbageMan/Sequentia/tree/HEAD/doc/sequentia);
+the SeqLN design spec is
+[seqln-core-lightning-fork-spec.md](https://github.com/GracedEternalKingCabbageMan/Sequentia/blob/HEAD/doc/sequentia/seqln-core-lightning-fork-spec.md).
+The public testnet explorer and API are at https://sequentiatestnet.com.
 
-Any help testing the implementation, reporting bugs, or helping with outstanding issues is very welcome.
-Don't hesitate to reach out to us on the implementation-specific [mailing list][ml1], or on [CLN Discord][discord], or on [CLN Telegram][telegram], or on IRC at [dev][irc1]/[gen][irc2] channel.
+## Status: what works today
 
-## Getting Started
+Everything below is committed on the `sequentia-stable` branch and was proven against the live
+public testnet (re-genesis 2026-07-05) unless noted. The precise file-level change list, with
+known hazards, is in [doc/sequentia-fork.md](doc/sequentia-fork.md).
 
-Core Lightning only works on Linux and macOS, and requires a locally (or remotely) running `bitcoind` (version 25.0 or above) that is fully caught up with the network you're running on, and relays transactions (ie with `blocksonly=0`).
-Pruning (`prune=n` option in `bitcoin.conf`) is partially supported, see [here](#pruning) for more details.
+- **Sequentia as a network.** `--network=sequentia-testnet` selects the live testnet
+  (`bitcoin/chainparams.c`). On-chain addresses share Bitcoin's `tb1` bech32 format (Sequentia is
+  transparent by default); invoices use the distinct Lightning HRP `tsqt` (`lntsqt...`).
+- **Anchored block headers.** Sequentia block headers carry a Bitcoin anchor
+  (`anchor_height` + `anchor_hash`); the parser (`bitcoin/block.c`) recomputes block hashes that
+  match the live chain byte-for-byte.
+- **Anchor-aware safety layer.** Confirmations are counted in quorum-certified blocks (the
+  "certified frontier", `plugins/bcli.c`), `minimum_depth` is 1 (a certified block is displaced
+  only by a Bitcoin-anchor reorg), timelocks are sized in wall-clock at Sequentia's measured ~58s
+  block cadence, and a channel's short-channel-id is announced only after its funding block's
+  Bitcoin anchor is buried (`lightningd/chaintopology.c`, `lightningd/channel_gossip.c`).
+- **Sequence-token channels.** Channels in the policy asset, the Sequence token (tSEQ on testnet):
+  open, route, and mutually close, demonstrated live on the public testnet.
+- **Asset channels.** `fundchannel ... asset=<32-byte hex asset id>` opens a single-funder channel
+  denominated in any issued asset (e.g. GOLD): per-asset coin selection and funding, commitment
+  transactions and HTLCs in the channel asset, force-close resolution and anchor CPFP in the
+  channel asset, and on-chain fees sized per-asset via the node's `getfeeexchangerates` whitelist
+  (Sequentia's open fee market: fees are payable in any accepted asset).
+- **Asset-aware gossip and payments.** Channel gossip records each channel's asset from its
+  funding output; `getroute` and `pay` take an `asset=<id>` parameter and route only over channels
+  of that asset. Nodes refuse to forward an HTLC across an asset boundary (no silent at-par
+  asset swaps).
+- **Pure-Lightning swap primitive.** `contrib/holdinvoice-seq/` is a hold-invoice plugin (hold an
+  externally-supplied payment hash until settle/cancel), the safety primitive for pure-Lightning
+  asset↔BTC swaps. The swap orchestration itself lives in
+  [seqdex](https://github.com/GracedEternalKingCabbageMan/seqdex).
+- **Signer split (non-custodial hosted nodes).** `hsmd/hsmd_proxy.c` + `hsmd/signerd.c` split the
+  key-holding signer out of the node process, and `contrib/seqln-signer/` is a Rust device signer
+  (byte-exact against libhsmd, BOLT-8 Noise_XK secured transport, WASM build for browsers) so a
+  thin wallet can hold the keys while a host runs the node. See
+  [contrib/seqln-signer/README.md](contrib/seqln-signer/README.md).
 
-### Installation
+Experimental / known limitations (details and file pointers in
+[doc/sequentia-fork.md](doc/sequentia-fork.md#known-hazards-and-limitations)):
 
-There are 3 supported installation options:
+- Dual-funded (v2) channel opens and splicing are not asset-aware; asset channels must use the
+  ordinary single-funder `fundchannel`.
+- Holding channels of *different* assets to the *same* peer is unsafe: parts of channel selection
+  are asset-blind and can put an HTLC on the wrong-asset channel. One asset per peer, and verify
+  per-asset balance movement.
+- BOLT11 invoices carry no asset field yet; the payer chooses the asset with `pay ... asset=<id>`.
+- The upstream CLN integration-test harness has no Sequentia network entries; Sequentia coverage
+  is standalone scripts under `tests/sequentia/` plus the signer conformance harness.
 
- - Installation of a pre-compiled binary from the [release page][releases] on GitHub.
- - Using one of the [provided docker images][dockerhub] on the Docker Hub.
- - Compiling the source code yourself as described in the [installation documentation](doc/getting-started/getting-started/installation.md).
+## Building from source
 
-### Starting `lightningd`
-
-#### Regtest (local, fast-start) Option
-If you want to experiment with `lightningd`, there's a script to set
-up a `bitcoind` regtest test network of two local lightning nodes,
-which provides a convenient `start_ln` helper. See the notes at the top
-of the `startup_regtest.sh` file for details on how to use it.
-
-```bash
-. contrib/startup_regtest.sh
-```
-
-#### Mainnet Option
-To test with real bitcoin,  you will need to have a local `bitcoind` node running:
-
-```bash
-bitcoind -daemon
-```
-
-Wait until `bitcoind` has synchronized with the network.
-
-Make sure that you do not have `walletbroadcast=0` in your `~/.bitcoin/bitcoin.conf`, or you may run into trouble.
-Notice that running `lightningd` against a pruned node may cause some issues if not managed carefully, see [below](#pruning) for more information.
-
-You can start `lightningd` with the following command:
-
-```bash
-lightningd --network=bitcoin --log-level=debug
-```
-
-This creates a `.lightning/` subdirectory in your home directory: see `man -l doc/lightningd.8` (or https://docs.corelightning.org/docs) for more runtime options.
-
-### Using The JSON-RPC Interface
-
-Core Lightning exposes a [JSON-RPC 2.0][jsonrpcspec] interface over a Unix Domain socket; the `lightning-cli` tool can be used to access it, or there is a [python client library](contrib/pyln-client).
-
-You can use `lightning-cli help` to print a table of RPC methods; `lightning-cli help <command>`
-will offer specific information on that command.
-
-Useful commands:
-
-* [newaddr](https://docs.corelightning.org/reference/newaddr): get a bitcoin address to deposit funds into your lightning node.
-* [listfunds](https://docs.corelightning.org/reference/listfunds): see where your funds are.
-* [connect](https://docs.corelightning.org/reference/connect): connect to another lightning node.
-* [fundchannel](https://docs.corelightning.org/reference/fundchannel): create a channel to another connected node.
-* [invoice](https://docs.corelightning.org/reference/invoice): create an invoice to get paid by another node.
-* [pay](https://docs.corelightning.org/reference/pay): pay someone else's invoice.
-* [plugin](https://docs.corelightning.org/reference/plugin): commands to control extensions.
-
-### Care And Feeding Of Your New Lightning Node
-
-Once you've started for the first time, there's a script called
-`contrib/bootstrap-node.sh` which will connect you to other nodes on
-the lightning network.
-
-There are also numerous plugins available for Core Lightning which add
-capabilities: in particular there's a collection at: https://github.com/lightningd/plugins
-
-For a less reckless experience, you can encrypt the HD wallet seed:
- see [HD wallet encryption](#hd-wallet-encryption).
-
-You can also chat to other users at Discord [core-lightning][discord];
-we are always happy to help you get started!
-
-
-### Opening A Channel
-
-First you need to transfer some funds to `lightningd` so that it can
-open a channel:
+SeqLN builds exactly like upstream CLN (see the
+[installation guide](doc/getting-started/getting-started/installation.md) for distro package
+lists), with one fork-specific point: the `external/libwally-core` submodule is pinned to the
+[Sequentia libwally fork](https://github.com/GracedEternalKingCabbageMan/libwally-core) (branch
+`sequentia-issuance-denomination`). Stock libwally under-reads Sequentia asset-issuance
+transactions by one byte (Sequentia adds a denomination byte to `CAssetIssuance`), which would
+crash a node syncing any issuance block; the pinned fork parses and round-trips it. Cloning with
+`--recurse-submodules` picks the right commit automatically.
 
 ```bash
-# Returns an address <address>
-lightning-cli newaddr
+git clone --recurse-submodules -b sequentia-stable https://github.com/GracedEternalKingCabbageMan/seqln.git
+cd seqln
+uv sync --all-extras --all-groups --frozen   # python deps (msggen, test harness)
+./configure
+make -j$(nproc)
 ```
 
-`lightningd` will register the funds once the transaction is confirmed.
+Binaries land in-tree: `lightningd/lightningd`, `cli/lightning-cli`, the subdaemons next to
+`lightningd/`, and the signer-split daemons `lightningd/lightning_hsmd_proxy` and
+`lightningd/lightning_signerd`.
 
-Alternatively you can generate a taproot address should your source of funds support it:
+Contributions go as PRs against the `sequentia-stable` branch (`sequentia` is the development
+branch).
+
+## Running against the Sequentia public testnet
+
+SeqLN needs a synced Sequentia node (the `elementsd` fork from
+[Sequentia](https://github.com/GracedEternalKingCabbageMan/Sequentia)) with RPC enabled, plus its
+`elements-cli` binary; the `bcli` backend plugin shells out to `elements-cli -chain=test`.
 
 ```bash
-# Return a taproot address
-lightning-cli newaddr p2tr
+lightningd --network=sequentia-testnet \
+  --bitcoin-cli=/path/to/elements-cli \
+  --bitcoin-datadir=/path/to/sequentia-datadir \
+  --lightning-dir=$HOME/.seqln
 ```
 
-Confirm `lightningd` got funds by:
+(`--bitcoin-rpcconnect/--bitcoin-rpcport/--bitcoin-rpcuser/--bitcoin-rpcpassword` work as usual if
+you prefer explicit RPC credentials over a datadir/cookie. The node's default RPC port is 18332.)
+
+Then, for example:
 
 ```bash
-# Returns an array of on-chain funds.
-lightning-cli listfunds
+# Fund the on-chain wallet (tSEQ or any issued asset), e.g. from the faucet at
+# https://sequentiatestnet.com/faucet, then:
+alias scli='lightning-cli --lightning-dir=$HOME/.seqln --network=sequentia-testnet'
+scli newaddr                                                # a shared-format tb1... address
+scli listfunds                                              # issued-asset UTXOs carry an "asset" field
+scli fundchannel id=<node_id> amount=100000                 # tSEQ channel
+scli fundchannel id=<node_id> amount=100000 asset=<hex_id>  # issued-asset channel
+scli pay bolt11=<lntsqt1...> asset=<hex_id>                 # pay routed over that asset only
 ```
 
-Once `lightningd` has funds, we can connect to a node and open a channel.
-Let's assume the **remote** node is accepting connections at `<ip>`
-(and optional `<port>`, if not 9735) and has the node ID `<node_id>`:
+Amounts for an asset channel are that asset's own atoms (there is no privileged unit; "sat" and
+"msat" field names are inherited from upstream wire formats but denominate the channel asset).
+
+## Running against Bitcoin testnet4
+
+Unchanged from upstream: point it at a `bitcoind` on testnet4.
 
 ```bash
-lightning-cli connect <node_id> <ip> [<port>]
-lightning-cli fundchannel <node_id> <amount_in_satoshis>
+lightningd --network=testnet4 --lightning-dir=$HOME/.cln-testnet4
 ```
 
-This opens a connection and, on top of that connection, then opens a channel.
-The funding transaction needs 3 confirmation in order for the channel to be usable, and 6 to be announced for others to use.
-You can check the status of the channel using `lightning-cli listpeers`, which after 3 confirmations (1 on testnet) should say that `state` is `CHANNELD_NORMAL`; after 6 confirmations you can use `lightning-cli listchannels` to verify that the `public` field is now `true`.
+The same binary, database format, plugins, and RPC surface apply; see the upstream docs below.
 
-### Sending and Receiving Payments
+## Testing
 
-Payments in Lightning are invoice based.
-The recipient creates an invoice with the expected `<amount>` in
-millisatoshi (or `"any"` for a donation), a unique `<label>` and a
-`<description>` the payer will see:
+- **Upstream suites** (Bitcoin regtest / liquid-regtest; no Sequentia entries yet):
+  `make check-units` for unit tests, `make pytest` (or
+  `uv run python -m pytest -v tests/`) for integration tests. See
+  [doc/contribute-to-core-lightning/testing.md](doc/contribute-to-core-lightning/testing.md).
+- **Sequentia live-chain checks** (`tests/sequentia/`): standalone scripts that point at any
+  reachable Sequentia node via `ELEMCLI` (path to `elements-cli`) and
+  `SEQ_RPC_{HOST,PORT,USER,PASS}`:
+  ```bash
+  ELEMCLI=/path/to/elements-cli python3 tests/sequentia/validate_live_blocks.py      # header parser vs live chain
+  ELEMCLI=/path/to/elements-cli python3 tests/sequentia/verify_certified_frontier.py # confirmation clamp
+  ELEMCLI=/path/to/elements-cli python3 tests/sequentia/verify_anchor_burial.py      # SCID announce gate
+  ELEMCLI=/path/to/elements-cli python3 tests/sequentia/verify_block_parse.py        # single-block regression
+  ```
+- **Signer**: `cargo test` in `contrib/seqln-signer/`, plus the byte-exact conformance harness
+  against libhsmd; see [contrib/seqln-signer/README.md](contrib/seqln-signer/README.md).
 
-```bash
-lightning-cli invoice <amount> <label> <description>
-```
+## Upstream documentation
 
-This returns some internal details, and a standard invoice string called `bolt11` (named after the [BOLT #11 lightning spec][BOLT11]).
+Everything generic about Core Lightning (configuration, RPC reference, plugins, man pages,
+developer guides) is unchanged in this fork and documented upstream: the in-tree
+[doc/](doc/index.rst) tree and https://docs.corelightning.org/docs. The Sequentia-specific delta
+is documented in [doc/sequentia-fork.md](doc/sequentia-fork.md).
 
-[BOLT11]: https://github.com/lightning/bolts/blob/master/11-payment-encoding.md
+## License
 
-The sender can feed this `bolt11` string to the `decode` command to see what it is, and pay it simply using the `pay` command:
-
-```bash
-lightning-cli pay <bolt11>
-```
-
-Note that there are lower-level interfaces (and more options to these
-interfaces) for more sophisticated use.
-
-## Configuration File
-
-`lightningd` can be configured either by passing options via the command line, or via a configuration file.
-Command line options will always override the values in the configuration file.
-
-To use a configuration file, create a file named `config` within your top-level lightning directory or network subdirectory
-(eg. `~/.lightning/config` or `~/.lightning/bitcoin/config`).  See `man -l doc/lightningd-config.5`.
-
-A sample configuration file is available at `contrib/config-example`.
-
-## Further information
-
-### Pruning
-
-Core Lightning requires JSON-RPC access to a fully synchronized `bitcoind` in order to synchronize with the Bitcoin network.
-Access to ZeroMQ is not required and `bitcoind` does not need to be run with `txindex` like other implementations.
-The lightning daemon will poll `bitcoind` for new blocks that it hasn't processed yet, thus synchronizing itself with `bitcoind`.
-If `bitcoind` prunes a block that Core Lightning has not processed yet, e.g., Core Lightning was not running for a prolonged period, then `bitcoind` will not be able to serve the missing blocks, hence Core Lightning will not be able to synchronize anymore and will be stuck.
-In order to avoid this situation you should be monitoring the gap between Core Lightning's blockheight using `lightning-cli getinfo` and `bitcoind`'s blockheight using `bitcoin-cli getblockchaininfo`.
-If the two blockheights drift apart it might be necessary to intervene.
-
-### HD wallet encryption
-
-You can encrypt the `hsm_secret` content (which is used to derive the HD wallet's master key) by passing the `--encrypted-hsm` startup argument, or by using the `lightning-hsmtool` (which you can find in the `tool/` directory at the root of this repo) with the `encrypt` method. You can unencrypt an encrypted `hsm_secret` using the `lightning-hsmtool` with the `decrypt` method.
-
-If you encrypt your `hsm_secret`, you will have to pass the `--encrypted-hsm` startup option to `lightningd`. Once your `hsm_secret` is encrypted, you __will not__ be able to access your funds without your password, so please beware with your password management. Also, beware of not feeling too safe with an encrypted `hsm_secret`: unlike for `bitcoind` where the wallet encryption can restrict the usage of some RPC command, `lightningd` always needs to access keys from the wallet which is thus __not locked__ (yet), even with an encrypted BIP32 master seed.
-
-### Developers
-
-Developers wishing to contribute should start with the developer guide [here](doc/contribute-to-core-lightning/coding-style-guidelines.md).
-
-[blockstream-store-blog]: https://blockstream.com/2018/01/16/en-lightning-charge/
-[std]: https://github.com/lightning/bolts
-[prs-badge]: https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat
-[prs]: http://makeapullrequest.com
-[ml1]: https://lists.ozlabs.org/listinfo/c-lightning
-[discord-badge]: https://badgen.net/badge/Discord/chat/blue
-[discord]: https://discord.gg/mE9s4rc5un
-[telegram-badge]: https://badgen.net/badge/Telegram/chat/blue
-[telegram]: https://t.me/lightningd
-[IRC-badge]: https://img.shields.io/badge/IRC-chat-blue.svg
-[IRC]: https://web.libera.chat/#c-lightning
-[irc1]: https://web.libera.chat/#lightning-dev
-[irc2]: https://web.libera.chat/#c-lightning
-[docs-badge]: https://readthedocs.org/projects/lightning/badge/?version=docs
-[docs]: https://docs.corelightning.org/docs
-[releases]: https://github.com/ElementsProject/lightning/releases
-[dockerhub]: https://hub.docker.com/r/elementsproject/lightningd/
-[jsonrpcspec]: https://www.jsonrpc.org/specification
-[helpme-github]: https://github.com/lightningd/plugins/tree/master/helpme
-[actions-badge]: https://github.com/ElementsProject/lightning/workflows/Continuous%20Integration/badge.svg
-[actions]: https://github.com/ElementsProject/lightning/actions
+[BSD-MIT](LICENSE), same as upstream Core Lightning (modules under `ccan/` carry their own
+licenses).
