@@ -21,8 +21,8 @@ Bitcoin testnet4). There is no Sequentia mainnet; the `sequentia` mainnet entry 
 | Repo | One-liner |
 |---|---|
 | [Sequentia](https://github.com/GracedEternalKingCabbageMan/Sequentia) | The Sequentia node (`elementsd` fork of Elements 23.3.3): consensus, anchoring, proof of stake, open fee market, plus the canonical protocol documentation in `doc/sequentia/`. |
-| [seqln](https://github.com/GracedEternalKingCabbageMan/seqln) | SeqLN: a Core Lightning fork that runs on Sequentia and Bitcoin from the same binary — asset channels, any-asset payments, pure-Lightning swaps. |
-| [seqdex](https://github.com/GracedEternalKingCabbageMan/seqdex) | SeqDEX: non-custodial atomic-swap DEX — P2P order book (seqob), same-chain swaps, and cross-chain BTC↔asset swaps made safe by Bitcoin anchoring. |
+| [seqln](https://github.com/GracedEternalKingCabbageMan/seqln) | SeqLN: a Core Lightning fork that runs on Sequentia and Bitcoin from the same binary, with asset channels, any-asset payments, pure-Lightning swaps. |
+| [seqdex](https://github.com/GracedEternalKingCabbageMan/seqdex) | SeqDEX: non-custodial atomic-swap DEX: P2P order book (seqob), same-chain swaps, and cross-chain BTC↔asset swaps made safe by Bitcoin anchoring. |
 | [fulmen](https://github.com/GracedEternalKingCabbageMan/fulmen) | Fulmen: desktop (Electron) wallet for SeqLN with a bundled Lightning node. |
 | [libwally-core](https://github.com/GracedEternalKingCabbageMan/libwally-core) | libwally fork with the Sequentia transaction-parsing patch (issuance denomination byte) used by SeqLN. |
 
