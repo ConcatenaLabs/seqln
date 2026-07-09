@@ -1852,6 +1852,38 @@ void handle_early_opts(struct lightningd *ld, int argc, char *argv[])
 		/* max HTLC CLTV ~2 weeks (Bitcoin 2016 blocks); without scaling,
 		 * an HTLC would cap at 2016 blocks ~= 32h on Sequentia. */
 		ld->config.max_htlc_cltv = 20160;
+
+		/* SEQUENTIA anchoring supremacy (first principle #1): a
+		 * Sequentia block references a Bitcoin header and is reorged
+		 * out in real time whenever its Bitcoin anchor is orphaned, at
+		 * ANY depth and with NO exception.  Because Sequentia produces
+		 * a block roughly every ~58s while Bitcoin produces one every
+		 * ~600s, a single-digit Bitcoin reorg unwinds ~10x as many
+		 * Sequentia blocks (a 6-block Bitcoin reorg ~= 60 Sequentia
+		 * blocks), so deep reorgs are NORMAL here, not an error.
+		 *
+		 * Upstream CLN pins its in-memory chain root only `rescan`
+		 * blocks below the tip (testnet 30 / mainnet 15).  Any reorg
+		 * deeper than that walks topo->tip back past topo->root in
+		 * chaintopology.c:remove_tip(), hits a NULL prev, and calls
+		 * fatal("Initial block ... reorganized out!") - i.e. the node
+		 * treats its start block as final and ABORTS.  That directly
+		 * contradicts anchoring supremacy.
+		 *
+		 * Fix: default to rescan = -1, which chaintopology.c reads as
+		 * an ABSOLUTE start height of 1 (just above genesis).  The root
+		 * is then pinned at the effectively-immutable base of the
+		 * chain, so a Bitcoin-driven reorg of any depth can never walk
+		 * past it and remove_tip() never reaches the fatal().  A finite
+		 * depth would only be a larger magic number that still fails
+		 * beyond it; genesis is the only correct floor for a
+		 * reorg-following chain.  Cost is a full rescan on restart,
+		 * which is acceptable (correctness > startup speed) and matches
+		 * the runtime `rescan=-1` workaround already proven on the live
+		 * node.  Scoped to has_anchor_header (Sequentia networks only),
+		 * so upstream Bitcoin testnet4/mainnet behaviour is unchanged;
+		 * operators may still override with --rescan. */
+		ld->config.rescan = -1;
 	}
 
 	/* No anchors if we're elements */

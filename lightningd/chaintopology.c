@@ -1118,6 +1118,15 @@ static void remove_tip(struct chain_topology *topo)
 	/* Move tip back one. */
 	topo->tip = b->prev;
 
+	/* SEQUENTIA anchoring supremacy (first principle #1): on a
+	 * reorg-following chain the start block must NOT be treated as final.
+	 * Sequentia networks (chainparams has_anchor_header) default to
+	 * config.rescan = -1 (see lightningd/options.c handle_early_opts),
+	 * which pins topo->root at absolute height 1 - just above genesis -
+	 * so a Bitcoin-driven reorg of any depth can never unwind the chain
+	 * past root and this fatal() is unreachable there.  It remains for
+	 * upstream Bitcoin networks, whose shallow rescan window makes an
+	 * over-deep reorg a genuine "give up and resync" condition. */
 	if (!topo->tip)
 		fatal("Initial block %u (%s) reorganized out!",
 		      b->height,
