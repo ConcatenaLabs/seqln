@@ -758,7 +758,11 @@ impl Signer {
                 }
             };
             // Low-R ECDSA, self-checked against the derived pubkey, DER-encoded.
-            let der = self.kernel().sign_low_r_der_checked(&hash, &sk, &pubkey)?;
+            // The withdrawal path signs through libwally's `wally_psbt_sign`, so we
+            // match ITS grind (NULL first nonce) — not `bitcoin/signature.c`'s
+            // `sign_hash` (32-zero first nonce) used for commitments — to reproduce
+            // the reference libhsmd partial-sig bytes exactly.
+            let der = self.kernel().sign_low_r_der_libwally_checked(&hash, &sk, &pubkey)?;
             // Splice a PSBT_IN_PARTIAL_SIG record (key 0x02||pubkey, value DER||sighash)
             // into input j's map. Re-navigate each time: earlier inserts shift offsets.
             let rec = partial_sig_record(&pubkey, &der, SIGHASH_ALL as u8);
@@ -1215,10 +1219,13 @@ mod withdrawal_tests {
     /// BIP-143 sighash over it, and splice a valid PSBT_IN_PARTIAL_SIG. This
     /// asserts: (a) the tx reconstructed from the PSET has the exact inputs,
     /// outputs, asset ids, amounts and empty-script fee output we encoded; and
-    /// (b) the spliced signature is over THAT reconstructed tx's sighash (low-R is
-    /// deterministic, so a correct handler reproduces these exact bytes). The
-    /// libhsmd byte-exactness itself is proven out-of-process against the real
-    /// oracle (`SEQLN_WITHDRAWAL_VECTOR` mode of the conformance harness).
+    /// (b) the spliced signature is over THAT reconstructed tx's sighash, using
+    /// libwally's low-R grind (so it reproduces these exact bytes). The full
+    /// libhsmd byte-exactness — the reconstructed-tx sighash AND the partial-sig
+    /// bytes are IDENTICAL to the reference `lightning_signerd` (libwally
+    /// `wally_psbt_sign`) for a real Elements v2 PSET withdrawal — is proven
+    /// out-of-process by the `SEQLN_WITHDRAWAL_VECTOR` mode of the conformance
+    /// harness fed by the `emit_elements_vector` binary.
     #[test]
     fn signs_own_elements_asset_funding_input() {
         // This test builds an Elements PSET; if the box env forces the Bitcoin
@@ -1370,7 +1377,7 @@ mod withdrawal_tests {
         let sk = signer.kernel().bip86_child_privkey(keyindex);
         let expected = signer
             .kernel()
-            .sign_low_r_der_checked(&hash, &sk, &pubkey)
+            .sign_low_r_der_libwally_checked(&hash, &sk, &pubkey)
             .expect("sig self-verifies");
         assert_eq!(der, expected.as_slice(), "signature is over the wrong (or Bitcoin-format) sighash");
     }
@@ -1461,7 +1468,7 @@ mod withdrawal_tests {
         let sk = signer.kernel().bip86_child_privkey(keyindex);
         let expected = signer
             .kernel()
-            .sign_low_r_der_checked(&hash, &sk, &pubkey)
+            .sign_low_r_der_libwally_checked(&hash, &sk, &pubkey)
             .expect("sig self-verifies");
         assert_eq!(der, expected.as_slice(), "signature is over the wrong sighash");
     }

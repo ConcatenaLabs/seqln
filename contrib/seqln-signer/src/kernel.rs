@@ -692,6 +692,57 @@ impl Kernel {
         }
     }
 
+    /// Low-R grind matching libwally's `wally_ec_sig_from_bytes`
+    /// (`EC_FLAG_GRIND_R`, `external/libwally-core/src/sign.c`), which is what
+    /// `sign_our_inputs` -> `wally_psbt_sign` uses to sign a withdrawal's wallet
+    /// inputs. It differs from [`sign_hash_low_r`] (a port of `bitcoin/signature.c`
+    /// `sign_hash`, used for the byte-exact COMMITMENT path) in exactly the first
+    /// grind round: libwally signs the first round with `noncedata = NULL` (no
+    /// extra entropy), and only from the second round on mixes in `le32(counter)`
+    /// (counter = 1, 2, ...) as the 32-byte extra_entropy. `sign_hash` instead
+    /// mixes 32 zero bytes even on the first round, so the two pick different
+    /// nonces. A withdrawal partial sig must reproduce libwally's exact bytes (so
+    /// the reply is byte-identical to the reference libhsmd), hence this variant.
+    pub fn sign_hash_low_r_libwally(&self, hash: &[u8; 32], sk: &SecretKey) -> [u8; 64] {
+        let msg = Message::from_digest(*hash);
+        // Round 0: noncedata = NULL (rust-secp `sign_ecdsa` passes NULL), matching
+        // libwally's first `secp256k1_ecdsa_sign_recoverable(.., entropy_p=NULL)`.
+        let sig: ecdsa::Signature = self.secp.sign_ecdsa(&msg, sk);
+        let compact = sig.serialize_compact();
+        if compact[0] < 0x80 {
+            return compact;
+        }
+        // Grind: counter = 1, 2, ... as le32 in a 32-byte extra_entropy buffer.
+        let mut counter: u32 = 1;
+        loop {
+            let mut extra = [0u8; 32];
+            extra[..4].copy_from_slice(&counter.to_le_bytes());
+            let sig: ecdsa::Signature = self.secp.sign_ecdsa_with_noncedata(&msg, sk, &extra);
+            let compact = sig.serialize_compact();
+            if compact[0] < 0x80 {
+                return compact;
+            }
+            counter = counter.wrapping_add(1);
+        }
+    }
+
+    /// [`sign_low_r_der_checked`] but grinding via [`sign_hash_low_r_libwally`] —
+    /// the DER-encoded, self-verified withdrawal partial signature that matches
+    /// libwally/libhsmd's `wally_psbt_sign` output byte-for-byte.
+    pub fn sign_low_r_der_libwally_checked(
+        &self,
+        hash: &[u8; 32],
+        sk: &SecretKey,
+        pubkey: &[u8; 33],
+    ) -> Option<Vec<u8>> {
+        let compact = self.sign_hash_low_r_libwally(hash, sk);
+        let msg = Message::from_digest(*hash);
+        let sig = ecdsa::Signature::from_compact(&compact).ok()?;
+        let pk = PublicKey::from_slice(pubkey).ok()?;
+        self.secp.verify_ecdsa(&msg, &sig, &pk).ok()?;
+        Some(sig.serialize_der().to_vec())
+    }
+
     /// `secp256k1_ecdsa_sign_recoverable` (RFC6979, no grind) over `hash` with
     /// the node key, serialized as `towire_secp256k1_ecdsa_recoverable_signature`
     /// does: 64-byte compact || recid(u8). Used by `handle_sign_invoice`.
