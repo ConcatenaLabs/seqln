@@ -843,6 +843,191 @@ pub fn psbt_global_unsigned_tx(psbt: &[u8]) -> Option<&[u8]> {
     }
 }
 
+// =====================================================================
+// v2 PSET (Elements) unsigned-tx reconstruction.
+//
+// A v2 PSET has NO `PSBT_GLOBAL_UNSIGNED_TX` field (that global key is a
+// Bitcoin-v0-only construct — see [`psbt_global_unsigned_tx`], which returns
+// None here). lightningd downgrades a Bitcoin PSBT to v0 before handing it to
+// the signer, but an Elements PSET is only ever v2 (a v0 global unsigned tx
+// cannot carry confidential fields), so a Sequentia asset funding withdrawal
+// arrives with the transaction spread across the per-input and per-output maps.
+//
+// We rebuild the exact unsigned Elements tx that libwally's `psbt_build_tx`
+// (`unblinded == false`, the mode `wally_psbt_sign` uses to compute the
+// signature hash) would produce, so [`crate::kernel::elements_sighash_sw_v0`]
+// over it yields the SAME sighash libhsmd signs. Faithful to `psbt_build_tx`
+// -> `psbt_build_input` / `psbt_build_output` (`external/libwally-core/src/psbt.c`):
+//
+//   * version  = PSBT_GLOBAL_TX_VERSION (global key 0x02, le32).
+//   * locktime = PSBT_GLOBAL_FALLBACK_LOCKTIME (global key 0x03, le32) when no
+//     input carries a required locktime — the funding-open case (`wally_psbt_get_locktime`).
+//   * input i  = { PSBT_IN_PREVIOUS_TXID (0x0e, 32 bytes, internal order),
+//                  PSBT_IN_OUTPUT_INDEX (0x0f, le32, issuance/pegin flag bits
+//                  masked off — funding inputs never issue), PSBT_IN_SEQUENCE
+//                  (0x10, le32; default 0xffffffff when absent) }.
+//   * output j = { asset      = PSET_OUT_ASSET_COMMITMENT (0x03) if present, else
+//                               0x01||PSET_OUT_ASSET (0x02, 32-byte id) — explicit;
+//                  value      = PSET_OUT_VALUE_COMMITMENT (0x01) if present, else
+//                               0x01||u64_be(PSBT_OUT_AMOUNT (0x03, le64)) — explicit;
+//                  nonce      = PSET_OUT_ECDH_PUBKEY (0x07, 33 bytes) if present,
+//                               else the single null byte 0x00;
+//                  script     = PSBT_OUT_SCRIPT (0x04; empty for the fee output) }.
+//
+// PSET-specific fields use PROPRIETARY keys: 0xfc || varbuff("pset") || type,
+// i.e. the 7-byte key `fc 04 70 73 65 74 <type>` for a single-byte field type.
+// =====================================================================
+
+/// Elements PSET proprietary key prefix: `WALLY_PSBT_PROPRIETARY_TYPE(0xfc) ||
+/// varbuff("pset")` = `fc 04 70 73 65 74`. A PSET field key is this prefix
+/// followed by the (varint) field type.
+const PSET_KEY_PREFIX: [u8; 6] = [0xfc, 0x04, 0x70, 0x73, 0x65, 0x74];
+
+/// Parse one PSBT/PSET key-value map starting at `*p` (pointing at the first
+/// keylen byte), advancing `*p` past the 0x00 terminator. Returns each record as
+/// borrowed `(key, value)` slices.
+fn parse_psbt_map<'a>(d: &'a [u8], p: &mut usize) -> Option<Vec<(&'a [u8], &'a [u8])>> {
+    let mut recs = Vec::new();
+    loop {
+        let keylen = read_compact(d, p)? as usize;
+        if keylen == 0 {
+            return Some(recs);
+        }
+        let key = d.get(*p..*p + keylen)?;
+        *p += keylen;
+        let vallen = read_compact(d, p)? as usize;
+        let val = d.get(*p..*p + vallen)?;
+        *p += vallen;
+        recs.push((key, val));
+    }
+}
+
+/// Value of a standard single-byte-key field `t` in a parsed map, or None.
+fn map_std<'a>(recs: &[(&'a [u8], &'a [u8])], t: u8) -> Option<&'a [u8]> {
+    recs.iter()
+        .find(|(k, _)| k.len() == 1 && k[0] == t)
+        .map(|(_, v)| *v)
+}
+
+/// Value of a PSET proprietary field `t` (`fc 04 "pset" <t>`) in a map, or None.
+fn map_pset<'a>(recs: &[(&'a [u8], &'a [u8])], t: u8) -> Option<&'a [u8]> {
+    recs.iter()
+        .find(|(k, _)| k.len() == 7 && k[..6] == PSET_KEY_PREFIX && k[6] == t)
+        .map(|(_, v)| *v)
+}
+
+fn le32(b: &[u8]) -> Option<u32> {
+    Some(u32::from_le_bytes(b.get(0..4)?.try_into().ok()?))
+}
+
+/// Reconstruct the unsigned Elements transaction from a v2 PSET's global, input
+/// and output maps (see the module-level notes above). The result feeds
+/// [`crate::kernel::elements_sighash_sw_v0`] and matches, byte-for-byte, the tx
+/// libwally builds internally when libhsmd signs the same withdrawal.
+pub fn reconstruct_elements_tx_from_pset(psbt: &[u8]) -> Option<ElementsTx> {
+    if psbt.len() < 5 {
+        return None;
+    }
+    let mut p = 5usize; // skip magic "pset\xff" / "psbt\xff"
+
+    // ---- global map: tx version, fallback locktime, input/output counts ----
+    let g = parse_psbt_map(psbt, &mut p)?;
+    let version = le32(map_std(&g, 0x02)?)?; // PSBT_GLOBAL_TX_VERSION
+    let fallback_locktime = map_std(&g, 0x03).and_then(le32).unwrap_or(0); // FALLBACK_LOCKTIME
+    // INPUT_COUNT / OUTPUT_COUNT values are a varint inside the value buffer.
+    let num_inputs = {
+        let v = map_std(&g, 0x04)?;
+        read_compact(v, &mut 0usize)? as usize
+    };
+    let num_outputs = {
+        let v = map_std(&g, 0x05)?;
+        read_compact(v, &mut 0usize)? as usize
+    };
+
+    // ---- input maps ----
+    let mut inputs = Vec::with_capacity(num_inputs);
+    let mut any_required_locktime = false;
+    let mut max_required_locktime = 0u32;
+    for _ in 0..num_inputs {
+        let m = parse_psbt_map(psbt, &mut p)?;
+        let txid_bytes = map_std(&m, 0x0e)?; // PSBT_IN_PREVIOUS_TXID (internal order)
+        let txhash: [u8; 32] = txid_bytes.get(0..32)?.try_into().ok()?;
+        // PSBT_IN_OUTPUT_INDEX, masking off any issuance/pegin flag bits.
+        let index = le32(map_std(&m, 0x0f)?)? & !(WALLY_TX_ISSUANCE_FLAG | WALLY_TX_PEGIN_FLAG);
+        // PSBT_IN_SEQUENCE (default final when absent).
+        let sequence = map_std(&m, 0x10).and_then(le32).unwrap_or(0xffff_ffff);
+        // Per-input required locktime (0x11 time / 0x12 height) — absent for a
+        // funding open, but honour it so the tx locktime matches libwally.
+        if let Some(v) = map_std(&m, 0x11).and_then(le32) {
+            any_required_locktime = true;
+            max_required_locktime = max_required_locktime.max(v);
+        }
+        if let Some(v) = map_std(&m, 0x12).and_then(le32) {
+            any_required_locktime = true;
+            max_required_locktime = max_required_locktime.max(v);
+        }
+        inputs.push(TxInput {
+            txhash,
+            index,
+            sequence,
+            is_issuance: false,
+        });
+    }
+
+    let locktime = if any_required_locktime {
+        max_required_locktime
+    } else {
+        fallback_locktime
+    };
+
+    // ---- output maps ----
+    let mut outputs = Vec::with_capacity(num_outputs);
+    for _ in 0..num_outputs {
+        let m = parse_psbt_map(psbt, &mut p)?;
+        // asset commitment: real commitment if present, else explicit 0x01||id.
+        let asset = if let Some(c) = map_pset(&m, 0x03) {
+            c.to_vec() // PSET_OUT_ASSET_COMMITMENT (33 bytes)
+        } else {
+            let id = map_pset(&m, 0x02)?; // PSET_OUT_ASSET (32-byte id)
+            let mut a = Vec::with_capacity(33);
+            a.push(0x01);
+            a.extend_from_slice(id.get(0..32)?);
+            a
+        };
+        // value commitment: real commitment if present, else explicit 0x01||be.
+        let value = if let Some(c) = map_pset(&m, 0x01) {
+            c.to_vec() // PSET_OUT_VALUE_COMMITMENT (33 bytes)
+        } else {
+            let amt = map_std(&m, 0x03)?; // PSBT_OUT_AMOUNT (le64)
+            let sats = u64::from_le_bytes(amt.get(0..8)?.try_into().ok()?);
+            let mut v = Vec::with_capacity(9);
+            v.push(0x01);
+            v.extend_from_slice(&sats.to_be_bytes());
+            v
+        };
+        // nonce commitment: the ECDH pubkey (blinded) or a single null byte.
+        let nonce = match map_pset(&m, 0x07) {
+            Some(n) => n.to_vec(), // PSET_OUT_ECDH_PUBKEY (33 bytes)
+            None => vec![0x00],
+        };
+        let script = map_std(&m, 0x04).map(|s| s.to_vec()).unwrap_or_default(); // PSBT_OUT_SCRIPT
+        outputs.push(TxOutput {
+            asset,
+            value,
+            nonce,
+            script,
+        });
+    }
+
+    Some(ElementsTx {
+        version,
+        inputs,
+        outputs,
+        locktime,
+        network: Network::Elements,
+    })
+}
+
 /// Byte offset of the 0x00 terminator of input map `idx` (0-based), i.e. the
 /// splice point at which to insert a new record into that input's key-value map.
 /// Mirrors the map navigation of [`psbt_witness_utxo_raw`].

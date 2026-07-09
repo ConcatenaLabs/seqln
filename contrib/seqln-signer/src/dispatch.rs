@@ -664,16 +664,24 @@ impl Signer {
     fn h_sign_withdrawal(&self, m: &[u8]) -> Option<Vec<u8>> {
         let (utxos, psbt) = wire::parse_sign_withdrawal(m)?;
         let network = wire::detect_network(&psbt);
-        // The tx being signed is the PSBT's global unsigned tx (v0 on the Bitcoin
-        // path, which lightningd downgrades to before sending).
-        let lin = wire::psbt_global_unsigned_tx(&psbt)?;
-        let tx = match network {
-            kernel::Network::Bitcoin => wire::parse_bitcoin_tx(lin)?,
-            kernel::Network::Elements => wire::parse_elements_tx(lin)?,
+        // The tx being signed comes from the PSBT. On the Bitcoin path lightningd
+        // downgrades to a v0 PSBT first, so the whole unsigned tx sits in the
+        // global `PSBT_GLOBAL_UNSIGNED_TX` field. An Elements asset PSET is only
+        // ever v2 and has NO such field, so we rebuild the unsigned tx from its
+        // per-input/per-output maps (see `wire::reconstruct_elements_tx_from_pset`);
+        // the reconstructed tx yields the exact sighash libhsmd's libwally signs.
+        // `tx_bytes` (the linearized tx) is only consumed by the Bitcoin taproot
+        // key-path branch below; Elements funding inputs are segwit-v0, so it
+        // stays empty there.
+        let (tx, tx_bytes) = match network {
+            kernel::Network::Bitcoin => {
+                let lin = wire::psbt_global_unsigned_tx(&psbt)?;
+                (wire::parse_bitcoin_tx(lin)?, lin.to_vec())
+            }
+            kernel::Network::Elements => {
+                (wire::reconstruct_elements_tx_from_pset(&psbt)?, Vec::new())
+            }
         };
-        // Own copy of the unsigned tx bytes: the taproot sighash path needs them
-        // inside the loop, past the `psbt` move below.
-        let tx_bytes = lin.to_vec();
 
         let mut out = psbt;
         // Every input's (amount, scriptPubkey) from the PSBT witness_utxos, in tx
@@ -1172,6 +1180,199 @@ mod withdrawal_tests {
         // output-0 map: empty
         p.push(0x00);
         p
+    }
+
+    /// One PSET key-value record: keylen(compact) || key || vallen(compact) || val.
+    fn pset_rec(key: &[u8], val: &[u8]) -> Vec<u8> {
+        let mut r = compact(key.len());
+        r.extend_from_slice(key);
+        r.extend_from_slice(&compact(val.len()));
+        r.extend_from_slice(val);
+        r
+    }
+
+    /// The 7-byte PSET proprietary key for a single-byte field type: `fc 04 "pset" t`.
+    fn pset_key(t: u8) -> Vec<u8> {
+        vec![0xfc, 0x04, 0x70, 0x73, 0x65, 0x74, t]
+    }
+
+    /// An Elements explicit witness_utxo (the UTXO being spent):
+    /// asset(0x01||32) || value(0x01||u64_be) || null nonce(0x00) || varbuff(spk).
+    fn elements_wu(asset_id: &[u8; 32], sats: u64, spk: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x01u8];
+        v.extend_from_slice(asset_id);
+        v.push(0x01);
+        v.extend_from_slice(&sats.to_be_bytes());
+        v.push(0x00);
+        v.extend_from_slice(&compact(spk.len()));
+        v.extend_from_slice(spk);
+        v
+    }
+
+    /// The reconstruction fix, end-to-end: a Sequentia ASSET funding withdrawal
+    /// arrives as a v2 PSET (NO global unsigned tx). The signer must rebuild the
+    /// unsigned Elements tx from the input/output maps, compute the Elements
+    /// BIP-143 sighash over it, and splice a valid PSBT_IN_PARTIAL_SIG. This
+    /// asserts: (a) the tx reconstructed from the PSET has the exact inputs,
+    /// outputs, asset ids, amounts and empty-script fee output we encoded; and
+    /// (b) the spliced signature is over THAT reconstructed tx's sighash (low-R is
+    /// deterministic, so a correct handler reproduces these exact bytes). The
+    /// libhsmd byte-exactness itself is proven out-of-process against the real
+    /// oracle (`SEQLN_WITHDRAWAL_VECTOR` mode of the conformance harness).
+    #[test]
+    fn signs_own_elements_asset_funding_input() {
+        // This test builds an Elements PSET; if the box env forces the Bitcoin
+        // sighash format the reconstruction would be wrong, so skip there.
+        if matches!(
+            std::env::var("SEQLN_SIGNER_NETWORK").ok().as_deref(),
+            Some("bitcoin") | Some("btc")
+        ) {
+            eprintln!("SKIP: SEQLN_SIGNER_NETWORK forces Bitcoin");
+            return;
+        }
+
+        let seed = crate::kernel::bip39_seed(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            "",
+        );
+        let kernel = Kernel::new(seed.to_vec(), BIP32_VER_TEST_PUBLIC, BIP32_VER_TEST_PRIVATE);
+
+        // The node's own P2WPKH wallet input (bip86 key) it funds the channel from.
+        let keyindex = 4u32;
+        let pubkey = kernel.bip86_child_pubkey(keyindex);
+        let keyhash = kernel::hash160(&pubkey);
+        let in_spk: Vec<u8> = [0x00u8, 0x14].iter().copied().chain(keyhash).collect();
+
+        // A Sequentia asset id + a distinct fee (policy) asset id (tSEQ).
+        let asset_id: [u8; 32] = {
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&crate::kernel::hash160(b"GOLD").to_vec().repeat(2)[..32]);
+            a
+        };
+        let fee_asset: [u8; 32] = [0x77u8; 32];
+
+        let txid = [0x33u8; 32];
+        let in_amount = 500_000u64;
+        let seq = 0xffff_fffdu32; // RBF-enabled, like a real funding input
+
+        // ---- build the v2 PSET (magic "pset\xff") ----
+        let mut p = Vec::new();
+        p.extend_from_slice(b"pset\xff");
+        // global: TX_VERSION(2), FALLBACK_LOCKTIME(0), INPUT_COUNT(1), OUTPUT_COUNT(3)
+        p.extend_from_slice(&pset_rec(&[0x02], &2u32.to_le_bytes()));
+        p.extend_from_slice(&pset_rec(&[0x03], &0u32.to_le_bytes()));
+        p.extend_from_slice(&pset_rec(&[0x04], &[0x01])); // varint(1) inside varbuff
+        p.extend_from_slice(&pset_rec(&[0x05], &[0x03])); // varint(3)
+        p.push(0x00); // global terminator
+
+        // input 0: witness_utxo(asset), previous_txid, output_index, sequence.
+        let wu = elements_wu(&asset_id, in_amount, &in_spk);
+        p.extend_from_slice(&pset_rec(&[0x01], &wu)); // PSBT_IN_WITNESS_UTXO
+        p.extend_from_slice(&pset_rec(&[0x0e], &txid)); // PSBT_IN_PREVIOUS_TXID
+        p.extend_from_slice(&pset_rec(&[0x0f], &0u32.to_le_bytes())); // OUTPUT_INDEX
+        p.extend_from_slice(&pset_rec(&[0x10], &seq.to_le_bytes())); // SEQUENCE
+        p.push(0x00); // input-0 terminator
+
+        // output 0: the channel funding output (P2WSH), asset = GOLD, 300000.
+        let fund_spk: Vec<u8> = [0x00u8, 0x20].iter().copied().chain([0xabu8; 32]).collect();
+        p.extend_from_slice(&pset_rec(&pset_key(0x02), &asset_id)); // PSET_OUT_ASSET
+        p.extend_from_slice(&pset_rec(&[0x03], &300_000u64.to_le_bytes())); // PSBT_OUT_AMOUNT
+        p.extend_from_slice(&pset_rec(&[0x04], &fund_spk)); // PSBT_OUT_SCRIPT
+        p.push(0x00);
+
+        // output 1: change back to a P2WPKH of ours, asset = GOLD, 199000.
+        let change_spk: Vec<u8> = [0x00u8, 0x14].iter().copied().chain([0xcdu8; 20]).collect();
+        p.extend_from_slice(&pset_rec(&pset_key(0x02), &asset_id));
+        p.extend_from_slice(&pset_rec(&[0x03], &199_000u64.to_le_bytes()));
+        p.extend_from_slice(&pset_rec(&[0x04], &change_spk));
+        p.push(0x00);
+
+        // output 2: the FEE output — explicit fee asset, empty script.
+        p.extend_from_slice(&pset_rec(&pset_key(0x02), &fee_asset));
+        p.extend_from_slice(&pset_rec(&[0x03], &1_000u64.to_le_bytes()));
+        p.extend_from_slice(&pset_rec(&[0x04], &[])); // empty scriptPubkey
+        p.push(0x00);
+        let psbt = p;
+
+        // Sanity: detect_network must resolve Elements from the witness_utxo shape.
+        assert_eq!(wire::detect_network(&psbt), kernel::Network::Elements);
+
+        // The reconstruction must yield exactly what we encoded.
+        let tx = wire::reconstruct_elements_tx_from_pset(&psbt).expect("reconstruct pset tx");
+        assert_eq!(tx.network, kernel::Network::Elements);
+        assert_eq!(tx.version, 2);
+        assert_eq!(tx.locktime, 0);
+        assert_eq!(tx.inputs.len(), 1);
+        assert_eq!(tx.inputs[0].txhash, txid);
+        assert_eq!(tx.inputs[0].index, 0);
+        assert_eq!(tx.inputs[0].sequence, seq);
+        assert_eq!(tx.outputs.len(), 3);
+        // Funding output: explicit GOLD asset, explicit 300000, P2WSH script.
+        assert_eq!(tx.outputs[0].asset[0], 0x01);
+        assert_eq!(&tx.outputs[0].asset[1..], &asset_id);
+        assert_eq!(tx.outputs[0].value[0], 0x01);
+        assert_eq!(u64::from_be_bytes(tx.outputs[0].value[1..9].try_into().unwrap()), 300_000);
+        assert_eq!(tx.outputs[0].nonce, vec![0x00]);
+        assert_eq!(tx.outputs[0].script, fund_spk);
+        // Fee output: explicit fee asset, empty script.
+        assert_eq!(&tx.outputs[2].asset[1..], &fee_asset);
+        assert_eq!(u64::from_be_bytes(tx.outputs[2].value[1..9].try_into().unwrap()), 1_000);
+        assert!(tx.outputs[2].script.is_empty());
+
+        // ---- drive the handler ----
+        let mut w = Writer::new(msg::HSMD_SIGN_WITHDRAWAL);
+        w.u16(1); // num_inputs
+        w.bytes(&txid);
+        w.u32(0); // vout
+        w.u64(in_amount);
+        w.u32(keyindex);
+        w.bool(false); // legacy is_p2sh
+        w.u16(in_spk.len() as u16);
+        w.bytes(&in_spk);
+        w.bool(false); // is_unilateral_close
+        w.bool(false); // legacy is_in_coinbase
+        w.u32(psbt.len() as u32);
+        w.bytes(&psbt);
+        let req_msg = w.into_vec();
+
+        let secret = HsmSecret { seed, secret_type: 2, mnemonic: String::new() };
+        let mut signer = Signer::new(secret);
+        signer.kernel = Some(kernel);
+        signer.hsm_version = 6;
+
+        let reply = signer.h_sign_withdrawal(&req_msg).expect("elements withdrawal reply");
+        assert_eq!(u16::from_be_bytes([reply[0], reply[1]]), msg::HSMD_SIGN_WITHDRAWAL_REPLY);
+        let rlen = u32::from_be_bytes([reply[2], reply[3], reply[4], reply[5]]) as usize;
+        let rpsbt = &reply[6..6 + rlen];
+        assert!(rpsbt.len() > psbt.len(), "partial_sig not added");
+
+        // Locate the partial_sig record (key 0x22, 0x02, <pubkey33>; val DER||0x01).
+        let mut key = vec![34u8, 0x02];
+        key.extend_from_slice(&pubkey);
+        let pos = rpsbt
+            .windows(key.len())
+            .position(|win| win == key.as_slice())
+            .expect("partial_sig record for our wallet pubkey present");
+        let vp = pos + key.len();
+        let vallen = rpsbt[vp] as usize;
+        let value = &rpsbt[vp + 1..vp + 1 + vallen];
+        let (der, sighash_byte) = value.split_at(value.len() - 1);
+        assert_eq!(sighash_byte, &[SIGHASH_ALL as u8]);
+
+        // Recompute the ELEMENTS sighash over the reconstructed tx and re-sign; the
+        // handler's signature must match byte-for-byte (proves it signed the right
+        // preimage over the reconstructed asset tx, not a stale/blank one).
+        let scriptcode = p2pkh_scriptcode(&keyhash);
+        let mut v9 = [0u8; 9];
+        v9[0] = 0x01;
+        v9[1..].copy_from_slice(&in_amount.to_be_bytes());
+        let hash = kernel::elements_sighash_sw_v0(&tx, 0, &scriptcode, &v9, SIGHASH_ALL);
+        let sk = signer.kernel().bip86_child_privkey(keyindex);
+        let expected = signer
+            .kernel()
+            .sign_low_r_der_checked(&hash, &sk, &pubkey)
+            .expect("sig self-verifies");
+        assert_eq!(der, expected.as_slice(), "signature is over the wrong (or Bitcoin-format) sighash");
     }
 
     /// End-to-end validity self-check: a mnemonic (BIP86) node signs its own

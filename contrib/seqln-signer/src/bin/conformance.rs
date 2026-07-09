@@ -146,6 +146,22 @@ fn main() {
         return;
     }
 
+    // Single SIGN_WITHDRAWAL (type 7) vector: a hex file holding ONE raw hsmd
+    // message. Frames it as a main-daemon withdrawal and drives BOTH signers, then
+    // compares the extracted PSBT_IN_PARTIAL_SIG (+ PSBT_IN_TAP_KEY_SIG) records
+    // byte-for-byte. This is the correct comparison for a withdrawal reply: unlike
+    // a commitment, libhsmd ALSO splices a PSBT_IN_BIP32_DERIVATION keypath before
+    // signing (`psbt_input_add_pubkey`), so the WHOLE reply PSBTs differ; the
+    // security-critical artefact is the signature over the sighash, and IT must be
+    // byte-identical to libhsmd's. Used to anchor the Elements-asset funding
+    // withdrawal reconstruction against the real libhsmd.
+    if let Ok(vec_path) = std::env::var("SEQLN_WITHDRAWAL_VECTOR") {
+        let secret_path = std::env::var("SEQLN_HSM_SECRET")
+            .expect("SEQLN_HSM_SECRET (the node's hsm_secret) is required for the withdrawal vector");
+        compare_withdrawal_vector(&oracle, &proxy, &vec_path, &secret_path);
+        return;
+    }
+
     // Fixed hsm_secret (mnemonic, no passphrase): 32 zero bytes || mnemonic.
     let mut hsm_secret = vec![0u8; 32];
     hsm_secret.extend_from_slice(MNEMONIC.as_bytes());
@@ -296,6 +312,139 @@ fn replay_corpus(oracle: &str, proxy: &str, corpus_path: &str, secret_path: &str
     if failed != 0 {
         std::process::exit(1);
     }
+}
+
+/// Decode a hex string (whitespace-tolerant) to bytes.
+fn unhex(s: &str) -> Vec<u8> {
+    let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+/// The reply body is `type(u16) || u32(len) || psbt`. Return the psbt slice.
+fn reply_psbt(reply: &[u8]) -> Option<&[u8]> {
+    if reply.len() < 6 {
+        return None;
+    }
+    let len = u32::from_be_bytes([reply[2], reply[3], reply[4], reply[5]]) as usize;
+    reply.get(6..6 + len)
+}
+
+/// Extract the signature-bearing records from a withdrawal reply PSBT: every
+/// PSBT_IN_PARTIAL_SIG (key `0x02||pubkey33`, value `DER||sighash`) and every
+/// PSBT_IN_TAP_KEY_SIG (key `0x13`, value = 64/65-byte schnorr sig). Returned as
+/// a sorted Vec of `(kind, key_or_pubkey, sig_value)` so two replies can be
+/// compared regardless of record ordering. Scans the raw bytes for the record
+/// shapes (sufficient here: these key bytes do not otherwise collide in a PSET).
+fn extract_sig_records(psbt: &[u8]) -> Vec<(u8, Vec<u8>, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < psbt.len() {
+        // PSBT_IN_PARTIAL_SIG: keylen=0x22, 0x02, 33-byte pubkey, then vallen, val.
+        if psbt[i] == 0x22
+            && i + 2 + 33 < psbt.len()
+            && psbt[i + 1] == 0x02
+        {
+            let pk = psbt[i + 2..i + 2 + 33].to_vec();
+            let vp = i + 2 + 33;
+            let vallen = psbt[vp] as usize;
+            if vp + 1 + vallen <= psbt.len() {
+                let val = psbt[vp + 1..vp + 1 + vallen].to_vec();
+                out.push((0x02, pk, val));
+                i = vp + 1 + vallen;
+                continue;
+            }
+        }
+        // PSBT_IN_TAP_KEY_SIG: keylen=0x01, 0x13, then vallen, val.
+        if psbt[i] == 0x01 && i + 2 < psbt.len() && psbt[i + 1] == 0x13 {
+            let vp = i + 2;
+            let vallen = psbt[vp] as usize;
+            if vp + 1 + vallen <= psbt.len() && (vallen == 64 || vallen == 65) {
+                let val = psbt[vp + 1..vp + 1 + vallen].to_vec();
+                out.push((0x13, vec![0x13], val));
+                i = vp + 1 + vallen;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.sort();
+    out
+}
+
+fn compare_withdrawal_vector(oracle: &str, proxy: &str, vec_path: &str, secret_path: &str) {
+    let hex_str = std::fs::read_to_string(vec_path).expect("read withdrawal vector");
+    let msg = unhex(&hex_str);
+    assert!(
+        seqln_signer::wire::peektype(&msg) == Some(msg::HSMD_SIGN_WITHDRAWAL),
+        "vector is not a SIGN_WITHDRAWAL (type 7); got type {:?}",
+        seqln_signer::wire::peektype(&msg)
+    );
+    let secret = std::fs::read(secret_path).expect("read hsm_secret");
+
+    let base = std::env::temp_dir().join(format!("seqln-wdvec-{}", std::process::id()));
+    let oracle_dir = base.join("oracle");
+    let proxy_dir = base.join("proxy");
+    for d in [&oracle_dir, &proxy_dir] {
+        std::fs::create_dir_all(d).expect("mkdir");
+        std::fs::write(d.join("hsm_secret"), &secret).expect("write hsm_secret");
+    }
+
+    let mut oracle_proc = spawn(oracle, &oracle_dir);
+    let mut proxy_proc = spawn(proxy, &proxy_dir);
+
+    let zero = [0u8; 33];
+    let a = oracle_proc.roundtrip(true, &zero, 0, ALL_CAPS, &msg);
+    let b = proxy_proc.roundtrip(true, &zero, 0, ALL_CAPS, &msg);
+
+    drop(oracle_proc.stream);
+    drop(proxy_proc.stream);
+    let _ = oracle_proc.child.wait();
+    let _ = proxy_proc.child.wait();
+    let _ = std::fs::remove_dir_all(&base);
+
+    println!("\n== SeqLN SIGN_WITHDRAWAL vector: libhsmd vs seqln-signer ==\n");
+    let (ap, bp) = match (&a, &b) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            println!("  oracle reply: {}", opt(&a));
+            println!("  proxy  reply: {}", opt(&b));
+            println!("\n== FAIL: a signer produced no reply (crashed / rejected) ==");
+            std::process::exit(1);
+        }
+    };
+    let a_psbt = reply_psbt(ap).expect("oracle reply psbt");
+    let b_psbt = reply_psbt(bp).expect("proxy reply psbt");
+    let a_sigs = extract_sig_records(a_psbt);
+    let b_sigs = extract_sig_records(b_psbt);
+
+    println!("  oracle reply psbt: {} bytes, {} signature record(s)", a_psbt.len(), a_sigs.len());
+    println!("  proxy  reply psbt: {} bytes, {} signature record(s)", b_psbt.len(), b_sigs.len());
+    for (kind, k, v) in &a_sigs {
+        let label = if *kind == 0x02 { "PARTIAL_SIG" } else { "TAP_KEY_SIG" };
+        println!("  oracle {label}: pubkey/key {} sig {}", hex(k), hex(v));
+    }
+    for (kind, k, v) in &b_sigs {
+        let label = if *kind == 0x02 { "PARTIAL_SIG" } else { "TAP_KEY_SIG" };
+        println!("  proxy  {label}: pubkey/key {} sig {}", hex(k), hex(v));
+    }
+
+    if a_sigs.is_empty() {
+        println!("\n== FAIL: oracle produced no signature records (unexpected) ==");
+        std::process::exit(1);
+    }
+    if a_sigs == b_sigs {
+        println!(
+            "\n== PASS: {} signature record(s) BYTE-IDENTICAL to libhsmd ==",
+            a_sigs.len()
+        );
+    } else {
+        println!("\n== FAIL: signature records differ from libhsmd ==");
+        std::process::exit(1);
+    }
+    std::io::stdout().flush().ok();
 }
 
 fn build_cases(k: &Kernel) -> Vec<Case> {
