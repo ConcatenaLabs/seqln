@@ -396,6 +396,13 @@ fn compare_withdrawal_vector(oracle: &str, proxy: &str, vec_path: &str, secret_p
     let mut proxy_proc = spawn(proxy, &proxy_dir);
 
     let zero = [0u8; 33];
+    // Both signers must be INITialized (kernel + wire version) before they will
+    // handle any signing request — exactly as lightningd does at startup.
+    let init = init_msg();
+    let ia = oracle_proc.roundtrip(true, &zero, 0, ALL_CAPS, &init);
+    let ib = proxy_proc.roundtrip(true, &zero, 0, ALL_CAPS, &init);
+    assert!(ia.is_some() && ib.is_some(), "INIT failed (oracle {} / proxy {})", ia.is_some(), ib.is_some());
+
     let a = oracle_proc.roundtrip(true, &zero, 0, ALL_CAPS, &msg);
     let b = proxy_proc.roundtrip(true, &zero, 0, ALL_CAPS, &msg);
 
