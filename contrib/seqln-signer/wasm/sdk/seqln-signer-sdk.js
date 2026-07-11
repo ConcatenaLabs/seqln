@@ -125,6 +125,12 @@ export class SeqlnSigner {
     // onRequest({seq,type,name,replyBytes,rejected}).
     this.onStatus = opts.onStatus || null;
     this.onRequest = opts.onRequest || null;
+    // TEST-ONLY hook (opt-in; null in production). A Set of hsmd wire types to
+    // reject ONCE each: the first time such a type is seen the serve loop sends
+    // the zero-length error sentinel instead of the wasm reply, then serves it
+    // normally. Used by the reconnect stress harness to exercise the proxy's
+    // B6 fail-soft path (a device reject on a master-fd op must not kill the node).
+    this._rejectOnce = opts.rejectOnce ? new Set(opts.rejectOnce.map(Number)) : null;
   }
 
   // Build from a BIP-39 mnemonic (no passphrase). `opts.wasm` overrides the wasm
@@ -251,7 +257,13 @@ export class SeqlnSigner {
           const type = frameHsmdType(frame);
           this._served.set(type, (this._served.get(type) || 0) + 1);
 
-          const reply = this._inner.processFrame(frame);   // wasm signs
+          let reply = this._inner.processFrame(frame);   // wasm signs
+          // TEST-ONLY one-shot reject (see constructor): emit the zero-length
+          // error sentinel (a 4-byte frame, body length 0) for a listed type.
+          if (this._rejectOnce && this._rejectOnce.has(type)) {
+            this._rejectOnce.delete(type);
+            reply = new Uint8Array([0, 0, 0, 0]);
+          }
           if (this._nodeId === null) {
             const id = nodeIdFromInitReply(reply);
             if (id) { this._nodeId = id; this._status('node_id', id); }

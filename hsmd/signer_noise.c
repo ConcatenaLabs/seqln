@@ -27,6 +27,10 @@
 #include <hsmd/signer_noise.h>
 #include <secp256k1_ecdh.h>
 #include <sodium/crypto_aead_chacha20poly1305.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -245,10 +249,81 @@ struct signer_noise *signer_noise_connect(const tal_t *ctx, int fd,
  * transport-key split is the responder one (rk=okm[0], sk=okm[1]), matching the
  * initiator's (sk=okm[0], rk=okm[1]) so the two directions line up.
  * contrib/seqln-signer/src/noise.rs's `Initiator` is the byte-compatible peer. */
+/*~ SeqLN Tier-2 A2: bare-fd poll-gated exact read/write for the RESPONDER
+ * HANDSHAKE.  The accepted device fd is O_NONBLOCK from its first byte (set in
+ * signer_noise_accept BEFORE the handshake), so a connector that completes TCP
+ * but then stalls (or dribbles) handshake bytes can NEVER block the proxy's
+ * single-threaded io loop: every read/write is gated by poll() against a
+ * per-handshake `deadline`.  No cipher, no watch-fd — a stalled handshake simply
+ * times out and the connector is rejected (fail-closed), and the proxy keeps
+ * listening.  Returns true once `len` bytes are moved, false on EOF/error/deadline. */
+static bool hs_poll_exact(int fd, u8 *buf, size_t len, bool writing,
+			  struct timemono deadline)
+{
+	size_t done = 0;
+
+	while (done < len) {
+		struct pollfd pfd;
+		struct timemono now = time_mono();
+		u64 msleft;
+		int ms, pr;
+		ssize_t n;
+
+		if (!timemono_before(now, deadline))
+			return false; /* handshake deadline exceeded */
+		msleft = time_to_msec(timemono_between(deadline, now));
+		if (msleft == 0)
+			msleft = 1;
+		if (msleft > 500)
+			msleft = 500; /* slice so we re-check the deadline promptly */
+		ms = (int)msleft;
+
+		pfd.fd = fd;
+		pfd.events = writing ? POLLOUT : POLLIN;
+		pfd.revents = 0;
+		pr = poll(&pfd, 1, ms);
+		if (pr < 0) {
+			if (errno == EINTR)
+				continue;
+			return false;
+		}
+		if (pr == 0)
+			continue; /* slice elapsed; loop re-checks the deadline */
+
+		if (writing)
+			n = (pfd.revents & POLLOUT) ? write(fd, buf + done, len - done)
+						   : -2;
+		else
+			n = (pfd.revents & POLLIN) ? read(fd, buf + done, len - done)
+						  : -2;
+		if (n == -2) {
+			/* No I/O readiness; a HUP/ERR with nothing to read is dead. */
+			if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL))
+				return false;
+			continue;
+		}
+		if (n > 0) {
+			done += n;
+			continue;
+		}
+		if (n == 0)
+			return false; /* EOF */
+		if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+			continue;
+		return false;
+	}
+	return true;
+}
+
+/*~ Run the Noise_XK RESPONDER handshake, poll-driven with a per-handshake
+ * deadline (SeqLN Tier-2 A2) so a stalled/half-open connector can never freeze
+ * the proxy.  See hs_poll_exact.  The crypto is identical to a synchronous run;
+ * only the raw fd I/O is now poll-gated. */
 static bool responder_handshake(int fd,
 				const struct secret *my_privkey,
 				const struct pubkey *their_pinned_pub,
-				struct crypto_state *cs)
+				struct crypto_state *cs,
+				struct timemono deadline)
 {
 	struct sha256 h;
 	struct secret ck, temp_k, ss;
@@ -270,7 +345,7 @@ static bool responder_handshake(int fd,
 	sha_mix_in_key(&h, &my_pub);
 
 	/* --- Act One (receive) --- */
-	if (!read_all(fd, act1, sizeof(act1)))
+	if (!hs_poll_exact(fd, act1, sizeof(act1), false, deadline))
 		return false;
 	if (act1[0] != 0)
 		return false;
@@ -305,11 +380,11 @@ static bool responder_handshake(int fd,
 				      &e_pub.pubkey, SECP256K1_EC_COMPRESSED);
 	encrypt_ad(&temp_k, 0, &h, sizeof(h), NULL, 0, act2 + 34, 16);
 	sha_mix_in(&h, act2 + 34, 16);
-	if (!write_all(fd, act2, sizeof(act2)))
+	if (!hs_poll_exact(fd, act2, sizeof(act2), true, deadline))
 		return false;
 
 	/* --- Act Three (receive the initiator's static key, then pin-check) --- */
-	if (!read_all(fd, act3, sizeof(act3)))
+	if (!hs_poll_exact(fd, act3, sizeof(act3), false, deadline))
 		return false;
 	if (act3[0] != 0)
 		return false;
@@ -348,12 +423,36 @@ struct signer_noise *signer_noise_accept(const tal_t *ctx, int fd,
 					 const struct pubkey *their_pinned_pub)
 {
 	struct signer_noise *n = tal(ctx, struct signer_noise);
+	struct timemono hs_deadline;
+	const char *e;
+	int hs_ms = 4000; /* per-handshake budget; env-overridable (tests shorten) */
+
 	n->fd = fd;
 	n->rbuf = NULL;
 	n->roff = 0;
 	tal_add_destructor(n, destroy_signer_noise);
 
-	if (!responder_handshake(fd, my_privkey, their_pinned_pub, &n->cs))
+	/*~ A2: the BROWSER/LISTEN topology drives this fd with the poll-driven,
+	 * reconnect-aware I/O below (never the blocking calls) — AND the handshake
+	 * itself is now poll-driven — so a half-dead or stalled connector can never
+	 * freeze the proxy's single-threaded io loop.  Flip it non-blocking BEFORE
+	 * the handshake (the old code did this only AFTER, leaving the handshake
+	 * reads as a second unbounded blocking-wedge site). */
+	{
+		int fl = fcntl(fd, F_GETFL, 0);
+		if (fl != -1)
+			fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+	}
+	e = getenv("SEQLN_SIGNER_HS_TIMEOUT_MS");
+	if (e && e[0]) {
+		int v = atoi(e);
+		if (v > 0)
+			hs_ms = v;
+	}
+	hs_deadline = timemono_add(time_mono(), time_from_msec(hs_ms));
+
+	if (!responder_handshake(fd, my_privkey, their_pinned_pub, &n->cs,
+				 hs_deadline))
 		return tal_free(n);
 	return n;
 }
@@ -446,4 +545,256 @@ u8 *signer_noise_read_reply(const tal_t *ctx, struct signer_noise *n)
 	if (len && !noise_stream_read_all(n, msg, len))
 		return tal_free(msg);
 	return msg;
+}
+
+/* ------------------------------------------------------------------------- *
+ * SeqLN Tier-2 ROBUST (poll-driven) LISTEN-mode I/O.  See signer_noise.h.
+ *
+ * The fd is O_NONBLOCK (set by signer_noise_accept).  We never let a syscall
+ * block: every raw read()/write() is gated by poll() with a bounded per-op
+ * DEADLINE, and while we wait we ALSO watch a caller-supplied listen socket so a
+ * reconnecting device pre-empts a stuck one.  On any non-OK the caller discards
+ * this whole channel, so bailing out mid-record (with a partly-advanced cipher
+ * nonce) is safe — the request is re-sent fresh to the next device.
+ * ------------------------------------------------------------------------- */
+
+/* poll() budget per wait: bounded so we re-check the deadline promptly and stay
+ * responsive to a newcomer even on a long total deadline. */
+#define NOISE_POLL_SLICE_MS 500
+
+/* Milliseconds until `deadline`, clamped to a poll slice; <=0 means expired. */
+static int ms_until(struct timemono deadline)
+{
+	struct timemono now = time_mono();
+	u64 ms;
+	if (!timemono_before(now, deadline))
+		return -1;
+	ms = time_to_msec(timemono_between(deadline, now));
+	if (ms == 0)
+		ms = 1;
+	if (ms > NOISE_POLL_SLICE_MS)
+		ms = NOISE_POLL_SLICE_MS;
+	return (int)ms;
+}
+
+/* Read EXACTLY len raw bytes into dst, poll-gated on n->fd (+ optional watch_fd),
+ * honouring `deadline`.  Returns OK / DEVICE_DEAD / NEWCOMER / TIMEOUT. */
+static enum signer_noise_status
+poll_read_raw(struct signer_noise *n, u8 *dst, size_t len,
+	      int watch_fd, struct timemono deadline)
+{
+	size_t got = 0;
+
+	while (got < len) {
+		struct pollfd pfd[2];
+		int nfds = 1, ms, pr;
+
+		pfd[0].fd = n->fd; pfd[0].events = POLLIN; pfd[0].revents = 0;
+		if (watch_fd >= 0) {
+			pfd[1].fd = watch_fd; pfd[1].events = POLLIN;
+			pfd[1].revents = 0; nfds = 2;
+		}
+		ms = ms_until(deadline);
+		if (ms < 0)
+			return SIGNER_NOISE_TIMEOUT;
+
+		pr = poll(pfd, nfds, ms);
+		if (pr < 0) {
+			if (errno == EINTR)
+				continue;
+			return SIGNER_NOISE_DEVICE_DEAD;
+		}
+		if (pr == 0)
+			continue; /* slice elapsed; ms_until re-checks the deadline */
+
+		/* Always drain a device that has data (finish a legit in-flight
+		 * reply) BEFORE yielding to a newcomer. */
+		if (pfd[0].revents & POLLIN) {
+			ssize_t r = read(n->fd, dst + got, len - got);
+			if (r > 0) {
+				got += r;
+				continue;
+			}
+			if (r == 0)
+				return SIGNER_NOISE_DEVICE_DEAD; /* EOF */
+			if (errno == EINTR || errno == EAGAIN
+			    || errno == EWOULDBLOCK)
+				continue;
+			return SIGNER_NOISE_DEVICE_DEAD;
+		}
+		/* No device data: a pending newcomer means the browser
+		 * reconnected — "newest wins", so yield to it. */
+		if (nfds == 2 && (pfd[1].revents & POLLIN))
+			return SIGNER_NOISE_NEWCOMER;
+		if (pfd[0].revents & (POLLHUP | POLLERR | POLLNVAL))
+			return SIGNER_NOISE_DEVICE_DEAD;
+	}
+	return SIGNER_NOISE_OK;
+}
+
+/* Write EXACTLY len raw bytes from src, poll-gated on n->fd (+ optional
+ * watch_fd), honouring `deadline`. */
+static enum signer_noise_status
+poll_write_raw(struct signer_noise *n, const u8 *src, size_t len,
+	       int watch_fd, struct timemono deadline)
+{
+	size_t sent = 0;
+
+	while (sent < len) {
+		struct pollfd pfd[2];
+		int nfds = 1, ms, pr;
+
+		pfd[0].fd = n->fd; pfd[0].events = POLLOUT; pfd[0].revents = 0;
+		if (watch_fd >= 0) {
+			pfd[1].fd = watch_fd; pfd[1].events = POLLIN;
+			pfd[1].revents = 0; nfds = 2;
+		}
+		ms = ms_until(deadline);
+		if (ms < 0)
+			return SIGNER_NOISE_TIMEOUT;
+
+		pr = poll(pfd, nfds, ms);
+		if (pr < 0) {
+			if (errno == EINTR)
+				continue;
+			return SIGNER_NOISE_DEVICE_DEAD;
+		}
+		if (pr == 0)
+			continue;
+
+		if (pfd[0].revents & POLLOUT) {
+			ssize_t w = write(n->fd, src + sent, len - sent);
+			if (w > 0) {
+				sent += w;
+				continue;
+			}
+			if (w < 0 && (errno == EINTR || errno == EAGAIN
+				      || errno == EWOULDBLOCK))
+				continue;
+			return SIGNER_NOISE_DEVICE_DEAD;
+		}
+		/* Can't make write progress (stuck send buffer) but a newcomer
+		 * is waiting: the current link is wedged — yield to the newcomer. */
+		if (nfds == 2 && (pfd[1].revents & POLLIN))
+			return SIGNER_NOISE_NEWCOMER;
+		if (pfd[0].revents & (POLLHUP | POLLERR | POLLNVAL))
+			return SIGNER_NOISE_DEVICE_DEAD;
+	}
+	return SIGNER_NOISE_OK;
+}
+
+/* Poll-gated variant of noise_stream_read_all: fill dst with len decrypted
+ * plaintext bytes, reading fresh BOLT-8 records via poll_read_raw as needed. */
+static enum signer_noise_status
+noise_stream_read_all_poll(struct signer_noise *n, u8 *dst, size_t len,
+			   int watch_fd, struct timemono deadline)
+{
+	size_t got = 0;
+
+	while (got < len) {
+		size_t avail;
+		enum signer_noise_status st;
+
+		/* Drain buffered plaintext first. */
+		if (n->rbuf && n->roff < tal_bytelen(n->rbuf)) {
+			avail = tal_bytelen(n->rbuf) - n->roff;
+			if (avail > len - got)
+				avail = len - got;
+			memcpy(dst + got, n->rbuf + n->roff, avail);
+			n->roff += avail;
+			got += avail;
+			continue;
+		}
+
+		/* Fresh BOLT-8 message: 18-byte header then body. */
+		{
+			u8 hdr[CRYPTOMSG_HDR_SIZE];
+			u8 *body, *pt;
+			u16 bodylen;
+
+			n->rbuf = tal_free(n->rbuf);
+			n->roff = 0;
+
+			st = poll_read_raw(n, hdr, sizeof(hdr), watch_fd, deadline);
+			if (st != SIGNER_NOISE_OK)
+				return st;
+			if (!cryptomsg_decrypt_header(&n->cs, hdr, &bodylen))
+				return SIGNER_NOISE_DEVICE_DEAD;
+			body = tal_arr(tmpctx, u8,
+				       (size_t)bodylen + CRYPTOMSG_BODY_OVERHEAD);
+			st = poll_read_raw(n, body, tal_bytelen(body),
+					   watch_fd, deadline);
+			if (st != SIGNER_NOISE_OK) {
+				tal_free(body);
+				return st;
+			}
+			pt = cryptomsg_decrypt_body(n, &n->cs, body);
+			tal_free(body);
+			if (!pt)
+				return SIGNER_NOISE_DEVICE_DEAD;
+			n->rbuf = pt;
+			n->roff = 0;
+		}
+	}
+	return SIGNER_NOISE_OK;
+}
+
+int signer_noise_fd(const struct signer_noise *n)
+{
+	return n->fd;
+}
+
+enum signer_noise_status
+signer_noise_write_request_poll(struct signer_noise *n, bool is_main,
+				const struct node_id *id, u64 dbid,
+				u64 capabilities, const u8 *hsmd_msg,
+				int watch_fd, struct timemono deadline)
+{
+	u8 *frame = signer_frame_build_request(tmpctx, is_main, id, dbid,
+					       capabilities, hsmd_msg);
+	size_t len = tal_bytelen(frame), off = 0;
+
+	/* Encrypt + send as one or more BOLT-8 records (mirrors
+	 * noise_stream_write_all, but each record is poll-gated). */
+	while (off < len) {
+		size_t chunk = len - off > NOISE_MAX_MSG ? NOISE_MAX_MSG
+							 : len - off;
+		u8 *pt = tal_dup_arr(tmpctx, u8, frame + off, chunk, 0);
+		u8 *rec = cryptomsg_encrypt_msg(tmpctx, &n->cs, take(pt));
+		enum signer_noise_status st =
+		    poll_write_raw(n, rec, tal_bytelen(rec), watch_fd, deadline);
+		tal_free(rec);
+		if (st != SIGNER_NOISE_OK)
+			return st;
+		off += chunk;
+	}
+	return SIGNER_NOISE_OK;
+}
+
+enum signer_noise_status
+signer_noise_read_reply_poll(const tal_t *ctx, struct signer_noise *n,
+			     int watch_fd, struct timemono deadline,
+			     u8 **reply)
+{
+	enum signer_noise_status st;
+	u8 lenbuf[4];
+	u32 len;
+	u8 *msg;
+
+	*reply = NULL;
+	st = noise_stream_read_all_poll(n, lenbuf, sizeof(lenbuf),
+					watch_fd, deadline);
+	if (st != SIGNER_NOISE_OK)
+		return st;
+	len = sframe_get_u32(lenbuf);
+	msg = tal_arr(ctx, u8, len);
+	if (len) {
+		st = noise_stream_read_all_poll(n, msg, len, watch_fd, deadline);
+		if (st != SIGNER_NOISE_OK) {
+			tal_free(msg);
+			return st;
+		}
+	}
+	*reply = msg;
+	return SIGNER_NOISE_OK;
 }
