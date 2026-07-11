@@ -32,9 +32,15 @@ if (!wsUrl || !secretPath || !hostPubHex || !devicePrivHex) {
 const enforce = rest.includes('--enforce');
 const useHsmSecret = rest.includes('--hsm-secret');
 
+// TEST-ONLY: SEQLN_DEV_REJECT_ONCE="56,23" makes the device reject each listed
+// hsmd wire type ONCE (zero-length sentinel), to exercise the proxy's B6 fail-soft.
+const rejectOnce = (process.env.SEQLN_DEV_REJECT_ONCE || '')
+  .split(',').map((s) => s.trim()).filter(Boolean).map(Number);
+const sopts = { wasm: WASM, rejectOnce: rejectOnce.length ? rejectOnce : undefined };
+
 const signer = useHsmSecret
-  ? await SeqlnSigner.fromHsmSecret(new Uint8Array(readFileSync(secretPath)), { wasm: WASM })
-  : await SeqlnSigner.fromMnemonic(readFileSync(secretPath, 'utf8'), { wasm: WASM });
+  ? await SeqlnSigner.fromHsmSecret(new Uint8Array(readFileSync(secretPath)), sopts)
+  : await SeqlnSigner.fromMnemonic(readFileSync(secretPath, 'utf8'), sopts);
 if (enforce) signer.setPolicy('enforce');
 
 signer.onStatus = (st) => {

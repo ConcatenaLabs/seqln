@@ -37,6 +37,7 @@
 #include <common/timeout.h>
 #include <common/utils.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -592,29 +593,160 @@ static void remember_priming(bool is_main, const struct node_id *id, u64 dbid,
 	}
 }
 
+/*~ Per-op device round-trip deadline (ms).  A device disconnect is normally
+ * caught by poll (HUP/EOF) or pre-empted by a reconnecting device, so this is
+ * only the backstop for a link that is ESTAB but SILENT (browser asleep, no TCP
+ * RST): after it, we drop the stale device and await a reconnect rather than
+ * freezing.  Generous by default (covers a phone waking + the user approving a
+ * sign); env-overridable, mainly so tests can shorten it. */
+static int op_timeout_ms(void)
+{
+	const char *e = getenv("SEQLN_SIGNER_OP_TIMEOUT_MS");
+	if (e && e[0]) {
+		int v = atoi(e);
+		if (v > 0)
+			return v;
+	}
+	return 120000;
+}
+
+/*~ Small env-int helper (returns dflt unless the env var parses to > 0). */
+static int env_int(const char *name, int dflt)
+{
+	const char *e = getenv(name);
+	if (e && e[0]) {
+		int v = atoi(e);
+		if (v > 0)
+			return v;
+	}
+	return dflt;
+}
+
+/*~ SeqLN Tier-2 A3: make a HALF-DEAD device link detectable by the KERNEL, not
+ * just our userspace op-timeout.  A browser tab that sleeps or a phone that drops
+ * off the network severs the ws WITHOUT a TCP RST, so the fronting relay's TCP to
+ * us stays ESTAB-but-silent and delivers neither EOF nor POLLHUP.  Setting
+ * SO_KEEPALIVE + a bounded TCP_USER_TIMEOUT makes the kernel tear such a link
+ * within a small bound (delivering EOF/error to our poll), which drives the
+ * reconnect path promptly instead of parking on the 120s op backstop.  Applied to
+ * EVERY accepted device fd.  All bounds env-overridable so tests can shorten them.
+ * (This does NOT cover an app-level soft-wedge where the relay is alive and ACKs
+ * at TCP level but the browser stops answering — that is handled by newcomer
+ * eviction + the op-timeout, not the kernel.) */
+static void set_device_sockopts(int fd)
+{
+	int one = 1;
+	int user_to = env_int("SEQLN_SIGNER_TCP_USER_TIMEOUT_MS", 20000);
+	int idle_s = env_int("SEQLN_SIGNER_TCP_KEEPIDLE_S", 10);
+	int intvl_s = env_int("SEQLN_SIGNER_TCP_KEEPINTVL_S", 5);
+	int cnt = env_int("SEQLN_SIGNER_TCP_KEEPCNT", 3);
+
+	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+	setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+#ifdef TCP_USER_TIMEOUT
+	setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_to, sizeof(user_to));
+#endif
+#ifdef TCP_KEEPIDLE
+	setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle_s, sizeof(idle_s));
+#endif
+#ifdef TCP_KEEPINTVL
+	setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl_s, sizeof(intvl_s));
+#endif
+#ifdef TCP_KEEPCNT
+	setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+#endif
+}
+
+/*~ SeqLN Tier-2 A5: poll-gated accept on the LISTEN socket.  Waits for a device
+ * in 1s slices instead of hard-blocking in a bare accept() syscall — signal/EINTR
+ * safe, and never left un-interruptible.  A master-fd op with the device absent
+ * MUST wait for a device (it cannot complete without one), so there is no
+ * deadline here; but the wait is now poll-driven so the proxy is never wedged in
+ * an un-pollable syscall.  The listen fd is O_NONBLOCK so accept() cannot block if
+ * the pending connector vanished between poll and accept. */
+static int poll_accept(int listen_fd)
+{
+	for (;;) {
+		struct pollfd pfd = { .fd = listen_fd, .events = POLLIN,
+				      .revents = 0 };
+		int pr = poll(&pfd, 1, 1000);
+		int cfd;
+
+		if (pr < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		if (pr == 0)
+			continue; /* no device yet; keep waiting */
+		cfd = accept(listen_fd, NULL, NULL);
+		if (cfd < 0) {
+			if (errno == EINTR || errno == EAGAIN
+			    || errno == EWOULDBLOCK)
+				continue;
+			return -1;
+		}
+		return cfd;
+	}
+}
+
+/*~ A6 eviction-storm damping: the monotonic time we last installed+primed a
+ * device.  A burst of reconnects (a wallet retry storm, or a second same-mnemonic
+ * tab) must not thrash-evict a freshly-primed device before an op can complete. */
+static struct timemono last_prime_time;
+static bool have_prime_time = false;
+#define SEQLN_MIN_EVICT_INTERVAL_MS 750
+
 /*~ Replay one cached priming request to the (freshly reconnected) device and
  * discard the reply.  Returns false if the device dropped again mid-replay (so
  * the caller re-accepts), or — for INIT — if the reply DIFFERS from the one the
  * original device gave: that means a different node secret behind the pinned
- * transport key, which we refuse (fail-closed identity guard). */
+ * transport key, which we refuse (fail-closed identity guard).  Poll-driven with
+ * a deadline so priming a silent/half-dead reconnect can never wedge either; we
+ * pass watch_fd=-1 (a newcomer racing the ~ms priming window is handled by the
+ * next evict tick). */
 static bool replay_priming(const struct primed_req *p, const u8 *expect_reply)
 {
+	struct timemono deadline
+		= timemono_add(time_mono(), time_from_msec(op_timeout_ms()));
 	u8 *reply;
 
-	if (!signer_noise_write_request(signer_noise, p->is_main, &p->id,
-					p->dbid, p->capabilities, p->msg))
+	if (signer_noise_write_request_poll(signer_noise, p->is_main, &p->id,
+					    p->dbid, p->capabilities, p->msg,
+					    -1, deadline) != SIGNER_NOISE_OK)
 		return false;
-	reply = signer_noise_read_reply(tmpctx, signer_noise);
+	if (signer_noise_read_reply_poll(tmpctx, signer_noise, -1, deadline,
+					 &reply) != SIGNER_NOISE_OK)
+		return false;
 	if (!reply)
 		return false;
 
-	if (expect_reply
-	    && (tal_bytelen(reply) != tal_bytelen(expect_reply)
-		|| memcmp(reply, expect_reply, tal_bytelen(reply)) != 0)) {
-		status_broken("hsmd-proxy: reconnected device INIT reply MISMATCH"
-			      " — a different node identity behind the pinned"
-			      " transport key; refusing this device");
-		return false;
+	/*~ A7: guard IDENTITY, not the whole reply.  The original device's INIT
+	 * reply is compared to the reconnecting device's, but only on the
+	 * identity-bearing fields (node_id + bolt12 pubkey — both seed-derived, so
+	 * equality proves the SAME node secret behind the pinned transport key).
+	 * hsm_version, the capabilities array and the TLVs are NOT compared: a
+	 * benign wallet-build drift there must not permanently lock out the legit
+	 * device (which, mid a master-fd op, would hang that op forever).  A genuine
+	 * identity mismatch still fails closed. */
+	if (expect_reply) {
+		u32 va, vb, *capa, *capb;
+		struct node_id ida, idb;
+		struct ext_key bipa, bipb;
+		struct pubkey b12a, b12b;
+		struct tlv_hsmd_init_reply_v4_tlvs *tlva, *tlvb;
+		bool oka = fromwire_hsmd_init_reply_v4(tmpctx, reply, &va, &capa,
+						       &ida, &bipa, &b12a, &tlva);
+		bool okb = fromwire_hsmd_init_reply_v4(tmpctx, expect_reply, &vb,
+						       &capb, &idb, &bipb, &b12b,
+						       &tlvb);
+		if (!oka || !okb || !node_id_eq(&ida, &idb)
+		    || !pubkey_eq(&b12a, &b12b)) {
+			status_broken("hsmd-proxy: reconnected device INIT identity"
+				      " MISMATCH (node_id/bolt12): a different node"
+				      " behind the pinned transport key; refusing");
+			return false;
+		}
 	}
 	return true;
 }
@@ -654,10 +786,10 @@ static bool prime_device(void)
  * destructor — and we keep listening (fail-closed).  Sets `signer_noise`. */
 static void accept_one_device(void)
 {
-	int cfd, one = 1;
+	int cfd;
 
 	for (;;) {
-		cfd = accept(signer_listen_fd, NULL, NULL);
+		cfd = poll_accept(signer_listen_fd);
 		if (cfd < 0) {
 			if (errno == EINTR)
 				continue;
@@ -665,7 +797,7 @@ static void accept_one_device(void)
 				      "signer listen accept failed: %s",
 				      strerror(errno));
 		}
-		setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+		set_device_sockopts(cfd);
 		signer_noise = signer_noise_accept(NULL, cfd,
 						   &signer_listen_priv,
 						   &signer_listen_pinned);
@@ -694,6 +826,43 @@ static void reconnect_device(void)
 			       " priming; awaiting another device");
 		signer_noise = tal_free(signer_noise);
 	}
+}
+
+/*~ Accept + Noise-authenticate ONE pending connector on the listen socket
+ * (non-blocking; assumes poll already showed it readable).  On the PINNED device:
+ * EVICT the current signer, install the newcomer, re-prime it, and return true —
+ * "newest device wins".  On a rejected/failed connector (wrong key / bad
+ * handshake / dropped mid-priming): return false and leave `signer_noise`
+ * cleared to NULL if we had to tear a bad newcomer down, else untouched.  Shared
+ * by evict_on_connect_tick (idle path) and listen_roundtrip (in-flight path). */
+static bool accept_newcomer_once(void)
+{
+	int cfd = accept(signer_listen_fd, NULL, NULL);
+	struct signer_noise *newn;
+
+	if (cfd < 0)
+		return false;
+	set_device_sockopts(cfd);
+	newn = signer_noise_accept(NULL, cfd, &signer_listen_priv,
+				   &signer_listen_pinned);
+	if (!newn) {
+		status_unusual("hsmd-proxy: REJECTED a connector (not the pinned"
+			       " device key); keeping the current signer");
+		return false;
+	}
+	status_unusual("hsmd-proxy: newcomer AUTHENTICATED; evicting the previous"
+		       " signer and re-priming the newcomer (newest wins)");
+	tal_free(signer_noise);
+	signer_noise = newn;
+	if (!prime_device()) {
+		status_unusual("hsmd-proxy: newcomer dropped during priming;"
+			       " awaiting another device");
+		signer_noise = tal_free(signer_noise);
+		return false;
+	}
+	last_prime_time = time_mono();
+	have_prime_time = true;
+	return true;
 }
 
 /*~ SeqLN Tier-2 BROWSER topology (the role flip).  A browser device signer
@@ -766,7 +935,14 @@ static void listen_remote_signer(const char *addr)
 			      "signer listen bind %s:%s failed: %s",
 			      host, port, strerror(errno));
 
-	/* Latch reconnect mode + keep the listen socket open for our lifetime. */
+	/* Latch reconnect mode + keep the listen socket open for our lifetime.
+	 * Non-blocking so poll_accept()/the evict tick can never block in accept()
+	 * if a pending connector vanishes between poll and accept. */
+	{
+		int fl = fcntl(lfd, F_GETFL, 0);
+		if (fl != -1)
+			fcntl(lfd, F_SETFL, fl | O_NONBLOCK);
+	}
 	signer_listen_fd = lfd;
 	signer_listen_mode = true;
 
@@ -787,40 +963,113 @@ static void listen_remote_signer(const char *addr)
  * round-trip; the whole hsmd protocol is request/response so blocking the io
  * loop here is exactly the monolithic behaviour. */
 /*~ LISTEN mode round-trip: write the request + read the reply over the secure
- * device channel, transparently surviving a device disconnect.  If the device
- * drops (write or read fails / EOF), we close the dead channel and block in
- * reconnect_device() until a fresh device authenticates and is re-primed, then
- * RETRY the same request — so no lightningd request is lost and fd-3 is never
- * touched.  Always returns a non-NULL reply (a zero-length array is the device's
- * error sentinel, handled by the caller). */
+ * device channel, transparently surviving a device disconnect — WITHOUT ever
+ * blocking the proxy's single-threaded io loop.
+ *
+ * Every device-link read/write is poll-driven with a per-op DEADLINE, and while
+ * we wait we ALSO watch the listen socket.  So the three ways a device link can
+ * go bad are all handled here without freezing lightningd (and without ever
+ * touching its hsmd fd-3):
+ *   - DEVICE_DEAD (clean EOF / HUP / error): drop the channel, block in
+ *     reconnect_device() for a fresh device, re-prime, RETRY the same request.
+ *   - NEWCOMER (a reconnecting browser is pending on the listen socket while the
+ *     old link is stuck or silent): accept + authenticate it, EVICT the stale
+ *     one, re-prime, RETRY — "newest wins", even mid-request.  THIS is the fix
+ *     for the half-dead-relay wedge: the old blocking read could never notice a
+ *     reconnect, so the fresh device sat unaccepted and the node froze forever.
+ *   - TIMEOUT (link ESTAB but silent past the deadline): treat like DEVICE_DEAD
+ *     — drop it (which closes the stale relay's TCP) and await a reconnect, so a
+ *     soft-wedged signer fails just this op's wait, never the node.
+ * On a successful round-trip returns the device's reply.  A zero-length reply is
+ * the device's error/reject sentinel: for a per-channel op it is returned as-is
+ * (the caller closes just that channeld client); for a MASTER-fd op (dbid==0) it
+ * is handled HERE (B6 fail-soft) — the rejecting device is dropped and the op
+ * re-sent on the next reconnect, so a device reject never fatally kills the node. */
 static u8 *listen_roundtrip(const tal_t *ctx, bool is_main,
 			    const struct node_id *id, u64 dbid,
 			    u64 capabilities, const u8 *msg_in,
 			    enum hsmd_wire reqt)
 {
 	for (;;) {
+		struct timemono deadline;
+		enum signer_noise_status st;
 		u8 *reply;
 
-		if (!signer_noise)
+		if (!signer_noise) {
+			/*~ Diagnostic + operational health signal (the spec asks to
+			 * distinguish "blocked awaiting signer for op X" from
+			 * healthy-idle): a master-fd op with no device PARKS the
+			 * whole node until a device returns.  This is the persistence
+			 * hazard — a device-absent node can WATCH/sync (needs no
+			 * hsmd) but any master-fd op (node_announcement, ECDH, an
+			 * onchaind sweep, …) blocks here.  Fund-defence while the
+			 * device is offline needs a watchtower (blockers B1-B3). */
+			status_unusual("hsmd-proxy: no device for %s (dbid=%"PRIu64
+				       "): PARKING this op; the node cannot make"
+				       " progress on it until a device reconnects",
+				       hsmd_wire_name(reqt), dbid);
 			reconnect_device();
+		}
 
-		if (!signer_noise_write_request(signer_noise, is_main, id, dbid,
-						capabilities, msg_in)) {
-			status_unusual("hsmd-proxy: device link WRITE failed on"
-				       " %s; device disconnected, awaiting"
-				       " reconnect", hsmd_wire_name(reqt));
-			signer_noise = tal_free(signer_noise);
+		deadline = timemono_add(time_mono(),
+					time_from_msec(op_timeout_ms()));
+
+		st = signer_noise_write_request_poll(signer_noise, is_main, id,
+						     dbid, capabilities, msg_in,
+						     signer_listen_fd, deadline);
+		if (st == SIGNER_NOISE_OK)
+			st = signer_noise_read_reply_poll(ctx, signer_noise,
+							  signer_listen_fd,
+							  deadline, &reply);
+		if (st == SIGNER_NOISE_OK) {
+			/*~ B6 FAIL-SOFT (fund-critical).  A zero-length reply is
+			 * the device's error/reject sentinel.  For a MASTER-fd op
+			 * (dbid==0: lightningd/gossipd/connectd) forward_to_signer
+			 * would route it through bad_req_fmt -> master_badmsg ->
+			 * FATAL node exit; a keyless node then CANNOT reboot without
+			 * the device (a mass undefended window, blocker B3).  So we
+			 * do NOT return it: drop the rejecting device and re-send the
+			 * parked op on the next reconnect (a device that authorises
+			 * it), keeping the node alive.  This is bounded by reconnect
+			 * cadence (accept blocks until a fresh connection), not a
+			 * busy loop.  PER-CHANNEL rejects (dbid!=0) are returned
+			 * as-is so an enforce theft-rejection still fails just that
+			 * channel's signing (closing only that channeld client). */
+			if (is_main && tal_bytelen(reply) == 0) {
+				status_broken("hsmd-proxy: device REJECTED master op"
+					      " %s (zero-length): NOT killing the"
+					      " node; dropping this device and"
+					      " re-sending on the next reconnect"
+					      " (B6 fail-soft)",
+					      hsmd_wire_name(reqt));
+				reply = tal_free(reply);
+				signer_noise = tal_free(signer_noise);
+				continue;
+			}
+			return reply;
+		}
+
+		if (st == SIGNER_NOISE_NEWCOMER) {
+			/* A device reconnected while the old link was stuck:
+			 * swap to it and re-send.  If the newcomer is bogus (or
+			 * drops), accept_newcomer_once() has cleared any dead
+			 * channel; ensure the stuck old one is gone too. */
+			status_unusual("hsmd-proxy: device reconnected during %s;"
+				       " switching to the new signer and"
+				       " re-sending", hsmd_wire_name(reqt));
+			if (!accept_newcomer_once())
+				signer_noise = tal_free(signer_noise);
 			continue;
 		}
-		reply = signer_noise_read_reply(ctx, signer_noise);
-		if (!reply) {
-			status_unusual("hsmd-proxy: device link READ failed on"
-				       " %s; device disconnected, awaiting"
-				       " reconnect", hsmd_wire_name(reqt));
-			signer_noise = tal_free(signer_noise);
-			continue;
-		}
-		return reply;
+
+		/* DEVICE_DEAD or TIMEOUT: drop the stale channel (this also
+		 * closes the fronting relay's now-severed TCP) and await a
+		 * reconnect, then re-send.  The node keeps running + syncing. */
+		status_unusual("hsmd-proxy: device link %s on %s; dropping the"
+			       " stale signer and awaiting reconnect",
+			       st == SIGNER_NOISE_TIMEOUT ? "TIMED OUT" : "DIED",
+			       hsmd_wire_name(reqt));
+		signer_noise = tal_free(signer_noise);
 	}
 }
 
@@ -1183,48 +1432,48 @@ static void master_gone(struct io_conn *unused UNUSED, struct client *c UNUSED)
  * listen socket is never accept()ed — it sticks at the handshake forever until a
  * full proxy revive.
  *
- * This periodic tick closes that gap: a NON-BLOCKING poll of the listen socket,
- * and if a newcomer is pending we accept + Noise-authenticate it.  If it presents
- * the pinned device key we EVICT the current signer and install + re-prime the
- * newcomer — "newest device wins" — so a reconnect always replaces a stale one
- * without a manual revive.  A connector that fails the pinned-key handshake is
- * rejected and the current signer is left untouched (fail-closed, same contract
- * as accept_one_device).  The tick only fires when the io_loop is idle (never
- * mid-request, since listen_roundtrip's device I/O is blocking), so it never
- * interrupts an in-flight signing round-trip. */
+ * This periodic tick closes that gap for the IDLE case: a NON-BLOCKING poll of
+ * the listen socket, and if a newcomer is pending we accept + Noise-authenticate
+ * + evict via accept_newcomer_once() ("newest device wins").  With the poll-driven
+ * listen_roundtrip a reconnect is now also handled mid-request (its own listen-fd
+ * watch), so this tick is the belt to that suspenders: it promptly adopts a
+ * reconnecting device even when lightningd is completely idle (no request in
+ * flight to drive the swap). */
 #define SEQLN_EVICT_TICK_MS 1000
 static void evict_on_connect_tick(struct timers *timers)
 {
 	struct pollfd pfd = { .fd = signer_listen_fd, .events = POLLIN, .revents = 0 };
 
-	while (signer_listen_fd >= 0
-	       && poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
-		int one = 1, cfd = accept(signer_listen_fd, NULL, NULL);
-		struct signer_noise *newn;
-
-		pfd.revents = 0;
-		if (cfd < 0)
-			break;
-		setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-		newn = signer_noise_accept(NULL, cfd, &signer_listen_priv,
-					   &signer_listen_pinned);
-		if (!newn) {
-			/* Rejected (wrong key / bad handshake); the noise channel
-			 * already closed cfd.  Keep the current signer. */
-			status_unusual("hsmd-proxy: evict-on-connect REJECTED a"
-				       " connector (not the pinned device); keeping"
-				       " the current signer");
-			continue;
-		}
-		status_unusual("hsmd-proxy: evict-on-connect: newcomer"
-			       " AUTHENTICATED; evicting the previous signer and"
-			       " re-priming the newcomer (newest wins)");
-		tal_free(signer_noise);
-		signer_noise = newn;
-		if (!prime_device()) {
-			status_unusual("hsmd-proxy: evict-on-connect: newcomer"
-				       " dropped during priming; awaiting another");
-			signer_noise = tal_free(signer_noise);
+	/*~ Process AT MOST ONE pending connector per tick.  A burst of connectors
+	 * — or, with the poll-driven handshake (A2), a set of stalled/slow-loris
+	 * connectors each of which costs up to one handshake deadline INLINE here —
+	 * must never monopolise the proxy's io loop; the rest are handled on later
+	 * ticks (the io_loop returns between ticks so lightningd requests interleave).
+	 * A single genuine reconnect is still adopted on the very next tick. */
+	if (signer_listen_fd >= 0
+	    && poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
+		/*~ A6 eviction-storm damping (IDLE path only — the mid-request
+		 * NEWCOMER path is already storm-safe because poll drains a
+		 * responsive device's reply before ever yielding to a newcomer).
+		 * If we installed+primed a device within the cooldown, a further
+		 * connector is almost certainly a retry storm (a bursty wallet
+		 * liveness driver, or a second same-mnemonic tab — the transport
+		 * pin can't tell them apart); re-priming it (INIT + every tracked
+		 * SETUP_CHANNEL) on every tick would thrash.  Drain+close the
+		 * redundant connector and KEEP the current device.  A genuinely
+		 * dead link is torn by kernel keepalive (A3) / op-timeout, which
+		 * NULLs signer_noise, so this never blocks replacing a dead one. */
+		if (signer_noise && have_prime_time
+		    && time_to_msec(timemono_between(time_mono(),
+						     last_prime_time))
+		       < SEQLN_MIN_EVICT_INTERVAL_MS) {
+			int c = accept(signer_listen_fd, NULL, NULL);
+			if (c >= 0)
+				close(c);
+			status_debug("hsmd-proxy: idle connector within eviction"
+				     " cooldown; dropped (storm damping)");
+		} else {
+			accept_newcomer_once();
 		}
 	}
 
