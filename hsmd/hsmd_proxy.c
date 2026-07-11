@@ -28,16 +28,19 @@
 #include <ccan/tal/grab_file/grab_file.h>
 #include <ccan/tal/path/path.h>
 #include <ccan/tal/str/str.h>
+#include <ccan/time/time.h>
 #include <common/daemon_conn.h>
 #include <common/memleak.h>
 #include <common/status.h>
 #include <common/status_wiregen.h>
 #include <common/subdaemon.h>
+#include <common/timeout.h>
 #include <common/utils.h>
 #include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1171,6 +1174,65 @@ static void master_gone(struct io_conn *unused UNUSED, struct client *c UNUSED)
 	exit(2);
 }
 
+/*~ SeqLN EVICT-ON-CONNECT (LISTEN/browser mode only).
+ *
+ * The request-driven reconnect path (listen_roundtrip) only notices a dropped
+ * device when lightningd next makes an HSM request.  So if the LSP restarts (or a
+ * tab closes) while lightningd is IDLE, the proxy keeps holding the now-severed
+ * device as its "active" signer, and a FRESH browser signer connecting on the
+ * listen socket is never accept()ed — it sticks at the handshake forever until a
+ * full proxy revive.
+ *
+ * This periodic tick closes that gap: a NON-BLOCKING poll of the listen socket,
+ * and if a newcomer is pending we accept + Noise-authenticate it.  If it presents
+ * the pinned device key we EVICT the current signer and install + re-prime the
+ * newcomer — "newest device wins" — so a reconnect always replaces a stale one
+ * without a manual revive.  A connector that fails the pinned-key handshake is
+ * rejected and the current signer is left untouched (fail-closed, same contract
+ * as accept_one_device).  The tick only fires when the io_loop is idle (never
+ * mid-request, since listen_roundtrip's device I/O is blocking), so it never
+ * interrupts an in-flight signing round-trip. */
+#define SEQLN_EVICT_TICK_MS 1000
+static void evict_on_connect_tick(struct timers *timers)
+{
+	struct pollfd pfd = { .fd = signer_listen_fd, .events = POLLIN, .revents = 0 };
+
+	while (signer_listen_fd >= 0
+	       && poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
+		int one = 1, cfd = accept(signer_listen_fd, NULL, NULL);
+		struct signer_noise *newn;
+
+		pfd.revents = 0;
+		if (cfd < 0)
+			break;
+		setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+		newn = signer_noise_accept(NULL, cfd, &signer_listen_priv,
+					   &signer_listen_pinned);
+		if (!newn) {
+			/* Rejected (wrong key / bad handshake); the noise channel
+			 * already closed cfd.  Keep the current signer. */
+			status_unusual("hsmd-proxy: evict-on-connect REJECTED a"
+				       " connector (not the pinned device); keeping"
+				       " the current signer");
+			continue;
+		}
+		status_unusual("hsmd-proxy: evict-on-connect: newcomer"
+			       " AUTHENTICATED; evicting the previous signer and"
+			       " re-priming the newcomer (newest wins)");
+		tal_free(signer_noise);
+		signer_noise = newn;
+		if (!prime_device()) {
+			status_unusual("hsmd-proxy: evict-on-connect: newcomer"
+				       " dropped during priming; awaiting another");
+			signer_noise = tal_free(signer_noise);
+		}
+	}
+
+	/* Re-arm. */
+	new_reltimer(timers, NULL, time_from_msec(SEQLN_EVICT_TICK_MS),
+		     evict_on_connect_tick, timers);
+}
+
 int main(int argc, char *argv[])
 {
 	struct client *master;
@@ -1216,6 +1278,26 @@ int main(int argc, char *argv[])
 
 	/* When conn closes, everything is freed. */
 	io_set_finish(master->conn, master_gone, master);
+
+	/*~ In LISTEN (browser) mode we drive a short recurring timer so a
+	 * reconnecting device is accepted promptly even while lightningd is idle
+	 * (evict-on-connect, above).  io_loop returns on each timer expiry; we run
+	 * the timer's callback (which re-arms) and loop.  master_gone exit(2)s on
+	 * shutdown, so this loop never needs to terminate on its own.  Other
+	 * transports have no listen socket, so they keep the original timer-less
+	 * loop unchanged. */
+	if (signer_listen_mode) {
+		struct timers timers;
+		timers_init(&timers, time_mono());
+		new_reltimer(&timers, NULL,
+			     time_from_msec(SEQLN_EVICT_TICK_MS),
+			     evict_on_connect_tick, &timers);
+		for (;;) {
+			struct timer *expired;
+			io_loop(&timers, &expired);
+			timer_expired(expired);
+		}
+	}
 
 	/*~ The two NULL args are a list of timers, and the timer which expired:
 	 * we don't have any timers. */
