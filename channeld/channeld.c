@@ -1238,6 +1238,29 @@ static u8 *send_commit_part(const tal_t *ctx,
 		pbase = penalty_base_new(tmpctx, remote_index,
 					 txs[0], direct_outputs[LOCAL]);
 
+		/* Watchtower Phase B: also capture every non-dust HTLC output
+		 * on this (soon-to-be-revoked) remote commitment, so that at
+		 * revoke_and_ack we can pre-sign a steal_htlc penalty per HTLC
+		 * output (not just the to_local penalty).  htlc_map is indexed
+		 * by output index of txs[0]; a non-NULL entry is an HTLC
+		 * output.  The keyset is re-derived from the revealed secret at
+		 * revoke time, so we only need the per-HTLC identity here. */
+		for (size_t hi = 0; hi < tal_count(htlc_map); hi++) {
+			const struct htlc *h = htlc_map[hi];
+			struct amount_asset asset;
+			struct amount_sat hsat;
+
+			if (!h)
+				continue;
+			asset = wally_tx_output_get_amount(&txs[0]->wtx->outputs[hi]);
+			if (!amount_asset_is_main(&asset))
+				continue;
+			hsat = amount_asset_to_sat(&asset);
+			penalty_base_add_htlc(pbase, hi, hsat, &h->rhash,
+					      h->expiry.locktime,
+					      htlc_state_owner(h->state) == REMOTE);
+		}
+
 		/* Add the penalty_base to our in-memory list as well, so we
 		 * can find it again later. */
 		tal_arr_expand(&peer->pbases, tal_steal(peer, pbase));
@@ -2534,6 +2557,7 @@ static u8 *got_revoke_msg(struct peer *peer, u64 revoke_num,
 	struct penalty_base *pbase;
 	struct changed_htlc *changed = tal_arr(tmpctx, struct changed_htlc, 0);
 	const struct bitcoin_tx *ptx = NULL;
+	struct watchtower_blob **wt_blobs;
 
 	for (size_t i = 0; i < tal_count(changed_htlcs); i++) {
 		struct changed_htlc c;
@@ -2558,12 +2582,26 @@ static u8 *got_revoke_msg(struct peer *peer, u64 revoke_num,
 		    peer->final_scriptpubkey, per_commitment_secret,
 		    &pbase->txid, pbase->outnum, pbase->amount,
 		    HSM_FD);
-	}
+
+		/* Watchtower Phase B: pre-sign the FULL justice set for the
+		 * just-revoked state (to_local penalty + one steal_htlc
+		 * penalty per revoked HTLC output) so lightningd can persist it
+		 * fsync-durably before it relies on advancing past this state
+		 * (Justice-Before-Advance). */
+		wt_blobs = build_watchtower_justice_set(
+		    tmpctx, peer->channel, peer->feerate_penalty,
+		    peer->final_index, peer->final_ext_key,
+		    peer->final_scriptpubkey, per_commitment_secret,
+		    pbase, HSM_FD);
+	} else
+		wt_blobs = tal_arr(tmpctx, struct watchtower_blob *, 0);
 
 	msg = towire_channeld_got_revoke(peer, revoke_num, per_commitment_secret,
 					next_per_commit_point, fee_states,
 					blockheight_states, changed,
-					pbase, ptx);
+					pbase, ptx,
+					cast_const2(const struct watchtower_blob **,
+						    wt_blobs));
 	tal_free(ptx);
 	return msg;
 }
@@ -6912,9 +6950,15 @@ static void init_channel(struct peer *peer)
 	/* Keeping an array of pointers is better since it allows us to avoid
 	 * extra allocations later. */
 	peer->pbases = tal_arr(peer, struct penalty_base *, 0);
-	for (size_t i=0; i<tal_count(pbases); i++)
-		tal_arr_expand(&peer->pbases,
-			       tal_dup(peer, struct penalty_base, &pbases[i]));
+	for (size_t i=0; i<tal_count(pbases); i++) {
+		struct penalty_base *pb = tal_dup(peer, struct penalty_base,
+						  &pbases[i]);
+		/* tal_dup is a shallow copy; re-parent the htlcs array onto
+		 * the new pbase (the source array is freed below). */
+		pb->htlcs = tal_dup_talarr(pb, struct penalty_htlc,
+					   pbases[i].htlcs);
+		tal_arr_expand(&peer->pbases, pb);
+	}
 	tal_free(pbases);
 
 	/* stdin == requests, 3 == peer */

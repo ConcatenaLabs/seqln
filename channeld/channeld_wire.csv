@@ -186,6 +186,18 @@ subtypedata,commitsig,commit_signature,bitcoin_signature,
 subtypedata,commitsig,num_htlcs,u16,
 subtypedata,commitsig,htlc_signatures,bitcoin_signature,num_htlcs
 
+# Watchtower Phase B: one pre-signed defensive tx + the metadata the
+# fsync-durable store persists (see common/presign_templates.h wt_tmpl_kind).
+subtype,watchtower_blob
+subtypedata,watchtower_blob,kind,u8,
+subtypedata,watchtower_blob,commit_num,u64,
+subtypedata,watchtower_blob,output_index,u32,
+subtypedata,watchtower_blob,amount,amount_sat,
+subtypedata,watchtower_blob,deadline_delta,u32,
+subtypedata,watchtower_blob,wscript_len,u16,
+subtypedata,watchtower_blob,wscript,u8,wscript_len
+subtypedata,watchtower_blob,tx,bitcoin_tx,
+
 # Wait for reply, to make sure it's on disk before we send revocation.
 msgtype,channeld_got_commitsig_reply,1121
 
@@ -202,6 +214,12 @@ msgdata,channeld_got_revoke,num_changed,u16,
 msgdata,channeld_got_revoke,changed,changed_htlc,num_changed
 msgdata,channeld_got_revoke,pbase,?penalty_base,
 msgdata,channeld_got_revoke,penalty_tx,?bitcoin_tx,
+# Watchtower Phase B: the full pre-signed defensive set for the just-revoked
+# state (to_local penalty + one steal_htlc penalty per revoked HTLC output),
+# which lightningd persists to the fsync-durable watchtower store before
+# replying (Justice-Before-Advance).
+msgdata,channeld_got_revoke,num_wt_blobs,u16,
+msgdata,channeld_got_revoke,wt_blobs,watchtower_blob,num_wt_blobs
 # Wait for reply, to make sure it's on disk before we continue
 # (eg. if we sent another commitment_signed, that would implicitly ack).
 msgtype,channeld_got_revoke_reply,1122
