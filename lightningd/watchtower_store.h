@@ -11,8 +11,15 @@
  * ON-DISK FORMAT (documented so Phase C/D slot in without a schema change):
  *
  *   <config_netdir>/watchtower/<channel_dbid>/
- *     meta                     little-endian: u64 version(=1),
- *                              u64 channel_dbid, u64 current_commit_num.
+ *     meta                     little-endian: u64 version(=2),
+ *                              u64 channel_dbid, u64 current_commit_num,
+ *                              bitcoin_outpoint funding (txid+u32 vout),
+ *                              u16 remote_to_self_delay.  (v1 wrote only the
+ *                              first three fields; speculad reads both.)  The
+ *                              funding outpoint is for the future preemptive-
+ *                              close/funding-watch; remote_to_self_delay gives
+ *                              speculad the exact RBF deadline window
+ *                              (close_height + to_self_delay[REMOTE]).
  *     justice/<txid_hex>/      CLASS A: one directory per REVOKED commitment,
  *                              named by the full 64-char remote-commitment
  *                              txid hex (a stable, self-describing locator; a

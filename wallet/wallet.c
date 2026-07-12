@@ -6011,6 +6011,33 @@ void wallet_penalty_base_add(struct wallet *w, u64 chan_id,
 	db_bind_amount_sat(stmt, pb->amount);
 
 	db_exec_prepared_v2(take(stmt));
+
+	/* Watchtower Phase E (seam #4): persist the per-HTLC steal_htlc vector so
+	 * a pbase reloaded after restart carries full HTLC coverage (there is no
+	 * db_bind_bool, so remote_offered is an INTEGER 0/1). */
+	for (size_t i = 0; i < tal_count(pb->htlcs); i++) {
+		const struct penalty_htlc *h = &pb->htlcs[i];
+		struct db_stmt *hstmt;
+
+		hstmt = db_prepare_v2(w->db,
+				      SQL("INSERT INTO penalty_htlcs ("
+					  "  channel_id"
+					  ", commitnum"
+					  ", outnum"
+					  ", amount"
+					  ", payment_hash"
+					  ", cltv_expiry"
+					  ", remote_offered"
+					  ") VALUES (?, ?, ?, ?, ?, ?, ?);"));
+		db_bind_u64(hstmt, chan_id);
+		db_bind_u64(hstmt, pb->commitment_num);
+		db_bind_int(hstmt, h->outnum);
+		db_bind_amount_sat(hstmt, h->amount);
+		db_bind_sha256(hstmt, &h->payment_hash);
+		db_bind_int(hstmt, h->cltv_expiry);
+		db_bind_int(hstmt, h->remote_offered ? 1 : 0);
+		db_exec_prepared_v2(take(hstmt));
+	}
 }
 
 struct penalty_base *wallet_penalty_base_load_for_channel(const tal_t *ctx,
@@ -6034,15 +6061,43 @@ struct penalty_base *wallet_penalty_base_load_for_channel(const tal_t *ctx,
 		db_col_txid(stmt, "txid", &pb.txid);
 		pb.outnum = db_col_int(stmt, "outnum");
 		pb.amount = db_col_amount_sat(stmt, "amount");
-		/* Watchtower Phase B: the DB penalty_bases table does not carry
-		 * the per-HTLC output vector, so a pbase reloaded from disk has
-		 * no HTLC steal data (tal_count(NULL) == 0 keeps towire safe).
-		 * HTLC steal_htlc justice thus only covers states committed in
-		 * the current process lifetime (see openIssues). */
+		/* htlcs filled in a second pass below (can't nest a query on the
+		 * same stmt while stepping it). */
 		pb.htlcs = NULL;
 		tal_arr_expand(&res, pb);
 	}
 	tal_free(stmt);
+
+	/* Watchtower Phase E (seam #4): rehydrate each pbase's per-HTLC vector
+	 * from penalty_htlcs so steal_htlc justice covers states revoked before
+	 * this process started. res indices are stable (not expanded here); the
+	 * htlc array is allocated off res so its lifetime matches the return. */
+	for (size_t i = 0; i < tal_count(res); i++) {
+		struct db_stmt *hstmt;
+		struct penalty_htlc *htlcs = tal_arr(res, struct penalty_htlc, 0);
+
+		hstmt = db_prepare_v2(
+			w->db,
+			SQL("SELECT outnum, amount, payment_hash, cltv_expiry"
+			    ", remote_offered "
+			    "FROM penalty_htlcs "
+			    "WHERE channel_id = ? AND commitnum = ?"));
+		db_bind_u64(hstmt, chan_id);
+		db_bind_u64(hstmt, res[i].commitment_num);
+		db_query_prepared(hstmt);
+
+		while (db_step(hstmt)) {
+			struct penalty_htlc h;
+			h.outnum = db_col_int(hstmt, "outnum");
+			h.amount = db_col_amount_sat(hstmt, "amount");
+			db_col_sha256(hstmt, "payment_hash", &h.payment_hash);
+			h.cltv_expiry = db_col_int(hstmt, "cltv_expiry");
+			h.remote_offered = db_col_int(hstmt, "remote_offered") != 0;
+			tal_arr_expand(&htlcs, h);
+		}
+		tal_free(hstmt);
+		res[i].htlcs = htlcs;
+	}
 	return res;
 }
 
@@ -6052,6 +6107,16 @@ void wallet_penalty_base_delete(struct wallet *w, u64 chan_id, u64 commitnum)
 	stmt = db_prepare_v2(
 		w->db,
 		SQL("DELETE FROM penalty_bases "
+		    "WHERE channel_id = ? AND commitnum = ?"));
+	db_bind_u64(stmt, chan_id);
+	db_bind_u64(stmt, commitnum);
+	db_exec_prepared_v2(take(stmt));
+
+	/* Watchtower Phase E (seam #4): explicitly drop the child rows too --
+	 * don't rely on FK ON DELETE CASCADE (SQLite needs PRAGMA foreign_keys=ON). */
+	stmt = db_prepare_v2(
+		w->db,
+		SQL("DELETE FROM penalty_htlcs "
 		    "WHERE channel_id = ? AND commitnum = ?"));
 	db_bind_u64(stmt, chan_id);
 	db_bind_u64(stmt, commitnum);

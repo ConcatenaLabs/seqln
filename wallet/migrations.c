@@ -1098,6 +1098,22 @@ static const struct db_migration dbmigrations[] = {
      * channel_announcement. NULL on existing rows -> the policy asset. */
     {SQL("ALTER TABLE utxoset ADD asset BLOB DEFAULT NULL;"), NULL,
      SQL("ALTER TABLE utxoset DROP COLUMN asset"), NULL},
+    /* Specula keyless watchtower (Phase E, seam #4): the per-HTLC output vector
+     * of each penalty base, so steal_htlc justice survives a lightningd/channeld
+     * restart (before this, a reloaded penalty_base had htlcs=NULL and covered
+     * only states revoked in the current process lifetime). Keyed by
+     * (channel_id, commitnum, outnum), FK to channels so it cascades on close. */
+    {SQL("CREATE TABLE penalty_htlcs ("
+	 "  channel_id BIGINT REFERENCES channels(id) ON DELETE CASCADE"
+	 ", commitnum BIGINT"
+	 ", outnum INTEGER"
+	 ", amount BIGINT"
+	 ", payment_hash BLOB"
+	 ", cltv_expiry INTEGER"
+	 ", remote_offered INTEGER"
+	 ", PRIMARY KEY (channel_id, commitnum, outnum)"
+	 ");"), NULL,
+     SQL("DROP TABLE penalty_htlcs"), NULL},
 };
 
 const struct db_migration *get_db_migrations(size_t *num)

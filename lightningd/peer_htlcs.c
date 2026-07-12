@@ -15,6 +15,7 @@
 #include <lightningd/channel.h>
 #include <lightningd/coin_mvts.h>
 #include <lightningd/notification.h>
+#include <lightningd/onchain_presign.h>
 #include <lightningd/peer_htlcs.h>
 #include <lightningd/plugin_hook.h>
 #include <lightningd/subd.h>
@@ -416,6 +417,18 @@ void fulfill_htlc(struct htlc_in *hin, const struct preimage *preimage)
 		msg = towire_onchaind_known_preimage(hin, preimage);
 	} else {
 		struct fulfilled_htlc fulfilled_htlc;
+
+		/* Specula Phase E (seam #1): JBA fulfill hard-gate -- pre-sign +
+		 * store the HTLC-success sweep for this incoming HTLC BEFORE we
+		 * release its preimage to the peer.  Best-effort on testnet until
+		 * the local keyset is threaded up (returns true); once wired, a
+		 * false return must defer this preimage release. */
+		if (!onchain_presign_htlc_success(channel, hin)) {
+			log_debug(channel->log,
+				  "HTLC %"PRIu64" fulfil deferred: success sweep "
+				  "not yet durable", hin->key.id);
+			return;
+		}
 		fulfilled_htlc.id = hin->key.id;
 		fulfilled_htlc.payment_preimage = *preimage;
 		msg = towire_channeld_fulfill_htlc(hin, &fulfilled_htlc);
@@ -2541,6 +2554,11 @@ void peer_got_commitsig(struct channel *channel, const u8 *msg)
 	/* Delete all HTLCs and add last_htlc_sigs back in */
 	wallet_htlc_sigs_save(ld->wallet, channel->dbid,
 			      channel->last_htlc_sigs);
+
+	/* Specula Phase E (seam #1): commitment-advance hook -- (re)pre-sign the
+	 * current-state CLASS-B honest-close sweeps to the watchtower store now
+	 * that last_tx + last_htlc_sigs are set for this new local commitment. */
+	onchain_presign_current_sweeps(channel);
 	/* Now append htlc sigs for inflights */
 	i = 0;
 	list_for_each(&channel->inflights, inflight, list) {

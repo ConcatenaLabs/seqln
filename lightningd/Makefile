@@ -29,6 +29,7 @@ LIGHTNINGD_SRC :=				\
 	lightningd/memdump.c			\
 	lightningd/notification.c		\
 	lightningd/onchain_control.c		\
+	lightningd/onchain_presign.c		\
 	lightningd/opening_common.c		\
 	lightningd/opening_control.c		\
 	lightningd/options.c			\
