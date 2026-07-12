@@ -36,6 +36,7 @@
 #include <lightningd/peer_fd.h>
 #include <lightningd/peer_htlcs.h>
 #include <lightningd/plugin_hook.h>
+#include <lightningd/watchtower_store.h>
 #include <onchaind/onchaind_wiregen.h>
 #include <openingd/dualopend_wiregen.h>
 #include <openingd/openingd_wiregen.h>
@@ -3894,6 +3895,64 @@ static const struct json_command dev_fail_command = {
 	.dev_only = true,
 };
 AUTODATA(json_command, &dev_fail_command);
+
+/* Specula Phase G (Task 2): arm/disarm the preemptive-close slot for a channel.
+ *
+ * This is THE arm path.  The wallet/LSP that owns the signing device's
+ * Noise/WebSocket link -- and therefore independently observes the device
+ * dropping mid commitment-round -- calls this to arm speculad's preemptive
+ * close so it can broadcast OUR current commitment and grab the funding
+ * outpoint before a peer breach.  It is NOT dev_only: production LSPs use it.
+ *
+ * Why arming is not auto-driven from lightningd's own fail-soft path: a
+ * device-absent master-fd op PARKS lightningd's single synchronous mainloop
+ * inside hsm_sync_req (lightningd/hsm_control.c:hsm_sync_req -- blocking
+ * wire_sync_read, FATAL on EOF), which in keyless mode waits in the hsmd_proxy
+ * listen_roundtrip deadline-less loop until the device reconnects.  hsmd_proxy
+ * is a SEPARATE process with no access to the watchtower store, the channel
+ * objects, or the config netdir, so there is no clean in-process point at which
+ * lightningd both (a) knows the device is gone and (b) can still run arm code.
+ * The device-link owner (wallet/LSP) is the correct, reachable arm trigger, via
+ * this RPC. */
+static struct command_result *param_channel_arg(struct command *cmd,
+						const char *name,
+						const char *buffer,
+						const jsmntok_t *tok,
+						struct channel **channel)
+{
+	return command_find_channel(cmd, name, buffer, tok, channel);
+}
+
+static struct command_result *json_setpreemptarmed(struct command *cmd,
+						   const char *buffer,
+						   const jsmntok_t *obj UNNEEDED,
+						   const jsmntok_t *params)
+{
+	struct channel *channel;
+	bool *armed;
+	struct json_stream *response;
+
+	if (!param(cmd, buffer, params,
+		   p_req("id", param_channel_arg, &channel),
+		   p_opt_def("armed", param_bool, &armed, true),
+		   NULL))
+		return command_param_failed();
+
+	if (!wt_store_set_preempt_armed(cmd->ld, channel, *armed))
+		return command_fail(cmd, LIGHTNINGD,
+				    "failed to persist preempt armed flag");
+
+	response = json_stream_success(cmd);
+	json_add_channel_id(response, "channel_id", &channel->cid);
+	json_add_bool(response, "armed", *armed);
+	return command_success(cmd, response);
+}
+
+static const struct json_command setpreemptarmed_command = {
+	"setpreemptarmed",
+	json_setpreemptarmed,
+};
+AUTODATA(json_command, &setpreemptarmed_command);
 
 static void dev_reenable_commit_finished(struct subd *channeld UNUSED,
 					 const u8 *resp UNUSED,
