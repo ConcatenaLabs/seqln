@@ -6,8 +6,10 @@
 #include <channeld/channeld_wiregen.h>
 #include <common/amount.h>
 #include <common/fee_states.h>
+#include <bitcoin/preimage.h>
 #include <common/htlc_tx.h>
 #include <common/keyset.h>
+#include <common/penalty_base.h>
 #include <common/presign_templates.h>
 #include <common/utils.h>
 #include <hsmd/hsmd_wiregen.h>
@@ -331,6 +333,8 @@ void onchain_presign_current_sweeps(struct channel *channel,
 	blobs = build_current_sweeps(tmpctx, channel, commit_num,
 				     local_per_commit, htlc_infos);
 	if (tal_count(blobs) == 0) {
+		/* Nothing new to sign for OUR commitment; leave the prior stored
+		 * set (which may carry a still-current kind-6) untouched. */
 		log_debug(channel->log,
 			  "onchain_presign: no CLASS-B current-state sweeps for "
 			  "commit %"PRIu64" (no to_local + no offered HTLCs); "
@@ -338,10 +342,233 @@ void onchain_presign_current_sweeps(struct channel *channel,
 		return;
 	}
 
+	/* wt_store_put_sweeps REPLACES the whole sweeps/ dir, but kind-6
+	 * (remote_htlc_to_us) is keyed to the PEER commitment -- which has NOT
+	 * advanced here (we're receiving THEIR sig on OUR new commitment) -- so
+	 * carry any stored kind-6 blob across the replace so it is not wiped. */
+	{
+		struct watchtower_blob **stored
+			= wt_store_load_sweeps(tmpctx, ld, channel);
+		for (size_t i = 0; i < tal_count(stored); i++) {
+			if (stored[i]->kind == WT_TMPL_REMOTE_HTLC_TO_US)
+				tal_arr_expand(&blobs, stored[i]);
+		}
+	}
+
 	if (!wt_store_put_sweeps(ld, channel, commit_num, blobs))
 		log_broken(channel->log,
 			   "onchain_presign: failed storing %zu CLASS-B sweeps",
 			   tal_count(blobs));
+}
+
+/* Our current LOCAL commitment number, used as the meta.current_commit_num guard
+ * reference whenever we re-put the sweeps set (so a kind-6 write at
+ * sending_commitsig time does not stamp meta with a REMOTE index). */
+static u64 our_current_commit_num(const struct channel *channel)
+{
+	if (channel->next_index[LOCAL] == 0)
+		return 0;
+	return channel->next_index[LOCAL] - 1;
+}
+
+/* Build one remote_htlc_to_us sweep off the PEER commitment (@remote_txid) for
+ * HTLC @h, DEVICE-signed via sign_any_remote_htlc_to_us(143).  @preimage != NULL
+ * for the received-by-us leg (h->remote_offered true: peer offered it to us,
+ * claim with the preimage); NULL for the offered-by-us timeout leg
+ * (h->remote_offered false: we offered it, it times back to us).  Byte-exact with
+ * onchaind's their_unilateral fulfill/htlc_expired builders.  Returns NULL
+ * (fail-soft) on any dust / derivation / device-REJECT failure. */
+static struct watchtower_blob *
+build_remote_htlc_sweep(const tal_t *ctx,
+			struct channel *channel,
+			u64 our_commit_num,
+			u64 remote_commit_num,
+			const struct keyset *keyset,
+			const struct bitcoin_txid *remote_txid,
+			const struct pubkey *remote_per_commit,
+			const struct penalty_htlc *h,
+			const struct preimage *preimage)
+{
+	struct lightningd *ld = channel->peer->ld;
+	const bool opt_anchor_outputs
+		= channel_has(channel, OPT_ANCHOR_OUTPUTS_DEPRECATED);
+	const bool opt_anchors_zero_fee
+		= channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX);
+	const bool hsm_anchors = channel_type_has_anchors(channel->type);
+	const struct amount_sat dust_limit = channel->our_config.dust_limit;
+	/* Frozen SIGHASH_ALL feerate (no SINGLE|ACP for remote_htlc_to_us in the
+	 * signer yet -> speculad cannot fee-bump without anchors; see openIssue).
+	 * The commitment feerate is a reasonable frozen value. */
+	const u32 feerate = get_feerate(channel->fee_states, channel->opener, LOCAL);
+	struct bitcoin_outpoint outpoint;
+	u8 *wscript;
+	u32 locktime, input_sequence;
+	struct bitcoin_tx *tx;
+	struct bitcoin_signature sig;
+	u8 **witness;
+	u32 final_index;
+	struct ext_key final_ext_key;
+	const u8 *final_scriptpubkey;
+
+	if (amount_sat_less_eq(h->amount, dust_limit))
+		return NULL;
+
+	if (!build_final_dest(channel, &final_index, &final_ext_key,
+			      &final_scriptpubkey))
+		return NULL;
+
+	outpoint.txid = *remote_txid;
+	outpoint.n = h->outnum;
+	/* BOLT #3: nSequence of a remote_htlc_to_us spend is 1 under anchors, 0
+	 * otherwise (matches onchain_control handle_onchaind_spend_fulfill /
+	 * _htlc_expired). */
+	input_sequence = hsm_anchors ? 1 : 0;
+
+	if (h->remote_offered) {
+		/* Peer OFFERED it to us -> a received-by-us output; sweep with the
+		 * preimage.  wscript = htlc_offer (offered-type on THEIR commit). */
+		if (!preimage)
+			return NULL;
+		wscript = bitcoin_wscript_htlc_offer(tmpctx,
+						     &keyset->self_htlc_key,
+						     &keyset->other_htlc_key,
+						     &h->payment_hash,
+						     &keyset->self_revocation_key,
+						     opt_anchor_outputs,
+						     opt_anchors_zero_fee);
+		locktime = 0;
+	} else {
+		/* WE offered it -> a received-type output on their commit that times
+		 * back to us; sweep after CLTV, no preimage. */
+		struct abs_locktime abstimeout;
+		if (!blocks_to_abs_locktime(h->cltv_expiry, &abstimeout))
+			return NULL;
+		wscript = bitcoin_wscript_htlc_receive(tmpctx, &abstimeout,
+						       &keyset->self_htlc_key,
+						       &keyset->other_htlc_key,
+						       &h->payment_hash,
+						       &keyset->self_revocation_key,
+						       opt_anchor_outputs,
+						       opt_anchors_zero_fee);
+		locktime = h->cltv_expiry;
+	}
+
+	tx = presign_sweep_tx(tmpctx, &outpoint, h->amount, wscript,
+			      input_sequence, locktime, feerate, dust_limit,
+			      false /* SIGHASH_ALL: self-deducting frozen fee */,
+			      channel->channel_asset,
+			      &final_index, &final_ext_key, final_scriptpubkey);
+	if (!tx)
+		return NULL;
+
+	if (!master_sign_sweep(ld, channel,
+			       take(towire_hsmd_sign_any_remote_htlc_to_us(
+				       NULL, remote_per_commit, tx, wscript,
+				       hsm_anchors, 0, &channel->peer->id,
+				       channel->dbid)),
+			       &sig)) {
+		log_broken(channel->log,
+			   "onchain_presign: kind-6 sign failed for remote output "
+			   "%u (device REJECT?)", h->outnum);
+		return NULL;
+	}
+
+	/* Witness: <sig> <preimage> (received) or <sig> <> (timeout). */
+	witness = bitcoin_witness_sig_and_element(tx, &sig,
+						  preimage, preimage ? sizeof(*preimage) : 0,
+						  wscript);
+	bitcoin_tx_input_set_witness(tx, 0, take(witness));
+
+	(void)remote_commit_num;
+	/* deadline_delta 0: broadcast-eligibility is the tx nLocktime (0 for the
+	 * preimage leg, cltv for the timeout leg), which speculad reads from the
+	 * tx. */
+	return presign_blob(ctx, WT_TMPL_REMOTE_HTLC_TO_US, our_commit_num,
+			    h->outnum, h->amount, 0, wscript, tx);
+}
+
+/* Re-put the sweeps/ set = (all stored blobs of the kept kinds) + @add, dropping
+ * every prior blob of @drop_kind (and, when @drop_output is not (u32)-1, only the
+ * one at that output).  Meta is stamped with OUR current local commit num. */
+static void merge_put_sweeps(struct channel *channel,
+			     enum wt_tmpl_kind drop_kind,
+			     u32 drop_output,
+			     struct watchtower_blob *const *add)
+{
+	struct lightningd *ld = channel->peer->ld;
+	struct watchtower_blob **stored, **out;
+
+	stored = wt_store_load_sweeps(tmpctx, ld, channel);
+	out = tal_arr(tmpctx, struct watchtower_blob *, 0);
+	for (size_t i = 0; i < tal_count(stored); i++) {
+		if (stored[i]->kind == drop_kind
+		    && (drop_output == (u32)-1
+			|| stored[i]->output_index == drop_output))
+			continue;
+		tal_arr_expand(&out, stored[i]);
+	}
+	for (size_t i = 0; i < tal_count(add); i++)
+		tal_arr_expand(&out, add[i]);
+
+	if (!wt_store_put_sweeps(ld, channel, our_current_commit_num(channel), out))
+		log_broken(channel->log,
+			   "onchain_presign: failed merging %zu kind-%u sweeps",
+			   tal_count(add), drop_kind);
+}
+
+void onchain_presign_remote_htlc_sweeps(struct channel *channel,
+					const struct pubkey *remote_per_commit,
+					const struct penalty_base *pbase)
+{
+	struct keyset keyset;
+	struct watchtower_blob **add;
+	const bool static_remotekey
+		= pbase->commitment_num >= channel->static_remotekey_start[REMOTE];
+
+	/* Stash the REMOTE commitment ingredients for the fulfill-time
+	 * received-by-us (kind-6, preimage) rebuild. */
+	channel->presign_remote_commit_num = pbase->commitment_num;
+	tal_free(channel->presign_remote_per_commit);
+	channel->presign_remote_per_commit
+		= tal_dup(channel, struct pubkey, remote_per_commit);
+	tal_free((void *)channel->presign_remote_pbase);
+	{
+		struct penalty_base *pb
+			= tal_dup(channel, struct penalty_base, pbase);
+		pb->htlcs = tal_dup_talarr(pb, struct penalty_htlc, pbase->htlcs);
+		channel->presign_remote_pbase = pb;
+	}
+
+	/* REMOTE keyset: self = the peer (output owner), other = us. */
+	if (!derive_keyset(remote_per_commit, &channel->channel_info.theirbase,
+			   &channel->local_basepoints, static_remotekey, &keyset)) {
+		log_broken(channel->log,
+			   "onchain_presign: kind-6 REMOTE keyset derivation failed "
+			   "for remote commit %"PRIu64, pbase->commitment_num);
+		return;
+	}
+
+	/* Build the offered-by-us (timeout, no preimage) legs now; the
+	 * received-by-us (preimage) legs are added at fulfill. */
+	add = tal_arr(tmpctx, struct watchtower_blob *, 0);
+	for (size_t i = 0; i < tal_count(pbase->htlcs); i++) {
+		const struct penalty_htlc *h = &pbase->htlcs[i];
+		struct watchtower_blob *b;
+
+		if (h->remote_offered)
+			continue;	/* received-by-us: deferred to fulfill */
+		b = build_remote_htlc_sweep(add, channel,
+					    our_current_commit_num(channel),
+					    pbase->commitment_num, &keyset,
+					    &pbase->txid, remote_per_commit, h,
+					    NULL);
+		if (b)
+			tal_arr_expand(&add, b);
+	}
+
+	/* Replace ALL prior kind-6 (they were bound to the previous, now-stale
+	 * remote commitment) with this remote commitment's timeout legs. */
+	merge_put_sweeps(channel, WT_TMPL_REMOTE_HTLC_TO_US, (u32)-1, add);
 }
 
 bool onchain_presign_htlc_success(struct channel *channel, struct htlc_in *hin)
@@ -472,14 +699,53 @@ bool onchain_presign_htlc_success(struct channel *channel, struct htlc_in *hin)
 						  hin->preimage, commit_wscript);
 	bitcoin_tx_input_set_witness(tx, 0, take(witness));
 
+	/* Phase F (kind 6): the SAME received HTLC can also be swept off the PEER
+	 * commitment (remote_htlc_to_us, preimage-gated) if the peer honestly
+	 * force-closes.  Rebuild it here (the preimage is only known now) from the
+	 * stashed REMOTE commitment metadata; best-effort -- absent metadata (e.g.
+	 * right after a restart) simply omits it. */
+	struct watchtower_blob *b6 = NULL;
+	u32 remote_out6 = (u32)-1;
+	if (channel->presign_remote_pbase && channel->presign_remote_per_commit) {
+		const struct penalty_base *rpb = channel->presign_remote_pbase;
+		const bool rstatic = rpb->commitment_num
+			>= channel->static_remotekey_start[REMOTE];
+		struct keyset rkeyset;
+
+		if (derive_keyset(channel->presign_remote_per_commit,
+				  &channel->channel_info.theirbase,
+				  &channel->local_basepoints, rstatic, &rkeyset)) {
+			for (size_t i = 0; i < tal_count(rpb->htlcs); i++) {
+				const struct penalty_htlc *h = &rpb->htlcs[i];
+
+				if (!h->remote_offered)
+					continue;
+				if (!sha256_eq(&h->payment_hash, &hin->payment_hash))
+					continue;
+				b6 = build_remote_htlc_sweep(tmpctx, channel,
+							     our_current_commit_num(channel),
+							     rpb->commitment_num,
+							     &rkeyset, &rpb->txid,
+							     channel->presign_remote_per_commit,
+							     h, hin->preimage);
+				remote_out6 = h->outnum;
+				break;
+			}
+		}
+	}
+
 	/* Merge into the stored CLASS-B set WITHOUT clobbering kinds 3/4 (or a
-	 * prior kind-5 for another HTLC): load, drop any existing kind-5 for
-	 * this same output (idempotent re-fulfill), append the new one, re-put. */
+	 * prior kind-5/6 for another HTLC): load, drop any existing kind-5 for
+	 * this same output (idempotent re-fulfill) and any prior kind-6 for the
+	 * matching remote output, append the new one(s), re-put. */
 	stored = wt_store_load_sweeps(tmpctx, ld, channel);
 	out = tal_arr(tmpctx, struct watchtower_blob *, 0);
 	for (size_t i = 0; i < tal_count(stored); i++) {
 		if (stored[i]->kind == WT_TMPL_HTLC_SUCCESS
 		    && stored[i]->output_index == match->output_index)
+			continue;
+		if (b6 && stored[i]->kind == WT_TMPL_REMOTE_HTLC_TO_US
+		    && stored[i]->output_index == remote_out6)
 			continue;
 		tal_arr_expand(&out, stored[i]);
 	}
@@ -488,6 +754,8 @@ bool onchain_presign_htlc_success(struct channel *channel, struct htlc_in *hin)
 				    match->output_index,
 				    amount_msat_to_sat_round_down(match->amount),
 				    0, commit_wscript, tx));
+	if (b6)
+		tal_arr_expand(&out, b6);
 
 	if (!wt_store_put_sweeps(ld, channel, commit_num, out)) {
 		log_broken(channel->log,

@@ -848,6 +848,7 @@ static struct changed_htlc *changed_htlc_arr(const tal_t *ctx,
 
 static u8 *sending_commitsig_msg(const tal_t *ctx,
 				 u64 remote_commit_index,
+				 const struct pubkey *remote_per_commit,
 				 struct penalty_base *pbase,
 				 const struct fee_states *fee_states,
 				 const struct height_states *blockheight_states,
@@ -860,6 +861,7 @@ static u8 *sending_commitsig_msg(const tal_t *ctx,
 	 * committed to. */
 	changed = changed_htlc_arr(tmpctx, changed_htlcs);
 	msg = towire_channeld_sending_commitsig(ctx, remote_commit_index,
+						remote_per_commit,
 						pbase, fee_states,
 						blockheight_states, changed);
 	return msg;
@@ -1290,7 +1292,8 @@ static u8 *send_commit_part(const tal_t *ctx,
 		status_debug("Telling master we're about to commit...");
 		/* Tell master to save this next commit to database, then wait.
 		 */
-		msg = sending_commitsig_msg(NULL, remote_index, pbase,
+		msg = sending_commitsig_msg(NULL, remote_index, remote_per_commit,
+					    pbase,
 					    peer->channel->fee_states,
 					    peer->channel->blockheight_states,
 					    changed_htlcs);

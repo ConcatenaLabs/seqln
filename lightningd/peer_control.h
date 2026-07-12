@@ -187,6 +187,16 @@ void peer_channels_cleanup(struct peer *peer);
 /* Ancient (0.7.0 and before) releases could create invalid commitment txs! */
 bool invalid_last_tx(const struct bitcoin_tx *tx);
 
+/* Specula watchtower Phase F (preemptive close): device-sign OUR current
+ * commitment (@last_tx + the peer's @last_sig) into a fully-witnessed 2-of-2
+ * unilateral close, so it can be stored in the preempt slot at advance time
+ * (device online) and broadcast by speculad while the device is offline.  This
+ * is a MASTER-fd op (keyless-forwarded to the device); fatal on a bad reply. */
+struct bitcoin_tx *sign_last_tx(const tal_t *ctx,
+				const struct channel *channel,
+				const struct bitcoin_tx *last_tx,
+				const struct bitcoin_signature *last_sig);
+
 static const struct node_id *peer_node_id(const struct peer *peer)
 {
 	return &peer->id;

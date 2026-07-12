@@ -385,6 +385,9 @@ struct channel *new_unsaved_channel(struct peer *peer,
 	channel->presign_commit_num = 0;
 	channel->presign_local_per_commit = NULL;
 	channel->presign_htlc_infos = NULL;
+	channel->presign_remote_commit_num = 0;
+	channel->presign_remote_per_commit = NULL;
+	channel->presign_remote_pbase = NULL;
 	channel->remote_channel_ready = false;
 	channel->scid = NULL;
 	channel->old_scids = NULL;
@@ -661,6 +664,9 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 	channel->presign_commit_num = 0;
 	channel->presign_local_per_commit = NULL;
 	channel->presign_htlc_infos = NULL;
+	channel->presign_remote_commit_num = 0;
+	channel->presign_remote_per_commit = NULL;
+	channel->presign_remote_pbase = NULL;
 	channel->fee_states = dup_fee_states(channel, fee_states);
 	channel->shutdown_scriptpubkey[REMOTE]
 		= tal_steal(channel, remote_shutdown_scriptpubkey);

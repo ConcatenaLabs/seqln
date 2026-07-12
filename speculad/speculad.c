@@ -103,8 +103,13 @@ struct watched_channel {
 	struct revoked_commit **revoked;/* CLASS-A, all revoked states */
 	struct spd_blob **sweeps;	/* CLASS-B, current-state honest sweeps */
 	/* Phase E (seam #3), from meta v2 (0 when meta is v1/absent): */
-	struct bitcoin_outpoint funding;   /* for future preemptive-close/funding-watch */
+	struct bitcoin_outpoint funding;   /* funding outpoint (preempt funding-watch) */
 	u32 remote_to_self_delay;	   /* exact RBF deadline window (CSV) */
+	/* Phase F preemptive close (withhold-revoke / JBA defense): */
+	struct bitcoin_tx *preempt_tx;	   /* OUR fully-signed current commitment */
+	u64 preempt_commit_num;		   /* the commitment num it names */
+	bool preempt_armed;		   /* device-down-mid-round flag present */
+	u64 preempt_armed_commit_num;	   /* the commit_num the arm was set for */
 };
 
 /* ---- Globals (config; all box-owned, no secrets) ------------------------- */
@@ -260,6 +265,49 @@ static u64 read_meta(const char *chandir, struct bitcoin_outpoint *funding,
 	return commit_num;
 }
 
+/* Phase F: read the preempt slot <chandir>/preempt/commit = LE u64 commit_num +
+ * bitcoin_tx (OUR fully-signed current commitment).  Fills *commit_num + *tx
+ * (tal'd off ctx); returns true iff decoded. */
+static bool read_preempt(const tal_t *ctx, const char *chandir,
+			 u64 *commit_num, struct bitcoin_tx **tx)
+{
+	char *path = path_join(tmpctx, chandir, "preempt/commit");
+	u8 *contents = grab_file_str(tmpctx, path);
+	const u8 *cursor;
+	size_t max;
+
+	*tx = NULL;
+	if (!contents)
+		return false;
+	cursor = contents;
+	max = tal_count(contents) - 1;
+	*commit_num = fromwire_u64(&cursor, &max);
+	*tx = fromwire_bitcoin_tx(ctx, &cursor, &max);
+	if (!cursor) {
+		*tx = tal_free(*tx);
+		return false;
+	}
+	return true;
+}
+
+/* Phase F: read the preempt "armed" flag <chandir>/preempt/armed (presence ==
+ * armed; the file's LE u64 records the commit_num it was armed for). */
+static bool read_preempt_armed(const char *chandir, u64 *armed_commit_num)
+{
+	char *path = path_join(tmpctx, chandir, "preempt/armed");
+	u8 *contents = grab_file_str(tmpctx, path);
+	const u8 *cursor;
+	size_t max;
+
+	*armed_commit_num = 0;
+	if (!contents)
+		return false;
+	cursor = contents;
+	max = tal_count(contents) - 1;
+	*armed_commit_num = fromwire_u64(&cursor, &max);
+	return cursor != NULL;
+}
+
 /* Enumerate <netdir>/watchtower/<dbid>/ into watched_channel records. */
 static struct watched_channel **load_channels(const tal_t *ctx,
 					      const char *netdir)
@@ -292,6 +340,15 @@ static struct watched_channel **load_channels(const tal_t *ctx,
 		c->current_commit_num = read_meta(chandir, &c->funding,
 						  &c->remote_to_self_delay);
 		c->revoked = tal_arr(c, struct revoked_commit *, 0);
+
+		/* Phase F preempt slot + arm flag (both inert when absent). */
+		c->preempt_tx = NULL;
+		c->preempt_commit_num = 0;
+		if (read_preempt(c, chandir, &c->preempt_commit_num,
+				 &c->preempt_tx))
+			c->preempt_tx = tal_steal(c, c->preempt_tx);
+		c->preempt_armed = read_preempt_armed(chandir,
+						      &c->preempt_armed_commit_num);
 
 		sweepsdir = path_join(tmpctx, chandir, "sweeps");
 		c->sweeps = load_blob_dir(c, sweepsdir);
@@ -861,6 +918,92 @@ static void defend_blob(struct revoked_commit *rc, const struct spd_blob *b,
 	}
 }
 
+/* Phase F: preemptive close (withhold-revoke / JBA defense).  If the signing
+ * device dropped while lightningd was mid-commitment-round, lightningd sets the
+ * preempt "armed" flag; speculad then broadcasts OUR CURRENT already-signed
+ * commitment to grab the funding outpoint FIRST, so a later peer breach becomes a
+ * double-spend.
+ *
+ * NON-CUSTODY: the broadcast is OUR OWN current commitment == a legitimate
+ * unilateral (force) close returning funds to the user on-chain (subject to
+ * to_self_delay), NEVER a revoked state.  The airtight guard is the equality
+ * preempt_commit_num == meta.current_commit_num: lightningd bumps the preempt
+ * slot + meta ATOMICALLY on every advance (BEFORE the prior state's secret is
+ * revealed), so a superseded/revoked commitment is never equal-and-armed.  This
+ * is exactly what separated Specula (safe) from the disqualified Vigilia design;
+ * speculad enforces the equality as defense-in-depth and REFUSES on mismatch. */
+static bool outpoint_is_zero(const struct bitcoin_outpoint *o)
+{
+	struct bitcoin_outpoint zero;
+	memset(&zero, 0, sizeof(zero));
+	return memcmp(o, &zero, sizeof(zero)) == 0;
+}
+
+static void maybe_preempt_close(struct watched_channel *c, bool may_broadcast)
+{
+	enum spd_txout_state ts;
+	char *txid_hex, *hex, *res;
+	const char **extra;
+	u8 *raw;
+
+	/* (a) only mid-round-device-down channels are armed. */
+	if (!c->preempt_armed)
+		return;
+
+	/* (b) THE GUARD: never broadcast anything but the CURRENT, non-revoked
+	 * local commitment.  A mismatch means the slot is stale/torn (or a revoked
+	 * state) -> REFUSE. */
+	if (!c->preempt_tx
+	    || c->preempt_commit_num != c->current_commit_num
+	    || c->preempt_armed_commit_num != c->current_commit_num) {
+		fprintf(stderr, "speculad: REFUSING preempt dbid=%"PRIu64
+			" (commit_num mismatch: preempt=%"PRIu64" armed=%"PRIu64
+			" meta=%"PRIu64") -- stale/revoked, not broadcasting\n",
+			c->dbid, c->preempt_commit_num, c->preempt_armed_commit_num,
+			c->current_commit_num);
+		return;
+	}
+
+	/* (c) FUNDING WATCH: only broadcast while the funding outpoint is still
+	 * unspent.  SPENT -> a close already happened (our preempt confirmed, or
+	 * the peer beat us -> the justice path handles a breach); reorg-safe, no
+	 * latch (auto-resumes if a reorg re-exposes the funding outpoint). */
+	if (outpoint_is_zero(&c->funding))
+		return;		/* v1/absent meta: cannot watch funding */
+	txid_hex = fmt_bitcoin_txid(tmpctx, &c->funding.txid);
+	ts = rpc_txout_state(tmpctx, txid_hex, c->funding.n);
+	if (ts == SPD_TXOUT_SPENT)
+		return;		/* channel already closed on-chain */
+
+	/* (d) need the sole-broadcaster lease. */
+	if (!may_broadcast)
+		return;
+
+	/* Broadcast OUR current commitment (a complete 2-of-2 unilateral close: it
+	 * carries its own baked-in fee, so NO fee attach, unlike the SINGLE|ACP
+	 * sweeps).  Idempotent: re-broadcasting an already-in-mempool/confirmed
+	 * commitment each poll is a harmless duplicate; the funding-SPENT gate stops
+	 * it once it confirms. */
+	raw = linearize_tx(tmpctx, c->preempt_tx);
+	hex = tal_hexstr(tmpctx, raw, tal_bytelen(raw));
+	extra = tal_arr(tmpctx, const char *, 1);
+	extra[0] = hex;
+	res = run_cli(tmpctx, "sendrawtransaction", extra);
+	if (res) {
+		size_t n = strlen(res);
+		while (n && (res[n - 1] == '\n' || res[n - 1] == '\r'
+			     || res[n - 1] == ' '))
+			res[--n] = '\0';
+		fprintf(stderr, "speculad: PREEMPT close dbid=%"PRIu64
+			" commit=%"PRIu64" -> txid %s\n",
+			c->dbid, c->preempt_commit_num, res);
+	} else {
+		fprintf(stderr, "speculad: preempt sendrawtransaction rejected "
+			"dbid=%"PRIu64" commit=%"PRIu64" (likely already in "
+			"mempool/confirmed)\n", c->dbid, c->preempt_commit_num);
+	}
+}
+
 /* ---- Sole-broadcaster lease (heartbeat, not a static lockfile) ------------ *
  * A standby speculad refuses to broadcast while a peer's heartbeat is fresh, so
  * two instances never double-RBF one fee input.  Heartbeat = atomically rewrite
@@ -1028,6 +1171,12 @@ int main(int argc, char *argv[])
 		chans = load_channels(tmpctx, netdir);
 		for (size_t i = 0; i < tal_count(chans); i++) {
 			struct watched_channel *c = chans[i];
+
+			/* Phase F: race the peer to the funding outpoint with OUR
+			 * current commitment if the device dropped mid-round.  Run
+			 * FIRST (before the revoked/justice loop) so an armed channel
+			 * grabs the funding outpoint before anything else. */
+			maybe_preempt_close(c, may_broadcast);
 
 			for (size_t j = 0; j < tal_count(c->revoked); j++) {
 				struct revoked_commit *rc = c->revoked[j];

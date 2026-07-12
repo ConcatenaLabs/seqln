@@ -16,6 +16,7 @@
 #include <lightningd/coin_mvts.h>
 #include <lightningd/notification.h>
 #include <lightningd/onchain_presign.h>
+#include <lightningd/peer_control.h>
 #include <lightningd/peer_htlcs.h>
 #include <lightningd/plugin_hook.h>
 #include <lightningd/subd.h>
@@ -2243,9 +2244,13 @@ void peer_sending_commitsig(struct channel *channel, const u8 *msg)
 	size_t i, maxid = 0, num_local_added = 0;
 	struct lightningd *ld = channel->peer->ld;
 	struct penalty_base *pbase;
+	/* Watchtower Phase F (kind 6): REMOTE keyset ingredient for the
+	 * remote_htlc_to_us pre-sign off the PEER commitment. */
+	struct pubkey remote_per_commit;
 
 	if (!fromwire_channeld_sending_commitsig(msg, msg,
 						&commitnum,
+						&remote_per_commit,
 						&pbase,
 						&fee_states,
 						&blockheight_states,
@@ -2308,6 +2313,15 @@ void peer_sending_commitsig(struct channel *channel, const u8 *msg)
 
 	if (pbase)
 		wallet_penalty_base_add(ld->wallet, channel->dbid, pbase);
+
+	/* Specula Phase F (kind 6): the peer's new commitment (which they may now
+	 * broadcast) is described by pbase (txid + per-HTLC metadata) with keyset
+	 * point remote_per_commit -- pre-sign the remote_htlc_to_us sweeps of OUR
+	 * HTLC outputs on it so a PEER honest force-close is defended while the
+	 * device is offline. */
+	if (pbase)
+		onchain_presign_remote_htlc_sweeps(channel, &remote_per_commit,
+						   pbase);
 
 	/* Tell it we've got it, and to go ahead with commitment_signed. */
 	subd_send_msg(channel->owner,
@@ -2569,6 +2583,27 @@ void peer_got_commitsig(struct channel *channel, const u8 *msg)
 	 * commitment secret. */
 	onchain_presign_current_sweeps(channel, commitnum, &local_per_commit,
 				       htlc_infos);
+
+	/* Specula Phase F (preemptive close, the JBA barrier): store OUR current
+	 * fully-signed local commitment N into the preempt slot HERE -- after the
+	 * advance to N (last_tx/last_sig now name N) and BEFORE the got_commitsig
+	 * reply below that lets channeld send revoke_and_ack revealing state N-1's
+	 * per-commitment secret.  Because the slot + meta.current_commit_num are
+	 * bumped to N durably before N-1 becomes punishable, the stored preempt
+	 * commitment ALWAYS names a local state whose secret we have NOT revealed
+	 * (never a revoked one) -- the Specula-vs-Vigilia guard.  Fail-soft (B6):
+	 * a device REJECT / store failure is logged, never fatal. */
+	if (channel->last_tx && !invalid_last_tx(channel->last_tx)) {
+		struct bitcoin_tx *preempt_tx
+			= sign_last_tx(tmpctx, channel, channel->last_tx,
+				       &channel->last_sig);
+		if (preempt_tx
+		    && !wt_store_put_preempt(ld, channel, commitnum, preempt_tx))
+			log_broken(channel->log,
+				   "watchtower: failed storing preempt commitment "
+				   "for commit %"PRIu64, commitnum);
+	}
+
 	/* Now append htlc sigs for inflights */
 	i = 0;
 	list_for_each(&channel->inflights, inflight, list) {
