@@ -61,6 +61,9 @@ contrib/pyln-*/pyln_*.egg-info/
 contrib/pyln-*/.eggs/
 contrib/pyln-*/pyln/*/__version__.py
 tests/plugins/test_selfdisable_after_getmanifest
+lightningd/lightning_hsmd_proxy
+lightningd/lightning_signerd
+speculad/speculad
 
 # Ignore generated files
 doc/schemas/sql.json
