@@ -202,7 +202,10 @@ function initFrame() {
 function initedSigner(enforce) {
   const s = Signer.fromMnemonic(MNEMONIC);
   s.processFrame(initFrame());
-  if (enforce) s.setEnforce(true);
+  // Set the policy EXPLICITLY in both directions: the device signer now
+  // DEFAULTS to enforce (the watchtower custody flip), so a permissive signer
+  // for the enforce-vs-permissive comparison must opt out via the kill-switch.
+  s.setEnforce(enforce);
   return s;
 }
 

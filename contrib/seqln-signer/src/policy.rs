@@ -38,17 +38,31 @@
 //! carries NO HTLC data, so HTLC outputs cannot be reconstructed; see
 //! [`validate_local_commitment_no_htlcs`] for the strongest correct subset there.
 //!
-//! Deferred to a VLS-parity follow-up (still signed as today, even in enforce):
-//! HTLC-transaction signs (`sign_remote_htlc_tx`, `sign_any_local_htlc_tx`),
-//! onchain sweep signs (`sign_*_to_us`, penalties — these pay to keys we own),
-//! rate-limiting, and per-state velocity checks.
+//! The watchtower custody fix (Phase A) EXTENDED enforcement to the on-chain
+//! sweep/penalty/HTLC-tx handlers: `sign_*_to_us` + penalties now range-check
+//! the committed output against the node's own cached wallet scripts, and the
+//! two HTLC-tx signs (`sign_remote_htlc_tx`, `sign_any_local_htlc_tx`) against
+//! the reconstructed to_local P2WSH — see `dispatch.rs::check_sweep_outputs`.
+//! Still deferred to a VLS-parity follow-up (signed as today, even in enforce):
+//! rate-limiting and per-state velocity checks.
 
 use crate::kernel::{ElementsTx, Kernel, Network, TxOutput};
 use bitcoin::hashes::{hash160, ripemd160, sha256, Hash};
 
-/// Signing policy. DEFAULT is `Permissive` (= the pre-M4 sign-on-request
-/// behaviour), so shipping this module regresses nothing and the demo path is
-/// unaffected; `Enforce` turns the validation on.
+/// Signing policy. DEFAULT is now `Enforce` (the watchtower custody guard: the
+/// device refuses any commitment/sweep whose output is not the channel's own
+/// reconstructed script). `Permissive` (= the pre-M4 sign-on-request behaviour)
+/// is the explicit opt-out KILL-SWITCH, selected only by
+/// `SEQLN_SIGNER_POLICY=permissive` (native) or the wallet passing
+/// `enforce=false` (WASM), so a mis-cache can never brick signing.
+///
+/// The flip is safe for already-open channels: every legitimate sweep an
+/// existing channel produces still signs under enforce — proven by the
+/// `enforce_signs_every_existing_channel_op` corpus replay (tests/tamper.rs),
+/// the reconnect path replays `SETUP_CHANNEL` per channel so the store is warm
+/// before any HTLC-tx sign (hsmd/hsmd_proxy.c), and the sweep destination
+/// (`bip86_pubkey(final_key_idx)`) sits far below the `SWEEP_KEY_SCAN` custody
+/// range on a hosted keyless node.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Policy {
     Permissive,
@@ -57,12 +71,14 @@ pub enum Policy {
 
 impl Policy {
     /// Read `SEQLN_SIGNER_POLICY` (`enforce` | `permissive`), defaulting to
-    /// `Permissive`. Kept out of `kernel.rs`; this is the one env touch and it
-    /// is a plain string read, not device I/O.
+    /// `Enforce`. Only the literal `permissive` opts back out (the kill-switch);
+    /// anything else — unset, empty, or `enforce` — enforces. Kept out of
+    /// `kernel.rs`; this is the one env touch and it is a plain string read, not
+    /// device I/O.
     pub fn from_env() -> Policy {
         match std::env::var("SEQLN_SIGNER_POLICY").ok().as_deref() {
-            Some("enforce") => Policy::Enforce,
-            _ => Policy::Permissive,
+            Some("permissive") => Policy::Permissive,
+            _ => Policy::Enforce,
         }
     }
     pub fn is_enforce(self) -> bool {

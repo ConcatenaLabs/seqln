@@ -69,7 +69,8 @@ pub struct Signer {
     hsm_version: u32,
     /// M4: per-channel state (from setup_channel), for validating signing.
     store: ChannelStore,
-    /// M4: enforce | permissive (default permissive = pre-M4 behaviour).
+    /// M4: enforce | permissive (default ENFORCE = watchtower custody guard;
+    /// permissive is the explicit kill-switch, see `Policy::from_env`).
     policy: Policy,
     /// Watchtower custody fix: the cached set of the node's OWN wallet sweep
     /// scriptPubKeys (p2wpkh + p2tr over key indices [0, SWEEP_KEY_SCAN)), used
@@ -80,7 +81,7 @@ pub struct Signer {
 
 impl Signer {
     /// Construct a signer, reading the policy from `SEQLN_SIGNER_POLICY`
-    /// (default permissive, so nothing regresses).
+    /// (default ENFORCE; `SEQLN_SIGNER_POLICY=permissive` is the kill-switch).
     pub fn new(secret: HsmSecret) -> Self {
         Self::with_policy(secret, Policy::from_env())
     }
