@@ -6034,6 +6034,12 @@ struct penalty_base *wallet_penalty_base_load_for_channel(const tal_t *ctx,
 		db_col_txid(stmt, "txid", &pb.txid);
 		pb.outnum = db_col_int(stmt, "outnum");
 		pb.amount = db_col_amount_sat(stmt, "amount");
+		/* Watchtower Phase B: the DB penalty_bases table does not carry
+		 * the per-HTLC output vector, so a pbase reloaded from disk has
+		 * no HTLC steal data (tal_count(NULL) == 0 keeps towire safe).
+		 * HTLC steal_htlc justice thus only covers states committed in
+		 * the current process lifetime (see openIssues). */
+		pb.htlcs = NULL;
 		tal_arr_expand(&res, pb);
 	}
 	tal_free(stmt);

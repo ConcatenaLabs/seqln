@@ -18,6 +18,7 @@
 #include <lightningd/peer_htlcs.h>
 #include <lightningd/plugin_hook.h>
 #include <lightningd/subd.h>
+#include <lightningd/watchtower_store.h>
 #include <onchaind/onchaind_wiregen.h>
 
 #ifndef SUPERVERBOSE
@@ -2630,6 +2631,7 @@ void peer_got_revoke(struct channel *channel, const u8 *msg)
 	struct penalty_base *pbase;
 	struct commitment_revocation_payload *payload;
 	struct bitcoin_tx *penalty_tx;
+	struct watchtower_blob **wt_blobs;
 
 	if (!fromwire_channeld_got_revoke(msg, msg,
 					 &revokenum, &per_commitment_secret,
@@ -2638,7 +2640,8 @@ void peer_got_revoke(struct channel *channel, const u8 *msg)
 					 &blockheight_states,
 					 &changed,
 					 &pbase,
-					 &penalty_tx)
+					 &penalty_tx,
+					 &wt_blobs)
 	    || !fee_states_valid(fee_states, channel->opener)
 	    || !height_states_valid(blockheight_states, channel->opener)) {
 		channel_internal_error(channel, "bad fromwire_channeld_got_revoke %s",
@@ -2714,6 +2717,21 @@ void peer_got_revoke(struct channel *channel, const u8 *msg)
 
 	/* FIXME: Check per_commitment_secret -> per_commit_point */
 	update_per_commit_point(channel, &next_per_commitment_point);
+
+	/* Watchtower Phase B (Justice-Before-Advance): persist the device-
+	 * pre-signed justice set for the state we are revoking to the
+	 * fsync-durable, secret-free store BEFORE we let the node advance past
+	 * it.  On any store failure we log but do not block the reply on
+	 * testnet (correctness-focused, no fund-safety blocker); the off-box
+	 * N-of-M quorum gate that HARD-blocks the reply is Phase D. */
+	if (pbase && tal_count(wt_blobs) > 0) {
+		if (!wt_store_put_justice(ld, channel, &pbase->txid,
+					  pbase->commitment_num, wt_blobs))
+			log_broken(channel->log,
+				   "watchtower store: failed to persist %zu "
+				   "justice blobs for commit %"PRIu64,
+				   tal_count(wt_blobs), pbase->commitment_num);
+	}
 
 	/* BOLT #2:
 	 *  - MUST respond with a `revoke_and_ack` message.
