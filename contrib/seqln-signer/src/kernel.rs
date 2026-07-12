@@ -557,6 +557,25 @@ impl Kernel {
         s
     }
 
+    /// The node's OWN BIP-86 taproot wallet OUTPUT scriptPubKey at `index`:
+    /// `OP_1 OP_PUSH32 <32-byte tweaked x-only key>` (34 bytes). This is the p2tr
+    /// form a modern mnemonic node sweeps a BITCOIN unilateral-close output to
+    /// (`onchain_control.c` builds the sweep destination with
+    /// `scriptpubkey_p2tr(bip86 final_key)` on the Bitcoin parent chain). The
+    /// tweak mirrors [`Self::taproot_keyspend_sign`]: a BIP-86 key-path (empty
+    /// script tree) tweak of the internal key at m/86'/0'/0'/0/index.
+    pub fn bip86_p2tr_scriptpubkey(&self, index: u32) -> Vec<u8> {
+        use bitcoin::key::{Keypair, TapTweak};
+        let sk = self.bip86_child_privkey(index);
+        let kp = Keypair::from_secret_key(&self.secp, &sk);
+        let (xo, _) = kp.tap_tweak(&self.secp, None).to_keypair().x_only_public_key();
+        let mut s = Vec::with_capacity(34);
+        s.push(0x51); // OP_1
+        s.push(0x20); // push 32
+        s.extend_from_slice(&xo.serialize());
+        s
+    }
+
     /// `bip86_key()` PRIVATE key for a wallet output at `index`:
     /// m/86'/0'/0'/0/index. This is the key `hsm_key_for_utxo()` uses for EVERY
     /// wallet UTXO on a mnemonic (BIP86) node — note the OUTPUT can still be a

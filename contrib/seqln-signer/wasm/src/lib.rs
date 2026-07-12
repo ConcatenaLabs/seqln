@@ -72,6 +72,16 @@ impl Signer {
         self.inner.set_policy(policy);
     }
 
+    /// The node's OWN wallet sweep scriptPubKey for key `index`: p2wpkh of the
+    /// bip86 key when `taproot` is false (the Elements sweep destination), or the
+    /// bip86 taproot output when true (the Bitcoin sweep destination). Lets a JS
+    /// harness synthesize a legit sweep output (and tamper it) for the enforce
+    /// custody proof, without hard-coding key derivation in JS.
+    #[wasm_bindgen(js_name = walletSweepScript)]
+    pub fn wallet_sweep_script(&self, index: u32, taproot: bool) -> Vec<u8> {
+        self.inner.wallet_sweep_script(index, taproot)
+    }
+
     /// Drive ONE hsmd request -> reply. `frame_bytes` is a single signer-split
     /// frame (`signer_frame.h`: little-endian `u32 len | is_main | node_id? |
     /// dbid | capabilities | hsmd_msg`); the return is the single framed reply

@@ -24,6 +24,14 @@ const SIGHASH_SINGLE_ACP: u32 = 0x03 | 0x80;
 /// Wire size of a `hsm_htlc` subtype: side(u8) + amount(u64) + hash(32) + cltv(u32).
 const HSM_HTLC_LEN: usize = 1 + 8 + 32 + 4;
 
+/// How many of the node's OWN wallet key indices [0, N) we derive into the sweep
+/// custody set. The signer never learns `final_key_idx` (it is not in the
+/// setup_channel wire), so the enforce-mode output-ownership check on sweep/
+/// penalty handlers is a bounded range-check over indices [0, N). N is generous
+/// so an honest sweep is never falsely refused; the set is derived once (OnceCell)
+/// because deriving ~N*3 keys per signature would be prohibitive.
+const SWEEP_KEY_SCAN: u32 = 5000;
+
 /// The capabilities array from `hsmd_init()`, in the exact order libhsmd emits
 /// it, followed by the two preapprove-check caps (`dev_no_preapprove_check` is
 /// false in a normal, non-dev node).
@@ -63,6 +71,11 @@ pub struct Signer {
     store: ChannelStore,
     /// M4: enforce | permissive (default permissive = pre-M4 behaviour).
     policy: Policy,
+    /// Watchtower custody fix: the cached set of the node's OWN wallet sweep
+    /// scriptPubKeys (p2wpkh + p2tr over key indices [0, SWEEP_KEY_SCAN)), used
+    /// by the enforce-mode output-ownership check on the sweep/penalty handlers.
+    /// Derived lazily on first use (a pure function of the seed).
+    own_sweep_scripts: std::cell::OnceCell<std::collections::HashSet<Vec<u8>>>,
 }
 
 impl Signer {
@@ -81,6 +94,7 @@ impl Signer {
             hsm_version: 0,
             store: ChannelStore::new(),
             policy,
+            own_sweep_scripts: std::cell::OnceCell::new(),
         }
     }
 
@@ -128,6 +142,10 @@ impl Signer {
             // withdrawal / channel-funding tx (the funder role). Not a theft
             // vector for the fundee split, so no policy gate.
             msg::HSMD_SIGN_WITHDRAWAL => opt(self.h_sign_withdrawal(&req.hsmd_msg)),
+            // SIGN_ANCHORSPEND (147): CPFP-bump a commitment by spending its
+            // anchor output (funding-key partial sig) plus the node's own wallet
+            // fee inputs. Advertised in CAPABILITIES but previously unhandled.
+            msg::HSMD_SIGN_ANCHORSPEND => opt(self.h_sign_anchorspend(&req.hsmd_msg)),
             msg::HSMD_SIGN_MUTUAL_CLOSE_TX => opt(self.h_sign_mutual_close_tx(req)),
             msg::HSMD_SIGN_REMOTE_HTLC_TX => opt(self.h_sign_remote_htlc_tx(req)),
             msg::HSMD_SIGN_ANY_LOCAL_HTLC_TX => opt(self.h_sign_any_local_htlc_tx(&req.hsmd_msg)),
@@ -441,6 +459,153 @@ impl Signer {
     // real captured requests are always well-formed and produce a reply).
     // =================================================================
 
+    // =================================================================
+    // Watchtower custody fix (enforce mode): every sweep/penalty/HTLC sign
+    // must pay only the node's OWN outputs, so a compromised host cannot get
+    // a self-paying sweep signed. Model on check_own/remote/local_commitment.
+    // =================================================================
+
+    /// The cached set of the node's OWN wallet sweep scriptPubKeys: for each key
+    /// index in [0, SWEEP_KEY_SCAN) the p2wpkh(bip86 pubkey) [Elements sweep
+    /// dest], the bip86 p2tr output [Bitcoin sweep dest], and — defensively —
+    /// p2wpkh(legacy m/0/0/idx pubkey). Derived once, then reused.
+    fn own_sweep_script_set(&self) -> &std::collections::HashSet<Vec<u8>> {
+        self.own_sweep_scripts.get_or_init(|| {
+            let k = self.kernel();
+            let mut s =
+                std::collections::HashSet::with_capacity(SWEEP_KEY_SCAN as usize * 3);
+            for i in 0..SWEEP_KEY_SCAN {
+                s.insert(k.p2wpkh_scriptpubkey(&k.bip86_child_pubkey(i)));
+                s.insert(k.bip86_p2tr_scriptpubkey(i));
+                s.insert(k.p2wpkh_scriptpubkey(&k.bip32_child_pubkey(i)));
+            }
+            s
+        })
+    }
+
+    /// The node's OWN wallet sweep scriptPubKey for `index` (p2tr when `taproot`,
+    /// else p2wpkh of the bip86 key). Used by the WASM binding to let a browser
+    /// harness synthesize a legit/tampered sweep for the enforce proof.
+    pub fn wallet_sweep_script(&self, index: u32, taproot: bool) -> Vec<u8> {
+        if taproot {
+            self.kernel().bip86_p2tr_scriptpubkey(index)
+        } else {
+            self.kernel()
+                .p2wpkh_scriptpubkey(&self.kernel().bip86_child_pubkey(index))
+        }
+    }
+
+    /// Enforce-mode custody check for a sweep/penalty/HTLC transaction: every
+    /// output that this signature commits to must pay a script in `allowed`.
+    /// Sighash-aware — under SIGHASH_SINGLE only the output at `sign_index` is
+    /// committed (the tower appends its own fee inputs/outputs elsewhere); under
+    /// SIGHASH_ALL every non-fee output is committed. The Elements explicit fee
+    /// output (empty scriptPubKey) is skipped, exactly as `policy.rs` does.
+    fn check_sweep_outputs(
+        &self,
+        bt: &BitcoinTx,
+        sign_index: usize,
+        sighash: u32,
+        allowed: &std::collections::HashSet<Vec<u8>>,
+    ) -> Result<(), String> {
+        let base = sighash & 0x1f; // WALLY_SIGHASH_MASK
+        let outs = &bt.tx.outputs;
+        if base == 0x03 {
+            // SIGHASH_SINGLE: only outputs[sign_index] is committed.
+            let o = outs
+                .get(sign_index)
+                .ok_or_else(|| format!("no output at sign index {sign_index}"))?;
+            if o.script.is_empty() {
+                return Err("committed output is an (empty-script) fee output".to_string());
+            }
+            if !allowed.contains(&o.script) {
+                return Err(format!(
+                    "sweep output {sign_index} pays a non-owned script {}",
+                    hexbytes(&o.script)
+                ));
+            }
+        } else {
+            // SIGHASH_ALL: every non-fee output is committed and must be ours.
+            for (i, o) in outs.iter().enumerate() {
+                if o.script.is_empty() {
+                    continue; // Elements explicit fee output.
+                }
+                if !allowed.contains(&o.script) {
+                    return Err(format!(
+                        "sweep output {i} pays a non-owned script {}",
+                        hexbytes(&o.script)
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The enforce gate for a DIRECT-TO-WALLET sweep (Class A: delayed/penalty/
+    /// htlc-to-us). Returns Err if enforce is on and a committed output is not the
+    /// node's own. `label` names the handler for the log line.
+    fn enforce_wallet_sweep(
+        &self,
+        label: &str,
+        bt: &BitcoinTx,
+        sign_index: usize,
+        sighash: u32,
+    ) -> Result<(), ()> {
+        if !self.policy.is_enforce() {
+            return Ok(());
+        }
+        match self.check_sweep_outputs(bt, sign_index, sighash, self.own_sweep_script_set()) {
+            Ok(()) => Ok(()),
+            Err(reason) => {
+                eprintln!("{label} refused (enforce): {reason}");
+                Err(())
+            }
+        }
+    }
+
+    /// The enforce gate for a SECOND-STAGE HTLC transaction (Class B:
+    /// sign_remote_htlc_tx / sign_any_local_htlc_tx). Its lone output is the
+    /// revocable-delayed to_local P2WSH rebuilt from the tracked channel, NOT a
+    /// wallet address, so the wallet range does not apply. Rejects if the channel
+    /// is untracked or the committed output is not that script.
+    fn enforce_htlc_tx_output(
+        &self,
+        label: &str,
+        node_id: &[u8; 33],
+        dbid: u64,
+        side: crate::policy::Side,
+        point: &[u8; 33],
+        bt: &BitcoinTx,
+        sign_index: usize,
+        sighash: u32,
+    ) -> Result<(), ()> {
+        if !self.policy.is_enforce() {
+            return Ok(());
+        }
+        let expected = match self.store.get(node_id, dbid) {
+            Some(st) => {
+                crate::policy::expected_htlc_tx_to_local(self.kernel(), node_id, dbid, st, side, point)
+            }
+            None => Err("no tracked channel (setup_channel not seen)".to_string()),
+        };
+        let spk = match expected {
+            Ok(spk) => spk,
+            Err(reason) => {
+                eprintln!("{label} refused (enforce): {reason}");
+                return Err(());
+            }
+        };
+        let mut set = std::collections::HashSet::with_capacity(1);
+        set.insert(spk);
+        match self.check_sweep_outputs(bt, sign_index, sighash, &set) {
+            Ok(()) => Ok(()),
+            Err(reason) => {
+                eprintln!("{label} refused (enforce): {reason}");
+                Err(())
+            }
+        }
+    }
+
     /// The shared final step: the BIP-143 segwit-v0 sighash over `scriptcode`
     /// with the input `sign_index` amount (from the PSBT witness_utxo), low-R
     /// sign, and frame the `bitcoin_signature` reply (compact 64 || sighash byte).
@@ -527,6 +692,19 @@ impl Signer {
         let s = self.kernel().channel_secrets(&req.node_id, req.dbid);
         let htlc_privkey = self.kernel().derive_simple_privkey(&s.htlc, &remote_per_commit);
         let sighash = if anchor { SIGHASH_SINGLE_ACP } else { SIGHASH_ALL };
+        // Custody (enforce): the HTLC-tx output must be the to_local P2WSH for
+        // the tracked channel on the REMOTE side, not a host-chosen script.
+        self.enforce_htlc_tx_output(
+            "SIGN_REMOTE_HTLC_TX",
+            &req.node_id,
+            req.dbid,
+            Side::Remote,
+            &remote_per_commit,
+            &bt,
+            0,
+            sighash,
+        )
+        .ok()?;
         self.sig_reply(&bt, 0, &wscript, &htlc_privkey, sighash, msg::HSMD_SIGN_TX_REPLY)
     }
 
@@ -545,6 +723,19 @@ impl Signer {
         let point = self.kernel().per_commit_point_at(&s.shaseed, commit_num);
         let htlc_privkey = self.kernel().derive_simple_privkey(&s.htlc, &point);
         let sighash = if anchor { SIGHASH_SINGLE_ACP } else { SIGHASH_ALL };
+        // Custody (enforce): the HTLC-tx output must be the to_local P2WSH for
+        // the tracked channel on OUR (LOCAL) side.
+        self.enforce_htlc_tx_output(
+            "SIGN_ANY_LOCAL_HTLC_TX",
+            &peer_id,
+            dbid,
+            Side::Local,
+            &point,
+            &bt,
+            input_num,
+            sighash,
+        )
+        .ok()?;
         self.sig_reply(&bt, input_num, &wscript, &htlc_privkey, sighash, msg::HSMD_SIGN_TX_REPLY)
     }
 
@@ -559,6 +750,7 @@ impl Signer {
         let s = self.kernel().channel_secrets(&req.node_id, req.dbid);
         let privkey = self.kernel().derive_simple_privkey(&s.htlc, &remote_per_commit);
         let sighash = if anchor { SIGHASH_SINGLE_ACP } else { SIGHASH_ALL };
+        self.enforce_wallet_sweep("SIGN_REMOTE_HTLC_TO_US", &bt, 0, sighash).ok()?;
         self.sig_reply(&bt, 0, &wscript, &privkey, sighash, msg::HSMD_SIGN_TX_REPLY)
     }
 
@@ -576,6 +768,7 @@ impl Signer {
         let s = self.kernel().channel_secrets(&peer_id, dbid);
         let privkey = self.kernel().derive_simple_privkey(&s.htlc, &remote_per_commit);
         let sighash = if anchor { SIGHASH_SINGLE_ACP } else { SIGHASH_ALL };
+        self.enforce_wallet_sweep("SIGN_ANY_REMOTE_HTLC_TO_US", &bt, 0, sighash).ok()?;
         self.sig_reply(&bt, 0, &wscript, &privkey, sighash, msg::HSMD_SIGN_TX_REPLY)
     }
 
@@ -589,7 +782,10 @@ impl Signer {
         let s = self.kernel().channel_secrets(&req.node_id, req.dbid);
         let point = self.kernel().per_commit_point_at(&s.shaseed, commit_num);
         let privkey = self.kernel().derive_simple_privkey(&s.delayed, &point);
-        self.sig_reply(&bt, 0, &wscript, &privkey, SIGHASH_ALL, msg::HSMD_SIGN_TX_REPLY)
+        // SINGLE|ACP (watchtower): pins the user's recovery output 0 while
+        // speculad appends its own fee inputs at index >= 1 and RBFs autonomously.
+        self.enforce_wallet_sweep("SIGN_DELAYED_PAYMENT_TO_US", &bt, 0, SIGHASH_SINGLE_ACP).ok()?;
+        self.sig_reply(&bt, 0, &wscript, &privkey, SIGHASH_SINGLE_ACP, msg::HSMD_SIGN_TX_REPLY)
     }
 
     /// SIGN_ANY_DELAYED_PAYMENT_TO_US (142): peer_id/dbid from MESSAGE.
@@ -605,7 +801,9 @@ impl Signer {
         let s = self.kernel().channel_secrets(&peer_id, dbid);
         let point = self.kernel().per_commit_point_at(&s.shaseed, commit_num);
         let privkey = self.kernel().derive_simple_privkey(&s.delayed, &point);
-        self.sig_reply(&bt, 0, &wscript, &privkey, SIGHASH_ALL, msg::HSMD_SIGN_TX_REPLY)
+        // SINGLE|ACP (watchtower), see SIGN_DELAYED_PAYMENT_TO_US.
+        self.enforce_wallet_sweep("SIGN_ANY_DELAYED_PAYMENT_TO_US", &bt, 0, SIGHASH_SINGLE_ACP).ok()?;
+        self.sig_reply(&bt, 0, &wscript, &privkey, SIGHASH_SINGLE_ACP, msg::HSMD_SIGN_TX_REPLY)
     }
 
     /// SIGN_PENALTY_TO_US (14): spend a revoked peer output. seed from FRAME.
@@ -645,7 +843,10 @@ impl Signer {
         let privkey = self
             .kernel()
             .derive_revocation_privkey(&s.revocation, &rev_sk, &point);
-        self.sig_reply(bt, 0, wscript, &privkey, SIGHASH_ALL, msg::HSMD_SIGN_TX_REPLY)
+        // SINGLE|ACP (watchtower): pins the recovery output 0 while speculad
+        // appends its own fee inputs and RBFs the justice tx autonomously.
+        self.enforce_wallet_sweep("SIGN_PENALTY_TO_US", bt, 0, SIGHASH_SINGLE_ACP).ok()?;
+        self.sig_reply(bt, 0, wscript, &privkey, SIGHASH_SINGLE_ACP, msg::HSMD_SIGN_TX_REPLY)
     }
 
     /// SIGN_WITHDRAWAL (7): sign the node's OWN wallet inputs of a withdrawal /
@@ -663,6 +864,23 @@ impl Signer {
     /// key, which also covers native-P2WPKH and P2SH-P2WPKH transparently.
     fn h_sign_withdrawal(&self, m: &[u8]) -> Option<Vec<u8>> {
         let (utxos, psbt) = wire::parse_sign_withdrawal(m)?;
+        let out = self.sign_wallet_inputs_into_psbt(&utxos, psbt)?;
+        let mut w = Writer::new(msg::HSMD_SIGN_WITHDRAWAL_REPLY);
+        w.u32(out.len() as u32);
+        w.bytes(&out);
+        Some(w.into_vec())
+    }
+
+    /// Sign every HD-wallet input listed in `utxos` of `psbt`, splicing a
+    /// PSBT_IN_PARTIAL_SIG (or PSBT_IN_TAP_KEY_SIG for a taproot input) per input,
+    /// and return the mutated PSBT bytes. Shared by SIGN_WITHDRAWAL and
+    /// SIGN_ANCHORSPEND (which additionally signs the anchor input with the
+    /// funding key). Byte-identical to the previous inline withdrawal loop.
+    fn sign_wallet_inputs_into_psbt(
+        &self,
+        utxos: &[wire::HsmUtxo],
+        psbt: Vec<u8>,
+    ) -> Option<Vec<u8>> {
         let network = wire::detect_network(&psbt);
         // The tx being signed comes from the PSBT. On the Bitcoin path lightningd
         // downgrades to a v0 PSBT first, so the whole unsigned tx sits in the
@@ -693,7 +911,7 @@ impl Signer {
             .map(|i| wire::psbt_input_btc_prevout(&out, i))
             .collect::<Option<Vec<_>>>()
             .unwrap_or_default();
-        for utxo in &utxos {
+        for utxo in utxos {
             // The HD wallet path only; a their-close sweep needs channel keys and
             // is never part of a channel-funding withdrawal.
             if utxo.is_unilateral_close {
@@ -774,10 +992,69 @@ impl Signer {
             out = next;
         }
 
-        let mut w = Writer::new(msg::HSMD_SIGN_WITHDRAWAL_REPLY);
+        Some(out)
+    }
+
+    /// SIGN_ANCHORSPEND (147): CPFP a commitment by spending its anchor output.
+    /// Mirrors libhsmd `handle_sign_anchorspend`: sign the node's own wallet fee
+    /// inputs (like a withdrawal), THEN sign the anchor input with the channel
+    /// FUNDING key. The anchor input is the one whose witness_utxo pays
+    /// `p2wsh(wscript_anchor(local_funding_pubkey))`. Reply (148) = the mutated
+    /// wally_psbt (u32 len || bytes). Any valid partial sig suffices (lightningd
+    /// finalizes the PSBT), so this is not on the byte-exact commitment path.
+    fn h_sign_anchorspend(&self, m: &[u8]) -> Option<Vec<u8>> {
+        let (peer_id, dbid, utxos, psbt) = wire::parse_sign_anchorspend(m)?;
+        // (a) sign the appended wallet fee inputs, exactly as a withdrawal.
+        let out = self.sign_wallet_inputs_into_psbt(&utxos, psbt)?;
+        // (b) sign the anchor input with the funding key.
+        let out = self.sign_anchor_input(&peer_id, dbid, out)?;
+        let mut w = Writer::new(msg::HSMD_SIGN_ANCHORSPEND_REPLY);
         w.u32(out.len() as u32);
         w.bytes(&out);
         Some(w.into_vec())
+    }
+
+    /// Splice a funding-key PSBT_IN_PARTIAL_SIG over the anchor input of `psbt`.
+    /// Returns the mutated PSBT, or None if the anchor input can't be located /
+    /// the sighash can't be built.
+    fn sign_anchor_input(&self, peer_id: &[u8; 33], dbid: u64, psbt: Vec<u8>) -> Option<Vec<u8>> {
+        let network = wire::detect_network(&psbt);
+        // Rebuild the unsigned tx the same way the withdrawal path does.
+        let tx = match network {
+            kernel::Network::Bitcoin => {
+                wire::parse_bitcoin_tx(wire::psbt_global_unsigned_tx(&psbt)?)?
+            }
+            kernel::Network::Elements => wire::reconstruct_elements_tx_from_pset(&psbt)?,
+        };
+        let s = self.kernel().channel_secrets(peer_id, dbid);
+        let funding_pub = self.kernel().pubkey_of(&s.funding);
+        let wscript = crate::policy::anchor_wscript(&funding_pub);
+        let anchor_spk = crate::policy::p2wsh_spk(&wscript);
+        // Locate the anchor input: its witness_utxo scriptPubKey is the anchor P2WSH.
+        let j = (0..tx.inputs.len())
+            .find(|&i| wire::psbt_input_witness_spk(&psbt, i, network).as_deref() == Some(&anchor_spk))?;
+        // BIP-143 sighash over the anchor witnessScript, SIGHASH_ALL (libwally
+        // grind), self-checked, then splice PSBT_IN_PARTIAL_SIG into input j.
+        let hash = match network {
+            kernel::Network::Bitcoin => {
+                let v8 = wire::psbt_input_value_sats_le(&psbt, j)?;
+                kernel::bitcoin_sighash_sw_v0(&tx, j, &wscript, &v8, SIGHASH_ALL)
+            }
+            kernel::Network::Elements => {
+                let v9 = wire::psbt_input_value9(&psbt, j)?;
+                kernel::elements_sighash_sw_v0(&tx, j, &wscript, &v9, SIGHASH_ALL)
+            }
+        };
+        let der = self
+            .kernel()
+            .sign_low_r_der_libwally_checked(&hash, &s.funding, &funding_pub)?;
+        let rec = partial_sig_record(&funding_pub, &der, SIGHASH_ALL as u8);
+        let term = wire::psbt_input_map_terminator(&psbt, j)?;
+        let mut next = Vec::with_capacity(psbt.len() + rec.len());
+        next.extend_from_slice(&psbt[..term]);
+        next.extend_from_slice(&rec);
+        next.extend_from_slice(&psbt[term..]);
+        Some(next)
     }
 
     /// Find the wallet privkey (+ its pubkey + HASH160) that produces `spk`,
@@ -953,6 +1230,15 @@ fn opt(o: Option<Vec<u8>>) -> Outcome {
         Some(b) => Outcome::Reply(b),
         None => Outcome::Sentinel,
     }
+}
+
+/// Lowercase hex, for enforce-mode rejection log lines.
+fn hexbytes(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for x in b {
+        s.push_str(&format!("{x:02x}"));
+    }
+    s
 }
 
 /// The BIP-143 scriptCode for a P2WPKH / P2SH-P2WPKH input: the P2PKH template
@@ -1599,5 +1885,146 @@ mod withdrawal_tests {
         let msg = Message::from_digest(sighash.to_byte_array());
         secp.verify_schnorr(&sig, &msg, &out_xonly)
             .expect("taproot key-spend signature must verify against the output key");
+    }
+}
+
+#[cfg(test)]
+mod sweep_enforce_tests {
+    //! The authoritative accept/reject proof for the watchtower custody fix: in
+    //! enforce mode a DIRECT-TO-WALLET sweep (delayed_payment_to_us) is SIGNED
+    //! byte-identically to permissive when its output is the node's own address,
+    //! and REFUSED (None) when the output is redirected to an attacker — while
+    //! permissive still signs it (so the fix is enforce-only, live flow untouched).
+    use super::*;
+    use crate::hsm_secret::HsmSecret;
+    use crate::kernel::{Kernel, BIP32_VER_TEST_PRIVATE, BIP32_VER_TEST_PUBLIC};
+    use crate::policy::Policy;
+
+    const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    fn compact(n: usize) -> Vec<u8> {
+        assert!(n < 0xfd);
+        vec![n as u8]
+    }
+
+    /// 1-in / 1-out Bitcoin sweep tx paying `out_spk`.
+    fn sweep_tx(out_spk: &[u8]) -> Vec<u8> {
+        let mut t = Vec::new();
+        t.extend_from_slice(&2u32.to_le_bytes());
+        t.push(0x01);
+        t.extend_from_slice(&[0x33u8; 32]);
+        t.extend_from_slice(&0u32.to_le_bytes());
+        t.push(0x00);
+        t.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+        t.push(0x01);
+        t.extend_from_slice(&90_000u64.to_le_bytes());
+        t.extend_from_slice(&compact(out_spk.len()));
+        t.extend_from_slice(out_spk);
+        t.extend_from_slice(&0u32.to_le_bytes());
+        t
+    }
+
+    /// v0 PSBT: global{unsigned tx} || input0{witness_utxo} || output0{}.
+    fn sweep_psbt(tx: &[u8], in_amount: u64, in_spk: &[u8]) -> Vec<u8> {
+        let mut wu = in_amount.to_le_bytes().to_vec();
+        wu.extend_from_slice(&compact(in_spk.len()));
+        wu.extend_from_slice(in_spk);
+        let mut p = Vec::new();
+        p.extend_from_slice(b"psbt\xff");
+        p.extend_from_slice(&[0x01, 0x00]);
+        p.extend_from_slice(&compact(tx.len()));
+        p.extend_from_slice(tx);
+        p.push(0x00);
+        p.extend_from_slice(&[0x01, 0x01]);
+        p.extend_from_slice(&compact(wu.len()));
+        p.extend_from_slice(&wu);
+        p.push(0x00);
+        p.push(0x00);
+        p
+    }
+
+    /// A SIGN_DELAYED_PAYMENT_TO_US (12) Request whose sweep output is `out_spk`.
+    fn delayed_req(out_spk: &[u8]) -> Request {
+        let tx = sweep_tx(out_spk);
+        let in_spk: Vec<u8> = [0x00u8, 0x20].iter().copied().chain([0xabu8; 32]).collect();
+        let psbt = sweep_psbt(&tx, 100_000, &in_spk);
+        let wscript = vec![0x51u8]; // dummy scriptcode; Class A does not inspect it
+        let mut w = Writer::new(msg::HSMD_SIGN_DELAYED_PAYMENT_TO_US);
+        w.u64(0); // commit_num
+        w.u32(tx.len() as u32);
+        w.bytes(&tx);
+        w.u32(psbt.len() as u32);
+        w.bytes(&psbt);
+        w.u16(wscript.len() as u16);
+        w.bytes(&wscript);
+        Request {
+            is_main: false,
+            node_id: [7u8; 33],
+            dbid: 1,
+            capabilities: 0,
+            hsmd_msg: w.into_vec(),
+        }
+    }
+
+    fn signer(policy: Policy) -> Signer {
+        let seed = crate::kernel::bip39_seed(MNEMONIC, "");
+        let kernel = Kernel::new(seed.to_vec(), BIP32_VER_TEST_PUBLIC, BIP32_VER_TEST_PRIVATE);
+        let secret = HsmSecret { seed, secret_type: 2, mnemonic: String::new() };
+        let mut s = Signer::with_policy(secret, policy);
+        s.kernel = Some(kernel);
+        s.hsm_version = 6;
+        s
+    }
+
+    #[test]
+    fn delayed_sweep_accept_byte_exact_reject_tampered() {
+        if matches!(
+            std::env::var("SEQLN_SIGNER_NETWORK").ok().as_deref(),
+            Some("elements") | Some("liquid")
+        ) {
+            eprintln!("SKIP: SEQLN_SIGNER_NETWORK forces Elements");
+            return;
+        }
+
+        // The node's OWN sweep destination (bip86 p2wpkh, index 4).
+        let permissive = signer(Policy::Permissive);
+        let own_spk = permissive.wallet_sweep_script(4, false);
+        assert!(permissive.own_sweep_script_set().contains(&own_spk));
+
+        // (1) ACCEPT: enforce signs the honest sweep byte-identically to permissive.
+        let legit = delayed_req(&own_spk);
+        let perm_reply = permissive
+            .h_sign_delayed_payment_to_us(&legit)
+            .expect("permissive signs honest sweep");
+        let enforce = signer(Policy::Enforce);
+        let enf_reply = enforce
+            .h_sign_delayed_payment_to_us(&delayed_req(&own_spk))
+            .expect("enforce signs honest sweep");
+        assert_eq!(
+            perm_reply, enf_reply,
+            "enforcement must be transparent to an honest sweep (byte-exact)"
+        );
+        assert!(perm_reply.len() > 2, "a signed reply carries the sig");
+
+        // (2) REJECT: redirect the sweep to an ATTACKER address (flip the last
+        // byte of the keyhash). Enforce refuses (None); permissive still signs.
+        let mut attacker_spk = own_spk.clone();
+        let last = attacker_spk.len() - 1;
+        attacker_spk[last] ^= 0x01;
+        assert!(!permissive.own_sweep_script_set().contains(&attacker_spk));
+
+        let tampered = delayed_req(&attacker_spk);
+        assert!(
+            signer(Policy::Permissive)
+                .h_sign_delayed_payment_to_us(&delayed_req(&attacker_spk))
+                .is_some(),
+            "permissive still signs a redirected sweep (enforce-only fix)"
+        );
+        assert!(
+            signer(Policy::Enforce)
+                .h_sign_delayed_payment_to_us(&tampered)
+                .is_none(),
+            "enforce must REFUSE a sweep paying a non-owned output"
+        );
     }
 }

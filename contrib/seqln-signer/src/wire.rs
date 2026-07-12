@@ -45,6 +45,7 @@ pub mod msg {
     pub const HSMD_SIGN_ANY_REMOTE_HTLC_TO_US: u16 = 143;
     pub const HSMD_SIGN_ANY_PENALTY_TO_US: u16 = 144;
     pub const HSMD_SIGN_ANY_LOCAL_HTLC_TX: u16 = 146;
+    pub const HSMD_SIGN_ANCHORSPEND: u16 = 147;
 
     pub const HSMD_ECDH_RESP: u16 = 100;
     pub const HSMD_CANNOUNCEMENT_SIG_REPLY: u16 = 102;
@@ -74,6 +75,7 @@ pub mod msg {
     pub const HSMD_PREAPPROVE_INVOICE_CHECK_REPLY: u16 = 151;
     pub const HSMD_PREAPPROVE_KEYSEND_CHECK_REPLY: u16 = 152;
     pub const HSMD_CHECK_BIP86_PUBKEY_REPLY: u16 = 156;
+    pub const HSMD_SIGN_ANCHORSPEND_REPLY: u16 = 148;
 }
 
 /// Append-only big-endian wire builder.
@@ -817,6 +819,50 @@ pub fn parse_sign_withdrawal(m: &[u8]) -> Option<(Vec<HsmUtxo>, Vec<u8>)> {
     let plen = r.u32()? as usize;
     let psbt = r.take_bytes(plen)?;
     Some((utxos, psbt))
+}
+
+/// Parse a `hsmd_sign_anchorspend` request (msg 147) into
+/// (peer_id, dbid, utxos, raw psbt). Layout (`hsmd/hsmd_wire.csv`):
+/// peerid(node_id 33) || channel_dbid(u64) || num_inputs(u16) ||
+/// inputs(hsm_utxo * num_inputs) || psbt(wally_psbt: u32 len || bytes). This is
+/// the SIGN_WITHDRAWAL tail with a peerid + dbid prefix.
+pub fn parse_sign_anchorspend(m: &[u8]) -> Option<([u8; 33], u64, Vec<HsmUtxo>, Vec<u8>)> {
+    let mut r = Reader::new(m);
+    if r.u16()? != msg::HSMD_SIGN_ANCHORSPEND {
+        return None;
+    }
+    let peer_id = r.arr33()?;
+    let dbid = r.u64()?;
+    let num_inputs = r.u16()? as usize;
+    let mut utxos = Vec::with_capacity(num_inputs);
+    for _ in 0..num_inputs {
+        utxos.push(read_hsm_utxo(&mut r)?);
+    }
+    let plen = r.u32()? as usize;
+    let psbt = r.take_bytes(plen)?;
+    Some((peer_id, dbid, utxos, psbt))
+}
+
+/// The scriptPubKey held in input `input_index`'s `PSBT_IN_WITNESS_UTXO`,
+/// decoded per network: a Bitcoin TxOut is `value(8 LE) || varbuff(spk)`; an
+/// Elements output is `asset || value || nonce || varbuff(spk)`. Used to locate
+/// the anchor input (the one whose witness_utxo pays the anchor P2WSH) in an
+/// anchorspend PSBT. Returns None if there is no witness_utxo or it is malformed.
+pub fn psbt_input_witness_spk(psbt: &[u8], input_index: usize, network: Network) -> Option<Vec<u8>> {
+    let val = psbt_witness_utxo_raw(psbt, input_index)?;
+    let mut p = 0usize;
+    match network {
+        Network::Bitcoin => {
+            p = 8;
+        }
+        Network::Elements => {
+            commit_field(val, &mut p, false)?; // asset
+            commit_field(val, &mut p, true)?; // value
+            commit_field(val, &mut p, false)?; // nonce
+        }
+    }
+    let slen = read_compact(val, &mut p)? as usize;
+    Some(val.get(p..p + slen)?.to_vec())
 }
 
 /// Return the raw value of the v0 `PSBT_GLOBAL_UNSIGNED_TX` (global map key 0x00)

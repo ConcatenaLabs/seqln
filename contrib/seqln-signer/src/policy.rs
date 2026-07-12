@@ -644,6 +644,45 @@ pub fn validate_local_commitment_no_htlcs(
     Ok(())
 }
 
+/// The anchor output's witnessScript for a funding key (`bitcoin_wscript_anchor`).
+/// Exposed for the device signer's `SIGN_ANCHORSPEND` handler, which must build
+/// the anchor input's scriptCode + scriptPubKey to locate and sign it.
+pub fn anchor_wscript(funding_key: &[u8; 33]) -> Vec<u8> {
+    wscript_anchor(funding_key)
+}
+
+/// The P2WSH scriptPubKey for a witnessScript (`OP_0 <sha256(wscript)>`). Exposed
+/// so the signer can match an anchor input's witness_utxo scriptPubKey.
+pub fn p2wsh_spk(wscript: &[u8]) -> Vec<u8> {
+    p2wsh(wscript)
+}
+
+/// The expected single `to_local` (revocable, CSV-delayed) P2WSH output of a
+/// SECOND-STAGE HTLC transaction (htlc-timeout / htlc-success) for the tracked
+/// channel `st` on `side` at per-commitment `point`. Unlike a direct wallet
+/// sweep, an HTLC tx does NOT pay a wallet address: its lone output is the same
+/// revocable-delayed to_local script the commitment uses, rebuilt from the
+/// channel keys. Used by the device signer's custody check on the two HTLC-tx
+/// handlers (`sign_remote_htlc_tx`, `sign_any_local_htlc_tx`).
+pub fn expected_htlc_tx_to_local(
+    kernel: &Kernel,
+    node_id: &[u8; 33],
+    dbid: u64,
+    st: &ChannelState,
+    side: Side,
+    point: &[u8; 33],
+) -> Result<Vec<u8>, String> {
+    let static_remotekey = st.option_static_remotekey || st.option_anchors;
+    let our_bp = kernel.channel_basepoints(node_id, dbid);
+    let ks = build_keyset(kernel, st, &our_bp, side, point, static_remotekey)?;
+    Ok(p2wsh(&wscript_to_local(
+        ks.to_self_delay,
+        0,
+        &ks.self_revocation_key,
+        &ks.self_delayed_key,
+    )))
+}
+
 fn hexstr(b: &[u8]) -> String {
     let mut s = String::with_capacity(b.len() * 2);
     for x in b {
