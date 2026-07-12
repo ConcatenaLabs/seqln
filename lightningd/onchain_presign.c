@@ -111,14 +111,32 @@ static bool master_sign_sweep(struct lightningd *ld,
  * kind 5 (received-HTLC success) is preimage-gated and produced at fulfill time
  * (onchain_presign_htlc_success).
  *
- * DEFERRED SEAM -- kind 6 (WT_TMPL_REMOTE_HTLC_TO_US): defends when the PEER
- * force-closes honestly, sweeping HTLC outputs on the REMOTE commitment.
- * lightningd does NOT hold the remote commitment tx (channel->last_tx is OURS;
- * the remote commitment is built in channeld's send_commit_part), so the
- * remote-commitment HTLC outpoints/amounts must be threaded from channeld's
- * SENDING_COMMITSIG path first (a separate wiregen change).  Until then the
- * peer-honest-close HTLC gap stays on onchaind at real force-close time
- * (device-online), exactly as today. */
+ * kind 6 (WT_TMPL_REMOTE_HTLC_TO_US) -- defends when the PEER force-closes
+ * honestly, sweeping OUR HTLC outputs on the REMOTE commitment -- is NOT built
+ * here.  lightningd does not hold the remote commitment tx (channel->last_tx is
+ * OURS); the remote commitment + its HTLC outpoints/amounts are built in
+ * channeld's send_commit_part and threaded up via SENDING_COMMITSIG, so kind 6
+ * is produced from that path (onchain_presign_remote_htlc_sweeps + the fulfill-
+ * time received leg in onchain_presign_htlc_success), NOT from this GOT_COMMITSIG
+ * path.  Split by leg, kind 6 is:
+ *   - offered-by-us (times back to us, no preimage): built + master-signed +
+ *     stored on EVERY advance in onchain_presign_remote_htlc_sweeps.
+ *   - received-by-us (peer offered it TO us): PREIMAGE-GATED.  Before we hold the
+ *     preimage there is no valid witness for the output (it just times back to
+ *     the peer), so it is un-presignable keyless OR with keys -- inherently
+ *     fulfill-time only, and IS built there (onchain_presign_htlc_success).
+ * Two narrow fail-soft residual seams remain (both fall back to onchaind at real
+ * force-close, device-online; neither is a fund-safety blocker):
+ *   (a) the remote-commitment carrier is only threaded when the peer holds a
+ *       non-dust to_local on their commitment (channeld.c: pbase requires
+ *       direct_outputs[LOCAL]); in the degenerate case where the peer's balance
+ *       is below dust no pbase is emitted, so no kind-6 is stashed for that
+ *       advance.  The normal LSP-leaf topology (the peer/LSP holds routing
+ *       capital) always has a non-dust peer to_local, so kind 6 fires on every
+ *       advance there.
+ *   (b) the REMOTE stash (presign_remote_pbase/_per_commit) is in-memory, so a
+ *       fulfill in the window right after a restart, before the next advance
+ *       re-stashes it, omits the received-by-us kind-6 leg (best-effort). */
 static struct watchtower_blob **build_current_sweeps(const tal_t *ctx,
 						     struct channel *channel,
 						     u64 commit_num,
