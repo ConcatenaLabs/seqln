@@ -54,6 +54,7 @@
 #include <ccan/tal/str/str.h>
 #include <ccan/tal/tal.h>
 #include <common/amount.h>
+#include <common/presign_templates.h>	/* enum wt_tmpl_kind (stable on-disk u8) */
 #include <common/setup.h>
 #include <common/utils.h>
 #include <ctype.h>
@@ -520,6 +521,24 @@ static char *rpc_getbestblockhash(const tal_t *ctx)
 			res[--len] = '\0';
 	}
 	return res;
+}
+
+/* Current chain tip height (elementsd getblockcount prints a bare integer).
+ * Returns -1 on RPC failure (callers then skip the CLTV pre-check and let the
+ * mempool be the nLocktime authority). */
+static long rpc_getblockcount(const tal_t *ctx)
+{
+	char *res = run_cli(ctx, "getblockcount", NULL);
+	long h;
+
+	if (!res)
+		return -1;
+	while (*res == ' ' || *res == '\n' || *res == '\r')
+		res++;
+	if (*res != '-' && !isdigit((unsigned char)*res))
+		return -1;
+	h = strtol(res, NULL, 10);
+	return h;
 }
 
 /* Build [fee_cli_base..., method, extra..., NULL] and run it.  fee_cli_base is
@@ -1004,6 +1023,181 @@ static void maybe_preempt_close(struct watched_channel *c, bool may_broadcast)
 	}
 }
 
+/* Specula Phase G (Task 1): broadcast one stored CLASS-B honest-close sweep.
+ *
+ * The commitment this sweep spends is recoverable from the blob itself: input 0's
+ * prevout IS commitment_txid:output_index (kinds 3/4/5 spend an output of OUR
+ * current commitment; kind 6 spends an output of the PEER's current commitment),
+ * so speculad needs NO extra locator and lightningd need not hold the peer tx.
+ *
+ * MATCH gate ("this sweep belongs to a CONFIRMED commitment, and it is an HONEST
+ * close, not a breach"): rpc_tx_confirmations(commit_txid) >= 1.  An honest close
+ * confirms its commitment; a REVOKED close's txid is a justice locator that no
+ * honest sweep references, so on a breach every honest sweep's commitment is not
+ * confirmed -- and, belt-and-braces, we additionally skip any sweep whose confirmed
+ * commitment IS a revoked locator (the justice path owns it).  No double broadcast.
+ *
+ * De-dup + reorg-safety: gate on rpc_txout_state(commit_txid, output_index) --
+ * the same non-latched confirmed-UTXO gate defend_blob uses.  SPENT -> our sweep
+ * (or the peer) already consumed that commitment output, skip THIS round only; a
+ * reorg re-exposing it auto-resumes (principle #1, no finality latch).
+ *
+ * Timelocks: kind 3 (to_local-delayed) is CSV-encumbered -- broadcastable only
+ * once the commitment has >= to_self_delay confirmations.  kind 4 and the kind-6
+ * timeout leg carry an absolute nLocktime (== cltv_expiry) -- broadcastable only
+ * once tip_height >= nLocktime.  kind 5 and the kind-6 preimage leg have nLocktime
+ * 0 -> mature as soon as the commitment confirms.  We pre-gate on maturity to
+ * avoid burning a fee-UTXO/RBF rung, but the mempool is the ultimate authority.
+ *
+ * Fee: kind 3 is SINGLE|ACP -> reuse attach_fee_and_sign (the exact non-custody
+ * path, incl. the output-0-unchanged guard, that justice uses).  kinds 4/5/6 are
+ * SIGHASH_ALL with a frozen self-deducting fee already baked in -> broadcast the
+ * device-signed tx byte-for-byte AS-IS (no tower mutation, no RBF). */
+static void defend_sweep(struct watched_channel *c, const struct spd_blob *b,
+			 long tip_height, bool may_broadcast)
+{
+	struct bitcoin_outpoint commit_op;
+	char *commit_txid_hex, *key, *signed_hex, *res;
+	struct justice_state *st;
+	enum spd_txout_state ts;
+	long confs;
+	const char **extra;
+
+	/* (1) The commitment this blob spends == its input-0 prevout. */
+	bitcoin_tx_input_get_outpoint(b->tx, 0, &commit_op);
+	commit_txid_hex = fmt_bitcoin_txid(tmpctx, &commit_op.txid);
+	/* Defensive: the stored output_index must equal the spent prevout n, so
+	 * the gettxout de-dup below queries the correct commitment output. */
+	if (commit_op.n != b->output_index) {
+		fprintf(stderr, "speculad: sweep kind %u output_index %u != "
+			"input-0 prevout n %u (%s) -- skipping malformed blob\n",
+			b->kind, b->output_index, commit_op.n, commit_txid_hex);
+		return;
+	}
+
+	/* (2) MATCH: only defend a sweep whose commitment is CONFIRMED.  <1 means
+	 * this is not the on-chain close (a stale prior-state sweep, or a breach
+	 * the justice path owns). */
+	confs = rpc_tx_confirmations(tmpctx, commit_txid_hex);
+	if (confs < 1)
+		return;
+
+	/* (3) Breach guard (belt-and-braces): if the confirmed commitment is a
+	 * REVOKED locator, the justice path defends it -- never the honest sweep. */
+	for (size_t j = 0; j < tal_count(c->revoked); j++) {
+		if (streq(c->revoked[j]->locator, commit_txid_hex)) {
+			fprintf(stderr, "speculad: sweep commitment %s is a "
+				"REVOKED locator -- leaving it to the justice "
+				"path\n", commit_txid_hex);
+			return;
+		}
+	}
+
+	/* (4) REORG-SAFE de-dup: if the swept commitment output is no longer in
+	 * the confirmed UTXO set, our sweep (or the peer) already claimed it --
+	 * skip this round only, no latch. */
+	ts = rpc_txout_state(tmpctx, commit_txid_hex, b->output_index);
+	if (ts == SPD_TXOUT_SPENT)
+		return;
+	if (!may_broadcast)
+		return;
+
+	/* (5) Timelock maturity gate (avoid wasting an RBF rung; the mempool is
+	 * the final nLocktime/BIP68 authority either way). */
+	if (b->kind == WT_TMPL_TO_LOCAL_DELAYED_SWEEP) {
+		u32 window = b->deadline_delta ? b->deadline_delta
+			: (c->remote_to_self_delay ? c->remote_to_self_delay
+			   : g_assumed_csv);
+		if (confs < (long)window) {
+			fprintf(stderr, "speculad: to_local sweep %s:%u not CSV-"
+				"mature (%ld/%u confs)\n", commit_txid_hex,
+				b->output_index, confs, window);
+			return;
+		}
+	} else {
+		u32 lt = b->tx->wtx->locktime;
+		if (lt != 0 && tip_height >= 0 && (u32)tip_height < lt) {
+			fprintf(stderr, "speculad: HTLC sweep %s:%u not CLTV-"
+				"mature (tip %ld < locktime %u)\n",
+				commit_txid_hex, b->output_index, tip_height, lt);
+			return;
+		}
+	}
+
+	/* (6) Build the broadcastable hex per fee policy. */
+	key = tal_fmt(tmpctx, "sweep:%s:%u:%u", commit_txid_hex, b->output_index,
+		      b->kind);
+	st = spd_get_state(key);
+	if (b->kind == WT_TMPL_TO_LOCAL_DELAYED_SWEEP) {
+		/* SINGLE|ACP: append our own fee input (+ change + fee output),
+		 * RBF, non-custody output-0 guard -- reused verbatim from justice. */
+		signed_hex = attach_fee_and_sign(tmpctx, b, st, confs,
+						 c->remote_to_self_delay);
+		if (!signed_hex) {
+			/* No fee wallet (testnet) / no suitable UTXO: surface the
+			 * raw zero-fee blob (below-min-relay), same seam as justice. */
+			u8 *raw = linearize_tx(tmpctx, b->tx);
+			signed_hex = tal_hexstr(tmpctx, raw, tal_bytelen(raw));
+		}
+	} else {
+		/* kinds 4/5/6: SIGHASH_ALL frozen self-deducting fee -> broadcast
+		 * byte-for-byte as the device signed it (NO fee attach, NO RBF). */
+		u8 *raw = linearize_tx(tmpctx, b->tx);
+		signed_hex = tal_hexstr(tmpctx, raw, tal_bytelen(raw));
+	}
+
+	extra = tal_arr(tmpctx, const char *, 1);
+	extra[0] = signed_hex;
+	res = run_cli(tmpctx, "sendrawtransaction", extra);
+	if (res) {
+		size_t n = strlen(res);
+		while (n && (res[n - 1] == '\n' || res[n - 1] == '\r'
+			     || res[n - 1] == ' '))
+			res[--n] = '\0';
+		tal_free(st->broadcast_txid);
+		st->broadcast_txid = tal_strdup(g_state_ctx, res);
+		if (b->kind == WT_TMPL_TO_LOCAL_DELAYED_SWEEP)
+			st->rung++;	/* next round escalates the feerate (RBF) */
+		fprintf(stderr, "speculad: HONEST-CLOSE SWEEP kind %u %s -> txid "
+			"%s\n", b->kind, key, res);
+	} else {
+		fprintf(stderr, "speculad: sweep sendrawtransaction rejected for "
+			"%s (kind %u; not yet mature / below-min-relay?)\n",
+			key, b->kind);
+		if (b->kind == WT_TMPL_TO_LOCAL_DELAYED_SWEEP)
+			st->have_feeutxo = false;   /* re-pick the fee UTXO next round */
+	}
+}
+
+/* Specula Phase G (Task 1): per-round funding-outpoint watch.  When a channel's
+ * funding outpoint leaves the confirmed UTXO set, a force-close has confirmed on-
+ * chain -> try to broadcast every stored CLASS-B honest-close sweep (each blob
+ * self-selects its own confirmed commitment + honest-vs-breach inside
+ * defend_sweep).  Non-latched, reorg-safe, exactly like maybe_preempt_close's
+ * funding gate. */
+static void defend_honest_close(struct watched_channel *c, long tip_height,
+				bool may_broadcast)
+{
+	char *txid_hex;
+	enum spd_txout_state ts;
+
+	if (tal_count(c->sweeps) == 0)
+		return;
+	if (outpoint_is_zero(&c->funding))
+		return;		/* v1/absent meta: cannot watch the funding outpoint */
+
+	txid_hex = fmt_bitcoin_txid(tmpctx, &c->funding.txid);
+	ts = rpc_txout_state(tmpctx, txid_hex, c->funding.n);
+	if (ts == SPD_TXOUT_UNSPENT)
+		return;		/* channel still open -> nothing force-closed yet */
+
+	/* SPENT (a close confirmed) or UNKNOWN (RPC error -> be conservative):
+	 * run each sweep; defend_sweep's own commitment-confirmed + de-dup gates
+	 * make a stale/wrong-commitment sweep a no-op. */
+	for (size_t k = 0; k < tal_count(c->sweeps); k++)
+		defend_sweep(c, c->sweeps[k], tip_height, may_broadcast);
+}
+
 /* ---- Sole-broadcaster lease (heartbeat, not a static lockfile) ------------ *
  * A standby speculad refuses to broadcast while a peer's heartbeat is fresh, so
  * two instances never double-RBF one fee input.  Heartbeat = atomically rewrite
@@ -1149,6 +1343,7 @@ int main(int argc, char *argv[])
 
 	while (!g_stop) {
 		char *tip;
+		long tip_height;
 		bool may_broadcast, reorg_or_new;
 		struct watched_channel **chans;
 
@@ -1165,6 +1360,12 @@ int main(int argc, char *argv[])
 			last_tip = tal_strdup(top, tip);
 		}
 
+		/* Chain tip height (once per round) for the CLTV maturity gate on
+		 * kind-4/kind-6-timeout honest-close sweeps.  -1 on RPC failure ->
+		 * defend_sweep skips the pre-check and lets the mempool enforce
+		 * nLocktime. */
+		tip_height = rpc_getblockcount(tmpctx);
+
 		/* Sole-broadcaster gate (failover via heartbeat staleness). */
 		may_broadcast = acquire_or_refresh_lease(leasefile, lease_stale);
 
@@ -1177,6 +1378,12 @@ int main(int argc, char *argv[])
 			 * FIRST (before the revoked/justice loop) so an armed channel
 			 * grabs the funding outpoint before anything else. */
 			maybe_preempt_close(c, may_broadcast);
+
+			/* Phase G (Task 1): honest-close sweeps.  A confirmed
+			 * commitment is exactly one of honest-or-revoked, so this
+			 * and the justice loop below never collide (defend_sweep
+			 * skips a commitment that is a revoked locator). */
+			defend_honest_close(c, tip_height, may_broadcast);
 
 			for (size_t j = 0; j < tal_count(c->revoked); j++) {
 				struct revoked_commit *rc = c->revoked[j];
