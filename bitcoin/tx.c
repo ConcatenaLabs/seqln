@@ -127,6 +127,31 @@ int bitcoin_tx_add_output(struct bitcoin_tx *tx, const u8 *script,
 	return i;
 }
 
+void bitcoin_tx_reserve_output(struct bitcoin_tx *tx)
+{
+	struct wally_tx_output *dummy;
+
+	/* A cloned tx (clone_bitcoin_tx) allocates exactly its own outputs, so
+	 * appending one more (e.g. speculad's fee-change output on a justice or
+	 * honest-close sweep blob) would trip bitcoin_tx_add_output()'s
+	 * allocation assert.  Grow the wally output allocation by one via an
+	 * add+remove of a throwaway output: wally_tx_add_output() reallocs on
+	 * demand (outputs_allocation_len += 1) and wally_tx_remove_output()
+	 * restores num_outputs without shrinking the allocation. */
+	if (tx->wtx->num_outputs < tx->wtx->outputs_allocation_len)
+		return;
+
+	dummy = wally_tx_output_asset(NULL, NULL, amount_sat(0),
+				      tx->output_asset);
+	assert(dummy);
+	tal_wally_start();
+	assert(wally_tx_add_output(tx->wtx, dummy) == WALLY_OK);
+	assert(wally_tx_remove_output(tx->wtx, tx->wtx->num_outputs - 1)
+	       == WALLY_OK);
+	tal_wally_end(tx->wtx);
+	wally_tx_output_free(dummy);
+}
+
 void bitcoin_tx_remove_output(struct bitcoin_tx *tx, size_t outnum)
 {
 	int ret;
@@ -400,6 +425,19 @@ void bitcoin_tx_input_set_witness(struct bitcoin_tx *tx, int innum,
 	tal_wally_end(tx->psbt);
 
 	tal_free_if_taken(witness);
+}
+
+void bitcoin_tx_input_copy_witness(struct bitcoin_tx *dst, int dst_innum,
+				   const struct bitcoin_tx *src, int src_innum)
+{
+	/* wally_tx_set_input_witness clones the passed stack, so src is left
+	 * untouched.  Used to restore a device-pre-signed input witness that an
+	 * external signer (elements signrawtransactionwithwallet) stripped when
+	 * it re-serialized a tx containing an input it does not own. */
+	tal_wally_start();
+	wally_tx_set_input_witness(dst->wtx, dst_innum,
+				   src->wtx->inputs[src_innum].witness);
+	tal_wally_end(dst->wtx);
 }
 
 void bitcoin_tx_input_set_script(struct bitcoin_tx *tx, int innum, u8 *script)
