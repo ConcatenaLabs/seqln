@@ -39,6 +39,8 @@ struct bitcoin_tx *presign_sweep_tx(const tal_t *ctx,
 				    u32 locktime,
 				    u32 feerate_perkw,
 				    struct amount_sat dust_limit,
+				    bool single_acp,
+				    const u8 *channel_asset,
 				    u32 *final_index,
 				    struct ext_key *final_ext_key,
 				    const u8 *final_scriptpubkey)
@@ -54,6 +56,12 @@ struct bitcoin_tx *presign_sweep_tx(const tal_t *ctx,
 	}
 
 	tx = bitcoin_tx(ctx, chainparams, 1, 1, locktime);
+	/* Asset-aware channels: denominate the output (and elements fee) in the
+	 * channel asset, mirroring onchaind's sweep builder and
+	 * lightningd/onchain_control.c.  Must precede the input/output adds.
+	 * NULL keeps the network policy asset; no-op on non-elements chains. */
+	if (channel_asset)
+		bitcoin_tx_set_output_asset(tx, channel_asset);
 	bitcoin_tx_add_input(tx, outpoint, input_sequence,
 			     NULL, in_sats, NULL, wscript);
 
@@ -69,7 +77,18 @@ struct bitcoin_tx *presign_sweep_tx(const tal_t *ctx,
 		}
 	}
 
-	/* Worst-case sig is 73 bytes (matches penalty_tx_create /
+	/* SIGHASH_SINGLE|ANYONECANPAY: the output must carry the FULL input
+	 * value.  speculad appends its OWN per-asset fee input (+ change) at
+	 * index >= 1 and pays the fee; deducting one here would burn value and
+	 * change the pre-signed bytes.  Output 0 was already added at in_sats. */
+	if (single_acp) {
+		bitcoin_tx_finalize(tx);
+		return tx;
+	}
+
+	/* Legacy SIGHASH_ALL path (the tower cannot add inputs): deduct the fee
+	 * from the single output.
+	 * Worst-case sig is 73 bytes (matches penalty_tx_create /
 	 * onchaind_tx_unsigned weight model exactly). */
 	weight = bitcoin_tx_weight(tx) + 1 + 3 + 73 + 0 + tal_count(wscript);
 	weight += elements_tx_overhead(chainparams, 1, 1);
@@ -107,6 +126,8 @@ struct presign_template *presign_template_new(const tal_t *ctx,
 					      u32 deadline_delta,
 					      u32 feerate_perkw,
 					      struct amount_sat dust_limit,
+					      bool single_acp,
+					      const u8 *channel_asset,
 					      u32 *final_index,
 					      struct ext_key *final_ext_key,
 					      const u8 *final_scriptpubkey)
@@ -119,7 +140,8 @@ struct presign_template *presign_template_new(const tal_t *ctx,
 	t->wscript = tal_dup_talarr(t, u8, wscript);
 	t->tx = presign_sweep_tx(t, outpoint, in_sats, t->wscript,
 				 input_sequence, locktime, feerate_perkw,
-				 dust_limit, final_index, final_ext_key,
+				 dust_limit, single_acp, channel_asset,
+				 final_index, final_ext_key,
 				 final_scriptpubkey);
 	if (!t->tx)
 		return tal_free(t);

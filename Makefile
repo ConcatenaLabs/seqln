@@ -404,6 +404,7 @@ include onchaind/Makefile
 include connectd/Makefile
 include lightningd/Makefile
 include cli/Makefile
+include speculad/Makefile
 include doc/Makefile
 include contrib/msggen/Makefile
 include devtools/Makefile
