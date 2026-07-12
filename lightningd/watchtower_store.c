@@ -241,6 +241,67 @@ bool wt_store_put_sweeps(struct lightningd *ld,
 	return write_meta(channel, chandir, current_commit_num);
 }
 
+bool wt_store_put_preempt(struct lightningd *ld,
+			  const struct channel *channel,
+			  u64 commit_num,
+			  const struct bitcoin_tx *signed_commit_tx)
+{
+	char *preemptdir, *chandir, *armed;
+	u8 *enc = tal_arr(tmpctx, u8, 0);
+
+	preemptdir = channel_store_dir(tmpctx, ld, channel, "preempt");
+	if (!preemptdir)
+		return false;
+
+	/* preempt/commit = LE u64 commit_num + our fully-signed 2-of-2 commitment. */
+	towire_u64(&enc, commit_num);
+	towire_bitcoin_tx(&enc, signed_commit_tx);
+	if (!write_durable(preemptdir, "commit", enc, tal_bytelen(enc)))
+		return false;
+
+	/* A fresh clean advance completed -> we are NOT mid-round; clear any
+	 * stale armed flag so speculad won't preempt-broadcast an active channel. */
+	armed = path_join(tmpctx, preemptdir, "armed");
+	if (unlink(armed) == 0)
+		fsync_dir(preemptdir);
+
+	/* Bump meta.current_commit_num UNCONDITIONALLY on every advance so the
+	 * broadcast guard's reference is never stale (the CLASS-B sweeps path can
+	 * early-return without a meta bump when a state has no sweepable output). */
+	chandir = channel_store_dir(tmpctx, ld, channel, NULL);
+	if (!chandir || !write_meta(channel, chandir, commit_num)) {
+		log_broken(channel->log,
+			   "watchtower store: preempt stored but meta bump failed");
+		return false;
+	}
+	return true;
+}
+
+bool wt_store_set_preempt_armed(struct lightningd *ld,
+				const struct channel *channel,
+				bool armed)
+{
+	char *preemptdir, *path;
+
+	preemptdir = channel_store_dir(tmpctx, ld, channel, "preempt");
+	if (!preemptdir)
+		return false;
+
+	if (armed) {
+		u8 *enc = tal_arr(tmpctx, u8, 0);
+		u64 cn = channel->next_index[LOCAL]
+			? channel->next_index[LOCAL] - 1 : 0;
+		towire_u64(&enc, cn);
+		return write_durable(preemptdir, "armed", enc, tal_bytelen(enc));
+	}
+
+	path = path_join(tmpctx, preemptdir, "armed");
+	if (unlink(path) == 0)
+		return fsync_dir(preemptdir);
+	/* Already absent (ENOENT) is success; any other error is a failure. */
+	return errno == ENOENT;
+}
+
 /* Load every blob_* file under dir, decoding each as a watchtower_blob. */
 static struct watchtower_blob **load_blob_dir(const tal_t *ctx,
 					      const struct channel *channel,

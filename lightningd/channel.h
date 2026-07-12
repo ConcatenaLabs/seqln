@@ -17,6 +17,8 @@
 struct uncommitted_channel;
 struct wally_psbt;
 struct got_commitsig_htlc_info;
+struct penalty_base;
+struct pubkey;
 
 /* FIXME: Define serialization primitive for this? */
 struct channel_info {
@@ -262,6 +264,18 @@ struct channel {
 	u64 presign_commit_num;
 	struct pubkey *presign_local_per_commit;
 	const struct got_commitsig_htlc_info *presign_htlc_infos;
+
+	/* Specula watchtower Phase F (kind 6): the current REMOTE commitment
+	 * ingredients threaded up in the last WIRE_CHANNELD_SENDING_COMMITSIG, so
+	 * onchain_presign can sweep OUR HTLC outputs off the PEER commitment
+	 * (remote_htlc_to_us).  presign_remote_pbase carries the remote commitment
+	 * txid + per-HTLC outpoints/amounts/cltv/offered flags; the received-by-us
+	 * (preimage) leg is rebuilt at fulfill time (the preimage is only known
+	 * then).  NULL/0 until the first sending_commitsig (and after a restart
+	 * until the next advance -- best-effort on testnet). */
+	u64 presign_remote_commit_num;
+	struct pubkey *presign_remote_per_commit;
+	const struct penalty_base *presign_remote_pbase;
 
 	/* Keys for channel */
 	struct channel_info channel_info;

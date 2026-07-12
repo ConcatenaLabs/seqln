@@ -146,6 +146,13 @@ msgdata,channeld_local_anchor_info,anchors,local_anchor_info,num_anchors
 # When we send a commitment_signed message, tell master.
 msgtype,channeld_sending_commitsig,1020
 msgdata,channeld_sending_commitsig,commitnum,u64,
+# Watchtower Phase F (kind 6): the REMOTE per_commitment_point that built the
+# peer's (soon-broadcastable) commitment this pbase describes.  Threaded up so a
+# KEYLESS lightningd can derive the REMOTE keyset and pre-sign the
+# remote_htlc_to_us sweep of OUR HTLC outputs on the PEER commitment
+# (onchain_presign.c kind 6).  pbase already carries the remote txid + per-HTLC
+# outpoints/amounts/cltv/offered flags, so no per-HTLC wire change is needed.
+msgdata,channeld_sending_commitsig,remote_per_commit,pubkey,
 msgdata,channeld_sending_commitsig,pbase,?penalty_base,
 msgdata,channeld_sending_commitsig,fee_states,fee_states,
 msgdata,channeld_sending_commitsig,blockheight_states,height_states,

@@ -37,6 +37,20 @@
  *     sweeps/                  CLASS B: CURRENT-state honest sweeps only,
  *       blob_0000 .. blob_NNNN atomically replaced (rename) on each state
  *                              advance so it obsoletes the prior set.
+ *     preempt/                 Phase F preemptive-close (withhold-revoke / JBA
+ *                              defense) slot:
+ *       commit                 little-endian: u64 commit_num, then
+ *                              towire_bitcoin_tx of OUR CURRENT fully-signed
+ *                              (2-of-2) local commitment.  Rewritten atomically
+ *                              on EACH state advance in the SAME durable step
+ *                              that bumps meta.current_commit_num, so it always
+ *                              names the CURRENT (never a revoked) local state.
+ *       armed                  presence-flag (little-endian u64 commit_num it was
+ *                              armed for): set by lightningd when it detects the
+ *                              signer dropped mid-round, cleared on the next
+ *                              clean advance / device reconnect.  speculad only
+ *                              broadcasts the preempt commitment while this is
+ *                              present AND commit==meta.current_commit_num.
  *
  * NO seed / key / per-commitment-secret is EVER written -- only signed txs +
  * the metadata needed to broadcast + fee-bump them.  Every write is durable:
@@ -75,5 +89,25 @@ struct watchtower_blob **wt_store_load_justice(const tal_t *ctx,
 struct watchtower_blob **wt_store_load_sweeps(const tal_t *ctx,
 					      struct lightningd *ld,
 					      const struct channel *channel);
+
+/* Phase F preemptive close: durably store OUR current fully-signed local
+ * commitment @signed_commit_tx into the preempt/ slot, keyed to @commit_num, and
+ * (unconditionally) bump meta.current_commit_num to @commit_num in the SAME
+ * durable step -- so the broadcast guard (commit_num == meta.current_commit_num)
+ * can never see a REVOKED local commitment.  Also clears the armed flag (a clean
+ * advance completed).  Returns false on any I/O failure (fail-soft: the caller
+ * logs, never fatal). */
+bool wt_store_put_preempt(struct lightningd *ld,
+			  const struct channel *channel,
+			  u64 commit_num,
+			  const struct bitcoin_tx *signed_commit_tx);
+
+/* Phase F: set/clear the preempt "armed" flag (device-down-mid-round signal that
+ * tells speculad it may broadcast the stored preempt commitment).  When arming,
+ * it records the current local commit_num so a stale arm cannot fire against a
+ * newer state (speculad also enforces commit_num == meta.current_commit_num). */
+bool wt_store_set_preempt_armed(struct lightningd *ld,
+				const struct channel *channel,
+				bool armed);
 
 #endif /* LIGHTNING_LIGHTNINGD_WATCHTOWER_STORE_H */

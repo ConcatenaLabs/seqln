@@ -236,10 +236,10 @@ u8 *p2tr_for_keyidx(const tal_t *ctx, struct lightningd *ld, u64 keyidx)
  *   them (due to a failed connection),
  *     - Note: this is to reduce the above risk.
  */
-static struct bitcoin_tx *sign_last_tx(const tal_t *ctx,
-				       const struct channel *channel,
-				       const struct bitcoin_tx *last_tx,
-				       const struct bitcoin_signature *last_sig)
+struct bitcoin_tx *sign_last_tx(const tal_t *ctx,
+				const struct channel *channel,
+				const struct bitcoin_tx *last_tx,
+				const struct bitcoin_signature *last_sig)
 {
 	struct lightningd *ld = channel->peer->ld;
 	struct bitcoin_signature sig;
