@@ -1728,8 +1728,15 @@ static u8 *do_sign_penalty_to_us(struct hsmd_client *c,
 		return hsmd_status_bad_request_fmt(
 		    c, msg_in, "Failed deriving revocation privkey");
 
+	/* Specula Tier-1: sign the to_us penalty with SIGHASH_SINGLE|ANYONECANPAY
+	 * so it pins ONLY input 0 (the revoked output) and output 0 (the user's
+	 * recovery), letting the keyless watchtower (speculad) append its OWN fee
+	 * input(s) at index >= 1 and RBF WITHOUT a device round-trip.  A standalone
+	 * broadcast (online onchaind) still verifies: input 0 + output 0 are
+	 * committed exactly as before.  Mirrors the same change already made in the
+	 * Rust device signer (contrib/seqln-signer). */
 	return handle_sign_to_us_tx(c, msg_in, input_num, tx, &privkey, wscript,
-				    SIGHASH_ALL);
+				    SIGHASH_SINGLE | SIGHASH_ANYONECANPAY);
 }
 
 /*~ Called from channeld: used by watchtower code. */
@@ -2137,8 +2144,16 @@ static u8 *do_sign_delayed_payment_to_us(struct hsmd_client *c,
 		return hsmd_status_bad_request(c, msg_in,
 					       "failed deriving privkey");
 
+	/* Specula Tier-1: sign the honest-close to_local sweep (kind 3) with
+	 * SIGHASH_SINGLE|ANYONECANPAY so it pins ONLY input 0 (the delayed output)
+	 * and output 0 (the user's recovery), letting the keyless watchtower
+	 * (speculad) append its OWN fee input(s) at index >= 1 and RBF WITHOUT a
+	 * device round-trip -- the anchorless fee-attach path.  A standalone
+	 * broadcast (online onchaind spend_to_us) still verifies: it is 1-in/1-out
+	 * so input 0 + output 0 are committed exactly as before.  Mirrors the same
+	 * change already made in the Rust device signer (contrib/seqln-signer). */
 	return handle_sign_to_us_tx(c, msg_in, input_num, tx, &privkey, wscript,
-				    SIGHASH_ALL);
+				    SIGHASH_SINGLE | SIGHASH_ANYONECANPAY);
 }
 
 /*~ When called by onchaind */

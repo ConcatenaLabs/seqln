@@ -154,6 +154,16 @@ void bitcoin_tx_set_output_asset(struct bitcoin_tx *tx, const u8 *asset);
 /* Remove one output. */
 void bitcoin_tx_remove_output(struct bitcoin_tx *tx, size_t outnum);
 
+/* Ensure the tx has at least one spare output slot allocated, so a subsequent
+ * bitcoin_tx_add_output() on a cloned tx (which allocates exactly its own
+ * outputs) does not trip the allocation assert.  No-op if a slot is free. */
+void bitcoin_tx_reserve_output(struct bitcoin_tx *tx);
+
+/* Copy input src_innum's witness stack from src onto dst's input dst_innum,
+ * replacing whatever was there (the stack is cloned; src is unchanged). */
+void bitcoin_tx_input_copy_witness(struct bitcoin_tx *dst, int dst_innum,
+				   const struct bitcoin_tx *src, int src_innum);
+
 /* Set the locktime for a transaction */
 void bitcoin_tx_set_locktime(struct bitcoin_tx *tx, u32 locktime);
 

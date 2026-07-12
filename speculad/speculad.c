@@ -808,6 +808,9 @@ static char *attach_fee_and_sign(const tal_t *ctx, const struct spd_blob *b,
 	 * already carries a zero-value elements fee output (index 1) that
 	 * bitcoin_tx_finalize() will re-value to the real fee, so the change
 	 * lands at whatever index add_output returns (append). */
+	/* The clone allocates exactly the blob's own outputs; make room for the
+	 * appended change output (else bitcoin_tx_add_output asserts). */
+	bitcoin_tx_reserve_output(tx);
 	change_idx = bitcoin_tx_add_output(tx, st->feeutxo_spk, NULL,
 					   amount_sat(uval));
 
@@ -853,8 +856,27 @@ static char *attach_fee_and_sign(const tal_t *ctx, const struct spd_blob *b,
 	if (!res)
 		return NULL;
 	/* "complete":false is EXPECTED (the wallet can't verify input 0, whose
-	 * key is on the device) -- the returned hex still carries both witnesses. */
+	 * key is on the device). */
 	signed_hex = json_find_string(ctx, res, "hex");
+	if (!signed_hex)
+		return NULL;
+
+	/* Elements' signrawtransactionwithwallet re-serializes the tx and STRIPS
+	 * the witness of input 0 (the device pre-signed SINGLE|ACP penalty it
+	 * doesn't own) down to a single element, breaking the revocation spend.
+	 * Re-parse the wallet-signed tx (which now carries our fee input's
+	 * witness at index >= 1) and restore input 0's original pre-signed
+	 * witness from the clone. */
+	{
+		struct bitcoin_tx *stx;
+
+		stx = bitcoin_tx_from_hex(ctx, signed_hex, strlen(signed_hex));
+		if (!stx)
+			return NULL;
+		bitcoin_tx_input_copy_witness(stx, 0, tx, 0);
+		raw = linearize_tx(ctx, stx);
+		signed_hex = tal_hexstr(ctx, raw, tal_bytelen(raw));
+	}
 	return signed_hex;
 }
 
