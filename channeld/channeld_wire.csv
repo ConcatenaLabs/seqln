@@ -180,6 +180,14 @@ msgdata,channeld_got_commitsig,tx,bitcoin_tx,
 # Inflight splice commitments
 msgdata,channeld_got_commitsig,num_inflight_commitsigs,u16,
 msgdata,channeld_got_commitsig,inflight_commitsigs,commitsig,num_inflight_commitsigs
+# Watchtower Phase E (seam #1): the LOCAL per_commitment_point that built the
+# commitment tx above (`tx`), plus per-HTLC 2nd-stage metadata aligned 1:1 with
+# htlc_signature[] (== channel->last_htlc_sigs).  This is the single datum a
+# KEYLESS lightningd lacks to derive the LOCAL commitment keyset and pre-sign
+# the honest-close CLASS-B sweeps (onchain_presign.c) via the master hsm fd.
+msgdata,channeld_got_commitsig,local_per_commit,pubkey,
+msgdata,channeld_got_commitsig,num_htlc_infos,u16,
+msgdata,channeld_got_commitsig,htlc_infos,got_commitsig_htlc_info,num_htlc_infos
 subtype,commitsig
 subtypedata,commitsig,tx,bitcoin_tx,
 subtypedata,commitsig,commit_signature,bitcoin_signature,
@@ -197,6 +205,21 @@ subtypedata,watchtower_blob,deadline_delta,u32,
 subtypedata,watchtower_blob,wscript_len,u16,
 subtypedata,watchtower_blob,wscript,u8,wscript_len
 subtypedata,watchtower_blob,tx,bitcoin_tx,
+
+# Watchtower Phase E (seam #1): per-HTLC 2nd-stage metadata for the LOCAL
+# commitment, one entry per htlc_signature[] (== channel->last_htlc_sigs),
+# emitted in the SAME order so htlc_infos[i] pairs with last_htlc_sigs[i].
+# lightningd uses this to rebuild + master-sign the HTLC-timeout (offered) and
+# HTLC-success (received, at fulfill) sweeps byte-exact.
+subtype,got_commitsig_htlc_info
+# Commitment output index of this HTLC (its outpoint on `tx`).
+subtypedata,got_commitsig_htlc_info,output_index,u32,
+# The HTLC value (amount_msat); the commitment output holds msat/1000 sat.
+subtypedata,got_commitsig_htlc_info,amount,amount_msat,
+subtypedata,got_commitsig_htlc_info,cltv_expiry,u32,
+# true == offered BY US (HTLC-timeout, kind 4); false == received (HTLC-success, kind 5).
+subtypedata,got_commitsig_htlc_info,offered,bool,
+subtypedata,got_commitsig_htlc_info,payment_hash,sha256,
 
 # Wait for reply, to make sure it's on disk before we send revocation.
 msgtype,channeld_got_commitsig_reply,1121

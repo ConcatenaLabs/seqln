@@ -2442,6 +2442,10 @@ void peer_got_commitsig(struct channel *channel, const u8 *msg)
 	struct channel_inflight *inflight;
 	size_t i;
 	struct lightningd *ld = channel->peer->ld;
+	/* Watchtower Phase E (seam #1): LOCAL keyset ingredients for the
+	 * honest-close pre-sign. */
+	struct pubkey local_per_commit;
+	struct got_commitsig_htlc_info *htlc_infos;
 
 	if (!fromwire_channeld_got_commitsig(msg, msg,
 					    &commitnum,
@@ -2454,7 +2458,9 @@ void peer_got_commitsig(struct channel *channel, const u8 *msg)
 					    &failed,
 					    &changed,
 					    &tx,
-					    &inflight_commit_sigs)
+					    &inflight_commit_sigs,
+					    &local_per_commit,
+					    &htlc_infos)
 	    || !fee_states_valid(fee_states, channel->opener)
 	    || !height_states_valid(blockheight_states, channel->opener)) {
 		channel_internal_error(channel,
@@ -2557,8 +2563,12 @@ void peer_got_commitsig(struct channel *channel, const u8 *msg)
 
 	/* Specula Phase E (seam #1): commitment-advance hook -- (re)pre-sign the
 	 * current-state CLASS-B honest-close sweeps to the watchtower store now
-	 * that last_tx + last_htlc_sigs are set for this new local commitment. */
-	onchain_presign_current_sweeps(channel);
+	 * that last_tx + last_htlc_sigs are set for this new local commitment.
+	 * commitnum is the commitment number of local_per_commit (both name the
+	 * commitment that built `tx`), so hsmd re-derives the matching per-
+	 * commitment secret. */
+	onchain_presign_current_sweeps(channel, commitnum, &local_per_commit,
+				       htlc_infos);
 	/* Now append htlc sigs for inflights */
 	i = 0;
 	list_for_each(&channel->inflights, inflight, list) {
