@@ -244,6 +244,8 @@ build_watchtower_justice_set(const tal_t *ctx,
 						   &keyset.self_delayed_payment_key);
 		tx = presign_sweep_tx(tmpctx, &outpoint, pbase->amount, wscript,
 				      0xFFFFFFFF, 0, penalty_feerate, dust_limit,
+				      true /* SINGLE|ACP: no fee deduction */,
+				      channel->channel_asset,
 				      final_index, final_ext_key,
 				      final_scriptpubkey);
 		b = make_penalty_blob(blobs, WT_TMPL_TO_LOCAL_PENALTY,
@@ -294,6 +296,8 @@ build_watchtower_justice_set(const tal_t *ctx,
 		outpoint.n = h->outnum;
 		tx = presign_sweep_tx(tmpctx, &outpoint, h->amount, wscript,
 				      0xFFFFFFFF, 0, penalty_feerate, dust_limit,
+				      true /* SINGLE|ACP: no fee deduction */,
+				      channel->channel_asset,
 				      final_index, final_ext_key,
 				      final_scriptpubkey);
 		b = make_penalty_blob(blobs, WT_TMPL_STEAL_HTLC_PENALTY,

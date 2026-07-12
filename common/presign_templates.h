@@ -63,12 +63,27 @@ struct presign_template {
 
 /* Build the shared 1-in/1-out sweep tx (unsigned).  Byte-exact with
  * channeld/watchtower.c:penalty_tx_create and
- * lightningd/onchain_control.c:onchaind_tx_unsigned for the same inputs:
- * output = final_scriptpubkey, fee = amount_tx_fee(feerate_perkw, weight)
- * with the same worst-case-73-byte-sig weight model, falls back to
- * FEERATE_FLOOR if the output would go below dust+fee.  Adds the BIP32/BIP86
- * keypath to the output when final_index is non-NULL.  Returns NULL on the
- * dust/no-output cases (caller logs + skips). */
+ * lightningd/onchain_control.c:onchaind_tx_unsigned for the same inputs.
+ *
+ * FEE MODE (single_acp):
+ *  - single_acp == true  (SIGHASH_SINGLE|ANYONECANPAY blobs): output 0 carries
+ *    the FULL input value; NO fee is deducted here.  speculad appends its own
+ *    per-asset fee input (+ change) at index >= 1 and pays the fee, so the
+ *    pre-signed output must not be pre-shrunk (doing so would burn value and,
+ *    worse, be a different tx than what onchaind's package would model).
+ *  - single_acp == false (legacy SIGHASH_ALL blobs): output = in_sats minus
+ *    fee = amount_tx_fee(feerate_perkw, weight) with the worst-case-73-byte-sig
+ *    weight model, falling back to FEERATE_FLOOR if the output would go below
+ *    dust+fee (the tower cannot add inputs to a SIGHASH_ALL tx).
+ *
+ * ASSET (channel_asset): non-NULL 33-byte version+tag denominates the output +
+ * elements fee in the channel asset (mirrors onchaind's sweep builder and
+ * lightningd/onchain_control.c), so the pre-signed penalty is byte-valid on
+ * non-policy-asset channels; NULL keeps the network policy asset.  No-op on
+ * non-elements chains.
+ *
+ * Adds the BIP32/BIP86 keypath to the output when final_index is non-NULL.
+ * Returns NULL on the dust/no-output cases (caller logs + skips). */
 struct bitcoin_tx *presign_sweep_tx(const tal_t *ctx,
 				    const struct bitcoin_outpoint *outpoint,
 				    struct amount_sat in_sats,
@@ -77,6 +92,8 @@ struct bitcoin_tx *presign_sweep_tx(const tal_t *ctx,
 				    u32 locktime,
 				    u32 feerate_perkw,
 				    struct amount_sat dust_limit,
+				    bool single_acp,
+				    const u8 *channel_asset,
 				    u32 *final_index,
 				    struct ext_key *final_ext_key,
 				    const u8 *final_scriptpubkey);
@@ -94,6 +111,8 @@ struct presign_template *presign_template_new(const tal_t *ctx,
 					      u32 deadline_delta,
 					      u32 feerate_perkw,
 					      struct amount_sat dust_limit,
+					      bool single_acp,
+					      const u8 *channel_asset,
 					      u32 *final_index,
 					      struct ext_key *final_ext_key,
 					      const u8 *final_scriptpubkey);
