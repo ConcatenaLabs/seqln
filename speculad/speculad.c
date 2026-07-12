@@ -34,11 +34,14 @@
  */
 #include "config.h"
 #include <bitcoin/chainparams.h>
+#include <bitcoin/feerate.h>
+#include <bitcoin/script.h>
 #include <bitcoin/tx.h>
 #include <ccan/compiler/compiler.h>
 #include <ccan/err/err.h>
 #include <ccan/noerr/noerr.h>
 #include <ccan/read_write_all/read_write_all.h>
+#include <ccan/str/hex/hex.h>
 #include <ccan/str/str.h>
 #include <ccan/tal/grab_file/grab_file.h>
 #include <ccan/tal/path/path.h>
@@ -97,11 +100,62 @@ struct watched_channel {
 
 /* ---- Globals (config; all box-owned, no secrets) ------------------------- */
 static const char **g_cli_base;	/* argv prefix: elements-cli + connection flags */
+static const char **g_fee_cli_base;	/* g_cli_base + -rpcwallet=<fee wallet> */
+static const char *g_fee_wallet;	/* NULL == no fee wallet on this box (seam) */
 static volatile sig_atomic_t g_stop;
+
+/* Fee / RBF policy (all overridable on the command line). */
+static u32 g_fee_base_perkw = FEERATE_FLOOR;	/* ~1 unit/vB floor */
+static u32 g_fee_max_perkw  = 25000;		/* ceiling as the deadline nears */
+static u32 g_assumed_csv    = 144;		/* deadline window when meta lacks
+						 * remote to_self_delay (SEAM) */
+
+/* Opt-in RBF (BIP125) on the tower's own fee input so each escalating re-fund
+ * replaces the prior broadcast. */
+#define SPD_RBF_SEQUENCE 0xFFFFFFFDU
+/* Never leave a change output below this (drop-to-fee handled by caller). */
+#define SPD_DUST_SAT AMOUNT_SAT(1000)
+
+/* Persistent (cross-poll) per-blob state: the chosen fee UTXO (reused across
+ * RBF rungs so each replacement keeps the SAME inputs and only raises the fee),
+ * the escalation rung, the last broadcast txid, and the confirmed flag (once the
+ * justice tx confirms we STOP re-broadcasting -- the broadcast de-dup). */
+struct justice_state {
+	char *key;			/* "<locator>:<output_index>:<kind>" */
+	bool have_feeutxo;
+	struct bitcoin_outpoint feeutxo;
+	u64 feeutxo_val;		/* satoshis (exact) */
+	u8 *feeutxo_spk;		/* fee UTXO scriptPubKey (change goes back here) */
+	u32 rung;			/* RBF escalation counter */
+	char *broadcast_txid;		/* last justice txid we broadcast */
+	bool confirmed;			/* justice tx has confirmations>=1 -> done */
+};
+static struct justice_state **g_states;	/* persistent registry */
+static const tal_t *g_state_ctx;	/* owns g_states + entries (== top) */
 
 static void handle_sig(int s UNUSED)
 {
 	g_stop = 1;
+}
+
+static struct justice_state *spd_get_state(const char *key)
+{
+	struct justice_state *st;
+
+	for (size_t i = 0; i < tal_count(g_states); i++)
+		if (streq(g_states[i]->key, key))
+			return g_states[i];
+
+	st = tal(g_state_ctx, struct justice_state);
+	st->key = tal_strdup(st, key);
+	st->have_feeutxo = false;
+	st->feeutxo_val = 0;
+	st->feeutxo_spk = NULL;
+	st->rung = 0;
+	st->broadcast_txid = NULL;
+	st->confirmed = false;
+	tal_arr_expand(&g_states, st);
+	return st;
 }
 
 static struct spd_blob *spd_blob_decode(const tal_t *ctx,
@@ -353,42 +407,378 @@ static char *rpc_getbestblockhash(const tal_t *ctx)
 	return res;
 }
 
-/* ---- Fee attach + RBF (the single documented box-fee-wallet SEAM) --------- *
- * Under SIGHASH_SINGLE|ANYONECANPAY the blob's output 0 already carries the
- * full swept value and pays no fee.  Production speculad here:
- *   (a) selects a per-asset fee UTXO (in the channel asset) from the box-owned,
- *       per-channel-reserved, rate-limited fee wallet;
- *   (b) appends it as input index >= 1 (+ change back to the fee wallet);
- *   (c) re-broadcasts at an escalating feerate keyed to the deadline
- *       (recomputed as confirmation depth after every reorg).
- * The fee wallet is box infra not present on testnet, so this returns the blob
- * unchanged (broadcast as-is) and the escalation is a no-op; the coin selection
- * is the ONLY missing piece of the end-to-end breach path.  Kept as a seam so
- * the SINGLE|ACP invariant (append only OWN inputs, never touch a user output)
- * lives in exactly one place. */
-static const struct bitcoin_tx *attach_fee_and_rbf(const struct spd_blob *b,
-						   long confirmations UNUSED)
+/* Build [fee_cli_base..., method, extra..., NULL] and run it.  fee_cli_base is
+ * g_cli_base plus -rpcwallet=<fee wallet>; falls back to g_cli_base when no fee
+ * wallet is configured (only ever reached by callers guarded on g_fee_wallet). */
+static char *run_cli_wallet(const tal_t *ctx, const char *method,
+			    const char **extra)
 {
-	return b->tx;
+	const char **args = tal_arr(tmpctx, const char *, 0);
+	const char **base = g_fee_cli_base ? g_fee_cli_base : g_cli_base;
+	size_t i;
+
+	for (i = 0; i < tal_count(base); i++)
+		tal_arr_expand(&args, base[i]);
+	tal_arr_expand(&args, method);
+	for (i = 0; extra && i < tal_count(extra); i++)
+		tal_arr_expand(&args, extra[i]);
+	tal_arr_expand(&args, (const char *)NULL);
+	return run_cliv(ctx, args);
 }
 
-static bool broadcast_blob(const struct spd_blob *b, long confirmations)
+/* Extract the string value following "key":"..." (txid / scriptPubKey / hex). */
+static char *json_find_string(const tal_t *ctx, const char *s, const char *key)
 {
-	const struct bitcoin_tx *tx = attach_fee_and_rbf(b, confirmations);
-	u8 *raw = linearize_tx(tmpctx, tx);
-	char *hex = tal_hexstr(tmpctx, raw, tal_bytelen(raw));
-	const char **extra = tal_arr(tmpctx, const char *, 1);
-	char *res;
+	char *needle = tal_fmt(tmpctx, "\"%s\"", key);
+	const char *p = s ? strstr(s, needle) : NULL;
+	const char *start;
 
-	extra[0] = hex;
-	res = run_cli(tmpctx, "sendrawtransaction", extra);
-	/* Idempotent: elementsd returns the txid on accept AND on "already in
-	 * mempool/chain"; a byte-identical rebroadcast on reorg re-confirm is
-	 * therefore safe and expected.  We only warn on a hard reject. */
+	if (!p)
+		return NULL;
+	p += strlen(needle);
+	while (*p == ' ' || *p == ':')
+		p++;
+	if (*p != '"')
+		return NULL;
+	start = ++p;
+	while (*p && *p != '"')
+		p++;
+	if (*p != '"')
+		return NULL;
+	return tal_strndup(ctx, start, p - start);
+}
+
+/* Parse the BTC-decimal number after "key": into satoshis, EXACTLY (string
+ * parse, no float rounding -- an off-by-one sat makes the elements tx invalid).
+ * Returns false if absent, negative (unblindable) or malformed. */
+static bool json_find_btc_sat(const char *s, const char *key, u64 *sat_out)
+{
+	char *needle = tal_fmt(tmpctx, "\"%s\"", key);
+	const char *p = s ? strstr(s, needle) : NULL;
+	u64 whole = 0, frac = 0;
+	int fracdigits = 0;
+
+	if (!p)
+		return false;
+	p += strlen(needle);
+	while (*p == ' ' || *p == ':')
+		p++;
+	if (*p == '-')
+		return false;
+	if (!isdigit((unsigned char)*p))
+		return false;
+	while (isdigit((unsigned char)*p))
+		whole = whole * 10 + (*p++ - '0');
+	if (*p == '.') {
+		p++;
+		while (isdigit((unsigned char)*p)) {
+			if (fracdigits < 8)
+				frac = frac * 10 + (*p - '0');
+			fracdigits++;
+			p++;
+		}
+	}
+	while (fracdigits < 8) {		/* pad to 8 decimals == satoshis */
+		frac *= 10;
+		fracdigits++;
+	}
+	*sat_out = whole * 100000000ULL + frac;
+	return true;
+}
+
+/* Look for "key": true within a (bounded) JSON fragment. */
+static bool json_bool_true(const char *s, const char *key)
+{
+	char *needle = tal_fmt(tmpctx, "\"%s\"", key);
+	const char *p = s ? strstr(s, needle) : NULL;
+
+	if (!p)
+		return false;
+	p += strlen(needle);
+	while (*p == ' ' || *p == ':')
+		p++;
+	return strncmp(p, "true", 4) == 0;
+}
+
+/* The RPC-display asset hex (reversed 32-byte tag) of the 33-byte version+tag. */
+static char *asset33_to_rpchex(const tal_t *ctx, const u8 asset33[33])
+{
+	u8 tag[32];
+
+	memcpy(tag, asset33 + 1, 32);
+	reverse_bytes(tag, 32);		/* internal (wally) -> display order */
+	return tal_hexstr(ctx, tag, 32);
+}
+
+/* Select one spendable, confirmed fee UTXO in @asset_hex with value >= min_sat
+ * from the fee wallet (listunspent asset-filtered).  Confirmed-only keeps RBF
+ * replacements from adding new *unconfirmed* inputs (BIP125). */
+static bool pick_fee_utxo(const tal_t *ctx, const char *asset_hex, u64 min_sat,
+			  struct bitcoin_outpoint *out_op, u64 *out_val,
+			  u8 **out_spk)
+{
+	const char **extra = tal_arr(tmpctx, const char *, 5);
+	char *res;
+	const char *p;
+
+	extra[0] = "1";			/* minconf: confirmed only */
+	extra[1] = "9999999";		/* maxconf */
+	extra[2] = "[]";		/* addresses */
+	extra[3] = "false";		/* include_unsafe */
+	extra[4] = tal_fmt(tmpctx, "{\"asset\":\"%s\"}", asset_hex);
+	res = run_cli_wallet(tmpctx, "listunspent", extra);
 	if (!res)
-		fprintf(stderr, "speculad: sendrawtransaction rejected for "
-			"kind %u output %u\n", b->kind, b->output_index);
-	return res != NULL;
+		return false;
+
+	/* Walk each result object (each begins with its "txid" field). */
+	p = res;
+	while ((p = strstr(p, "\"txid\"")) != NULL) {
+		const char *nextobj = strstr(p + 6, "\"txid\"");
+		size_t objlen = nextobj ? (size_t)(nextobj - p) : strlen(p);
+		char *obj = tal_strndup(tmpctx, p, objlen);
+		char *txid_hex = json_find_string(tmpctx, obj, "txid");
+		char *spk_hex = json_find_string(tmpctx, obj, "scriptPubKey");
+		long vout = json_find_int(obj, "vout");
+		bool spendable = json_bool_true(obj, "spendable");
+		u64 val = 0;
+		bool haveval = json_find_btc_sat(obj, "amount", &val);
+
+		p = nextobj ? nextobj : (p + strlen(p));
+
+		if (!txid_hex || !spk_hex || vout < 0 || !haveval || !spendable)
+			continue;
+		if (val < min_sat)
+			continue;
+		if (!bitcoin_txid_from_hex(txid_hex, strlen(txid_hex),
+					   &out_op->txid))
+			continue;
+		out_op->n = (u32)vout;
+		*out_val = val;
+		*out_spk = tal_hexdata(ctx, spk_hex, strlen(spk_hex));
+		if (!*out_spk)
+			continue;
+		return true;
+	}
+	return false;
+}
+
+/* Escalating feerate: base -> max as the breach ages toward its deadline
+ * window, plus a per-rung bump so each RBF round strictly out-fees the last.
+ * Deadline window = the blob's stored deadline_delta, or the assumed remote
+ * to_self_delay (SEAM: not yet threaded into meta). */
+static u32 spd_feerate_perkw(const struct spd_blob *b, long breach_confs,
+			     u32 rung)
+{
+	u32 window = b->deadline_delta ? b->deadline_delta : g_assumed_csv;
+	double urgency;
+	u64 fr;
+
+	if (breach_confs < 0)
+		breach_confs = 0;
+	if (window && (u32)breach_confs > window)
+		breach_confs = window;
+	urgency = window ? (double)breach_confs / (double)window : 1.0;
+
+	fr = (u64)g_fee_base_perkw
+		+ (u64)(urgency * (double)(g_fee_max_perkw - g_fee_base_perkw))
+		+ (u64)rung * (g_fee_base_perkw / 4 + 1);
+	if (fr > g_fee_max_perkw)
+		fr = g_fee_max_perkw;
+	if (fr < FEERATE_FLOOR)
+		fr = FEERATE_FLOOR;
+	return (u32)fr;
+}
+
+/* ---- Fee attach + sign (the SINGLE|ACP append; box fee wallet) ------------ *
+ * A CLASS-A justice blob is SIGHASH_SINGLE|ANYONECANPAY: input 0 (the revoked
+ * outpoint, DEVICE-signed) + output 0 (full swept value to the user, no fee).
+ * sendrawtransaction rejects it (no fee / unbalanced), so we must append our OWN
+ * fee input (+ change + the elements explicit fee output) WITHOUT disturbing
+ * input 0 or output 0, then sign ONLY the appended input with the fee-wallet
+ * key.  ACP means input 0's signature survives the append.
+ *
+ * RPC CHOICE (verified against Sequentia-Core src/):
+ *  - fundrawtransaction / walletcreatefundedpsbt CANNOT be used: they re-run
+ *    CreateTransaction to balance the tx, but input 0 is EXTERNAL to the fee
+ *    wallet (its key is on the device), so the wallet can't value it and would
+ *    massively over-fund.  (converttopsbt is separately unusable: it CLEARS
+ *    scriptSig + witness -- rawtransaction.cpp:2293/2299 -- destroying the
+ *    SINGLE|ACP signature.)
+ *  - So we balance the tx OURSELVES (we know input 0's value == output 0's
+ *    value, and the fee UTXO's value) and hand it to signrawtransactionwithwallet,
+ *    which signs input 1 (a wallet UTXO) and LEAVES input 0 untouched: for an
+ *    input whose prevout the wallet doesn't own, ::SignTransaction sets an
+ *    input error and `continue`s -- it never rewrites that input's witness
+ *    (script/sign.cpp:645).  So input 0's SINGLE|ACP witness is preserved.
+ *
+ * Requires: fee-wallet UTXOs are segwit-v0 (bech32 p2wpkh) so signing input 1
+ * needs only its own BIP143 amount (the taproot sighash would need input 0's
+ * spent-output, which we don't feed the wallet).  Returns the fully-signed hex
+ * (child of ctx) or NULL (no fee wallet / no suitable UTXO / RPC failure). */
+static char *attach_fee_and_sign(const tal_t *ctx, const struct spd_blob *b,
+				 struct justice_state *st, long breach_confs)
+{
+	struct amount_asset oa;
+	u8 asset33[33];
+	char *asset_hex, *hex, *signed_hex, *res;
+	struct bitcoin_tx *tx;
+	struct amount_sat out0, feeamt, minfee, maxfee, changeamt;
+	u32 feerate;
+	size_t weight;
+	const char **extra;
+	u64 uval;
+	u8 *raw;
+	int change_idx;
+
+	if (!g_fee_wallet)
+		return NULL;			/* no fee wallet on this box (SEAM) */
+
+	/* Asset the blob output is denominated in (Fix B2 set it = channel asset). */
+	oa = bitcoin_tx_output_get_amount(b->tx, 0);
+	memcpy(asset33, oa.asset, sizeof(asset33));
+	asset_hex = asset33_to_rpchex(ctx, asset33);
+	out0 = bitcoin_tx_output_get_amount_sat(b->tx, 0);
+
+	/* Choose the fee UTXO once, then REUSE it for every RBF rung so each
+	 * replacement keeps the same inputs (only fee/change move). */
+	if (!st->have_feeutxo) {
+		struct bitcoin_outpoint op;
+		u8 *spk;
+		u64 v;
+		struct amount_sat need;
+
+		if (!amount_sat_add(&need, amount_tx_fee(g_fee_base_perkw, 500),
+				    SPD_DUST_SAT))
+			return NULL;
+		if (!pick_fee_utxo(ctx, asset_hex, need.satoshis, &op, &v, &spk))
+			return NULL;
+		st->feeutxo = op;
+		st->feeutxo_val = v;
+		st->feeutxo_spk = tal_steal(g_state_ctx, spk);
+		st->have_feeutxo = true;
+	}
+	uval = st->feeutxo_val;
+
+	/* Clone: never mutate the loaded blob; we only append at index >= 1. */
+	tx = clone_bitcoin_tx(ctx, b->tx);
+	bitcoin_tx_set_output_asset(tx, asset33);	/* change+fee in blob asset */
+	bitcoin_tx_add_input(tx, &st->feeutxo, SPD_RBF_SEQUENCE, NULL,
+			     amount_sat(uval), st->feeutxo_spk, NULL);
+	/* Change output back to the fee wallet (placeholder amount; set below).
+	 * output 0 (user recovery) is left strictly alone; the SINGLE|ACP blob
+	 * already carries a zero-value elements fee output (index 1) that
+	 * bitcoin_tx_finalize() will re-value to the real fee, so the change
+	 * lands at whatever index add_output returns (append). */
+	change_idx = bitcoin_tx_add_output(tx, st->feeutxo_spk, NULL,
+					   amount_sat(uval));
+
+	/* Weight incl. the p2wpkh fee-input witness (~108wu), change + fee out. */
+	weight = bitcoin_tx_weight(tx) + 4 + 1 + 108
+		+ elements_tx_overhead(chainparams, 2, 3);
+	feerate = spd_feerate_perkw(b, breach_confs, st->rung);
+	feeamt = amount_tx_fee(feerate, weight);
+	minfee = amount_tx_fee(FEERATE_FLOOR, weight);
+	if (amount_sat_less(feeamt, minfee))
+		feeamt = minfee;
+	/* Cap the fee so change stays >= dust (a too-small UTXO caps the max
+	 * feerate: the fee wallet must hold adequately-sized per-asset UTXOs). */
+	if (!amount_sat_sub(&maxfee, amount_sat(uval), SPD_DUST_SAT))
+		return NULL;
+	if (amount_sat_greater(feeamt, maxfee))
+		feeamt = maxfee;
+	if (!amount_sat_sub(&changeamt, amount_sat(uval), feeamt))
+		return NULL;
+	bitcoin_tx_output_set_amount(tx, change_idx, changeamt);
+	/* Re-values the existing explicit elements fee output (empty
+	 * scriptPubKey) in the blob asset to sum(inputs) - sum(non-fee outputs)
+	 * = feeamt.  Exactly one fee output either way. */
+	bitcoin_tx_finalize(tx);
+
+	/* NON-CUSTODY GUARD: the user recovery output 0 must be byte-unchanged. */
+	{
+		struct amount_sat now0 = bitcoin_tx_output_get_amount_sat(tx, 0);
+		struct amount_asset a0 = bitcoin_tx_output_get_amount(tx, 0);
+		if (!amount_sat_eq(now0, out0)
+		    || memcmp(a0.asset, asset33, sizeof(asset33)) != 0) {
+			fprintf(stderr, "speculad: REFUSING -- funding altered "
+				"output 0 (user recovery)\n");
+			return NULL;
+		}
+	}
+
+	raw = linearize_tx(ctx, tx);		/* keeps input 0's SINGLE|ACP witness */
+	hex = tal_hexstr(ctx, raw, tal_bytelen(raw));
+	extra = tal_arr(tmpctx, const char *, 1);
+	extra[0] = hex;
+	res = run_cli_wallet(ctx, "signrawtransactionwithwallet", extra);
+	if (!res)
+		return NULL;
+	/* "complete":false is EXPECTED (the wallet can't verify input 0, whose
+	 * key is on the device) -- the returned hex still carries both witnesses. */
+	signed_hex = json_find_string(ctx, res, "hex");
+	return signed_hex;
+}
+
+/* Defend one justice blob for a confirmed breach: de-dup (stop once our justice
+ * tx confirmed), else attach a fee + (re-)broadcast, escalating the feerate each
+ * round (RBF) toward the deadline. */
+static void defend_blob(struct revoked_commit *rc, const struct spd_blob *b,
+			long breach_confs, bool may_broadcast)
+{
+	char *key = tal_fmt(tmpctx, "%s:%u:%u",
+			    rc->locator, b->output_index, b->kind);
+	struct justice_state *st = spd_get_state(key);
+	char *signed_hex, *res;
+	const char **extra;
+
+	if (st->confirmed)
+		return;
+
+	/* Broadcast de-dup: once the justice tx we sent has confirmed, STOP
+	 * re-broadcasting.  (getrawtransaction confirmations needs txindex=1.) */
+	if (st->broadcast_txid) {
+		long c = rpc_tx_confirmations(tmpctx, st->broadcast_txid);
+		if (c >= 1) {
+			st->confirmed = true;
+			fprintf(stderr, "speculad: justice %s CONFIRMED "
+				"(depth %ld) for %s -- done\n",
+				st->broadcast_txid, c, key);
+			return;
+		}
+	}
+	if (!may_broadcast)
+		return;
+
+	signed_hex = attach_fee_and_sign(tmpctx, b, st, breach_confs);
+	if (!signed_hex) {
+		/* Fee wallet absent (testnet) or no suitable UTXO: broadcast the
+		 * raw zero-fee blob so the breach is still surfaced/logged.  It
+		 * will typically be rejected below-min-relay; this is the SEAM. */
+		u8 *raw = linearize_tx(tmpctx, b->tx);
+		signed_hex = tal_hexstr(tmpctx, raw, tal_bytelen(raw));
+	}
+
+	extra = tal_arr(tmpctx, const char *, 1);
+	extra[0] = signed_hex;
+	res = run_cli(tmpctx, "sendrawtransaction", extra);
+	if (res) {
+		size_t n = strlen(res);
+		while (n && (res[n - 1] == '\n' || res[n - 1] == '\r'
+			     || res[n - 1] == ' '))
+			res[--n] = '\0';
+		tal_free(st->broadcast_txid);
+		st->broadcast_txid = tal_strdup(g_state_ctx, res);
+		st->rung++;		/* next poll escalates the feerate (RBF) */
+		fprintf(stderr, "speculad: broadcast justice %s -> txid %s "
+			"(rung %u, feerate ~%u perkw)\n", key, res, st->rung,
+			spd_feerate_perkw(b, breach_confs, st->rung - 1));
+	} else {
+		fprintf(stderr, "speculad: sendrawtransaction rejected for %s "
+			"(kind %u output %u)\n", key, b->kind, b->output_index);
+		/* Re-select the fee UTXO next round: the cached one may have been
+		 * spent / reorged away, or the RBF bump was rejected as too small. */
+		st->have_feeutxo = false;
+	}
 }
 
 /* ---- Sole-broadcaster lease (heartbeat, not a static lockfile) ------------ *
@@ -439,13 +829,22 @@ static void usage_and_exit(const char *argv0)
 	fprintf(stderr,
 		"usage: %s --netdir=DIR [--network=NET] [--poll-interval=SECS]\n"
 		"          [--lease-file=PATH] [--lease-stale=SECS]\n"
+		"          [--fee-wallet=NAME] [--fee-base-perkw=N] [--fee-max-perkw=N]\n"
+		"          [--assumed-csv=BLOCKS]\n"
 		"          --cli=elements-cli [--cli=-datadir=/path] [--cli=...] ...\n"
 		"\n"
 		"speculad watches the Phase-B watchtower store under\n"
 		"DIR/watchtower/<dbid>/ and, on a revoked commitment confirming,\n"
 		"broadcasts the pre-signed justice blob(s) via the given CLI.\n"
 		"Repeat --cli to build the full elements-cli invocation (path +\n"
-		"connection flags).\n",
+		"connection flags).\n"
+		"\n"
+		"--fee-wallet names the box-owned elementsd wallet holding per-asset\n"
+		"fee UTXOs (bech32/p2wpkh) that speculad appends to SINGLE|ACP justice\n"
+		"blobs (+ change + explicit fee output) and RBFs.  Requires the node\n"
+		"to run with txindex=1 (breach + confirmation detection use\n"
+		"getrawtransaction).  Without --fee-wallet the zero-fee blob is\n"
+		"broadcast as-is (typically below-min-relay: the documented seam).\n",
 		argv0);
 	exit(2);
 }
@@ -463,6 +862,8 @@ int main(int argc, char *argv[])
 	common_setup(argv[0]);
 	top = tal(NULL, char);
 	g_cli_base = tal_arr(top, const char *, 0);
+	g_state_ctx = top;
+	g_states = tal_arr(top, struct justice_state *, 0);
 
 	for (int i = 1; i < argc; i++) {
 		if (strstarts(argv[i], "--netdir="))
@@ -475,6 +876,17 @@ int main(int argc, char *argv[])
 			poll_interval = atoi(argv[i] + strlen("--poll-interval="));
 		else if (strstarts(argv[i], "--lease-stale="))
 			lease_stale = atoi(argv[i] + strlen("--lease-stale="));
+		else if (strstarts(argv[i], "--fee-wallet="))
+			g_fee_wallet = tal_strdup(top,
+					argv[i] + strlen("--fee-wallet="));
+		else if (strstarts(argv[i], "--fee-base-perkw="))
+			g_fee_base_perkw = atoi(argv[i]
+					+ strlen("--fee-base-perkw="));
+		else if (strstarts(argv[i], "--fee-max-perkw="))
+			g_fee_max_perkw = atoi(argv[i]
+					+ strlen("--fee-max-perkw="));
+		else if (strstarts(argv[i], "--assumed-csv="))
+			g_assumed_csv = atoi(argv[i] + strlen("--assumed-csv="));
 		else if (strstarts(argv[i], "--cli="))
 			tal_arr_expand(&g_cli_base,
 				       tal_strdup(top, argv[i] + strlen("--cli=")));
@@ -489,6 +901,16 @@ int main(int argc, char *argv[])
 	if (!leasefile)
 		leasefile = tal_fmt(top, "%s/watchtower/speculad.lease", netdir);
 
+	/* Fee-wallet CLI = base + -rpcwallet=<name>, so the fee-input coin
+	 * selection / signing targets the dedicated fee wallet only. */
+	if (g_fee_wallet) {
+		g_fee_cli_base = tal_arr(top, const char *, 0);
+		for (size_t i = 0; i < tal_count(g_cli_base); i++)
+			tal_arr_expand(&g_fee_cli_base, g_cli_base[i]);
+		tal_arr_expand(&g_fee_cli_base,
+			       tal_fmt(top, "-rpcwallet=%s", g_fee_wallet));
+	}
+
 	chainparams = chainparams_for_network(network);
 	if (!chainparams)
 		errx(1, "speculad: unknown --network=%s (known: %s)",
@@ -499,8 +921,8 @@ int main(int argc, char *argv[])
 	signal(SIGPIPE, SIG_IGN);
 
 	fprintf(stderr, "speculad: watching %s/watchtower (network %s), "
-		"poll %us, lease %s\n", netdir, network, poll_interval,
-		leasefile);
+		"poll %us, lease %s, fee-wallet %s\n", netdir, network,
+		poll_interval, leasefile, g_fee_wallet ? g_fee_wallet : "(none)");
 
 	while (!g_stop) {
 		char *tip;
@@ -540,15 +962,18 @@ int main(int argc, char *argv[])
 				 * confirmed locator here is provably a cheat. */
 				rc->confirmations = confs;
 				fprintf(stderr, "speculad: BREACH dbid=%"PRIu64
-					" commit=%s confs=%ld -> broadcasting "
+					" commit=%s confs=%ld -> defending "
 					"%zu justice blob(s)%s\n",
 					c->dbid, rc->locator, confs,
 					tal_count(rc->blobs),
-					may_broadcast ? "" : " (SKIPPED: no lease)");
-				if (!may_broadcast)
-					continue;
+					may_broadcast ? "" : " (no lease: de-dup only)");
+				/* Per blob: attach a fee + (re-)broadcast with RBF
+				 * escalation, or stop once the justice tx confirmed
+				 * (de-dup).  defend_blob is safe without the lease
+				 * (it only reads confirmations then). */
 				for (size_t k = 0; k < tal_count(rc->blobs); k++)
-					broadcast_blob(rc->blobs[k], confs);
+					defend_blob(rc, rc->blobs[k], confs,
+						    may_broadcast);
 			}
 		}
 
