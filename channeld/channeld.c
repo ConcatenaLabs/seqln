@@ -1702,7 +1702,13 @@ static void send_revocation(struct peer *peer,
 			    const struct bitcoin_tx *committx,
 			    const struct secret *old_secret,
 			    const struct pubkey *next_point,
-			    const struct commitsig **splice_commitsigs)
+			    const struct commitsig **splice_commitsigs,
+			    /* Watchtower Phase E (seam #1): the LOCAL point that built
+			     * committx + per-HTLC 2nd-stage metadata (aligned to
+			     * htlc_sigs) so keyless lightningd can pre-sign the
+			     * honest-close CLASS-B sweeps. */
+			    const struct pubkey *local_per_commit,
+			    const struct got_commitsig_htlc_info *htlc_infos)
 {
 	struct changed_htlc *changed;
 	struct fulfilled_htlc *fulfilled;
@@ -1744,7 +1750,9 @@ static void send_revocation(struct peer *peer,
 					       failed,
 					       changed,
 					       committx,
-					       splice_commitsigs);
+					       splice_commitsigs,
+					       local_per_commit,
+					       htlc_infos);
 	master_wait_sync_reply(tmpctx, peer, take(msg_for_master),
 			       WIRE_CHANNELD_GOT_COMMITSIG_REPLY);
 
@@ -2339,8 +2347,40 @@ static struct commitsig_info *handle_peer_commit_sig(struct peer *peer,
 	/* After HSM_VERSION 5 old_secret is always NULL */
 	assert(!old_secret);
 
+	/* Watchtower Phase E (seam #1): build the per-HTLC 2nd-stage metadata
+	 * for the LOCAL commitment we just committed to.  htlc_sigs[i] signed
+	 * txs[i+1], whose commitment output index is
+	 * txs[i+1]->wtx->inputs[0].index, and the HTLC at that output is
+	 * htlc_map[outnum] -- so we emit one entry per htlc_sig, in the SAME
+	 * order, keeping htlc_infos[i] paired with htlc_sigs[i] (==
+	 * lightningd's channel->last_htlc_sigs[i]). */
+	struct got_commitsig_htlc_info *htlc_infos
+		= tal_arr(tmpctx, struct got_commitsig_htlc_info, 0);
+	for (i = 0; i < tal_count(htlc_sigs); i++) {
+		u32 outnum = txs[i+1]->wtx->inputs[0].index;
+		const struct htlc *h = htlc_map[outnum];
+		struct got_commitsig_htlc_info info;
+
+		/* Defensive: a NULL htlc_map entry would be an internal
+		 * inconsistency (a sig for a non-HTLC output); skip it rather
+		 * than deref (B6 fail-soft, never fatal). */
+		if (!h) {
+			status_broken("watchtower: no htlc at commit output %u"
+				      " for htlc_sig %zu; skipping presign meta",
+				      outnum, i);
+			continue;
+		}
+		info.output_index = outnum;
+		info.amount = h->amount;
+		info.cltv_expiry = h->expiry.locktime;
+		info.offered = (htlc_owner(h) == LOCAL);
+		info.payment_hash = h->rhash;
+		tal_arr_expand(&htlc_infos, info);
+	}
+
 	send_revocation(peer, &commit_sig, htlc_sigs, changed_htlcs, txs[0],
-			old_secret, &next_point, commitsigs);
+			old_secret, &next_point, commitsigs,
+			local_per_commit, htlc_infos);
 
 	tal_steal(tmpctx, result);
 	tal_free(commitsigs);

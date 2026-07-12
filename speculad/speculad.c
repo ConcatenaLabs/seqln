@@ -28,9 +28,15 @@
  * (infra, not present on testnet), so it is the single documented SEAM below
  * (attach_fee_and_rbf()); this daemon otherwise runs the breach path end to end.
  *
- * CLASS-B honest-force-close sweeps + HTLC 2nd-stage: Phase B left store slots
- * (sweeps/) but no producer yet; speculad already loads them and is structured
- * so the CLASS-B broadcast drops into the same watch/broadcast loop.
+ * CLASS-B honest-force-close sweeps + HTLC 2nd-stage: Phase E2 added the
+ * producer -- lightningd/onchain_presign.c device-master-signs the current-state
+ * honest-close set (kind 3 to_local-delayed + kind 4 offered-HTLC-timeout) at
+ * every commitment advance, and the kind 5 HTLC-success sweep at fulfill (the
+ * JBA fulfill hard-gate), writing them to the sweeps/ store slot this daemon
+ * already loads.  It drops into the same watch/broadcast loop as the justice
+ * set.  STILL A SEAM: kind 6 (remote_htlc_to_us, peer-honest-close HTLC sweep)
+ * needs the remote-commitment HTLC outpoints threaded from channeld's
+ * SENDING_COMMITSIG path first (lightningd lacks the remote commitment tx).
  */
 #include "config.h"
 #include <bitcoin/chainparams.h>

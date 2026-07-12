@@ -16,6 +16,7 @@
 
 struct uncommitted_channel;
 struct wally_psbt;
+struct got_commitsig_htlc_info;
 
 /* FIXME: Define serialization primitive for this? */
 struct channel_info {
@@ -250,6 +251,17 @@ struct channel {
 	struct bitcoin_tx *last_tx;
 	struct bitcoin_signature last_sig;
 	const struct bitcoin_signature *last_htlc_sigs;
+
+	/* Specula watchtower Phase E (seam #1): the LOCAL commitment keyset
+	 * ingredients threaded up in the last WIRE_CHANNELD_GOT_COMMITSIG, so
+	 * onchain_presign_htlc_success() can rebuild the kind-5 HTLC-success
+	 * sweep at fulfill time (the preimage is only known then).  Refreshed
+	 * every commitment advance; NULL/0 until the first got_commitsig (and
+	 * after a restart until the next advance -- best-effort on testnet).
+	 * presign_htlc_infos is aligned 1:1 with last_htlc_sigs. */
+	u64 presign_commit_num;
+	struct pubkey *presign_local_per_commit;
+	const struct got_commitsig_htlc_info *presign_htlc_infos;
 
 	/* Keys for channel */
 	struct channel_info channel_info;

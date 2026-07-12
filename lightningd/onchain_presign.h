@@ -17,34 +17,47 @@
  * each HTLC fulfill for success) and writes the results into the store sweeps/
  * dir so speculad can broadcast them while the device is offline.
  *
- * PREREQUISITE / SEAM (documented in openIssues): building these templates needs
- * the LOCAL commitment keyset (local per_commitment_point + per-HTLC 2nd-stage
- * wscripts).  lightningd is KEYLESS and cannot derive it, and
- * hsmd_get_per_commitment_point(18) is a channel-fd-only op.  channeld already
- * derives the keyset in commit_tx.c; it must thread the point (or the fully
- * built unsigned CLASS-B templates + per-HTLC metadata) up in
- * WIRE_CHANNELD_GOT_COMMITSIG -- a byte-exact wiregen change -- before the
- * template construction below can be filled in.  Until then these entry points
- * are structurally in place but produce no blobs, and the honest force-close
- * path stays on onchaind at real force-close time (device-online), exactly as
- * today -- i.e. no regression, only the not-yet-closed keyless honest-close gap.
+ * SEAM #1 CLOSED (Phase E2): channeld now threads the LOCAL per_commitment_point
+ * + per-HTLC 2nd-stage metadata up in WIRE_CHANNELD_GOT_COMMITSIG (the
+ * got_commitsig_htlc_info subtype, aligned 1:1 with channel->last_htlc_sigs),
+ * so keyless lightningd can derive the LOCAL commitment keyset and master-sign
+ * the honest-close sweeps here.  IMPLEMENTED: kind 3 (to_local-delayed) + kind 4
+ * (offered HTLC-timeout, 2-of-2 with the stored remote_htlc_sig) at commitment
+ * advance, and kind 5 (received HTLC-success, 2-of-2 + preimage) at fulfill.
+ *
+ * STILL A SEAM: kind 6 (remote_htlc_to_us) defends when the PEER force-closes
+ * honestly -- it sweeps HTLC outputs on the REMOTE commitment, whose tx lightningd
+ * does NOT hold (channel->last_tx is OURS; the remote commitment is built in
+ * channeld's send_commit_part).  Producing it needs the remote-commitment HTLC
+ * outpoints/amounts threaded from channeld's SENDING_COMMITSIG path (a separate
+ * wiregen change), so it is left documented here; the peer-honest-close HTLC gap
+ * stays on onchaind at real force-close time (device-online), exactly as today.
  */
 
 struct channel;
 struct htlc_in;
+struct pubkey;
+struct got_commitsig_htlc_info;
 
-/* Pre-sign the current-state CLASS-B honest sweeps (to_local-delayed,
- * remote_htlc_to_us, HTLC-timeout) for the just-advanced local commitment and
- * atomically replace the store sweeps/ set.  Call at commitment advance, AFTER
- * channel->last_htlc_sigs and channel->last_tx are set. */
-void onchain_presign_current_sweeps(struct channel *channel);
+/* Pre-sign the current-state CLASS-B honest sweeps (kind 3 to_local-delayed +
+ * kind 4 offered-HTLC-timeout) for the just-advanced local commitment
+ * @commit_num (whose keyset is derived from @local_per_commit), and atomically
+ * replace the store sweeps/ set.  @htlc_infos is the per-HTLC metadata aligned
+ * 1:1 with channel->last_htlc_sigs.  Also stashes the keyset ingredients on the
+ * channel for the fulfill-time kind-5 rebuild.  Call at commitment advance,
+ * AFTER channel->last_htlc_sigs and channel->last_tx are set. */
+void onchain_presign_current_sweeps(struct channel *channel,
+				    u64 commit_num,
+				    const struct pubkey *local_per_commit,
+				    const struct got_commitsig_htlc_info *htlc_infos);
 
-/* Best-effort pre-sign + store of the HTLC-success sweep (kind 5) for a just-
- * fulfilled incoming HTLC.  The JBA fulfill hard-gate: returns true iff it is
- * safe to release the preimage (a durable success sweep is stored, OR -- until
- * the keyset is threaded -- best-effort on testnet).  Returns false only once
- * signing is wired and the sign/store failed, so the caller defers releasing
- * the preimage this pass. */
+/* Pre-sign + store the HTLC-success sweep (kind 5) for a just-fulfilled incoming
+ * HTLC, using the preimage (only known now) + the stashed local keyset.  The JBA
+ * fulfill hard-gate: returns true iff it is safe to release the preimage (a
+ * durable success sweep is stored, or -- when the keyset stash is absent, e.g.
+ * right after a restart -- best-effort on testnet).  Returns false when we HAVE
+ * the ingredients but the sign or the durable store failed, so the caller defers
+ * releasing the preimage this pass. */
 bool onchain_presign_htlc_success(struct channel *channel, struct htlc_in *hin);
 
 #endif /* LIGHTNING_LIGHTNINGD_ONCHAIN_PRESIGN_H */
