@@ -158,16 +158,25 @@ static bool write_blob_set(const struct channel *channel,
 	return true;
 }
 
-/* meta = LE u64 version, u64 dbid, u64 current_commit_num. */
+/* meta = LE u64 version(=2), u64 dbid, u64 current_commit_num,
+ * bitcoin_outpoint funding, u16 remote_to_self_delay.
+ *
+ * v2 (Phase E, seam #3) appends the funding outpoint (for the future
+ * preemptive-close / funding-watch) and the REMOTE to_self_delay so speculad
+ * can compute the exact RBF deadline = close_height + to_self_delay[REMOTE]
+ * instead of an assumed CSV.  A v1 reader/writer only ever wrote the first
+ * three fields; speculad reads both versions. */
 static bool write_meta(const struct channel *channel,
 		       const char *chandir,
 		       u64 current_commit_num)
 {
 	u8 *enc = tal_arr(tmpctx, u8, 0);
 
-	towire_u64(&enc, 1 /* version */);
+	towire_u64(&enc, 2 /* version */);
 	towire_u64(&enc, channel->dbid);
 	towire_u64(&enc, current_commit_num);
+	towire_bitcoin_outpoint(&enc, &channel->funding);
+	towire_u16(&enc, channel->channel_info.their_config.to_self_delay);
 	return write_durable(chandir, "meta", enc, tal_bytelen(enc));
 }
 
@@ -198,6 +207,18 @@ bool wt_store_put_justice(struct lightningd *ld,
 			  "watchtower store: persisted %zu justice blobs for "
 			  "commit %"PRIu64" (%s)",
 			  tal_count(blobs), commitment_num, locator);
+
+	/* Phase E (seam #3): the only other write_meta caller (wt_store_put_sweeps)
+	 * has no producer yet, so without this the live breach path would never
+	 * write the funding outpoint / remote to_self_delay that speculad needs for
+	 * the exact RBF deadline.  current_commit_num here = our next local index. */
+	if (ok) {
+		char *chandir = channel_store_dir(tmpctx, ld, channel, NULL);
+		if (!chandir
+		    || !write_meta(channel, chandir, channel->next_index[LOCAL]))
+			log_broken(channel->log,
+				   "watchtower store: failed writing meta");
+	}
 	return ok;
 }
 

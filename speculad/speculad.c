@@ -96,6 +96,9 @@ struct watched_channel {
 	u64 current_commit_num;		/* from meta (broadcast guard reference) */
 	struct revoked_commit **revoked;/* CLASS-A, all revoked states */
 	struct spd_blob **sweeps;	/* CLASS-B, current-state honest sweeps */
+	/* Phase E (seam #3), from meta v2 (0 when meta is v1/absent): */
+	struct bitcoin_outpoint funding;   /* for future preemptive-close/funding-watch */
+	u32 remote_to_self_delay;	   /* exact RBF deadline window (CSV) */
 };
 
 /* ---- Globals (config; all box-owned, no secrets) ------------------------- */
@@ -128,7 +131,6 @@ struct justice_state {
 	u8 *feeutxo_spk;		/* fee UTXO scriptPubKey (change goes back here) */
 	u32 rung;			/* RBF escalation counter */
 	char *broadcast_txid;		/* last justice txid we broadcast */
-	bool confirmed;			/* justice tx has confirmations>=1 -> done */
 };
 static struct justice_state **g_states;	/* persistent registry */
 static const tal_t *g_state_ctx;	/* owns g_states + entries (== top) */
@@ -153,7 +155,6 @@ static struct justice_state *spd_get_state(const char *key)
 	st->feeutxo_spk = NULL;
 	st->rung = 0;
 	st->broadcast_txid = NULL;
-	st->confirmed = false;
 	tal_arr_expand(&g_states, st);
 	return st;
 }
@@ -217,14 +218,20 @@ static struct spd_blob **load_blob_dir(const tal_t *ctx, const char *dir)
 	return out;
 }
 
-/* meta = LE u64 version, u64 dbid, u64 current_commit_num. */
-static u64 read_meta_commit_num(const char *chandir)
+/* meta = LE u64 version, u64 dbid, u64 current_commit_num[, v2: bitcoin_outpoint
+ * funding, u16 remote_to_self_delay].  Fills *funding / *to_self_delay from a v2
+ * meta (left zeroed for v1/absent).  Returns current_commit_num (0 on absence). */
+static u64 read_meta(const char *chandir, struct bitcoin_outpoint *funding,
+		     u32 *to_self_delay)
 {
 	char *path = path_join(tmpctx, chandir, "meta");
 	u8 *contents = grab_file_str(tmpctx, path);
 	const u8 *cursor;
 	size_t max;
 	u64 version, dbid, commit_num;
+
+	memset(funding, 0, sizeof(*funding));
+	*to_self_delay = 0;
 
 	if (!contents)
 		return 0;
@@ -233,9 +240,17 @@ static u64 read_meta_commit_num(const char *chandir)
 	version = fromwire_u64(&cursor, &max);
 	dbid = fromwire_u64(&cursor, &max);
 	commit_num = fromwire_u64(&cursor, &max);
-	if (!cursor || version != 1)
+	if (!cursor || (version != 1 && version != 2))
 		return 0;
 	(void)dbid;
+	if (version >= 2) {
+		fromwire_bitcoin_outpoint(&cursor, &max, funding);
+		*to_self_delay = fromwire_u16(&cursor, &max);
+		if (!cursor) {		/* truncated v2 -> treat as bare */
+			memset(funding, 0, sizeof(*funding));
+			*to_self_delay = 0;
+		}
+	}
 	return commit_num;
 }
 
@@ -268,7 +283,8 @@ static struct watched_channel **load_channels(const tal_t *ctx,
 		c = tal(chans, struct watched_channel);
 		c->dbid = strtoull(ent->d_name, NULL, 10);
 		c->chandir = tal_strdup(c, chandir);
-		c->current_commit_num = read_meta_commit_num(chandir);
+		c->current_commit_num = read_meta(chandir, &c->funding,
+						  &c->remote_to_self_delay);
 		c->revoked = tal_arr(c, struct revoked_commit *, 0);
 
 		sweepsdir = path_join(tmpctx, chandir, "sweeps");
@@ -392,6 +408,42 @@ static long rpc_tx_confirmations(const tal_t *ctx, const char *txid_hex)
 		return -1;
 	confs = json_find_int(res, "confirmations");
 	return confs;
+}
+
+static char *json_find_string(const tal_t *ctx, const char *s, const char *key);
+
+/* Tri-state of a specific outpoint in the CONFIRMED UTXO set (gettxout with
+ * include_mempool=false). */
+enum spd_txout_state {
+	SPD_TXOUT_UNSPENT,	/* still in the confirmed UTXO set */
+	SPD_TXOUT_SPENT,	/* gone (spent or never existed): gettxout -> null */
+	SPD_TXOUT_UNKNOWN,	/* RPC error: be conservative, keep defending */
+};
+
+/* Phase E (seam #2): reorg-safe de-dup gate.  gettxout [txid, vout, false]
+ * queries ONLY the confirmed UTXO set: a non-null result means the outpoint is
+ * still unspent (justice not landed, or a reorg re-exposed it -> keep/resume
+ * broadcasting); the literal 'null' (exit 0) means spent/absent -> done for THIS
+ * round only, NEVER latched, so a later reorg re-exposing it auto-resumes.  An
+ * RPC error (run_cli -> NULL) is UNKNOWN -> conservatively keep defending. */
+static enum spd_txout_state rpc_txout_state(const tal_t *ctx,
+					    const char *txid_hex, u32 vout)
+{
+	const char **extra = tal_arr(tmpctx, const char *, 3);
+	char *res, *best;
+
+	extra[0] = txid_hex;
+	extra[1] = tal_fmt(tmpctx, "%u", vout);
+	extra[2] = "false";		/* include_mempool=false: confirmed set only */
+	res = run_cli(ctx, "gettxout", extra);
+	if (!res)
+		return SPD_TXOUT_UNKNOWN;
+	/* An unspent txout prints an object carrying "bestblock"/"scriptPubKey";
+	 * a spent/absent one prints the bare literal 'null'. */
+	best = json_find_string(tmpctx, res, "bestblock");
+	if (best)
+		return SPD_TXOUT_UNSPENT;
+	return SPD_TXOUT_SPENT;
 }
 
 static char *rpc_getbestblockhash(const tal_t *ctx)
@@ -567,9 +619,13 @@ static bool pick_fee_utxo(const tal_t *ctx, const char *asset_hex, u64 min_sat,
  * Deadline window = the blob's stored deadline_delta, or the assumed remote
  * to_self_delay (SEAM: not yet threaded into meta). */
 static u32 spd_feerate_perkw(const struct spd_blob *b, long breach_confs,
-			     u32 rung)
+			     u32 rung, u32 remote_to_self_delay)
 {
-	u32 window = b->deadline_delta ? b->deadline_delta : g_assumed_csv;
+	/* Deadline window: the blob's own stored delta if present; else the
+	 * channel's real remote to_self_delay from meta v2 (Phase E, seam #3);
+	 * else the assumed-CSV fallback (v1/absent meta). */
+	u32 window = b->deadline_delta ? b->deadline_delta
+		: (remote_to_self_delay ? remote_to_self_delay : g_assumed_csv);
 	double urgency;
 	u64 fr;
 
@@ -616,7 +672,8 @@ static u32 spd_feerate_perkw(const struct spd_blob *b, long breach_confs,
  * spent-output, which we don't feed the wallet).  Returns the fully-signed hex
  * (child of ctx) or NULL (no fee wallet / no suitable UTXO / RPC failure). */
 static char *attach_fee_and_sign(const tal_t *ctx, const struct spd_blob *b,
-				 struct justice_state *st, long breach_confs)
+				 struct justice_state *st, long breach_confs,
+				 u32 remote_to_self_delay)
 {
 	struct amount_asset oa;
 	u8 asset33[33];
@@ -675,7 +732,7 @@ static char *attach_fee_and_sign(const tal_t *ctx, const struct spd_blob *b,
 	/* Weight incl. the p2wpkh fee-input witness (~108wu), change + fee out. */
 	weight = bitcoin_tx_weight(tx) + 4 + 1 + 108
 		+ elements_tx_overhead(chainparams, 2, 3);
-	feerate = spd_feerate_perkw(b, breach_confs, st->rung);
+	feerate = spd_feerate_perkw(b, breach_confs, st->rung, remote_to_self_delay);
 	feeamt = amount_tx_fee(feerate, weight);
 	minfee = amount_tx_fee(FEERATE_FLOOR, weight);
 	if (amount_sat_less(feeamt, minfee))
@@ -723,33 +780,49 @@ static char *attach_fee_and_sign(const tal_t *ctx, const struct spd_blob *b,
  * tx confirmed), else attach a fee + (re-)broadcast, escalating the feerate each
  * round (RBF) toward the deadline. */
 static void defend_blob(struct revoked_commit *rc, const struct spd_blob *b,
-			long breach_confs, bool may_broadcast)
+			long breach_confs, bool may_broadcast,
+			u32 remote_to_self_delay)
 {
 	char *key = tal_fmt(tmpctx, "%s:%u:%u",
 			    rc->locator, b->output_index, b->kind);
 	struct justice_state *st = spd_get_state(key);
 	char *signed_hex, *res;
 	const char **extra;
+	enum spd_txout_state ts;
 
-	if (st->confirmed)
-		return;
-
-	/* Broadcast de-dup: once the justice tx we sent has confirmed, STOP
-	 * re-broadcasting.  (getrawtransaction confirmations needs txindex=1.) */
-	if (st->broadcast_txid) {
-		long c = rpc_tx_confirmations(tmpctx, st->broadcast_txid);
-		if (c >= 1) {
-			st->confirmed = true;
-			fprintf(stderr, "speculad: justice %s CONFIRMED "
-				"(depth %ld) for %s -- done\n",
-				st->broadcast_txid, c, key);
-			return;
+	/* Phase E (seam #2): REORG-SAFE de-dup.  The de-dup gate is the confirmed
+	 * UTXO-set status of the REVOKED outpoint this justice tx spends
+	 * (rc->locator : b->output_index) -- NOT a persistent "confirmed" latch.
+	 * If it is SPENT, justice has landed (our tx or the peer's honest close),
+	 * so we skip THIS round only; a later reorg that re-exposes the outpoint
+	 * flips this back to UNSPENT and broadcasting auto-resumes (principle #1,
+	 * no finality).  UNKNOWN (RPC error) conservatively keeps defending.
+	 *
+	 * NOTE: current CLASS-A blobs all spend a commitment output, so
+	 * (locator, output_index) is exactly the spent prevout.  A future
+	 * steal_htlc_tx 2nd-stage blob spends the HTLC-tx, not the commitment,
+	 * so it must instead query its OWN tx's input-0 prevout. */
+	ts = rpc_txout_state(tmpctx, rc->locator, b->output_index);
+	if (ts == SPD_TXOUT_SPENT) {
+		if (st->broadcast_txid) {
+			/* Secondary signal only (needs txindex=1); logged, not gating. */
+			long c = rpc_tx_confirmations(tmpctx, st->broadcast_txid);
+			fprintf(stderr, "speculad: revoked outpoint %s:%u SPENT "
+				"(our justice %s confs %ld) -- done this round\n",
+				rc->locator, b->output_index, st->broadcast_txid, c);
+		} else {
+			fprintf(stderr, "speculad: revoked outpoint %s:%u already "
+				"SPENT -- nothing to defend this round\n",
+				rc->locator, b->output_index);
 		}
+		return;
 	}
+	/* UNSPENT or UNKNOWN: the revoked output is (still) claimable -> defend. */
 	if (!may_broadcast)
 		return;
 
-	signed_hex = attach_fee_and_sign(tmpctx, b, st, breach_confs);
+	signed_hex = attach_fee_and_sign(tmpctx, b, st, breach_confs,
+					 remote_to_self_delay);
 	if (!signed_hex) {
 		/* Fee wallet absent (testnet) or no suitable UTXO: broadcast the
 		 * raw zero-fee blob so the breach is still surfaced/logged.  It
@@ -771,7 +844,8 @@ static void defend_blob(struct revoked_commit *rc, const struct spd_blob *b,
 		st->rung++;		/* next poll escalates the feerate (RBF) */
 		fprintf(stderr, "speculad: broadcast justice %s -> txid %s "
 			"(rung %u, feerate ~%u perkw)\n", key, res, st->rung,
-			spd_feerate_perkw(b, breach_confs, st->rung - 1));
+			spd_feerate_perkw(b, breach_confs, st->rung - 1,
+					  remote_to_self_delay));
 	} else {
 		fprintf(stderr, "speculad: sendrawtransaction rejected for %s "
 			"(kind %u output %u)\n", key, b->kind, b->output_index);
@@ -973,7 +1047,8 @@ int main(int argc, char *argv[])
 				 * (it only reads confirmations then). */
 				for (size_t k = 0; k < tal_count(rc->blobs); k++)
 					defend_blob(rc, rc->blobs[k], confs,
-						    may_broadcast);
+						    may_broadcast,
+						    c->remote_to_self_delay);
 			}
 		}
 
