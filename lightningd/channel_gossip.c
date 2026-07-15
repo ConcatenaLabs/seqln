@@ -345,7 +345,18 @@ static void check_channel_gossip(const struct channel *channel)
 		return;
 	case CGOSSIP_CHANNEL_UNANNOUNCED_DYING:
 		assert(!is_dead(channel));
-		assert(!has_announce_depth(channel));
+		/* SEQUENTIA: do NOT assert !has_announce_depth() here.  The two-stage
+		 * SCID holds a channel's announcement until the funding block's Bitcoin
+		 * anchor is buried (see has_announce_depth()), which decouples "reached
+		 * announce depth" from "was announced".  A channel can enter DYING while
+		 * its announcement is still held for anchor burial, then gain announce
+		 * depth once the anchor buries; it stays UNANNOUNCED_DYING (it never
+		 * announced and, being dying, never will) yet has_announce_depth() is
+		 * now true.  Upstream's invariant (unannounced-dying => no announce
+		 * depth) no longer holds under anchor-gated announcement, so asserting
+		 * it here SIGABRTs a fund-holding node on channel reestablish during a
+		 * perfectly normal mutual close.  The channel is legitimately dying and
+		 * unannounced regardless of depth; nothing else depends on this. */
 		assert(!cg->refresh_timer);
 		return;
 	case CGOSSIP_CHANNEL_ANNOUNCED_DYING:
