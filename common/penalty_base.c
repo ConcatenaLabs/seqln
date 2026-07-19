@@ -65,6 +65,21 @@ void fromwire_penalty_base(const u8 **pptr, size_t *max,
 	pbase->outnum = fromwire_u32(pptr, max);
 	pbase->amount = fromwire_amount_sat(pptr, max);
 	num_htlcs = fromwire_u16(pptr, max);
+	/* Phase-B invariant: only the POINTER-form messages (?penalty_base in
+	 * sending_commitsig / got_revoke, where wiregen allocates pbase as its
+	 * own tal object) ever carry htlcs. The ARRAY form (channeld_init)
+	 * passes a MID-ARRAY element pointer, which is NOT a tal parent -
+	 * tal_arr on it aborts in check_bounds, which crashed channeld at
+	 * init, deterministically, on every channel with a stored penalty
+	 * base (the array form's source is the wallet DB, which stores no
+	 * penalty_htlc rows yet, so it is always htlc-less). Allocate only
+	 * when htlcs are present; tal_count(NULL) == 0 keeps every consumer
+	 * correct. Phase C (DB penalty_htlc rows) must switch channeld_init
+	 * to the ctx-taking pointer pattern BEFORE populating htlcs here. */
+	if (num_htlcs == 0) {
+		pbase->htlcs = NULL;
+		return;
+	}
 	pbase->htlcs = tal_arr(pbase, struct penalty_htlc, num_htlcs);
 	for (size_t i = 0; i < num_htlcs; i++) {
 		pbase->htlcs[i].outnum = fromwire_u32(pptr, max);
