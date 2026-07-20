@@ -832,9 +832,10 @@ static struct command_result *getfeeexchangerates(struct command *cmd,
 						  const char *buf UNUSED,
 						  const jsmntok_t *toks UNUSED)
 {
-	struct bcli_result *res;
+	struct bcli_result *res, *labelres;
 	struct json_stream *response;
-	const jsmntok_t *tokens;
+	const jsmntok_t *rate_toks, *label_toks, *keytok;
+	size_t i;
 
 	if (!param(cmd, buf, toks, NULL))
 		return command_param_failed();
@@ -848,15 +849,55 @@ static struct command_result *getfeeexchangerates(struct command *cmd,
 		return command_finished(cmd, response);
 	}
 
-	/* Verify it parses, then re-emit the object verbatim. */
-	tokens = json_parse_simple(res->output, res->output, res->output_len);
-	if (!tokens || tokens[0].type != JSMN_OBJECT)
+	rate_toks = json_parse_simple(res->output, res->output, res->output_len);
+	if (!rate_toks || rate_toks[0].type != JSMN_OBJECT)
 		return command_err(cmd, res, "bad JSON: cannot parse rates");
 
-	strip_trailing_whitespace(res->output, res->output_len);
+	/* The backend may serialise the rate keys as human-readable ticker
+	 * labels (e.g. "EURX") when it has an asset-label registry loaded.
+	 * lightningd's feeexchangerates_callback only understands 32-byte
+	 * display-hex asset ids and silently drops every other key, which
+	 * would zero out all asset fee rates.  So resolve each label back to
+	 * its hex id here before re-emitting.  We pull the label->hex map from
+	 * the same backend; a backend without one (plain bitcoind) yields no
+	 * labels and the keys (already hex) pass through unchanged. */
+	labelres = run_bitcoin_cli(cmd, cmd->plugin, "dumpassetlabels", NULL);
+	if (labelres->exitstatus == 0 && labelres->output_len > 0) {
+		label_toks = json_parse_simple(labelres->output,
+					       labelres->output,
+					       labelres->output_len);
+		if (label_toks && label_toks[0].type != JSMN_OBJECT)
+			label_toks = NULL;
+	} else
+		label_toks = NULL;
 
 	response = jsonrpc_stream_success(cmd);
-	json_add_jsonstr(response, "rates", res->output, strlen(res->output));
+	json_object_start(response, "rates");
+	json_for_each_obj(i, keytok, rate_toks) {
+		const jsmntok_t *valtok = keytok + 1;
+		const char *key = json_strdup(tmpctx, res->output, keytok);
+		const jsmntok_t *hextok;
+
+		/* Keep the policy asset's label ("bitcoin") verbatim:
+		 * lightningd handles it 1:1 and skips it as a non-hex key. */
+		if (streq(key, "bitcoin")) {
+			json_add_tok(response, key, valtok, res->output);
+			continue;
+		}
+
+		/* Known ticker label -> emit its hex id; otherwise (already
+		 * hex, or unknown) pass the key through unchanged. */
+		hextok = label_toks
+			? json_get_member(labelres->output, label_toks, key)
+			: NULL;
+		if (hextok) {
+			const char *hex = json_strdup(tmpctx, labelres->output,
+						      hextok);
+			json_add_tok(response, hex, valtok, res->output);
+		} else
+			json_add_tok(response, key, valtok, res->output);
+	}
+	json_object_end(response);
 	return command_finished(cmd, response);
 }
 
