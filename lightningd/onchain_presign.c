@@ -213,8 +213,15 @@ static struct watchtower_blob **build_current_sweeps(const tal_t *ctx,
 			if (out->script_len == tal_bytelen(spk)
 			    && memcmp(out->script, spk, out->script_len) == 0) {
 				outpoint.n = o;
-				in_sats = bitcoin_tx_output_get_amount_sat(
-					channel->last_tx, o);
+				/* Asset-aware: read the raw to_local value WITHOUT asserting it is the
+				 * policy asset. On an asset-denominated channel the to_local output is in
+				 * channel->channel_asset, so the asserting bitcoin_tx_output_get_amount_sat()
+				 * would abort here — and this runs on EVERY commitsig (via
+				 * onchain_presign_current_sweeps), so it SIGABRTs BOTH sides of any asset
+				 * channel the instant a commitment is negotiated. presign_sweep_tx below is
+				 * handed channel->channel_asset, so the built sweep stays asset-correct. */
+				in_sats = amount_sat(bitcoin_tx_output_get_amount(
+					channel->last_tx, o).value);
 				found = true;
 				break;
 			}
