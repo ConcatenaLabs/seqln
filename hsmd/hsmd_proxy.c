@@ -553,6 +553,222 @@ static struct primed_req *new_primed_req(const tal_t *ctx, bool is_main,
 	return p;
 }
 
+
+/*~ DURABLE PRIMING (the keyless-restart fix).
+ *
+ * lightningd sends WIRE_HSMD_SETUP_CHANNEL exactly ONCE per channel, when the
+ * channel is opened (dualopend) or spliced (channeld).  A normal hsmd is local
+ * and remembers it forever.  Here the HSM is the user's DEVICE, and a fresh
+ * device instance remembers nothing -- which is why we cache SETUP_CHANNEL and
+ * replay it to every reconnecting device.
+ *
+ * But that cache lived only in this process, so it died with the node.  After a
+ * restart nothing ever re-sent SETUP_CHANNEL (the channel was opened long ago),
+ * so an enforce-policy device correctly refused every commitment signature with
+ * "no tracked channel (setup_channel not seen)".  channeld died on the refusal,
+ * the channel was left with no owning subdaemon, and EVERY outbound payment on
+ * it failed with "First peer not ready" -- permanently, for every pre-existing
+ * channel, after any node restart.
+ *
+ * So the cache has to outlive the process.  These are channel PARAMETERS
+ * (funding outpoint, basepoints, remote funding key, to_self_delay, channel
+ * type) -- the same data already in lightningd's own database, and no key
+ * material -- so persisting them beside the node's other state adds no secret
+ * to disk.  Written atomically (tmp + rename) so a crash mid-write cannot leave
+ * a half-file that would prime a device with garbage.
+ *
+ * Format: 1-byte version, then repeated records of
+ *   u8 is_main | 33B node_id | u64 dbid | u64 capabilities | u32 len | msg
+ * with integers big-endian.
+ */
+#define PRIMING_FILE_VERSION 1
+
+static const char *priming_path(const tal_t *ctx)
+{
+	const char *dir = getenv("SEQLN_PRIMING_DIR");
+	if (!dir || dir[0] == '\0')
+		dir = ".";
+	return path_join(ctx, dir, "hsmd_priming.dat");
+}
+
+static void put_bytes(u8 **buf, const void *src, size_t n)
+{
+	size_t off = tal_bytelen(*buf);
+	tal_resize(buf, off + n);
+	memcpy(*buf + off, src, n);
+}
+
+static void put_u32be(u8 **buf, u32 v)
+{
+	u8 b[4] = { (u8)(v >> 24), (u8)(v >> 16), (u8)(v >> 8), (u8)v };
+	put_bytes(buf, b, sizeof(b));
+}
+
+static void put_u64be(u8 **buf, u64 v)
+{
+	u8 b[8];
+	for (int i = 0; i < 8; i++)
+		b[i] = (u8)(v >> ((7 - i) * 8));
+	put_bytes(buf, b, sizeof(b));
+}
+
+static void append_record(u8 **buf, const struct primed_req *r)
+{
+	u8 m;
+
+	if (!r)
+		return;
+	m = r->is_main ? 1 : 0;
+	put_bytes(buf, &m, 1);
+	put_bytes(buf, &r->id, sizeof(r->id));
+	put_u64be(buf, r->dbid);
+	put_u64be(buf, r->capabilities);
+	put_u32be(buf, (u32)tal_bytelen(r->msg));
+	put_bytes(buf, r->msg, tal_bytelen(r->msg));
+}
+
+static void save_priming(void)
+{
+	u8 *buf;
+	const char *path, *tmp;
+	struct primed_req *r;
+	u64 dbid;
+	int fd;
+	u8 ver = PRIMING_FILE_VERSION;
+
+	if (!signer_listen_mode)
+		return;
+
+	buf = tal_arr(tmpctx, u8, 0);
+	put_bytes(&buf, &ver, 1);
+	if (primed_init)
+		append_record(&buf, primed_init);
+	for (r = uintmap_first(&primed_setup, &dbid); r;
+	     r = uintmap_after(&primed_setup, &dbid))
+		append_record(&buf, r);
+
+	path = priming_path(tmpctx);
+	tmp = tal_fmt(tmpctx, "%s.tmp", path);
+	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0) {
+		status_unusual("hsmd-proxy: cannot write priming cache %s: %s",
+			       tmp, strerror(errno));
+		return;
+	}
+	if (!write_all(fd, buf, tal_bytelen(buf))) {
+		status_unusual("hsmd-proxy: short write to priming cache");
+		close(fd);
+		return;
+	}
+	if (fsync(fd) != 0)
+		status_unusual("hsmd-proxy: fsync of priming cache failed");
+	close(fd);
+	if (rename(tmp, path) != 0)
+		status_unusual("hsmd-proxy: cannot rename priming cache: %s",
+			       strerror(errno));
+}
+
+static bool take_bytes(const u8 **p, size_t *left, void *dst, size_t n)
+{
+	if (*left < n)
+		return false;
+	if (dst)
+		memcpy(dst, *p, n);
+	*p += n;
+	*left -= n;
+	return true;
+}
+
+static bool take_u64be(const u8 **p, size_t *left, u64 *v)
+{
+	u8 b[8];
+
+	if (!take_bytes(p, left, b, sizeof(b)))
+		return false;
+	*v = 0;
+	for (size_t i = 0; i < 8; i++)
+		*v = (*v << 8) | b[i];
+	return true;
+}
+
+/*~ Restore the priming cache written by save_priming.  Called once at startup,
+ * before we serve lightningd, so the FIRST device to attach can be primed for
+ * channels opened in a previous run of this node. */
+static void load_priming(void)
+{
+	const char *path;
+	u8 *raw;
+	const u8 *p;
+	size_t left;
+	u8 ver;
+	int n = 0;
+
+	if (!signer_listen_mode)
+		return;
+
+	path = priming_path(tmpctx);
+	raw = grab_file(tmpctx, path);
+	if (!raw)
+		return;
+	/* grab_file NUL-terminates; the real payload is one byte shorter. */
+	left = tal_bytelen(raw) - 1;
+	p = raw;
+	if (!take_bytes(&p, &left, &ver, 1) || ver != PRIMING_FILE_VERSION) {
+		status_unusual("hsmd-proxy: priming cache version %u unusable;"
+			       " ignoring", ver);
+		return;
+	}
+	while (left > 0) {
+		u8 is_main;
+		struct node_id id;
+		u64 dbid, caps;
+		u8 lenb[4];
+		u32 len;
+		u8 *msg;
+		struct primed_req *old;
+
+		if (!take_bytes(&p, &left, &is_main, 1)
+		    || !take_bytes(&p, &left, &id, sizeof(id))
+		    || !take_u64be(&p, &left, &dbid)
+		    || !take_u64be(&p, &left, &caps)
+		    || !take_bytes(&p, &left, lenb, sizeof(lenb)))
+			break;
+		len = ((u32)lenb[0] << 24) | ((u32)lenb[1] << 16)
+			| ((u32)lenb[2] << 8) | (u32)lenb[3];
+		if (left < len)
+			break;
+		msg = tal_dup_arr(tmpctx, u8, p, len, 0);
+		p += len;
+		left -= len;
+
+		switch (fromwire_peektype(msg)) {
+		case WIRE_HSMD_INIT:
+			tal_free(primed_init);
+			primed_init = new_primed_req(prime_ctx, is_main, &id,
+						     dbid, caps, msg);
+			n++;
+			break;
+		case WIRE_HSMD_SETUP_CHANNEL:
+			old = uintmap_get(&primed_setup, dbid);
+			if (old) {
+				uintmap_del(&primed_setup, dbid);
+				tal_free(old);
+			}
+			uintmap_add(&primed_setup, dbid,
+				    new_primed_req(prime_ctx, is_main, &id,
+						   dbid, caps, msg));
+			n++;
+			break;
+		default:
+			break;
+		}
+	}
+	if (n)
+		status_unusual("hsmd-proxy: restored %d primed request(s) from"
+			       " %s; a reconnecting device can serve channels"
+			       " opened before this restart", n, path);
+}
+
 /*~ Called on the way through forward_to_signer (LISTEN mode only), after a
  * request was ACCEPTED by the device, to cache the ones a reconnecting device
  * would need replayed: the (single) INIT and the latest SETUP_CHANNEL per
@@ -589,8 +805,12 @@ static void remember_priming(bool is_main, const struct node_id *id, u64 dbid,
 		}
 		break;
 	default:
-		break;
+		return;
 	}
+	/*~ The cache must outlive this process: lightningd never re-sends
+	 * SETUP_CHANNEL for an existing channel, so losing it across a restart
+	 * means the device can never sign that channel again. */
+	save_priming();
 }
 
 /*~ Per-op device round-trip deadline (ms).  A device disconnect is normally
@@ -1517,6 +1737,14 @@ int main(int argc, char *argv[])
 		else
 			start_signerd(argv[0]);
 	}
+
+	/*~ Restore the priming cache BEFORE we serve lightningd.  lightningd
+	 * never re-sends SETUP_CHANNEL for a channel opened in an earlier run,
+	 * so without this the first device to attach cannot be primed for any
+	 * pre-existing channel and every commitment signature on it is refused
+	 * ("no tracked channel"), killing channeld and making the channel
+	 * unusable for the rest of the node's life. */
+	load_priming();
 
 	master = new_client(NULL, NULL, NULL, 0,
 			    HSM_PERM_MASTER | HSM_PERM_SIGN_GOSSIP | HSM_PERM_ECDH,
