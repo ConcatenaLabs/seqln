@@ -40,6 +40,11 @@ fn arr33(b: &[u8], what: &str) -> Result<[u8; 33], JsError> {
 #[wasm_bindgen]
 pub struct Signer {
     inner: InnerSigner,
+    /// The reason the LAST request was refused, if it was. A policy refusal and an
+    /// unimplemented message are the same zero-length sentinel on the wire, so without
+    /// this the host cannot tell "I will not sign that, because X" from "I do not know
+    /// that message" — and neither reaches any log.
+    last_reject: Option<String>,
 }
 
 #[wasm_bindgen]
@@ -52,6 +57,7 @@ impl Signer {
         let secret = hsm_secret::parse(hsm_secret_bytes).map_err(|e| JsError::new(&e))?;
         Ok(Signer {
             inner: InnerSigner::new(secret),
+            last_reject: None,
         })
     }
 
@@ -88,6 +94,12 @@ impl Signer {
     /// (`u32 len | hsmd_reply`, a zero-length body being the error sentinel) —
     /// byte-for-byte what the native serve loop writes back. Throws only on a
     /// libhsmd-fatal condition (which closes the transport natively).
+    /// The reason the last request was refused (cleared by the next successful one).
+    #[wasm_bindgen(js_name = lastReject, getter)]
+    pub fn last_reject(&self) -> Option<String> {
+        self.last_reject.clone()
+    }
+
     #[wasm_bindgen(js_name = processFrame)]
     pub fn process_frame(&mut self, frame_bytes: &[u8]) -> Result<Vec<u8>, JsError> {
         let mut rd: &[u8] = frame_bytes;
@@ -96,10 +108,29 @@ impl Signer {
             Ok(None) => return Err(JsError::new("short/empty frame")),
             Err(e) => return Err(JsError::new(&format!("frame decode error: {e}"))),
         };
+        self.last_reject = None;
         let reply: Vec<u8> = match self.inner.handle(&req) {
             Outcome::Reply(bytes) => bytes,
             // Sentinel and (policy) Reject are both the zero-length wire sentinel.
-            Outcome::Sentinel | Outcome::Reject(_) => Vec::new(),
+            //
+            // But the REASON must not die here. Outcome::Reject documents itself as
+            // "the reason is logged so a theft attempt is visible" — and this build
+            // dropped it on the floor, so a refusal reached the node as an anonymous
+            // empty reply. The node then logs only "signerd rejected request", channeld
+            // dies, and every payment on that channel fails with "First peer not ready"
+            // with nothing anywhere saying WHY the signer said no.
+            //
+            // That is the whole security payoff of the signer split rendered mute: a
+            // policy refusal and an unimplemented message look identical. Record it so
+            // the host can surface it (last_reject) and log it.
+            Outcome::Sentinel => {
+                self.last_reject = Some("unimplemented or malformed request".to_string());
+                Vec::new()
+            }
+            Outcome::Reject(reason) => {
+                self.last_reject = Some(reason);
+                Vec::new()
+            }
             Outcome::Fatal(m) => return Err(JsError::new(&format!("fatal: {m}"))),
         };
         let mut out = Vec::with_capacity(4 + reply.len());
