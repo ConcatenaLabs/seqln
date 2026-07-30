@@ -703,9 +703,10 @@ static void load_priming(void)
 	u8 ver;
 	int n = 0;
 
-	if (!signer_listen_mode)
-		return;
-
+	/*~ Deliberately NOT gated on signer_listen_mode: this runs BEFORE the
+	 * signer transport is chosen, because the FIRST device to attach must
+	 * already be primeable.  The file only exists for a listen-mode node, so
+	 * loading it unconditionally is a no-op everywhere else. */
 	path = priming_path(tmpctx);
 	raw = grab_file(tmpctx, path);
 	if (!raw)
@@ -1172,9 +1173,15 @@ static void listen_remote_signer(const char *addr)
 		       host, port, fmt_pubkey(tmpctx, &my_pub),
 		       fmt_pubkey(tmpctx, &signer_listen_pinned));
 
-	/* Bring up the first device (blocks until one authenticates).  Nothing
-	 * is cached yet, so prime_device() is a no-op; the incoming INIT primes. */
-	accept_one_device();
+	/*~ Bring up the first device (blocks until one authenticates), then PRIME
+	 * it.  This used to be a bare accept_one_device() because nothing could be
+	 * cached yet — true when the cache lived only in memory.  Now the cache is
+	 * restored from disk before we get here, and the first device is exactly the
+	 * one that needs it: lightningd re-sends INIT on every boot but NEVER
+	 * re-sends SETUP_CHANNEL for a channel opened in an earlier run, so without
+	 * this the first device serves a node whose channels it does not know, and
+	 * refuses their commitments until something forces a reconnect. */
+	reconnect_device();
 }
 
 /*~ Forward one request to signerd and relay its reply to the client.  This is
@@ -1727,6 +1734,12 @@ int main(int argc, char *argv[])
 	 *  - else SEQLN_SIGNER_ADDR="host:port" => connect() OUT to a REMOTE
 	 *    signer over TCP as the Noise INITIATOR (the phone/desktop topology).
 	 *  - otherwise (default) => fork+exec a LOCAL signerd (trusted socket). */
+	/*~ Restore the priming cache BEFORE the signer comes up.  lightningd never
+	 * re-sends SETUP_CHANNEL for a channel opened in an earlier run, so the
+	 * FIRST device to attach is the one that needs the replay; loading after the
+	 * handshake would leave it serving channels it does not know. */
+	load_priming();
+
 	{
 		const char *listen_addr = getenv("SEQLN_SIGNER_LISTEN");
 		const char *remote_addr = getenv("SEQLN_SIGNER_ADDR");
@@ -1738,13 +1751,6 @@ int main(int argc, char *argv[])
 			start_signerd(argv[0]);
 	}
 
-	/*~ Restore the priming cache BEFORE we serve lightningd.  lightningd
-	 * never re-sends SETUP_CHANNEL for a channel opened in an earlier run,
-	 * so without this the first device to attach cannot be primed for any
-	 * pre-existing channel and every commitment signature on it is refused
-	 * ("no tracked channel"), killing channeld and making the channel
-	 * unusable for the rest of the node's life. */
-	load_priming();
 
 	master = new_client(NULL, NULL, NULL, 0,
 			    HSM_PERM_MASTER | HSM_PERM_SIGN_GOSSIP | HSM_PERM_ECDH,
