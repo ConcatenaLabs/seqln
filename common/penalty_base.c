@@ -55,9 +55,10 @@ void towire_penalty_base(u8 **pptr, const struct penalty_base *pbase)
 	}
 }
 
-void fromwire_penalty_base(const u8 **pptr, size_t *max,
-			   struct penalty_base *pbase)
+struct penalty_base *fromwire_penalty_base(const tal_t *ctx,
+					   const u8 **pptr, size_t *max)
 {
+	struct penalty_base *pbase = tal(ctx, struct penalty_base);
 	u16 num_htlcs;
 
 	pbase->commitment_num = fromwire_u64(pptr, max);
@@ -65,20 +66,18 @@ void fromwire_penalty_base(const u8 **pptr, size_t *max,
 	pbase->outnum = fromwire_u32(pptr, max);
 	pbase->amount = fromwire_amount_sat(pptr, max);
 	num_htlcs = fromwire_u16(pptr, max);
-	/* Phase-B invariant: only the POINTER-form messages (?penalty_base in
-	 * sending_commitsig / got_revoke, where wiregen allocates pbase as its
-	 * own tal object) ever carry htlcs. The ARRAY form (channeld_init)
-	 * passes a MID-ARRAY element pointer, which is NOT a tal parent -
-	 * tal_arr on it aborts in check_bounds, which crashed channeld at
-	 * init, deterministically, on every channel with a stored penalty
-	 * base (the array form's source is the wallet DB, which stores no
-	 * penalty_htlc rows yet, so it is always htlc-less). Allocate only
-	 * when htlcs are present; tal_count(NULL) == 0 keeps every consumer
-	 * correct. Phase C (DB penalty_htlc rows) must switch channeld_init
-	 * to the ctx-taking pointer pattern BEFORE populating htlcs here. */
+	/* pbase is now ALWAYS its own tal object (penalty_base is a wiregen
+	 * varsize type), so the htlcs have a real tal parent in every message
+	 * form.  The old by-value signature handed the channeld_init ARRAY
+	 * form MID-ARRAY element pointers here, and tal_arr on one aborted in
+	 * check_bounds: channeld died AT INIT, deterministically, on every
+	 * channel whose DB held a penalty base with stored htlcs (any channel
+	 * that saw a payment since the watchtower began storing them) -- a
+	 * zombie CHANNELD_NORMAL that rejected every HTLC.  NULL when empty;
+	 * tal_count(NULL) == 0 keeps every consumer correct. */
 	if (num_htlcs == 0) {
 		pbase->htlcs = NULL;
-		return;
+		return pbase;
 	}
 	pbase->htlcs = tal_arr(pbase, struct penalty_htlc, num_htlcs);
 	for (size_t i = 0; i < num_htlcs; i++) {
@@ -88,4 +87,5 @@ void fromwire_penalty_base(const u8 **pptr, size_t *max,
 		pbase->htlcs[i].cltv_expiry = fromwire_u32(pptr, max);
 		pbase->htlcs[i].remote_offered = fromwire_bool(pptr, max);
 	}
+	return pbase;
 }

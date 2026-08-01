@@ -6899,7 +6899,7 @@ static void init_channel(struct peer *peer)
 	struct height_states *blockheight_states;
 	u32 minimum_depth, lease_expiry;
 	struct secret last_remote_per_commit_secret;
-	struct penalty_base *pbases;
+	struct penalty_base **pbases;
 	struct channel_type *channel_type;
 	bool found_locked_inflight;
 
@@ -6994,12 +6994,10 @@ static void init_channel(struct peer *peer)
 	 * extra allocations later. */
 	peer->pbases = tal_arr(peer, struct penalty_base *, 0);
 	for (size_t i=0; i<tal_count(pbases); i++) {
-		struct penalty_base *pb = tal_dup(peer, struct penalty_base,
-						  &pbases[i]);
-		/* tal_dup is a shallow copy; re-parent the htlcs array onto
-		 * the new pbase (the source array is freed below). */
-		pb->htlcs = tal_dup_talarr(pb, struct penalty_htlc,
-					   pbases[i].htlcs);
+		/* Wire elements are tal objects parented on the incoming
+		 * array (penalty_base is a wiregen varsize type); steal each
+		 * (htlcs ride along, parented on the element). */
+		struct penalty_base *pb = tal_steal(peer, pbases[i]);
 		tal_arr_expand(&peer->pbases, pb);
 	}
 	tal_free(pbases);
