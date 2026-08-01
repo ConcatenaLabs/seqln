@@ -245,6 +245,7 @@ class Type(FieldSet):
         'feature_set',
         'onionmsg_hop',
         'blinded_path',
+        'penalty_base',
         'route_hop',
         'tx_parts',
         'wally_psbt',

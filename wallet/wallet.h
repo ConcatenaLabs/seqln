@@ -1407,7 +1407,7 @@ void wallet_penalty_base_add(struct wallet *w, u64 chan_id,
  * This list should stay relatively small since we remove items from it as we
  * get revocations. We retrieve this list whenever we start a new `channeld`.
  */
-struct penalty_base *wallet_penalty_base_load_for_channel(const tal_t *ctx,
+struct penalty_base **wallet_penalty_base_load_for_channel(const tal_t *ctx,
 							  struct wallet *w,
 							  u64 chan_id);
 

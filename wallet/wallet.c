@@ -6040,12 +6040,16 @@ void wallet_penalty_base_add(struct wallet *w, u64 chan_id,
 	}
 }
 
-struct penalty_base *wallet_penalty_base_load_for_channel(const tal_t *ctx,
-							  struct wallet *w,
-							  u64 chan_id)
+struct penalty_base **wallet_penalty_base_load_for_channel(const tal_t *ctx,
+							   struct wallet *w,
+							   u64 chan_id)
 {
 	struct db_stmt *stmt;
-	struct penalty_base *res = tal_arr(ctx, struct penalty_base, 0);
+	/* An array of POINTERS, each element (and its htlcs) a tal object
+	 * parented on the array — the shape towire_channeld_init consumes now
+	 * that penalty_base is a wiregen varsize type (the flat struct-array
+	 * form could not tal-parent the per-element htlcs). */
+	struct penalty_base **res = tal_arr(ctx, struct penalty_base *, 0);
 	stmt = db_prepare_v2(
 		w->db,
 		SQL("SELECT commitnum, txid, outnum, amount "
@@ -6056,25 +6060,25 @@ struct penalty_base *wallet_penalty_base_load_for_channel(const tal_t *ctx,
 	db_query_prepared(stmt);
 
 	while (db_step(stmt)) {
-		struct penalty_base pb;
-		pb.commitment_num = db_col_u64(stmt, "commitnum");
-		db_col_txid(stmt, "txid", &pb.txid);
-		pb.outnum = db_col_int(stmt, "outnum");
-		pb.amount = db_col_amount_sat(stmt, "amount");
+		struct penalty_base *pb = tal(res, struct penalty_base);
+		pb->commitment_num = db_col_u64(stmt, "commitnum");
+		db_col_txid(stmt, "txid", &pb->txid);
+		pb->outnum = db_col_int(stmt, "outnum");
+		pb->amount = db_col_amount_sat(stmt, "amount");
 		/* htlcs filled in a second pass below (can't nest a query on the
 		 * same stmt while stepping it). */
-		pb.htlcs = NULL;
+		pb->htlcs = NULL;
 		tal_arr_expand(&res, pb);
 	}
 	tal_free(stmt);
 
 	/* Watchtower Phase E (seam #4): rehydrate each pbase's per-HTLC vector
 	 * from penalty_htlcs so steal_htlc justice covers states revoked before
-	 * this process started. res indices are stable (not expanded here); the
-	 * htlc array is allocated off res so its lifetime matches the return. */
+	 * this process started. Each htlc array is allocated off ITS pbase, so
+	 * the pair travels (and frees) as one object. */
 	for (size_t i = 0; i < tal_count(res); i++) {
 		struct db_stmt *hstmt;
-		struct penalty_htlc *htlcs = tal_arr(res, struct penalty_htlc, 0);
+		struct penalty_htlc *htlcs = tal_arr(res[i], struct penalty_htlc, 0);
 
 		hstmt = db_prepare_v2(
 			w->db,
@@ -6083,7 +6087,7 @@ struct penalty_base *wallet_penalty_base_load_for_channel(const tal_t *ctx,
 			    "FROM penalty_htlcs "
 			    "WHERE channel_id = ? AND commitnum = ?"));
 		db_bind_u64(hstmt, chan_id);
-		db_bind_u64(hstmt, res[i].commitment_num);
+		db_bind_u64(hstmt, res[i]->commitment_num);
 		db_query_prepared(hstmt);
 
 		while (db_step(hstmt)) {
@@ -6096,7 +6100,7 @@ struct penalty_base *wallet_penalty_base_load_for_channel(const tal_t *ctx,
 			tal_arr_expand(&htlcs, h);
 		}
 		tal_free(hstmt);
-		res[i].htlcs = htlcs;
+		res[i]->htlcs = htlcs;
 	}
 	return res;
 }

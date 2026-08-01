@@ -34,7 +34,8 @@ struct penalty_base {
 	/* The amount of the remote commitment's "to-local" output. */
 	struct amount_sat amount;
 	/* The remote commitment's non-dust HTLC outputs (for steal_htlc
-	 * justice).  Always a valid (possibly empty) tal array. */
+	 * justice).  NULL when empty (tal_count(NULL) == 0), else a tal array
+	 * parented on this penalty_base. */
 	struct penalty_htlc *htlcs;
 };
 
@@ -53,7 +54,10 @@ void penalty_base_add_htlc(struct penalty_base *pbase,
 			   bool remote_offered);
 
 void towire_penalty_base(u8 **pptr, const struct penalty_base *pbase);
-void fromwire_penalty_base(const u8 **ptr, size_t *max,
-			   struct penalty_base *pbase);
+/* Wiregen varsize type: pbase (and its htlcs) are allocated off ctx, so the
+ * ARRAY form (channeld_init) gets per-element tal objects parented on the
+ * array instead of mid-array element pointers that cannot parent the htlcs. */
+struct penalty_base *fromwire_penalty_base(const tal_t *ctx,
+					   const u8 **ptr, size_t *max);
 
 #endif /* LIGHTNING_COMMON_PENALTY_BASE_H */

@@ -1739,7 +1739,7 @@ bool peer_start_channeld(struct channel *channel,
 	struct lightningd *ld = channel->peer->ld;
 	const struct config *cfg = &ld->config;
 	struct secret last_remote_per_commit_secret;
-	struct penalty_base *pbases;
+	struct penalty_base **pbases;
 	u32 feerate_splice, min_feerate, max_feerate, curr_blockheight;
 	struct channel_inflight *inflight;
 	struct inflight **inflights;
@@ -1960,7 +1960,8 @@ bool peer_start_channeld(struct channel *channel,
 				       ld->dev_disable_commit == -1
 					     ? NULL
 					     : (u32 *)&ld->dev_disable_commit,
-				       pbases,
+				       cast_const2(const struct penalty_base **,
+						   pbases),
 				       cast_const2(const struct inflight **,
 						   inflights),
 				       *channel->alias[LOCAL]);
