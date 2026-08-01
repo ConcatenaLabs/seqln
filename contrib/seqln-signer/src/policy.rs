@@ -145,6 +145,125 @@ impl ChannelStore {
     pub fn get(&self, node_id: &[u8; 33], dbid: u64) -> Option<&ChannelState> {
         self.map.get(&(*node_id, dbid))
     }
+    pub fn contains(&self, node_id: &[u8; 33], dbid: u64) -> bool {
+        self.map.contains_key(&(*node_id, dbid))
+    }
+    /// Remove a channel (FORGET_CHANNEL). Returns whether anything was removed,
+    /// so the caller knows to re-persist.
+    pub fn remove(&mut self, node_id: &[u8; 33], dbid: u64) -> bool {
+        self.map.remove(&(*node_id, dbid)).is_some()
+    }
+    /// Insert only if absent (blob import: live state from a real setup_channel
+    /// this session always outranks a persisted snapshot). Returns whether the
+    /// entry was added.
+    pub fn insert_if_absent(&mut self, node_id: [u8; 33], dbid: u64, st: ChannelState) -> bool {
+        use std::collections::hash_map::Entry;
+        match self.map.entry((node_id, dbid)) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(v) => {
+                v.insert(st);
+                true
+            }
+        }
+    }
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+    /// Entries in key order, so the encoding (and therefore its MAC) is
+    /// deterministic for a given store.
+    pub fn entries_sorted(&self) -> Vec<(&([u8; 33], u64), &ChannelState)> {
+        let mut v: Vec<_> = self.map.iter().collect();
+        v.sort_by(|a, b| a.0.cmp(b.0));
+        v
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Channel-store persistence encoding.
+//
+// The store is IN-MEMORY state built from `setup_channel`, which CLN sends
+// only at channel CREATION (openingd/dualopend) — never again for the life of
+// the channel. A restarted signer that has lost it cannot validate, so enforce
+// mode refuses every commitment sign for the channel, `channeld` dies at init,
+// and the channel's funds are unspendable (even a close needs a signature).
+// The host therefore persists the store across signer restarts: this is the
+// canonical byte encoding. It carries NO secrets (funding outpoint + the
+// PEER's public basepoints only); integrity comes from the seed-derived MAC
+// the dispatcher wraps around it (a foreign or tampered blob fails import).
+// ---------------------------------------------------------------------------
+
+pub const CHSTORE_MAGIC: [u8; 4] = *b"SQCH";
+pub const CHSTORE_VERSION: u8 = 1;
+/// node_id(33) dbid(8) sats(8) txid(32) txout(2) local_delay(2) remote_delay(2)
+/// 5 pubkeys(165) static_remotekey(1) anchors(1)
+pub const CHSTORE_ENTRY_LEN: usize = 33 + 8 + 8 + 32 + 2 + 2 + 2 + 33 * 5 + 1 + 1;
+
+/// Encode the whole store (deterministically; no MAC — the dispatcher owns
+/// keying and appends it).
+pub fn encode_channel_store(store: &ChannelStore) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + 1 + 4 + store.len() * CHSTORE_ENTRY_LEN);
+    out.extend_from_slice(&CHSTORE_MAGIC);
+    out.push(CHSTORE_VERSION);
+    out.extend_from_slice(&(store.len() as u32).to_le_bytes());
+    for ((node_id, dbid), st) in store.entries_sorted() {
+        out.extend_from_slice(node_id);
+        out.extend_from_slice(&dbid.to_le_bytes());
+        out.extend_from_slice(&st.funding_sats.to_le_bytes());
+        out.extend_from_slice(&st.funding_txid);
+        out.extend_from_slice(&st.funding_txout.to_le_bytes());
+        out.extend_from_slice(&st.local_to_self_delay.to_le_bytes());
+        out.extend_from_slice(&st.remote_to_self_delay.to_le_bytes());
+        out.extend_from_slice(&st.remote_revocation);
+        out.extend_from_slice(&st.remote_payment);
+        out.extend_from_slice(&st.remote_htlc);
+        out.extend_from_slice(&st.remote_delayed);
+        out.extend_from_slice(&st.remote_funding);
+        out.push(st.option_static_remotekey as u8);
+        out.push(st.option_anchors as u8);
+    }
+    out
+}
+
+/// Decode a channel-store payload (the MAC must already have been verified
+/// and stripped by the caller).
+pub fn decode_channel_store(
+    bytes: &[u8],
+) -> Result<Vec<(([u8; 33], u64), ChannelState)>, String> {
+    if bytes.len() < 9 || bytes[..4] != CHSTORE_MAGIC {
+        return Err("not a channel-store blob (bad magic)".to_string());
+    }
+    if bytes[4] != CHSTORE_VERSION {
+        return Err(format!("unsupported channel-store version {}", bytes[4]));
+    }
+    let count = u32::from_le_bytes(bytes[5..9].try_into().unwrap()) as usize;
+    if bytes.len() != 9 + count * CHSTORE_ENTRY_LEN {
+        return Err("channel-store blob length does not match its count".to_string());
+    }
+    let mut out = Vec::with_capacity(count);
+    let mut o = 9;
+    let arr33 = |b: &[u8]| -> [u8; 33] { b.try_into().unwrap() };
+    for _ in 0..count {
+        let e = &bytes[o..o + CHSTORE_ENTRY_LEN];
+        let node_id = arr33(&e[0..33]);
+        let dbid = u64::from_le_bytes(e[33..41].try_into().unwrap());
+        let st = ChannelState {
+            funding_sats: u64::from_le_bytes(e[41..49].try_into().unwrap()),
+            funding_txid: e[49..81].try_into().unwrap(),
+            funding_txout: u16::from_le_bytes(e[81..83].try_into().unwrap()),
+            local_to_self_delay: u16::from_le_bytes(e[83..85].try_into().unwrap()),
+            remote_to_self_delay: u16::from_le_bytes(e[85..87].try_into().unwrap()),
+            remote_revocation: arr33(&e[87..120]),
+            remote_payment: arr33(&e[120..153]),
+            remote_htlc: arr33(&e[153..186]),
+            remote_delayed: arr33(&e[186..219]),
+            remote_funding: arr33(&e[219..252]),
+            option_static_remotekey: e[252] != 0,
+            option_anchors: e[253] != 0,
+        };
+        out.push(((node_id, dbid), st));
+        o += CHSTORE_ENTRY_LEN;
+    }
+    Ok(out)
 }
 
 /// Decode a BOLT/BOLT channel_type feature bitfield (BOLT-1 big-endian: the

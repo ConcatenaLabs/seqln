@@ -77,6 +77,13 @@ pub struct Signer {
     /// by the enforce-mode output-ownership check on the sweep/penalty handlers.
     /// Derived lazily on first use (a pure function of the seed).
     own_sweep_scripts: std::cell::OnceCell<std::collections::HashSet<Vec<u8>>>,
+    /// The channel store changed (setup/forget/arm) since the host last asked
+    /// (`take_channels_dirty`) — the host's cue to re-persist `export_channels`.
+    store_dirty: bool,
+    /// The (peer node_id, dbid) of the most recent "no tracked channel"
+    /// refusal, for the host's one-time re-arm recovery (`take_last_untracked`).
+    /// A Cell because the validation paths that detect it take &self.
+    last_untracked: std::cell::Cell<Option<([u8; 33], u64)>>,
 }
 
 impl Signer {
@@ -96,6 +103,8 @@ impl Signer {
             store: ChannelStore::new(),
             policy,
             own_sweep_scripts: std::cell::OnceCell::new(),
+            store_dirty: false,
+            last_untracked: std::cell::Cell::new(None),
         }
     }
 
@@ -194,7 +203,12 @@ impl Signer {
                 self.record_setup_channel(req);
                 Outcome::Reply(empty_reply(msg::HSMD_SETUP_CHANNEL_REPLY))
             }
-            msg::HSMD_FORGET_CHANNEL => Outcome::Reply(empty_reply(msg::HSMD_FORGET_CHANNEL_REPLY)),
+            msg::HSMD_FORGET_CHANNEL => {
+                // Drop the channel from the store (and so from the next
+                // persisted blob) — a forgotten channel must not linger.
+                self.forget_channel(req);
+                Outcome::Reply(empty_reply(msg::HSMD_FORGET_CHANNEL_REPLY))
+            }
             msg::HSMD_LOCK_OUTPOINT => Outcome::Reply(empty_reply(msg::HSMD_LOCK_OUTPOINT_REPLY)),
             msg::HSMD_CHECK_OUTPOINT => {
                 // handle_check_outpoint always approves: is_buried = true.
@@ -357,7 +371,134 @@ impl Signer {
         // enforce mode its commitment signs are then refused (the safe default).
         if let Some(st) = parse_setup_channel(&req.hsmd_msg) {
             self.store.insert(req.node_id, req.dbid, st);
+            self.store_dirty = true;
         }
+    }
+
+    /// Drop a channel on FORGET_CHANNEL. The peer id + dbid are in the MESSAGE
+    /// (this arrives on lightningd's main fd, not a per-channel client fd).
+    fn forget_channel(&mut self, req: &Request) {
+        let mut r = wire::Reader::new(&req.hsmd_msg);
+        let _ = r.u16();
+        if let (Some(node_id), Some(dbid)) = (r.arr33(), r.u64()) {
+            if self.store.remove(&node_id, dbid) {
+                self.store_dirty = true;
+            }
+        }
+    }
+
+    /// Record + return the standard refusal for a channel the store does not
+    /// know, so the host can drive a one-time re-arm (`take_last_untracked`).
+    fn untracked(&self, peer_id: &[u8; 33], dbid: u64) -> String {
+        self.last_untracked.set(Some((*peer_id, dbid)));
+        "no tracked channel (setup_channel not seen)".to_string()
+    }
+
+    // =================================================================
+    // Channel-store persistence + recovery (the host's restart contract).
+    //
+    // `setup_channel` is sent ONCE, at channel creation; a signer restart
+    // therefore orphans every live channel — enforce mode refuses all its
+    // commitment signs, channeld dies at init, and the funds are frozen
+    // (closing needs a signature too). The host persists the store across
+    // restarts: export after any frame that dirtied it, import on boot.
+    // The blob is authenticated by an HMAC keyed from the SEED (domain-
+    // separated, no key material inside), so a tampered or foreign blob
+    // fails import instead of poisoning validation.
+    // =================================================================
+
+    fn chstore_mac_key(&self) -> Vec<u8> {
+        kernel::hkdf_sha256(
+            32,
+            b"seqln-signer chstore mac v1",
+            &self.secret.seed,
+            b"",
+        )
+    }
+
+    fn chstore_mac(&self, payload: &[u8]) -> [u8; 32] {
+        use hmac::{Hmac, Mac};
+        let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(&self.chstore_mac_key())
+            .expect("hmac accepts any key length");
+        mac.update(payload);
+        mac.finalize().into_bytes().into()
+    }
+
+    /// The persistable channel store: canonical payload + seed-keyed MAC.
+    /// Contains no secrets (funding outpoints + PEER public basepoints only).
+    pub fn export_channels(&self) -> Vec<u8> {
+        let mut out = policy::encode_channel_store(&self.store);
+        let mac = self.chstore_mac(&out);
+        out.extend_from_slice(&mac);
+        out
+    }
+
+    /// Restore a persisted channel store. Entries already tracked live (a real
+    /// setup_channel this session) are NOT overwritten. Returns how many
+    /// entries were added; a bad MAC or malformed blob is refused whole.
+    pub fn import_channels(&mut self, bytes: &[u8]) -> Result<u32, String> {
+        if bytes.len() < 32 {
+            return Err("channel-store blob too short".to_string());
+        }
+        let (payload, mac) = bytes.split_at(bytes.len() - 32);
+        // Constant-time-ness is irrelevant here (the key holder verifies its
+        // own blob), but use the Mac verify anyway.
+        {
+            use hmac::{Hmac, Mac};
+            let mut m = <Hmac<sha2::Sha256> as Mac>::new_from_slice(&self.chstore_mac_key())
+                .expect("hmac accepts any key length");
+            m.update(payload);
+            m.verify_slice(mac)
+                .map_err(|_| "channel-store MAC mismatch (foreign or tampered blob)".to_string())?;
+        }
+        let entries = policy::decode_channel_store(payload)?;
+        let mut added = 0u32;
+        for ((node_id, dbid), st) in entries {
+            if self.store.insert_if_absent(node_id, dbid, st) {
+                added += 1;
+            }
+        }
+        if added > 0 {
+            self.store_dirty = true;
+        }
+        Ok(added)
+    }
+
+    /// One-time recovery: track a channel from parameters the host read off
+    /// the NODE (listpeerchannels) after the persisted blob was lost. Trust-
+    /// equivalent to `setup_channel` itself (which also comes via the node);
+    /// refuses to overwrite a channel that is already tracked, so a live
+    /// baseline can never be replaced through this path. `funding_txid` is in
+    /// INTERNAL byte order (the caller reverses a display-order txid).
+    #[allow(clippy::too_many_arguments)]
+    pub fn arm_channel(
+        &mut self,
+        node_id: [u8; 33],
+        dbid: u64,
+        st: ChannelState,
+    ) -> Result<bool, String> {
+        if self.store.contains(&node_id, dbid) {
+            return Ok(false);
+        }
+        self.store.insert(node_id, dbid, st);
+        self.store_dirty = true;
+        Ok(true)
+    }
+
+    /// Is this (peer, dbid) tracked? (Host-side reconcile/diagnostics.)
+    pub fn has_channel(&self, node_id: &[u8; 33], dbid: u64) -> bool {
+        self.store.contains(node_id, dbid)
+    }
+
+    /// The store changed since last asked (take-and-clear).
+    pub fn take_channels_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.store_dirty)
+    }
+
+    /// The most recent "no tracked channel" refusal (take-and-clear), as the
+    /// host's cue to fetch that channel's parameters and `arm_channel`.
+    pub fn take_last_untracked(&mut self) -> Option<([u8; 33], u64)> {
+        self.last_untracked.take()
     }
 
     /// SIGN_COMMITMENT_TX (5): OUR own commitment. Validate (no-HTLC subset)
@@ -398,7 +539,7 @@ impl Signer {
         let st = self
             .store
             .get(&req.node_id, req.dbid)
-            .ok_or_else(|| "no tracked channel (setup_channel not seen)".to_string())?;
+            .ok_or_else(|| self.untracked(&req.node_id, req.dbid))?;
         let (bt, remote_funding, remote_per_commit, htlcs) =
             parse_remote_commitment(&req.hsmd_msg)
                 .ok_or_else(|| "malformed request".to_string())?;
@@ -423,7 +564,7 @@ impl Signer {
         let st = self
             .store
             .get(&req.node_id, req.dbid)
-            .ok_or_else(|| "no tracked channel (setup_channel not seen)".to_string())?;
+            .ok_or_else(|| self.untracked(&req.node_id, req.dbid))?;
         let (bt, htlcs, commit_num) =
             parse_local_commitment(&req.hsmd_msg).ok_or_else(|| "malformed request".to_string())?;
         let s = self.kernel().channel_secrets(&req.node_id, req.dbid);
@@ -448,7 +589,7 @@ impl Signer {
         let st = self
             .store
             .get(&peer_id, dbid)
-            .ok_or_else(|| "no tracked channel (setup_channel not seen)".to_string())?;
+            .ok_or_else(|| self.untracked(&peer_id, dbid))?;
         let s = self.kernel().channel_secrets(&peer_id, dbid);
         let point = self.kernel().per_commit_point_at(&s.shaseed, commit_num);
         policy::validate_local_commitment_no_htlcs(self.kernel(), &peer_id, dbid, st, &point, &bt.tx)
@@ -587,7 +728,7 @@ impl Signer {
             Some(st) => {
                 crate::policy::expected_htlc_tx_to_local(self.kernel(), node_id, dbid, st, side, point)
             }
-            None => Err("no tracked channel (setup_channel not seen)".to_string()),
+            None => Err(self.untracked(node_id, dbid)),
         };
         let spk = match expected {
             Ok(spk) => spk,

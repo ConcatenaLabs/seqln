@@ -125,6 +125,20 @@ export class SeqlnSigner {
     // onRequest({seq,type,name,replyBytes,rejected}).
     this.onStatus = opts.onStatus || null;
     this.onRequest = opts.onRequest || null;
+    // Channel-store persistence (the restart contract). CLN sends setup_channel
+    // ONCE, at channel creation — a fresh wasm instance (any page reload) has
+    // lost every channel, enforce mode then refuses all their commitment signs,
+    // channeld dies at init and the channel funds are FROZEN (closing needs a
+    // signature too). Pass `channelStore` = { load(): bytes|null, save(bytes) }
+    // (both may be async) and the SDK restores on construction and re-persists
+    // after any frame that changed the store. The blob carries no secrets and
+    // is MAC'd to the seed, so a foreign/tampered blob fails import harmlessly.
+    this._chStore = opts.channelStore || null;
+    // Re-arm cue: fires with { peerId, dbid } when the signer refused a request
+    // for a channel it does not track (persisted blob lost/predates the fix).
+    // The host fetches that channel's parameters off the node and calls
+    // armChannel() — after which the next channeld restart succeeds.
+    this.onUntracked = opts.onUntracked || null;
     // TEST-ONLY hook (opt-in; null in production). A Set of hsmd wire types to
     // reject ONCE each: the first time such a type is seen the serve loop sends
     // the zero-length error sentinel instead of the wasm reply, then serves it
@@ -137,13 +151,68 @@ export class SeqlnSigner {
   // source (Node: pass the .wasm bytes; browser: omit).
   static async fromMnemonic(mnemonic, opts = {}) {
     await ensureWasm(opts.wasm);
-    return new SeqlnSigner(Signer.fromMnemonic(mnemonic.trim()), opts);
+    const s = new SeqlnSigner(Signer.fromMnemonic(mnemonic.trim()), opts);
+    await s._restoreChannels();
+    return s;
   }
   // Build from raw hsm_secret bytes (the on-disk `32 zero bytes || mnemonic`).
   static async fromHsmSecret(bytes, opts = {}) {
     await ensureWasm(opts.wasm);
-    return new SeqlnSigner(new Signer(hexToBytes(bytes)), opts);
+    const s = new SeqlnSigner(new Signer(hexToBytes(bytes)), opts);
+    await s._restoreChannels();
+    return s;
   }
+
+  // ---- channel-store persistence (see the constructor note) ----------------
+  async _restoreChannels() {
+    if (!this._chStore || !this._chStore.load) return;
+    try {
+      const blob = await this._chStore.load();
+      if (blob && blob.length) {
+        const n = this._inner.importChannels(blob instanceof Uint8Array ? blob : new Uint8Array(blob));
+        if (n) console.log(`seqln-signer: restored ${n} channel(s) from the persisted store`);
+      }
+    } catch (e) {
+      // A bad blob must never block the signer: it is refused whole (MAC) and
+      // the re-arm cue (onUntracked) recovers the channels off the node.
+      console.warn('seqln-signer: persisted channel store not restored:', e && e.message || e);
+    }
+  }
+  _persistChannels() {
+    if (!this._chStore || !this._chStore.save) return;
+    try {
+      if (this._inner.takeChannelsDirty()) this._chStore.save(this._inner.exportChannels());
+    } catch (e) {
+      console.warn('seqln-signer: channel store not persisted:', e && e.message || e);
+    }
+  }
+  _emitUntracked() {
+    if (!this.onUntracked) return;
+    const u = this._inner.takeLastUntracked();
+    if (!u) return;
+    const peerId = bytesToHex(u.subarray(0, 33));
+    const dv = new DataView(u.buffer, u.byteOffset + 33, 8);
+    const dbid = Number(dv.getBigUint64(0, true));
+    try { this.onUntracked({ peerId, dbid }); } catch {}
+  }
+
+  // One-time recovery: track a channel from `listpeerchannels` data after the
+  // persisted store was lost. Hex strings throughout; fundingTxid in DISPLAY
+  // order (as the RPC shows it). Returns false if the channel was already
+  // tracked (never overwrites). Persists on success.
+  armChannel({ peerId, dbid, fundingSats, fundingTxid, fundingOutnum,
+               localToSelfDelay, remoteToSelfDelay,
+               revocation, payment, htlc, delayed, funding,
+               staticRemotekey = true, anchors = false }) {
+    const added = this._inner.armChannel(
+      hexToBytes(peerId), BigInt(dbid), BigInt(fundingSats), hexToBytes(fundingTxid),
+      fundingOutnum, localToSelfDelay, remoteToSelfDelay,
+      hexToBytes(revocation), hexToBytes(payment), hexToBytes(htlc),
+      hexToBytes(delayed), hexToBytes(funding), staticRemotekey, anchors);
+    if (added) this._persistChannels();
+    return added;
+  }
+  hasChannel(peerId, dbid) { return this._inner.hasChannel(hexToBytes(peerId), BigInt(dbid)); }
   // Compute the transport pubkey a host must pin for a given device privkey,
   // without constructing a signer (handy for provisioning UIs).
   static async devicePubkey(privkey, opts = {}) {
@@ -274,6 +343,10 @@ export class SeqlnSigner {
               this.onRequest({ seq, type, name: hsmdName(type), replyBytes: reply.length - 4, rejected: reply.length === 4 });
             } catch {}
           }
+          // Persist the channel store if this frame changed it (setup/forget),
+          // and surface any untracked-channel refusal for the re-arm flow.
+          this._persistChannels();
+          this._emitUntracked();
           ws.send(noise.encrypt(reply));
           if (closed) break;
         }

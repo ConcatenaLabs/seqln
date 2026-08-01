@@ -23,7 +23,7 @@ use seqln_signer::dispatch::{Outcome, Signer as InnerSigner};
 use seqln_signer::frame;
 use seqln_signer::hsm_secret;
 use seqln_signer::noise::{self, Initiator, Transport};
-use seqln_signer::policy::Policy;
+use seqln_signer::policy::{ChannelState, Policy};
 use wasm_bindgen::prelude::*;
 
 fn arr32(b: &[u8], what: &str) -> Result<[u8; 32], JsError> {
@@ -136,6 +136,103 @@ impl Signer {
         let mut out = Vec::with_capacity(4 + reply.len());
         frame::write_reply(&mut out, &reply).expect("write to Vec never fails");
         Ok(out)
+    }
+
+    // =====================================================================
+    // Channel-store persistence + recovery (the host's restart contract).
+    //
+    // `setup_channel` is sent ONCE, at channel creation. A reloaded page (a
+    // fresh wasm instance) has therefore lost every channel, enforce mode
+    // refuses all their commitment signs, channeld dies at init, and the
+    // channel funds are frozen — closing needs a signature too. The host
+    // persists `exportChannels` whenever `takeChannelsDirty` says so and
+    // feeds it back to `importChannels` on boot. The blob carries no secrets
+    // and is authenticated by a seed-derived MAC, so a tampered or foreign
+    // blob fails import instead of poisoning validation.
+    // =====================================================================
+
+    /// The persistable channel store (canonical payload + seed-keyed MAC).
+    #[wasm_bindgen(js_name = exportChannels)]
+    pub fn export_channels(&self) -> Vec<u8> {
+        self.inner.export_channels()
+    }
+
+    /// Restore a persisted channel store. Live entries are never overwritten;
+    /// returns how many were added. Throws on a bad MAC / malformed blob.
+    #[wasm_bindgen(js_name = importChannels)]
+    pub fn import_channels(&mut self, blob: &[u8]) -> Result<u32, JsError> {
+        self.inner.import_channels(blob).map_err(|e| JsError::new(&e))
+    }
+
+    /// The store changed since last asked (take-and-clear) — the cue to
+    /// persist `exportChannels`.
+    #[wasm_bindgen(js_name = takeChannelsDirty)]
+    pub fn take_channels_dirty(&mut self) -> bool {
+        self.inner.take_channels_dirty()
+    }
+
+    /// The (peer node_id 33 bytes || dbid 8 bytes LE) of the most recent
+    /// "no tracked channel" refusal, take-and-clear; null when none. The
+    /// host's cue to fetch that channel off the node and `armChannel` it.
+    #[wasm_bindgen(js_name = takeLastUntracked)]
+    pub fn take_last_untracked(&mut self) -> Option<Vec<u8>> {
+        self.inner.take_last_untracked().map(|(node_id, dbid)| {
+            let mut v = Vec::with_capacity(41);
+            v.extend_from_slice(&node_id);
+            v.extend_from_slice(&dbid.to_le_bytes());
+            v
+        })
+    }
+
+    /// Is this (peer, dbid) tracked?
+    #[wasm_bindgen(js_name = hasChannel)]
+    pub fn has_channel(&self, node_id: &[u8], dbid: u64) -> Result<bool, JsError> {
+        Ok(self.inner.has_channel(&arr33(node_id, "node_id")?, dbid))
+    }
+
+    /// One-time recovery: track a channel from parameters read off the NODE
+    /// (`listpeerchannels`) after the persisted blob was lost — trust-
+    /// equivalent to `setup_channel`, which also comes via the node. Refuses
+    /// to overwrite a tracked channel (returns false). `funding_txid` is the
+    /// DISPLAY-order 32 bytes (as RPC JSON shows it); reversed internally.
+    #[wasm_bindgen(js_name = armChannel)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn arm_channel(
+        &mut self,
+        node_id: &[u8],
+        dbid: u64,
+        funding_sats: u64,
+        funding_txid: &[u8],
+        funding_txout: u16,
+        local_to_self_delay: u16,
+        remote_to_self_delay: u16,
+        remote_revocation: &[u8],
+        remote_payment: &[u8],
+        remote_htlc: &[u8],
+        remote_delayed: &[u8],
+        remote_funding: &[u8],
+        option_static_remotekey: bool,
+        option_anchors: bool,
+    ) -> Result<bool, JsError> {
+        let mut txid = arr32(funding_txid, "funding_txid")?;
+        txid.reverse(); // display -> internal byte order (as setup_channel carries it)
+        let st = ChannelState {
+            funding_sats,
+            funding_txid: txid,
+            funding_txout,
+            local_to_self_delay,
+            remote_to_self_delay,
+            remote_revocation: arr33(remote_revocation, "remote_revocation")?,
+            remote_payment: arr33(remote_payment, "remote_payment")?,
+            remote_htlc: arr33(remote_htlc, "remote_htlc")?,
+            remote_delayed: arr33(remote_delayed, "remote_delayed")?,
+            remote_funding: arr33(remote_funding, "remote_funding")?,
+            option_static_remotekey,
+            option_anchors,
+        };
+        self.inner
+            .arm_channel(arr33(node_id, "node_id")?, dbid, st)
+            .map_err(|e| JsError::new(&e))
     }
 }
 
