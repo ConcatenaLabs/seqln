@@ -7063,6 +7063,55 @@ static void init_channel(struct peer *peer)
 
 	update_view_from_inflights(peer);
 
+	/*~ RE-PRIME THE SIGNER WITH THIS CHANNEL, EVERY TIME WE START.
+	 *
+	 * A validating signer needs the channel's parameters (funding outpoint,
+	 * the PEER's basepoints + funding key, both to_self_delays, the channel
+	 * type) to check what it is asked to sign.  It learns them from
+	 * setup_channel -- which lightningd sends ONCE, at channel CREATION.
+	 *
+	 * With a LOCAL hsmd that is enough, because it remembers forever.  With
+	 * the signer SPLIT it is not: the signer is the user's DEVICE, so any
+	 * device that was not present at creation (a new browser session, a
+	 * restored wallet, a device whose cache was lost) knows nothing about a
+	 * channel opened long ago.  In enforce mode it then refuses the first
+	 * commitment signature, channeld exits at calc_commitsigs, lightningd
+	 * leaves the channel CHANNELD_NORMAL but UNOWNED, and every payment on
+	 * it fails with "Attempt to send HTLC but unowned" -- permanently.
+	 *
+	 * Caching the message and replaying it (hsmd-proxy priming) papers over
+	 * this only while the cache survives; a lost cache leaves the funds
+	 * frozen, closing included.  So send it from HERE instead: channeld
+	 * holds every one of these fields already, so the signer's knowledge is
+	 * REDERIVED on every start and no cache is load-bearing.  It is exactly
+	 * the message the splice path already re-sends (update_hsmd_with_splice)
+	 * with the non-splice values, and it is idempotent -- a signer that
+	 * already tracks the channel records the identical parameters again. */
+	{
+		u8 *setup = towire_hsmd_setup_channel(
+			NULL,
+			peer->channel->opener == LOCAL,
+			peer->channel->funding_sats,
+			AMOUNT_MSAT(0), /* push: informational, not used in validation */
+			&peer->channel->funding.txid,
+			peer->channel->funding.n,
+			peer->channel->config[LOCAL].to_self_delay,
+			/*local_upfront_shutdown_script*/ NULL,
+			/*local_upfront_shutdown_wallet_index*/ NULL,
+			&peer->channel->basepoints[REMOTE],
+			&peer->channel->funding_pubkey[REMOTE],
+			peer->channel->config[REMOTE].to_self_delay,
+			peer->remote_upfront_shutdown_script,
+			peer->channel->type);
+		u8 *reply;
+		wire_sync_write(HSM_FD, take(setup));
+		reply = wire_sync_read(tmpctx, HSM_FD);
+		if (!fromwire_hsmd_setup_channel_reply(reply))
+			status_failed(STATUS_FAIL_HSM_IO,
+				      "Bad setup_channel_reply %s",
+				      tal_hex(tmpctx, reply));
+	}
+
 	/* Default desired feerate is the feerate we set for them last. */
 	if (peer->channel->opener == LOCAL)
 		peer->desired_feerate = channel_feerate(peer->channel, REMOTE);
