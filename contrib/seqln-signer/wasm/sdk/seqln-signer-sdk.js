@@ -139,6 +139,8 @@ export class SeqlnSigner {
     // The host fetches that channel's parameters off the node and calls
     // armChannel() — after which the next channeld restart succeeds.
     this.onUntracked = opts.onUntracked || null;
+    // Fires with { type, name, reason } whenever the signer refuses a request.
+    this.onReject = opts.onReject || null;
     // TEST-ONLY hook (opt-in; null in production). A Set of hsmd wire types to
     // reject ONCE each: the first time such a type is seen the serve loop sends
     // the zero-length error sentinel instead of the wasm reply, then serves it
@@ -338,6 +340,21 @@ export class SeqlnSigner {
             if (id) { this._nodeId = id; this._status('node_id', id); }
           }
           seq += 1;
+          // A POLICY REFUSAL MUST NOT DIE SILENT. A rejected reply is the same
+          // zero-length sentinel as "unimplemented", and the node reacts by
+          // killing channeld ("Owning subdaemon channeld died (0)") — after
+          // which every payment on that channel fails with a message that
+          // names neither the channel nor the reason. The wasm signer records
+          // the reason; surface it here (onReject + a console warning) so the
+          // host can say WHY it refused instead of leaving a dead channel.
+          if (reply.length === 4) {
+            let why = null;
+            try { why = this._inner.lastReject; } catch {}
+            if (why) {
+              console.warn(`seqln-signer: REFUSED ${hsmdName(type)} — ${why}`);
+              if (this.onReject) { try { this.onReject({ type, name: hsmdName(type), reason: why }); } catch {} }
+            }
+          }
           if (this.onRequest) {
             try {
               this.onRequest({ seq, type, name: hsmdName(type), replyBytes: reply.length - 4, rejected: reply.length === 4 });
