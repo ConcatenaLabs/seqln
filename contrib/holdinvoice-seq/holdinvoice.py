@@ -70,7 +70,8 @@ def holdinvoice(plugin, payment_hash, amount_msat=0, label="", description="", c
         return {"payment_hash": ph, "state": HELD[ph]["state"],
                 "warning": "already registered"}
     HELD[ph] = {"state": "waiting", "preimage": None,
-                "amount_msat": int(amount_msat), "requests": []}
+                "amount_msat": int(amount_msat), "received_msat": 0,
+                "requests": []}
     plugin.log(f"holdinvoice: registered hash {ph} to hold", level="info")
     return {"payment_hash": ph, "state": "waiting", "bolt11": None}
 
@@ -82,7 +83,12 @@ def holdinvoicelookup(plugin, payment_hash):
     if e is None:
         return {"payment_hash": ph, "state": "unknown"}
     return {"payment_hash": ph, "state": e["state"],
-            "amount_msat": e["amount_msat"]}
+            # amount_msat is the REGISTERED amount, received_msat the summed incoming
+            # HTLCs. These used to be one accumulated field, so a lookup after the payer
+            # paid reported registered+received (a 9999-sat hold read as 19998000 msat)
+            # and looked like a double-pay in every audit that trusted it.
+            "amount_msat": e["amount_msat"],
+            "received_msat": e.get("received_msat", 0)}
 
 
 @plugin.method("holdinvoicesettle")
@@ -138,7 +144,7 @@ def on_htlc_accepted(onion, htlc, request, plugin, **kwargs):
     if isinstance(amt, str) and amt.endswith("msat"):
         amt = int(amt[:-4])
     try:
-        e["amount_msat"] = (e["amount_msat"] or 0) + int(amt)
+        e["received_msat"] = (e.get("received_msat") or 0) + int(amt)
     except (TypeError, ValueError):
         pass
     e["state"] = "accepted"
