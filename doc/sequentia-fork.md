@@ -2,8 +2,10 @@
 
 This document lists precisely what the SeqLN fork changes relative to upstream Core Lightning
 (base: CLN v26.06.2), at file/subsystem level, and the known hazards. The front door is the
-top-level [README.md](../README.md); the design spec lives in the Sequentia node repo:
-[doc/sequentia/seqln-core-lightning-fork-spec.md](https://github.com/GracedEternalKingCabbageMan/Sequentia/blob/HEAD/doc/sequentia/seqln-core-lightning-fork-spec.md).
+top-level [README.md](../README.md); the design spec is
+[seqln-design/seqln-core-lightning-fork-spec.md](seqln-design/seqln-core-lightning-fork-spec.md),
+alongside the rest of this fork's design documents in
+[seqln-design/](seqln-design/README.md).
 
 Branches: `sequentia-stable` is the recommended/deployed branch (all of the below); `sequentia`
 is the development branch. Everything here is testnet software.
