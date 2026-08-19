@@ -26,11 +26,11 @@ Bitcoin testnet4). There is no Sequentia mainnet; the `sequentia` mainnet entry 
 | [fulmen](https://github.com/GracedEternalKingCabbageMan/fulmen) | Fulmen: desktop (Electron) wallet for SeqLN with a bundled Lightning node. |
 | [libwally-core](https://github.com/GracedEternalKingCabbageMan/libwally-core) | libwally fork with the Sequentia transaction-parsing patch (issuance denomination byte) used by SeqLN. |
 
-Protocol-level documentation (anchoring, proof of stake, fees, the SeqLN design spec) lives in the
-node repo under
-[doc/sequentia/](https://github.com/GracedEternalKingCabbageMan/Sequentia/tree/HEAD/doc/sequentia);
-the SeqLN design spec is
-[seqln-core-lightning-fork-spec.md](https://github.com/GracedEternalKingCabbageMan/Sequentia/blob/HEAD/doc/sequentia/seqln-core-lightning-fork-spec.md).
+Protocol-level documentation (anchoring, proof of stake, fees) lives in the node repo under
+[doc/sequentia/](https://github.com/GracedEternalKingCabbageMan/Sequentia/tree/HEAD/doc/sequentia).
+The SeqLN design spec is this repository's own:
+[doc/seqln-design/seqln-core-lightning-fork-spec.md](doc/seqln-design/seqln-core-lightning-fork-spec.md),
+with the rest of the fork's design documents in [doc/seqln-design/](doc/seqln-design/README.md).
 The public testnet explorer and API are at https://sequentiatestnet.com.
 
 ## Status: what works today
