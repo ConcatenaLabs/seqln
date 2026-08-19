@@ -3,8 +3,7 @@
 A minimal CLN plugin that holds incoming HTLCs by `payment_hash` in the
 `accepted` state until told to settle (revealing the preimage) or cancel. It is
 the safety primitive for pure-Lightning swaps
-([doc/sequentia/seqln-step2-pure-ln-swaps-design.md](https://github.com/GracedEternalKingCabbageMan/Sequentia/blob/HEAD/doc/sequentia/seqln-step2-pure-ln-swaps-design.md)
-in the Sequentia node repo): a swap maker's *incoming* leg is held until the
+([doc/seqln-design/seqln-step2-pure-ln-swaps-design.md](../../doc/seqln-design/seqln-step2-pure-ln-swaps-design.md)): a swap maker's *incoming* leg is held until the
 maker learns the preimage by paying the *outgoing* leg.
 
 Crucially it holds an **externally-supplied hash with no local invoice and no
