@@ -4,10 +4,13 @@ A fork of Core Lightning (base version v26.06.2) that runs Lightning on Sequenti
 Bitcoin. `upstream` is `ElementsProject/lightning`; keep it configured, because telling upstream
 code from fork code is the first question in almost every change here.
 
-`doc/sequentia-fork.md` is the authoritative file-level delta and hazard list. The canonical
-protocol spec lives outside this repo, in
+`doc/sequentia-fork.md` is the authoritative file-level delta and hazard list, and
+`doc/seqln-design/` holds this fork's design specs — start at
+`doc/seqln-design/seqln-core-lightning-fork-spec.md`. The canonical *protocol* spec is a
+different thing and lives outside this repo, in
 [`Sequentia`](https://github.com/GracedEternalKingCabbageMan/Sequentia) under
-`doc/sequentia/`.
+`doc/sequentia/`: that repo specifies anchoring, proof of stake and the fee market, and
+owns nothing about how Lightning is built on top of them.
 
 ## Branches
 
