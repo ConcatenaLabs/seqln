@@ -1,16 +1,16 @@
 # SeqLN Tier 2: hosted channels via a CLN native signer split (design + milestones)
 
-Status: design, 2026-07-04. Grounds the build of the Tier-2 backend the UX audit (§8, decision 8.9)
-picks: **truly-instant pure-LN from a thin wallet, non-custodially** — we host the SeqLN node, the user's
+Status: design, 2026-07-04. Grounds the build of the Tier-2 backend chosen for the wallets:
+**truly-instant pure-LN from a thin wallet, non-custodially** — we host the SeqLN node, the user's
 device holds the keys and co-signs every channel state, so we can never move the user's funds. This is the
 foundation the wallet Lightning UX hangs off; it is built before the UX overhaul.
 
-Decision locked with the user (2026-07-04): the signer mechanism is the **CLN native signer split** (not VLS,
+Decision (2026-07-04): the signer mechanism is the **CLN native signer split** (not VLS,
 Greenlight, or a custodial interim). Rationale: smallest delta from our SeqLN fork, asset-native for free.
 
 ## 1. Why this is tractable (the three de-risking findings)
 
-From a full file-anchored map of `~/seqln`'s signer (`hsmd/hsmd_wire.csv`, `hsmd/hsmd.c`, `hsmd/libhsmd.c`,
+From a full file-anchored map of this repository's signer (`hsmd/hsmd_wire.csv`, `hsmd/hsmd.c`, `hsmd/libhsmd.c`,
 `lightningd/hsm_control.c`, `lightningd/lightningd.c:433`, `lightningd/options.c:365`):
 
 1. **The seam is production, not a hack.** `--subdaemon=hsmd:PATH` (`options.c:1633-1642`, resolved
@@ -152,9 +152,9 @@ mirroring the pure-LN M0-M5 discipline.
 **Signer split M0-M5 COMPLETE** (seqln `7527d3fbd`): the non-custodial CLN native signer split is proven
 end-to-end — hosted node with no local key, remote Rust device signer (byte-exact vs libhsmd, WASM-ready),
 network transport, asset channels, a validating policy that refuses theft, and device-only fund recovery. The
-remaining work is PRODUCTIZATION (§below): secure the transport (Noise/TLS + per-wallet auth), the hosted-LSP
-infra (JIT/pay-to-open liquidity + a wallet-facing API), and wallet integration (the signer as WASM/FFI + an
-SDK), then the parked UX overhaul.
+remaining work is productization: per-wallet auth and transport-key rotation (the Noise_XK transport itself
+is done, above); hosted-LSP liquidity (JIT/pay-to-open + a wallet-facing API), which is not in this repo; and
+wallet integration, which lives in Fulmen.
 
 - **CAPSTONE — vision proven end-to-end (2026-07-04).** A hosted node with NO local key (keys only on the
   remote Rust device signer) completed a real pure-LN GOLD<->BTC-stand-in trade through the `seqobd` order book,
@@ -210,7 +210,7 @@ CAN skip (advertise NOT-capable so lightningd adapts): all gossip sigs (`node_an
   DECISION: do NOT ship naive per-ECDH round-trips; **provision a device-authorized ECDH session key at channel
   open** (or a connectd-held ECDH subkey / delegated node-ECDH), rotated periodically, collapsing the hot path
   back to the in-process figure. The funds-moving commitment signs stay per-request round-trips (not
-  latency-critical, and the device must gate them). (Mirrors UX-spec §8.9.)
+  latency-critical, and the device must gate them).
 - **Validation policy depth (M4).** MVP can mirror the libhsmd stub (sign on request); the security win is a
   VLS-style policy (never sign a commitment that moves funds to a non-channel destination, enforce
   value-conservation, rate-limit). Depth vs latency tradeoff.

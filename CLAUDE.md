@@ -14,8 +14,8 @@ owns nothing about how Lightning is built on top of them.
 
 ## Branches
 
-`sequentia-stable` is the deployed branch and the one to open PRs against. Despite what
-`doc/sequentia-fork.md` says, `sequentia` is **not** where development happens — it is behind.
+`sequentia-stable` is the only maintained branch: deployed, and the one to open PRs against.
+`sequentia` is an older, diverged line kept for history; do not build from it or develop on it.
 `master` tracks pristine upstream; never commit fork work there.
 
 ## Building
@@ -40,10 +40,14 @@ runtime via `--network` (`sequentia-testnet`, or the Bitcoin/Liquid networks ups
 
 ```sh
 lightningd --network=sequentia-testnet \
-  --bitcoin-cli=/path/to/elements-cli \
+  --bitcoin-cli=/path/to/sequentia-cli \
   --bitcoin-datadir=/path/to/sequentia-datadir \
   --lightning-dir=$HOME/.seqln
 ```
+
+The node is Sequentia Core (`sequentiad`/`sequentia-cli`). The chainparams `cli` default is still
+the legacy name `elements-cli`, so `--bitcoin-cli` must always be passed. The node's RPC port on
+chain `test` is 18776; the 18332 in `bitcoin/chainparams.c` is the node's Bitcoin-parent port.
 
 Binaries land in-tree: `lightningd/lightningd`, `cli/lightning-cli`, the subdaemons beside
 `lightningd/`, and the signer-split daemons `lightningd/lightning_hsmd_proxy` and
@@ -59,10 +63,10 @@ make pytest                       # or: uv run python -m pytest -v tests/
 Sequentia-specific checks need a node's CLI:
 
 ```sh
-ELEMCLI=/path/to/elements-cli python3 tests/sequentia/validate_live_blocks.py
-ELEMCLI=/path/to/elements-cli python3 tests/sequentia/verify_certified_frontier.py
-ELEMCLI=/path/to/elements-cli python3 tests/sequentia/verify_anchor_burial.py
-ELEMCLI=/path/to/elements-cli python3 tests/sequentia/verify_block_parse.py
+ELEMCLI=/path/to/sequentia-cli python3 tests/sequentia/validate_live_blocks.py
+ELEMCLI=/path/to/sequentia-cli python3 tests/sequentia/verify_certified_frontier.py
+ELEMCLI=/path/to/sequentia-cli python3 tests/sequentia/verify_anchor_burial.py
+ELEMCLI=/path/to/sequentia-cli python3 tests/sequentia/verify_block_parse.py
 ```
 
 The device signer has its own workspace: `cargo test` in `contrib/seqln-signer/`.
@@ -112,9 +116,11 @@ strings puts a node in a re-exec loop.
 - Asset ids are stored as a 33-byte version+tag blob; `NULL` means the policy asset. There is no
   asset field in BOLT11 invoices — selection is payer-side only.
 
-`doc/sequentia-fork.md`'s hazard list is dated 2026-07-08 and predates the watchtower/Specula and
-signer-robustness work, so it does not mention `speculad/`, `lightningd/watchtower_store.*`,
-`lightningd/onchain_presign.*`, `common/presign_templates.*`, or the `penalty_htlcs` table.
+The Specula watchtower layer (`speculad/`, `channeld/watchtower.*`, `lightningd/watchtower_store.*`,
+`lightningd/onchain_presign.*`, `common/presign_templates.*`, the `penalty_htlcs` table, the
+`setpreemptarmed` RPC) is summarised in `doc/sequentia-fork.md` section 7b. Its design note is not
+yet published in this repository; the header comment of `speculad/speculad.c` is the fullest
+description.
 
 ## Working in this repo
 

@@ -6,6 +6,13 @@ Elements support CI-tested against Elements Core 23.2.1; Sequentia = Elements 23
 analysis already done in `seqdex/docs/seqdex-lightning-feasibility.md`. This document supersedes that memo's one wrong
 claim that CLN "dropped Liquid entirely": CLN's Elements support is in-tree and maintained.
 
+Status (2026-08-22): this is the spec as written before implementation. Where it differs from
+[`../sequentia-fork.md`](../sequentia-fork.md), the fork doc and the code win: the shipped Lightning
+HRPs are `sqt`/`tsqt` (not `seq`/`tseq`/`sqrt`), there is no `sequentia-regtest` entry, the chainparams
+`cli` is still the legacy `elements-cli`, the asset id TLV rides the v1 `open_channel` (v2 opens are not
+asset-aware), asset channels are announced with asset-aware gossip, and confirmations count certified
+depth while anchor burial gates only the announcement.
+
 Path convention in this document: `src/...` paths are in the **Sequentia node**
 repository ([`Sequentia`](https://github.com/GracedEternalKingCabbageMan/Sequentia)),
 which has no `src/` of its own to confuse them with here; everything else is a path

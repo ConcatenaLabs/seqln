@@ -17,8 +17,8 @@ import hashlib, os, subprocess, sys
 
 # Point this at any reachable Sequentia testnet node (local, or an SSH tunnel to
 # a remote one). Connection comes from the environment so no host or credential
-# is baked into the repo; unset values fall back to elements-cli's own config.
-ELEMCLI = os.environ.get("ELEMCLI", "elements-cli")
+# is baked into the repo; unset values fall back to sequentia-cli's own config.
+ELEMCLI = os.environ.get("ELEMCLI", "sequentia-cli")
 RPC = ["-chain=test"]
 for flag, var in (("-rpcconnect=", "SEQ_RPC_HOST"), ("-rpcport=", "SEQ_RPC_PORT"),
                   ("-rpcuser=", "SEQ_RPC_USER"), ("-rpcpassword=", "SEQ_RPC_PASS")):
