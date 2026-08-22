@@ -158,8 +158,9 @@ commit `5bc915e3`):
   blocked not just asset channels but SeqLN syncing the real Sequentia chain at all (the live node only
   survives because it hasn't re-parsed an issuance block). Patched `transaction.c` (analyze_tx count, field
   parser + new `wally_tx_input.issuance_denomination`, `get_txin_issuance_size` +1, `tx_to_bytes` re-emit) so
-  issuance txs round-trip byte-exact; non-issuance inputs untouched. See memory
-  `seqln-issuance-denomination-parse-bug`.
+  issuance txs round-trip byte-exact; non-issuance inputs untouched. The patch lives in the
+  [libwally-core fork](https://github.com/GracedEternalKingCabbageMan/libwally-core), branch
+  `sequentia-issuance-denomination` (see `SEQUENTIA-PATCH.md` there).
 - **Verified end-to-end on liquid-regtest:** rebuilt the chain transparent-only (`blindedaddresses=0`, matching
   Sequentia's default), issued GOLD unblinded, a node **synced past the issuance block without crashing** and
   recorded a **100-GOLD UTXO with the correct GOLD asset tag** (DB `outputs.asset` = reversed `83053bb2…499d`).
@@ -265,7 +266,7 @@ closingd changes were needed for the no-HTLC path.
   PUBLIC asset channels + display, not resolution.
 ## "Any asset, no code change" — PROVEN + M4 reframed (2026-07-04)
 
-The design goal (per Andreas): a user can open + transact an LN channel in ANY asset — even one nobody has
+The design goal: a user can open + transact an LN channel in ANY asset — even one nobody has
 used on LN before — with **zero changes to our CLN code**, the only external requirement being that some block
 producer accepts that asset for tx fees. **Verified live:** issued a brand-new asset id (`cbe3b48f…`), ran
 `setfeeexchangerates` (the producer-accepts-it-for-fees step, a node config, not code), and with the SAME

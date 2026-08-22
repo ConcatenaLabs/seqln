@@ -7,8 +7,9 @@ top-level [README.md](../README.md); the design spec is
 alongside the rest of this fork's design documents in
 [seqln-design/](seqln-design/README.md).
 
-Branches: `sequentia-stable` is the recommended/deployed branch (all of the below); `sequentia`
-is the development branch. Everything here is testnet software.
+Branches: `sequentia-stable` is the only maintained branch (deployed; all of the below; PRs
+target it). `sequentia` is an older, diverged line kept for history; do not build from it.
+Everything here is testnet software.
 
 ## 1. Networks (`bitcoin/chainparams.c`, `bitcoin/chainparams.h`)
 
@@ -38,8 +39,13 @@ Two Elements-family network entries are added, plus a `has_anchor_header` field 
   `amount_asset_is_main()` does a straight memcmp.
 - The `sequentia` mainnet entry is an explicit placeholder (all-zero genesis, NULL
   `fee_asset_tag`); there is no Sequentia mainnet. It must be filled before any use.
-- `cli` is `elements-cli` with `cli_args` `-chain=test`: the `bcli` backend drives a Sequentia
-  node (`elementsd` fork) through its CLI, exactly like the Liquid entries drive Elements.
+- `cli` is still the legacy name `elements-cli` with `cli_args` `-chain=test`: the `bcli` backend
+  drives a Sequentia Core node (`sequentiad`) through its CLI, exactly like the Liquid entries
+  drive Elements. The node has shipped its CLI as `sequentia-cli` since v24.1.0, so
+  `--bitcoin-cli=/path/to/sequentia-cli` must be passed. `rpc_port` (18332) is likewise stale: it
+  is the port the node uses for its Bitcoin parent, while the node's own RPC port on chain `test`
+  is 18776 (and the mainnet entry's 7040 should be 7332). `bcli` never reads `rpc_port`, so with
+  `--bitcoin-datadir` the CLI finds the right port and cookie on its own.
 
 ## 2. Anchored block header (`bitcoin/block.c`, `bitcoin/block.h`)
 
@@ -74,10 +80,10 @@ that honestly, all gated on `has_anchor_header`:
   retreat (Bitcoin-anchor reorg / tail truncation) is absorbed by CLN's normal reorg handling.
 - **`minimum_depth` = 1 and wall-clock timelocks** (`lightningd/options.c`): a certified funding
   block is final in the sense above, so `funding_confirms = 1`. Timelocks are sized in wall-clock
-  at the measured ~58s Sequentia block cadence, each at least its Bitcoin-mainnet wall-clock
-  equivalent: `locktime_blocks` (to_self_delay) 1440 (~1 day), `cltv_expiry_delta` 270 (~4.3h),
-  `cltv_final` 180 (~2.9h), `max_htlc_cltv` 20160 (~2 weeks). These are defaults; operators and
-  per-open flags can still override.
+  at Sequentia's 60-second block spacing (the consensus minimum since the testnet's 93,800 fork),
+  each at least its Bitcoin-mainnet wall-clock equivalent: `locktime_blocks` (to_self_delay) 1440
+  (~1 day), `cltv_expiry_delta` 270 (~4.3h), `cltv_final` 180 (~2.9h), `max_htlc_cltv` 20160
+  (~2 weeks). These are defaults; operators and per-open flags can still override.
 - **Two-stage SCID / anchor-burial announcement gate** (`lightningd/chaintopology.c`
   `topo_anchor_buried()`, `lightningd/channel_gossip.c` `has_announce_depth()`): a certified block
   can still fall to tail truncation until its Bitcoin anchor is buried, and a
@@ -86,6 +92,12 @@ that honestly, all gated on `has_anchor_header`:
   buried by `SEQUENTIA_ANCHOR_BURY_DEPTH` (2) Bitcoin-anchor blocks. The funding anchor is
   re-derived from the in-memory chain (no backend-protocol change, no DB migration) with a bounded
   walk that exploits the monotonicity of `anchor_height`.
+- **`rescan` defaults to `-1`** (`lightningd/options.c`): upstream pins the in-memory chain root
+  only `rescan` blocks below the tip and calls `fatal()` when a reorg walks past it. A Bitcoin
+  reorg unwinds roughly ten Sequentia blocks per Bitcoin block, so on Sequentia networks the
+  default is `-1`, which `chaintopology.c` reads as an absolute start height of 1: the root sits
+  just above genesis and no anchor-driven reorg can reach it. The cost is a full rescan on every
+  restart; `--rescan` overrides.
 - `lightningd/watch.c`: output-spend logging tolerates non-policy assets.
 
 ## 4. Fees: open fee market, no on-chain estimation
@@ -128,8 +140,8 @@ policy asset by default). File-level map of the threading:
   channel asset.
 - `lightningd/channel.{c,h}`, `lightningd/channel_control.c`, `lightningd/peer_control.c`,
   `wallet/wallet.{c,h}`, `wallet/migrations.c`: `channel_asset` on the channel state, persisted
-  across restarts (DB migration), surfaced in `listpeerchannels` as an `asset` field for
-  non-policy channels.
+  across restarts (DB migration), surfaced in `listpeerchannels` as `channel_asset` (32-byte
+  display hex) for non-policy channels.
 - `wallet/wallet.c`, `wallet/reservation.c`, `wallet/walletrpc.c`: the on-chain wallet records
   UTXOs of any issued asset, selects coins per-asset, funds single-asset transactions (change and
   fee in the funding asset, fee sized per section 4), and `listfunds` shows an `asset` field on
@@ -186,6 +198,32 @@ a user device while a host runs the node:
 - `contrib/seqln-signer/`: the Rust device signer (native + WASM) that replaces `signerd` on the
   device side. See [its README](../contrib/seqln-signer/README.md).
 
+## 7b. Specula keyless watchtower
+
+Built on the signer split: the device pre-signs the transactions a watchtower would need, so a
+host can defend the channel while the device is offline, without ever holding a key.
+
+- `channeld/watchtower.{c,h}`, `common/penalty_base.{c,h}`, `common/presign_templates.{c,h}`: at
+  every commitment advance channeld has the signer pre-sign the justice (penalty) set for the
+  newly revoked commitment. The templates are `SIGHASH_SINGLE|ANYONECANPAY`, so output 0 carries
+  the swept value and a fee input can be attached later without the device.
+- `lightningd/onchain_presign.{c,h}`: the same for the honest force-close sweeps (delayed
+  `to_local`, offered-HTLC timeout) at every advance, and the HTLC-success sweep at fulfil.
+- `lightningd/watchtower_store.{c,h}`: the fsync-durable, secret-free on-disk store they are
+  written to (format documented in the header); `wallet/migrations.c` adds the `penalty_htlcs`
+  table; `lightningd/peer_control.c` adds the `setpreemptarmed` RPC (`id`, `armed`), which
+  persists a per-channel flag in that store.
+- `speculad/speculad.c` (built as `speculad/speculad`, `speculad/Makefile`): a standalone daemon,
+  not a plugin and not spawned by `lightningd`, that loads the store, polls the chain through the
+  node's CLI for a revoked commitment confirming, and broadcasts the matching pre-signed
+  transactions. It never loads a secret. Attaching the per-asset fee input and RBF-escalating it
+  needs a fee-UTXO wallet on the host, which does not exist on testnet, so that step is the
+  documented seam (`attach_fee_and_rbf()`); sweeping the HTLC outputs of a peer's honest close
+  (`remote_htlc_to_us`) is a second seam.
+
+The Specula design note is not yet published in this repository; the header comment of
+`speculad/speculad.c` is the fullest description of the model.
+
 ## 8. Plugins and daemons affected (summary)
 
 | Component | Change |
@@ -197,6 +235,7 @@ a user device while a host runs the node:
 | `channeld`, `openingd`, `onchaind` | Channel asset threading (section 5) |
 | `gossipd` | On-chain asset learning + gossip store records (section 6) |
 | `hsmd` | Proxy/signer split (section 7); stock in-process `hsmd` is unchanged and remains the default |
+| `channeld`, `lightningd/onchain_presign.c`, `speculad` | Specula watchtower: pre-signed justice/sweep sets and their offline broadcaster (section 7b) |
 | `lightningd/plugin.c` | Startup fix: skip the `plugins_config` wait loop when every plugin is already `INIT_COMPLETE` (a hang reachable with a minimal plugin set, not Sequentia-specific) |
 | `contrib/holdinvoice-seq/` | New plugin: hold-invoice primitive for pure-Lightning swaps |
 | `contrib/seqln-signer/` | New crate: Rust device signer (native + WASM) |
@@ -223,8 +262,9 @@ byte-exact; non-issuance inputs are untouched. Build with `git submodule update 
 - `tests/sequentia/verify_anchor_burial.py`: checks the bounded burial walk against a brute-force
   oracle over real anchor heights plus boundary cases.
 
-All four point at any reachable Sequentia node via `ELEMCLI` and `SEQ_RPC_{HOST,PORT,USER,PASS}`
-environment variables; no host or credential is baked into the repo.
+All four point at any reachable Sequentia node via `ELEMCLI` (path to `sequentia-cli`, the
+default) and `SEQ_RPC_{HOST,PORT,USER,PASS}` environment variables; no host or credential is
+baked into the repo.
 
 Signer tests: `cargo test` in `contrib/seqln-signer/` plus the byte-exact conformance harness and
 WASM test scripts (see that README).

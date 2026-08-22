@@ -82,13 +82,13 @@ Net-new for Phase 2:
 
 ## 5b. Implementation seam (mapped against the live seqdex code)
 
-The cross-chain maker already exists in `~/seqdex/daemon` (branch `main`; SHARED with another session —
-coordinate). Phase 2 plugs into it; do NOT rebuild the SEQ leg or the anchor gate.
+The cross-chain maker already exists in seqdex's `daemon` (branch `main`). Phase 2 plugs into it; do NOT
+rebuild the Sequentia asset leg or the anchor gate.
 
 - `pkg/xchain/orchestrator.go` — the 5-step swap: (1) Alice locks the BTC leg (longer CLTV), (2) Bob locks
-  the SEQ leg (shorter CLTV), (3) **`VerifySeqLegSafe`** = the anchor-depth gate (SEQ leg's block
+  the Sequentia asset leg (shorter CLTV), (3) **`VerifySeqLegSafe`** = the anchor-depth gate (that leg's block
   `anchorheight >= Hp` AND `getanchorstatus == ok` AND quorum-certified; commit `444d26a` added the
-  certification requirement), (4) Alice redeems SEQ with the preimage (reveals it on-chain), (5) Bob reads
+  certification requirement), (4) Alice redeems the Sequentia asset with the preimage (reveals it on-chain), (5) Bob reads
   the preimage and redeems the BTC leg. The BTC leg is **pluggable via the `btcBackend` interface**
   (`pkg/xchain/btc_backend.go:26`): `LockBTCLeg` / `VerifyBTCLeg` / `ClaimBTCLeg` / `RefundBTCLeg`
   (`elementsBTCBackend`, and `NewSwapBitcoin` for real testnet4).
@@ -99,9 +99,9 @@ coordinate). Phase 2 plugs into it; do NOT rebuild the SEQ leg or the anchor gat
 - **Recommended approach:** generalise the parent leg to a `swapLeg` interface with two implementations —
   the existing on-chain-HTLC leg, and a new `lnLeg` (hold invoice). `lnLeg.Lock` = issue/observe a hold
   invoice on `H` (reverse) or prepare to pay a BOLT11 (normal); `lnLeg.Claim` = settle the hold invoice with
-  the preimage; `lnLeg.Refund` = cancel/let it time out. The orchestrator's step order and the SEQ-leg
+  the preimage; `lnLeg.Refund` = cancel/let it time out. The orchestrator's step order and the Sequentia-leg
   anchor gate (`VerifySeqLegSafe`) stay IDENTICAL — the only Sequentia-safety rule is unchanged: the maker
-  settles the BTC-LN hold invoice ONLY after Alice's SEQ redeem is anchor-deep (step 3 before step 5's
+  settles the BTC-LN hold invoice ONLY after Alice's Sequentia-side redeem is anchor-deep (step 3 before step 5's
   LN settle). The `lnLeg` talks to a SeqLN/CLN node on Bitcoin (step 1 of §5, done) via its RPC.
 - **Hold invoices:** core CLN has the primitives (`createinvoice`, the `htlc_accepted` hook,
   `preapproveinvoice`) but no turnkey hold command — the `lnLeg`/maker implements the hold via the
@@ -137,28 +137,28 @@ coordinate). Phase 2 plugs into it; do NOT rebuild the SEQ leg or the anchor gat
     (Three live-CLN bugs were found + fixed here: the decoder command is `decode` not `decodepay`; `pay`
     takes `invstring` not `bolt11`; and the request encoder must set `SetEscapeHTML(false)` — Go's default
     turns `<>&` into `\uXXXX`, which CLN's JSON parser rejects, e.g. a description containing `->`.)
-  - `submarine.go` — `SubmarineSwap` EMBEDS `*Swap` purely to reuse the SEQ leg unchanged
+  - `submarine.go` — `SubmarineSwap` EMBEDS `*Swap` purely to reuse the Sequentia asset leg unchanged
     (`VerifySEQLeg`/`LockSEQLeg`/`ClaimSEQLeg`/`RefundSEQLeg`/`WatchSEQClaim`/`InjectSecret`); the embedded
     `btcBackend` is nil and never touched (the BTC leg is the `LNLeg`). `RunNormal` and `RunReverse` are the
     two Case-A flows, each with its refund/cancel path on error.
   - **Anchor-depth gate implemented as `VerifySeqAnchorBuried`** (NOT `VerifySeqLegSafe`): it requires the
     relevant Sequentia block's Bitcoin anchor to be BURIED by `min_anchor_depth` Bitcoin blocks
     (`node anchor tip − block anchorheight >= min_anchor_depth`), plus quorum-certified + `anchorstatus==ok`.
-    `min_anchor_depth` is enforced `>= 2` (1 is unsafe, §3.2). `NORMAL` gates the SEQ *funding* before
-    `Pay`; `REVERSE` gates the taker's SEQ *claim* (which revealed `P`) before `SettleHold`. This is a
+    `min_anchor_depth` is enforced `>= 2` (1 is unsafe, §3.2). `NORMAL` gates the asset *funding* before
+    `Pay`; `REVERSE` gates the taker's asset *claim* (which revealed `P`) before `SettleHold`. This is a
     deliberate WAIT for real-time anchoring to bury the tx — consistent with anchoring supremacy (it does
     not block a reorg; it declines the irreversible LN action until a reorg is implausible).
   - Helpers added: `hexEq`/`hashEqualsPreimage` (`util.go`), errors `ErrLNLegInvalid`/`ErrLNLegTimeout`.
 - **NORMAL direction PROVEN END TO END, LIVE** (`TestSubmarineRunNormalLive`, env-gated; passing run
-  2026-07-03): the SEQ asset leg on the anchored two-chain regtest, the BTC leg on REAL testnet4 Lightning
+  2026-07-03): the Sequentia asset leg on the anchored two-chain regtest, the BTC leg on REAL testnet4 Lightning
   (the two SeqLN-on-Bitcoin nodes + the 40k channel). The run: taker mints a BOLT11 on a chosen preimage `P`
-  (payment_hash `H`) and funds the SEQ HTLC (claim=maker); the maker verifies it, the anchor gate REFUSES
+  (payment_hash `H`) and funds the Sequentia asset HTLC (claim=maker); the maker verifies it, the anchor gate REFUSES
   while shallow (depth 0 < 3), the parent (Bitcoin-stand-in) chain is advanced to bury the anchor to depth 3,
-  then `RunNormal` pays the invoice over testnet4 (learning `P`), and claims the SEQ asset with `P` — the
-  same `P` settles both legs, SEQ claim confirmed with the preimage on-chain. This is the NORMAL half of the
+  then `RunNormal` pays the invoice over testnet4 (learning `P`), and claims the Sequentia asset with `P` — the
+  same `P` settles both legs, the asset claim confirmed with the preimage on-chain. This is the NORMAL half of the
   §6 exit criterion WITH the anchor-depth secret-reveal gate enforced live. The LN-leg primitive alone is
   also covered by `TestLNLegPayLive`. (The anchor gate is demonstrable deterministically because the regtest
-  SEQ chain anchors to a parent chain we control — no waiting on real Bitcoin blocks.)
+  Sequentia chain anchors to a parent chain we control — no waiting on real Bitcoin blocks.)
 - **REVERSE direction PROVEN END TO END, LIVE — plugin-free (maker-secret mode)** (`TestSubmarine
   ReverseMakerSecretLive`, env-gated; passing run 2026-07-03). See §5e for why there are two REVERSE modes.
   The run: the maker generates `P`, locks the asset HTLC (claim=taker) and issues a PLAIN invoice on `H`; the
@@ -171,11 +171,11 @@ coordinate). Phase 2 plugs into it; do NOT rebuild the SEQ leg or the anchor gat
   the hold methods) is fully IMPLEMENTED but its live proof needs a hold-invoice plugin on the maker's
   `--network=testnet4` SeqLN node (§5d). It buys the FULLY-maker-non-custodial property (§5e). A correct hold
   invoice must construct a BOLT11 the node routes to but does NOT auto-settle (the node must not know `P`),
-  then hold the `htlc_accepted` hook and resolve it with the `P` learned from the taker's on-chain SEQ claim
+  then hold the `htlc_accepted` hook and resolve it with the `P` learned from the taker's on-chain asset claim
   — the tree's `tests/plugins/hold_htlcs.py` shows the hook-hold but not the invoice construction, so use/port
   the daywalker90 `holdinvoice` plugin (the tree has in-tree `cln-plugin`/`cln-rpc` crates to build against,
-  avoiding crates.io version drift). Deploying a plugin on the box's live node is a step to confirm with
-  Andreas first. (The SEQ-leg CLTV refund used by both modes' `RefundReverseSEQ` is already proven by
+  avoiding crates.io version drift). Deploying a plugin on the live node is a separate deployment step.
+  (The Sequentia-leg CLTV refund used by both modes' `RefundReverseSEQ` is already proven by
   `TestCrossChainSwap`.)
 
 ## 5d. Hold invoices: plugin over RPC (decision)
@@ -217,12 +217,12 @@ A non-custodial Sequentia-asset ↔ BTC-over-LN swap completed on testnets (both
 the timeout/refund path exercised, and the anchor-depth secret-reveal gate enforced (the party taking the
 irreversible LN action provably waits until the asset side is anchor-deep).
 
-**STATUS: MET (2026-07-03).** Both directions complete live end to end — the SEQ asset leg on the anchored
+**STATUS: MET (2026-07-03).** Both directions complete live end to end — the Sequentia asset leg on the anchored
 two-chain regtest, the BTC leg on real testnet4 Lightning:
-- NORMAL: `TestSubmarineRunNormalLive` (maker gates the SEQ funding, pays, learns `P`, claims the asset).
+- NORMAL: `TestSubmarineRunNormalLive` (maker gates the asset funding, pays, learns `P`, claims the asset).
 - REVERSE: `TestSubmarineReverseMakerSecretLive` (maker-secret mode; taker gates before paying, learns `P`,
   claims the asset).
 Both enforce `VerifySeqAnchorBuried >= min_anchor_depth` (each shown REFUSING a shallow anchor, then
-proceeding once buried). The refund path (`RefundReverseSEQ` → SEQ-leg CLTV) is covered by
+proceeding once buried). The refund path (`RefundReverseSEQ` → Sequentia-leg CLTV) is covered by
 `TestCrossChainSwap`. Remaining as an OPTIONAL enhancement (§5e): the hold-invoice REVERSE (`RunReverse`,
 fully-maker-non-custodial), which is coded but awaits a hold-invoice plugin on the node.

@@ -20,9 +20,9 @@ Bitcoin testnet4). There is no Sequentia mainnet; the `sequentia` mainnet entry 
 
 | Repo | One-liner |
 |---|---|
-| [Sequentia](https://github.com/GracedEternalKingCabbageMan/Sequentia) | The Sequentia node (`elementsd` fork of Elements 23.3.3): consensus, anchoring, proof of stake, open fee market, plus the canonical protocol documentation in `doc/sequentia/`. |
+| [Sequentia](https://github.com/GracedEternalKingCabbageMan/Sequentia) | Sequentia Core, the node (`sequentiad`/`sequentia-cli`, a fork of Elements 23.3.3): consensus, anchoring, proof of stake, open fee market, plus the canonical protocol documentation in `doc/sequentia/`. |
 | [seqln](https://github.com/GracedEternalKingCabbageMan/seqln) | SeqLN: a Core Lightning fork that runs on Sequentia and Bitcoin from the same binary, with asset channels, any-asset payments, pure-Lightning swaps. |
-| [seqdex](https://github.com/GracedEternalKingCabbageMan/seqdex) | SeqDEX: non-custodial atomic-swap DEX: P2P order book (seqob), same-chain swaps, and cross-chain BTC↔asset swaps made safe by Bitcoin anchoring. |
+| [seqdex](https://github.com/GracedEternalKingCabbageMan/seqdex) | SeqDEX: non-custodial order-book DEX: the SeqOB covenant on-chain order book, same-chain swaps, and cross-chain BTC↔asset and pure-Lightning swaps made safe by Bitcoin anchoring. |
 | [fulmen](https://github.com/GracedEternalKingCabbageMan/fulmen) | Fulmen: desktop (Electron) wallet for SeqLN with a bundled Lightning node. |
 | [libwally-core](https://github.com/GracedEternalKingCabbageMan/libwally-core) | libwally fork with the Sequentia transaction-parsing patch (issuance denomination byte) used by SeqLN. |
 
@@ -47,9 +47,12 @@ known hazards, is in [doc/sequentia-fork.md](doc/sequentia-fork.md).
   match the live chain byte-for-byte.
 - **Anchor-aware safety layer.** Confirmations are counted in quorum-certified blocks (the
   "certified frontier", `plugins/bcli.c`), `minimum_depth` is 1 (a certified block is displaced
-  only by a Bitcoin-anchor reorg), timelocks are sized in wall-clock at Sequentia's measured ~58s
-  block cadence, and a channel's short-channel-id is announced only after its funding block's
-  Bitcoin anchor is buried (`lightningd/chaintopology.c`, `lightningd/channel_gossip.c`).
+  only by a Bitcoin-anchor reorg), timelocks are sized in wall-clock at Sequentia's 60-second
+  block spacing (the consensus minimum since the testnet's 93,800 fork), and a channel's
+  short-channel-id is announced only after its funding block's Bitcoin anchor is buried
+  (`lightningd/chaintopology.c`, `lightningd/channel_gossip.c`). `rescan` defaults to `-1` on
+  Sequentia networks (`lightningd/options.c`): the node re-walks the chain from height 1 on every
+  restart, so a Bitcoin-anchor reorg of any depth can never abort it; `--rescan` overrides.
 - **Sequence-token channels.** Channels in the policy asset, the Sequence token (tSEQ on testnet):
   open, route, and mutually close, demonstrated live on the public testnet.
 - **Asset channels.** `fundchannel ... asset=<32-byte hex asset id>` opens a single-funder channel
@@ -70,6 +73,13 @@ known hazards, is in [doc/sequentia-fork.md](doc/sequentia-fork.md).
   (byte-exact against libhsmd, BOLT-8 Noise_XK secured transport, WASM build for browsers) so a
   thin wallet can hold the keys while a host runs the node. See
   [contrib/seqln-signer/README.md](contrib/seqln-signer/README.md).
+- **Specula keyless watchtower.** `channeld/watchtower.c` and `lightningd/onchain_presign.c` have
+  the signing device pre-sign justice and sweep transactions at every commitment advance into a
+  secret-free on-disk store (`lightningd/watchtower_store.c`, DB table `penalty_htlcs`);
+  `speculad/speculad` is a standalone daemon that watches the chain through the node's CLI and
+  broadcasts them while the signing device is offline. Attaching a fee input to the pre-signed
+  justice transactions is an open seam on testnet (see `speculad/speculad.c`). The design note is
+  not yet published in this repository.
 
 Experimental / known limitations (details and file pointers in
 [doc/sequentia-fork.md](doc/sequentia-fork.md#known-hazards-and-limitations)):
@@ -103,27 +113,34 @@ make -j$(nproc)
 ```
 
 Binaries land in-tree: `lightningd/lightningd`, `cli/lightning-cli`, the subdaemons next to
-`lightningd/`, and the signer-split daemons `lightningd/lightning_hsmd_proxy` and
-`lightningd/lightning_signerd`.
+`lightningd/`, the signer-split daemons `lightningd/lightning_hsmd_proxy` and
+`lightningd/lightning_signerd`, and the watchtower broadcaster `speculad/speculad`.
 
-Contributions go as PRs against the `sequentia-stable` branch (`sequentia` is the development
-branch).
+Contributions go as PRs against `sequentia-stable`, the only maintained branch (and the deployed
+one). `sequentia` is an older, diverged line kept for history; do not build from it.
 
 ## Running against the Sequentia public testnet
 
-SeqLN needs a synced Sequentia node (the `elementsd` fork from
+SeqLN needs a synced Sequentia Core node (`sequentiad`, from
 [Sequentia](https://github.com/GracedEternalKingCabbageMan/Sequentia)) with RPC enabled, plus its
-`elements-cli` binary; the `bcli` backend plugin shells out to `elements-cli -chain=test`.
+`sequentia-cli` binary; the `bcli` backend plugin shells out to it with `-chain=test`. The
+chainparams default is still the legacy name `elements-cli` (`bitcoin/chainparams.c`), so always
+pass `--bitcoin-cli=/path/to/sequentia-cli` (Fulmen stages `sequentia-cli` under the name
+`elements-cli` for this reason).
 
 ```bash
 lightningd --network=sequentia-testnet \
-  --bitcoin-cli=/path/to/elements-cli \
+  --bitcoin-cli=/path/to/sequentia-cli \
   --bitcoin-datadir=/path/to/sequentia-datadir \
   --lightning-dir=$HOME/.seqln
 ```
 
 (`--bitcoin-rpcconnect/--bitcoin-rpcport/--bitcoin-rpcuser/--bitcoin-rpcpassword` work as usual if
-you prefer explicit RPC credentials over a datadir/cookie. The node's default RPC port is 18332.)
+you prefer explicit RPC credentials over a datadir/cookie. The node's RPC port on chain `test` is
+18776; 18332 is the port the node uses to reach its Bitcoin parent, and the `rpc_port` value in
+`bitcoin/chainparams.c` still says 18332.)
+
+There is no public SeqLN routing node or LSP yet; run two nodes (or use Fulmen) to test.
 
 Then, for example:
 
@@ -158,13 +175,13 @@ The same binary, database format, plugins, and RPC surface apply; see the upstre
   `uv run python -m pytest -v tests/`) for integration tests. See
   [doc/contribute-to-core-lightning/testing.md](doc/contribute-to-core-lightning/testing.md).
 - **Sequentia live-chain checks** (`tests/sequentia/`): standalone scripts that point at any
-  reachable Sequentia node via `ELEMCLI` (path to `elements-cli`) and
+  reachable Sequentia node via `ELEMCLI` (path to `sequentia-cli`, the default) and
   `SEQ_RPC_{HOST,PORT,USER,PASS}`:
   ```bash
-  ELEMCLI=/path/to/elements-cli python3 tests/sequentia/validate_live_blocks.py      # header parser vs live chain
-  ELEMCLI=/path/to/elements-cli python3 tests/sequentia/verify_certified_frontier.py # confirmation clamp
-  ELEMCLI=/path/to/elements-cli python3 tests/sequentia/verify_anchor_burial.py      # SCID announce gate
-  ELEMCLI=/path/to/elements-cli python3 tests/sequentia/verify_block_parse.py        # single-block regression
+  ELEMCLI=/path/to/sequentia-cli python3 tests/sequentia/validate_live_blocks.py      # header parser vs live chain
+  ELEMCLI=/path/to/sequentia-cli python3 tests/sequentia/verify_certified_frontier.py # confirmation clamp
+  ELEMCLI=/path/to/sequentia-cli python3 tests/sequentia/verify_anchor_burial.py      # SCID announce gate
+  ELEMCLI=/path/to/sequentia-cli python3 tests/sequentia/verify_block_parse.py        # single-block regression
   ```
 - **Signer**: `cargo test` in `contrib/seqln-signer/`, plus the byte-exact conformance harness
   against libhsmd; see [contrib/seqln-signer/README.md](contrib/seqln-signer/README.md).
