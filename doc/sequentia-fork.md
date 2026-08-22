@@ -39,13 +39,13 @@ Two Elements-family network entries are added, plus a `has_anchor_header` field 
   `amount_asset_is_main()` does a straight memcmp.
 - The `sequentia` mainnet entry is an explicit placeholder (all-zero genesis, NULL
   `fee_asset_tag`); there is no Sequentia mainnet. It must be filled before any use.
-- `cli` is still the legacy name `elements-cli` with `cli_args` `-chain=test`: the `bcli` backend
-  drives a Sequentia Core node (`sequentiad`) through its CLI, exactly like the Liquid entries
-  drive Elements. The node has shipped its CLI as `sequentia-cli` since v24.1.0, so
-  `--bitcoin-cli=/path/to/sequentia-cli` must be passed. `rpc_port` (18332) is likewise stale: it
-  is the port the node uses for its Bitcoin parent, while the node's own RPC port on chain `test`
-  is 18776 (and the mainnet entry's 7040 should be 7332). `bcli` never reads `rpc_port`, so with
-  `--bitcoin-datadir` the CLI finds the right port and cookie on its own.
+- `cli` is `sequentia-cli` with `cli_args` `-chain=test`: the `bcli` backend drives a Sequentia
+  Core node (`sequentiad`) through its CLI, exactly like the Liquid entries drive Elements. Pass
+  `--bitcoin-cli=/path/to/sequentia-cli` when it is not on PATH (Fulmen stages it under the name
+  `elements-cli` for historical reasons and passes the explicit path). `rpc_port` is the node's
+  own RPC port: 18776 on chain `test`, 7332 on `sequentia` (18332 is the port the node uses to
+  reach its Bitcoin parent). `bcli` never reads `rpc_port`, so with `--bitcoin-datadir` the CLI
+  finds the right port and cookie on its own.
 
 ## 2. Anchored block header (`bitcoin/block.c`, `bitcoin/block.h`)
 

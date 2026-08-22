@@ -45,9 +45,11 @@ lightningd --network=sequentia-testnet \
   --lightning-dir=$HOME/.seqln
 ```
 
-The node is Sequentia Core (`sequentiad`/`sequentia-cli`). The chainparams `cli` default is still
-the legacy name `elements-cli`, so `--bitcoin-cli` must always be passed. The node's RPC port on
-chain `test` is 18776; the 18332 in `bitcoin/chainparams.c` is the node's Bitcoin-parent port.
+The node is Sequentia Core (`sequentiad`/`sequentia-cli`). The chainparams `cli` default is
+`sequentia-cli`; pass `--bitcoin-cli=/path/to/sequentia-cli` when it is not on PATH (Fulmen stages
+it under the name `elements-cli` for historical reasons and passes the explicit path). The
+chainparams `rpc_port` is the node's own RPC port on chain `test`, 18776 (18332 is the port the
+node uses to reach its Bitcoin parent).
 
 Binaries land in-tree: `lightningd/lightningd`, `cli/lightning-cli`, the subdaemons beside
 `lightningd/`, and the signer-split daemons `lightningd/lightning_hsmd_proxy` and
