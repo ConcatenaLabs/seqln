@@ -73,8 +73,13 @@ signed as requested (a VLS-parity follow-up), and there is no rate limiting.
 | `src/bin/conformance.rs` | Byte-exact conformance harness vs the libhsmd oracle. |
 | `src/bin/shadow.rs` | Live shadow comparator + corpus capture. |
 | `src/bin/ecdh_latency.rs` | ECDH hot-path latency probe (in-process vs transport round-trip). |
+| `src/bin/emit_elements_vector.rs` | Emits an Elements v2 PSET `sign_withdrawal` vector for the conformance harness's `SEQLN_WITHDRAWAL_VECTOR` mode. |
 | `tests/tamper.rs` | Enforce-mode theft-rejection test (skips without a captured corpus). |
+| `tests/chstore.rs` | Channel-store persistence contract (`export_channels`/`import_channels` round-trip, MAC refusal, merge semantics). |
 | `wasm/` | `wasm-bindgen` build of the same library for browsers/Node, plus SDK, relay, tests, demo page. |
+| `wasm/test/enforce.mjs` | WASM enforce-mode proof: corpus replay byte-exact, tampered commitment refused. |
+| `wasm/test/ws_device.mjs` | The browser-shaped device path over a real WebSocket, driven by the wallet SDK. |
+| `wasm/test/reconnect_stress.sh` | Isolated regtest harness: N device disconnect/reconnect cycles and a relay restart without wedging the hosted node. |
 
 ## Build and test
 
@@ -115,7 +120,13 @@ out-of-band first (`seqln-signer --genkey` prints a keypair):
   host proxy with `SEQLN_SIGNER_LISTEN=<bind:port>` (reconnect-tolerant), same key pinning.
 
 Other environment knobs: `SEQLN_SIGNER_POLICY=enforce|permissive` (default permissive),
-`SEQLN_SIGNER_TRACE` (per-request trace logging).
+`SEQLN_SIGNER_TRACE` (per-request trace logging), `SEQLN_SIGNER_CONNECT` (the env form of
+`--connect`), and `SEQLN_SIGNER_NETWORK=bitcoin|elements`, which selects the sighash family when one
+binary serves both a Bitcoin and a Sequentia node (unset: sniffed from the request's witness UTXO,
+defaulting to Elements; `src/wire.rs`). On the proxy side: `SEQLN_SIGNER_HS_TIMEOUT_MS` (Noise
+handshake timeout, `hsmd/signer_noise.c`), `SEQLN_SIGNER_OP_TIMEOUT_MS` (per-request timeout,
+default 120000) and `SEQLN_SIGNER_TCP_{USER_TIMEOUT_MS,KEEPIDLE_S,KEEPINTVL_S,KEEPCNT}` (TCP
+keepalive; `hsmd/hsmd_proxy.c`). `SEQLN_HSM_SECRET` is read only by the conformance harness.
 
 ## Browser / WASM
 

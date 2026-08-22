@@ -1,7 +1,7 @@
 # SeqLN Step 2 — Pure-LN asset↔BTC swaps (the "assets at the edges" reach layer) — design
 
 STATUS: design/scoping pass (2026-07-04). Step 1 (asset-aware channels + routing + `pay asset=`) is DONE and
-proven (doc `seqln-asset-channels-build-plan.md`). This scopes Step 2, the user's stated next phase:
+proven (doc `seqln-asset-channels-build-plan.md`). This scopes Step 2, the next phase:
 "pure-LN swaps working" before wallet/DEX integration.
 
 Grounding docs: `seqdex/docs/seqdex-lightning-feasibility.md` (§4 the pure-LN mechanism, §3 the anchoring↔LN safety
@@ -96,8 +96,7 @@ applied once, at the edge, per an RFQ quote (§5.3).
 
 ## 4. Reuse map (grounded in the live code — the elegant part)
 
-Everything below already exists in `~/seqdex/pkg/xchain` (branch `phase2-submarine-ln`; SHARED repo —
-coordinate). Step 2 is mostly *reuse + delete*, not new construction.
+Everything below already exists in seqdex's `pkg/xchain` (branch `phase2-submarine-ln`). Step 2 is mostly *reuse + delete*, not new construction.
 
 - **`LNLeg` interface + `clnLNLeg`** (`leg_lightning.go`) — a minimal CLN unix-socket JSON-RPC client. Already
   has `Pay(bolt11, wantHash, amountMsat)` (verifies `payment_hash == H` and the revealed preimage) and the
@@ -121,8 +120,8 @@ coordinate). Step 2 is mostly *reuse + delete*, not new construction.
 - **Step 1** — `pay asset=<id>` is the asset-leg payment primitive; the asset channels are the LP inventory.
 
 **The one asymmetry to fix (the crux of the work).** The **BTC leg is cleanly abstracted** (`LNLeg` interface
-`leg_lightning.go:40`; on-chain `btcBackend` interface `orchestrator.go:56`), but the **asset (SEQ) leg is NOT
-— it is hardcoded**: `SubmarineSwap` embeds a concrete `*Swap` (`submarine.go:32`) whose SEQ ops
+`leg_lightning.go:40`; on-chain `btcBackend` interface `orchestrator.go:56`), but the **asset (Sequentia) leg is NOT
+— it is hardcoded**: `SubmarineSwap` embeds a concrete `*Swap` (`submarine.go:32`) whose Sequentia-leg ops
 (`LockSEQLeg`/`ClaimSEQLeg`/`RefundSEQLeg`/`VerifySEQLeg`/`WatchSEQClaim`, `orchestrator.go:113–251`,
 `maker.go:112`) call a concrete `*ElementsLeg` (`leg_elements.go`) + `*Chain` (`chain.go`). There is **no
 `AssetLeg` interface**, so "add a second `LNLeg`" needs a small refactor. Two options:
@@ -136,7 +135,7 @@ coordinate). Step 2 is mostly *reuse + delete*, not new construction.
   - **(deeper, cleaner end-state)** introduce an `AssetLeg` interface mirroring `LNLeg`; give a new `PureLNSwap`
     **two LN-style legs** (asset + BTC), on-chain leg gone. Preferred once M2 proves the seam.
 
-- **Anchor gate `VerifySeqAnchorBuried`** (`submarine.go:73,:108`) — waits for the on-chain SEQ claim to bury
+- **Anchor gate `VerifySeqAnchorBuried`** (`submarine.go:73,:108`) — waits for the on-chain asset claim to bury
   to `min_anchor_depth`. Pure-LN happy path has **no on-chain claim → the gate is removed** (kept only on the
   on-chain refund/timeout fallback). This deletion *is* the latency win.
 - **Hold invoices — net-new wiring, not just a plugin deploy.** `clnLNLeg` already *calls* the daywalker90
@@ -314,7 +313,7 @@ doc's action items).
 
 ---
 
-## 7. Open questions for the user (decisions that steer M2+)
+## 7. Open questions (as posed before M0; all resolved by the M0-M5 log above)
 
 1. **Direction first?** Buy-GOLD-with-BTC (hold invoice on the BTC/Bitcoin leg — a plain CLN HTLC, lower risk)
    vs Sell-GOLD-for-BTC (hold invoice on the *asset*/Sequentia leg — must first confirm the plugin holds an
@@ -326,5 +325,5 @@ doc's action items).
    "assets at the edges" reach and the instant path), or also the intra-Sequentia GOLD↔USDX single-onion
    edge-forward (§5.6, harder, deferrable)?
 4. **Where the LP/translating node runs:** the box (alongside the existing seqob maker + the SeqLN-on-Bitcoin
-   nodes), confirmed with Andreas before any box deploy (per the deploy pipeline). Regtest+testnet4 harness
+   nodes), a deployment decision taken separately. Regtest+testnet4 harness
    for development, as with submarine swaps.
