@@ -12,7 +12,7 @@ Point at a node via ELEMCLI + SEQ_RPC_{HOST,PORT,USER,PASS}.
 """
 import json, os, subprocess, sys
 
-ELEMCLI = os.environ.get("ELEMCLI", "elements-cli")
+ELEMCLI = os.environ.get("ELEMCLI", "sequentia-cli")
 RPC = ["-chain=test"]
 for flag, var in (("-rpcconnect=", "SEQ_RPC_HOST"), ("-rpcport=", "SEQ_RPC_PORT"),
                   ("-rpcuser=", "SEQ_RPC_USER"), ("-rpcpassword=", "SEQ_RPC_PASS")):
