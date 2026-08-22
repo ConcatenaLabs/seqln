@@ -124,9 +124,9 @@ one). `sequentia` is an older, diverged line kept for history; do not build from
 SeqLN needs a synced Sequentia Core node (`sequentiad`, from
 [Sequentia](https://github.com/GracedEternalKingCabbageMan/Sequentia)) with RPC enabled, plus its
 `sequentia-cli` binary; the `bcli` backend plugin shells out to it with `-chain=test`. The
-chainparams default is still the legacy name `elements-cli` (`bitcoin/chainparams.c`), so always
-pass `--bitcoin-cli=/path/to/sequentia-cli` (Fulmen stages `sequentia-cli` under the name
-`elements-cli` for this reason).
+chainparams default is `sequentia-cli` (`bitcoin/chainparams.c`); pass
+`--bitcoin-cli=/path/to/sequentia-cli` when it is not on PATH (Fulmen stages it under the name
+`elements-cli` for historical reasons and passes the explicit path).
 
 ```bash
 lightningd --network=sequentia-testnet \

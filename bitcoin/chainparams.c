@@ -234,15 +234,17 @@ const struct chainparams networks[] = {
      * genesis_blockhash is the live testnet genesis in internal byte order
      * (display ddd11d54c87a2bd94400fd31ce05d8e1110bb4b78e7103f738342086fc4ea92e,
      * re-genesis 2026-07-05 with the finality-split-fix consensus rules).
-     * rpc_port is the node default; override with --bitcoin-rpcport as needed. */
+     * rpc_port is the node's own RPC port on chain `test` (18776; the node's
+     * 18332 is the port it uses to reach its Bitcoin parent); override with
+     * --bitcoin-rpcport as needed. */
     {.network_name = "sequentia-testnet",
      .onchain_hrp = "tb",
      .lightning_hrp = "tsqt",
      .bip70_name = "test",
      .genesis_blockhash = {{{.u.u8 = {0x2e, 0xa9, 0x4e, 0xfc, 0x86, 0x20, 0x34, 0x38, 0xf7, 0x03, 0x71, 0x8e, 0xb7, 0xb4, 0x0b, 0x11, 0xe1, 0xd8, 0x05, 0xce, 0x31, 0xfd, 0x00, 0x44, 0xd9, 0x2b, 0x7a, 0xc8, 0x54, 0x1d, 0xd1, 0xdd}}}},
-     .rpc_port = 18332,
+     .rpc_port = 18776,
      .ln_port = 19836,
-     .cli = "elements-cli",
+     .cli = "sequentia-cli",
      .cli_args = "-chain=test",
      .dust_limit = {546},
      .max_funding = AMOUNT_SAT_INIT((1 << 24) - 1),
@@ -266,9 +268,9 @@ const struct chainparams networks[] = {
      .lightning_hrp = "sqt",
      .bip70_name = "sequentia",
      .genesis_blockhash = {{{.u.u8 = {0}}}},
-     .rpc_port = 7040,
+     .rpc_port = 7332,
      .ln_port = 9836,
-     .cli = "elements-cli",
+     .cli = "sequentia-cli",
      .cli_args = "-chain=sequentia",
      .dust_limit = {546},
      .max_funding = AMOUNT_SAT_INIT((1 << 24) - 1),
