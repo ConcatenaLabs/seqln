@@ -71,7 +71,7 @@ def holdinvoice(plugin, payment_hash, amount_msat=0, label="", description="", c
                 "warning": "already registered"}
     HELD[ph] = {"state": "waiting", "preimage": None,
                 "amount_msat": int(amount_msat), "received_msat": 0,
-                "requests": []}
+                "cltv_expiry": None, "requests": []}
     plugin.log(f"holdinvoice: registered hash {ph} to hold", level="info")
     return {"payment_hash": ph, "state": "waiting", "bolt11": None}
 
@@ -88,7 +88,12 @@ def holdinvoicelookup(plugin, payment_hash):
             # paid reported registered+received (a 9999-sat hold read as 19998000 msat)
             # and looked like a double-pay in every audit that trusted it.
             "amount_msat": e["amount_msat"],
-            "received_msat": e.get("received_msat", 0)}
+            "received_msat": e.get("received_msat", 0),
+            # cltv_expiry is the EARLIEST absolute expiry among the held HTLCs: the
+            # payer chose it, and it is the hard deadline on everything the holder
+            # does with the incoming leg (an outgoing payment it makes against this
+            # hold must resolve before it). None until an HTLC is held.
+            "cltv_expiry": e.get("cltv_expiry")}
 
 
 @plugin.method("holdinvoicesettle")
@@ -145,6 +150,13 @@ def on_htlc_accepted(onion, htlc, request, plugin, **kwargs):
         amt = int(amt[:-4])
     try:
         e["received_msat"] = (e.get("received_msat") or 0) + int(amt)
+    except (TypeError, ValueError):
+        pass
+    exp = htlc.get("cltv_expiry")
+    try:
+        exp = int(exp)
+        if e.get("cltv_expiry") is None or exp < e["cltv_expiry"]:
+            e["cltv_expiry"] = exp
     except (TypeError, ValueError):
         pass
     e["state"] = "accepted"
