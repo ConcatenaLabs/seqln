@@ -13,7 +13,7 @@ knowledge of the preimage**: the taker generates `P`, the maker only ever sees
 
 ## RPC methods (match seqdex's `clnLNLeg`)
 - `holdinvoice payment_hash [amount_msat] [label] [description] [cltv]`: register `H` to be held.
-- `holdinvoicelookup payment_hash`: `{state: waiting|accepted|settled|cancelled|unknown, amount_msat}`.
+- `holdinvoicelookup payment_hash`: `{state: waiting|accepted|settled|cancelled|unknown, amount_msat, received_msat, cltv_expiry}`. `cltv_expiry` is the earliest absolute expiry among the held HTLCs (the payer chose it); the holder caps any outgoing payment it makes against the hold so it resolves before that height.
 - `holdinvoicesettle payment_hash preimage`: resolve held HTLC(s) with the preimage (must hash to `H`).
 - `holdinvoicecancel payment_hash`: fail held HTLC(s) back to the payer.
 
