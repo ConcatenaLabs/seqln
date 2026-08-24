@@ -159,13 +159,13 @@ commit `5bc915e3`):
   survives because it hasn't re-parsed an issuance block). Patched `transaction.c` (analyze_tx count, field
   parser + new `wally_tx_input.issuance_denomination`, `get_txin_issuance_size` +1, `tx_to_bytes` re-emit) so
   issuance txs round-trip byte-exact; non-issuance inputs untouched. The patch lives in the
-  [libwally-core fork](https://github.com/GracedEternalKingCabbageMan/libwally-core), branch
+  [libwally-core fork](https://github.com/ConcatenaLabs/libwally-core), branch
   `sequentia-issuance-denomination` (see `SEQUENTIA-PATCH.md` there).
 - **Verified end-to-end on liquid-regtest:** rebuilt the chain transparent-only (`blindedaddresses=0`, matching
   Sequentia's default), issued GOLD unblinded, a node **synced past the issuance block without crashing** and
   recorded a **100-GOLD UTXO with the correct GOLD asset tag** (DB `outputs.asset` = reversed `83053bb2…499d`).
 
-**DEPLOY — DONE.** The libwally fix is now shippable: forked to `GracedEternalKingCabbageMan/libwally-core`
+**DEPLOY — DONE.** The libwally fix is now shippable: forked to `ConcatenaLabs/libwally-core`
 (public), pushed to branch `sequentia-issuance-denomination` (commit `5bc915e3`); seqln `.gitmodules` now
 points at the fork + branch and the submodule pointer records `5bc915e3` (seqln `sequentia-stable` commit
 `ee0fcaab`, pushed). A fresh `git clone --recursive` (or `submodule update --init`) delivers the patch —

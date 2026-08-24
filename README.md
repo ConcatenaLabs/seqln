@@ -20,14 +20,14 @@ Bitcoin testnet4). There is no Sequentia mainnet; the `sequentia` mainnet entry 
 
 | Repo | One-liner |
 |---|---|
-| [Sequentia](https://github.com/GracedEternalKingCabbageMan/Sequentia) | Sequentia Core, the node (`sequentiad`/`sequentia-cli`, a fork of Elements 23.3.3): consensus, anchoring, proof of stake, open fee market, plus the canonical protocol documentation in `doc/sequentia/`. |
-| [seqln](https://github.com/GracedEternalKingCabbageMan/seqln) | SeqLN: a Core Lightning fork that runs on Sequentia and Bitcoin from the same binary, with asset channels, any-asset payments, pure-Lightning swaps. |
-| [seqdex](https://github.com/GracedEternalKingCabbageMan/seqdex) | SeqDEX: non-custodial order-book DEX: the SeqOB covenant on-chain order book, same-chain swaps, and cross-chain BTC↔asset and pure-Lightning swaps made safe by Bitcoin anchoring. |
-| [fulmen](https://github.com/GracedEternalKingCabbageMan/fulmen) | Fulmen: desktop (Electron) wallet for SeqLN with a bundled Lightning node. |
-| [libwally-core](https://github.com/GracedEternalKingCabbageMan/libwally-core) | libwally fork with the Sequentia transaction-parsing patch (issuance denomination byte) used by SeqLN. |
+| [Sequentia](https://github.com/ConcatenaLabs/Sequentia) | Sequentia Core, the node (`sequentiad`/`sequentia-cli`, a fork of Elements 23.3.3): consensus, anchoring, proof of stake, open fee market, plus the canonical protocol documentation in `doc/sequentia/`. |
+| [seqln](https://github.com/ConcatenaLabs/seqln) | SeqLN: a Core Lightning fork that runs on Sequentia and Bitcoin from the same binary, with asset channels, any-asset payments, pure-Lightning swaps. |
+| [seqdex](https://github.com/ConcatenaLabs/seqdex) | SeqDEX: non-custodial order-book DEX: the SeqOB covenant on-chain order book, same-chain swaps, and cross-chain BTC↔asset and pure-Lightning swaps made safe by Bitcoin anchoring. |
+| [fulmen](https://github.com/ConcatenaLabs/fulmen) | Fulmen: desktop (Electron) wallet for SeqLN with a bundled Lightning node. |
+| [libwally-core](https://github.com/ConcatenaLabs/libwally-core) | libwally fork with the Sequentia transaction-parsing patch (issuance denomination byte) used by SeqLN. |
 
 Protocol-level documentation (anchoring, proof of stake, fees) lives in the node repo under
-[doc/sequentia/](https://github.com/GracedEternalKingCabbageMan/Sequentia/tree/HEAD/doc/sequentia).
+[doc/sequentia/](https://github.com/ConcatenaLabs/Sequentia/tree/HEAD/doc/sequentia).
 The SeqLN design spec is this repository's own:
 [doc/seqln-design/seqln-core-lightning-fork-spec.md](doc/seqln-design/seqln-core-lightning-fork-spec.md),
 with the rest of the fork's design documents in [doc/seqln-design/](doc/seqln-design/README.md).
@@ -67,7 +67,7 @@ known hazards, is in [doc/sequentia-fork.md](doc/sequentia-fork.md).
 - **Pure-Lightning swap primitive.** `contrib/holdinvoice-seq/` is a hold-invoice plugin (hold an
   externally-supplied payment hash until settle/cancel), the safety primitive for pure-Lightning
   asset↔BTC swaps. The swap orchestration itself lives in
-  [seqdex](https://github.com/GracedEternalKingCabbageMan/seqdex).
+  [seqdex](https://github.com/ConcatenaLabs/seqdex).
 - **Signer split (non-custodial hosted nodes).** `hsmd/hsmd_proxy.c` + `hsmd/signerd.c` split the
   key-holding signer out of the node process, and `contrib/seqln-signer/` is a Rust device signer
   (byte-exact against libhsmd, BOLT-8 Noise_XK secured transport, WASM build for browsers) so a
@@ -98,14 +98,14 @@ Experimental / known limitations (details and file pointers in
 SeqLN builds exactly like upstream CLN (see the
 [installation guide](doc/getting-started/getting-started/installation.md) for distro package
 lists), with one fork-specific point: the `external/libwally-core` submodule is pinned to the
-[Sequentia libwally fork](https://github.com/GracedEternalKingCabbageMan/libwally-core) (branch
+[Sequentia libwally fork](https://github.com/ConcatenaLabs/libwally-core) (branch
 `sequentia-issuance-denomination`). Stock libwally under-reads Sequentia asset-issuance
 transactions by one byte (Sequentia adds a denomination byte to `CAssetIssuance`), which would
 crash a node syncing any issuance block; the pinned fork parses and round-trips it. Cloning with
 `--recurse-submodules` picks the right commit automatically.
 
 ```bash
-git clone --recurse-submodules -b sequentia-stable https://github.com/GracedEternalKingCabbageMan/seqln.git
+git clone --recurse-submodules -b sequentia-stable https://github.com/ConcatenaLabs/seqln.git
 cd seqln
 uv sync --all-extras --all-groups --frozen   # python deps (msggen, test harness)
 ./configure
@@ -122,7 +122,7 @@ one). `sequentia` is an older, diverged line kept for history; do not build from
 ## Running against the Sequentia public testnet
 
 SeqLN needs a synced Sequentia Core node (`sequentiad`, from
-[Sequentia](https://github.com/GracedEternalKingCabbageMan/Sequentia)) with RPC enabled, plus its
+[Sequentia](https://github.com/ConcatenaLabs/Sequentia)) with RPC enabled, plus its
 `sequentia-cli` binary; the `bcli` backend plugin shells out to it with `-chain=test`. The
 chainparams default is `sequentia-cli` (`bitcoin/chainparams.c`); pass
 `--bitcoin-cli=/path/to/sequentia-cli` when it is not on PATH (Fulmen stages it under the name

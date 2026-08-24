@@ -14,7 +14,7 @@ asset-aware), asset channels are announced with asset-aware gossip, and confirma
 depth while anchor burial gates only the announcement.
 
 Path convention in this document: `src/...` paths are in the **Sequentia node**
-repository ([`Sequentia`](https://github.com/GracedEternalKingCabbageMan/Sequentia)),
+repository ([`Sequentia`](https://github.com/ConcatenaLabs/Sequentia)),
 which has no `src/` of its own to confuse them with here; everything else is a path
 in this repository.
 
@@ -53,7 +53,7 @@ Sequentia; a public asset-routing gossip graph. Rationale in section 8.
 
 - Working name: SeqLN. Fork of `github.com/ElementsProject/lightning`, kept rebaseable onto upstream (all
   Sequentia changes isolated behind chainparams flags and a small number of `is_sequentia` guards, mirroring
-  the existing `is_elements` pattern so upstream merges stay clean). Repo `GracedEternalKingCabbageMan/seqln`
+  the existing `is_elements` pattern so upstream merges stay clean). Repo `ConcatenaLabs/seqln`
   (public, per the everything-public rule).
 - The same binary serves Bitcoin and Sequentia; network is selected per daemon instance at startup
   (`--network`), exactly as upstream. There is no compile-time Elements flag to toggle.

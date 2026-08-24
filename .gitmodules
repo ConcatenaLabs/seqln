@@ -6,7 +6,7 @@
 	url = https://github.com/ianlancetaylor/libbacktrace.git
 [submodule "external/libwally-core"]
 	path = external/libwally-core
-	url = https://github.com/GracedEternalKingCabbageMan/libwally-core.git
+	url = https://github.com/ConcatenaLabs/libwally-core.git
 	branch = sequentia-issuance-denomination
 	ignore = dirty
 [submodule "external/gheap"]
