@@ -118,3 +118,6 @@ autogenerate-examples-status.log
 result
 result-[0-9]*
 tests/plugins/channeld_fakenet
+
+# Agent worktrees and local agent state (never belongs in the repo).
+.claude/
