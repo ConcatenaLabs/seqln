@@ -8,7 +8,7 @@ code from fork code is the first question in almost every change here.
 `doc/seqln-design/` holds this fork's design specs — start at
 `doc/seqln-design/seqln-core-lightning-fork-spec.md`. The canonical *protocol* spec is a
 different thing and lives outside this repo, in
-[`Sequentia`](https://github.com/GracedEternalKingCabbageMan/Sequentia) under
+[`Sequentia`](https://github.com/ConcatenaLabs/Sequentia) under
 `doc/sequentia/`: that repo specifies anchoring, proof of stake and the fee market, and
 owns nothing about how Lightning is built on top of them.
 
@@ -28,7 +28,7 @@ looks fine and fails in production.
 
 ```sh
 git clone --recurse-submodules -b sequentia-stable \
-  https://github.com/GracedEternalKingCabbageMan/seqln.git
+  https://github.com/ConcatenaLabs/seqln.git
 cd seqln
 uv sync --all-extras --all-groups --frozen   # python deps (msggen, test harness)
 ./configure

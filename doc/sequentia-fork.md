@@ -243,7 +243,7 @@ The Specula design note is not yet published in this repository; the header comm
 ## 9. libwally dependency
 
 `.gitmodules` pins `external/libwally-core` to
-https://github.com/GracedEternalKingCabbageMan/libwally-core, branch
+https://github.com/ConcatenaLabs/libwally-core, branch
 `sequentia-issuance-denomination`. Sequentia extends the Elements `CAssetIssuance` serialization
 with a 1-byte `nDenomination` (asset decimal precision) after `nInflationKeys`. Stock libwally
 under-reads every issuance input by one byte, so `wally_tx_from_bytes` fails on any issuance
