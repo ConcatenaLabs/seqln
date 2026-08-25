@@ -7,7 +7,7 @@ with `--network`. On Sequentia it adds what the chain makes possible: channels d
 issued asset, asset-aware routing and payments, and an anchor-aware safety layer that turns
 Sequentia's Bitcoin-anchored finality into fast, honest confirmation counting.
 
-Sequentia is a Bitcoin sidechain for asset tokenization and decentralized exchange, built as a
+Sequentia is a Bitcoin sidechain for asset tokenization and disintermediated exchanges, built as a
 fork of Blockstream Elements. Every Sequentia block references a Bitcoin block header, and if
 Bitcoin reorganizes away an anchor, Sequentia reorganizes with it, in real time. That real-time
 reorg-following is what makes Lightning on a sidechain safe, and SeqLN is built around it.
