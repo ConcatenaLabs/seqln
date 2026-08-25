@@ -33,11 +33,11 @@ The SeqLN design spec is this repository's own:
 with the rest of the fork's design documents in [doc/seqln-design/](doc/seqln-design/README.md).
 The public testnet explorer and API are at https://sequentiatestnet.com.
 
-## Status: what works today
+## What the fork adds
 
-Everything below is committed on the `sequentia-stable` branch and was proven against the live
-public testnet (re-genesis 2026-07-05) unless noted. The precise file-level change list, with
-known hazards, is in [doc/sequentia-fork.md](doc/sequentia-fork.md).
+Everything below is on the `sequentia-stable` branch and is exercised against the live public
+testnet unless noted. The precise file-level change list, with known hazards, is in
+[doc/sequentia-fork.md](doc/sequentia-fork.md).
 
 - **Sequentia as a network.** `--network=sequentia-testnet` selects the live testnet
   (`bitcoin/chainparams.c`). On-chain addresses share Bitcoin's `tb1` bech32 format (Sequentia is
@@ -140,7 +140,11 @@ you prefer explicit RPC credentials over a datadir/cookie. The node's RPC port o
 18776; 18332 is the port the node uses to reach its Bitcoin parent, and the `rpc_port` value in
 `bitcoin/chainparams.c` still says 18332.)
 
-There is no public SeqLN routing node or LSP yet; run two nodes (or use Fulmen) to test.
+The public testnet runs hosted SeqLN nodes behind an LSP at
+`https://sequentiatestnet.com/lsp`, which is the rail Ambra and the browser extension use: the
+nodes are keyless and the wallet's own device signer co-signs every commitment, so the host can
+route but never move channel funds. That LSP serves wallets, not arbitrary peers, so to test
+node-to-node routing yourself run two nodes (or use Fulmen).
 
 Then, for example:
 
