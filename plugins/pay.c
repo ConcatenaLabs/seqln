@@ -948,11 +948,11 @@ static struct command_result *json_pay(struct command *cmd,
 		      NULL))
 		return command_param_failed();
 
-	/* We can't just mark this command deprecated, as that prevents
-	 * xpay from overriding (lightningd stops it first!) */
-	if (!command_deprecated_in_ok(cmd, NULL, "v26.06", "v27.03"))
-		return command_fail(cmd, JSONRPC2_METHOD_NOT_FOUND,
-				    "Command \"pay\" is deprecated");
+	/* Upstream deprecates pay in favour of xpay.  Not here: pay is the
+	 * one payment path that routes in a Sequentia asset (the asset
+	 * parameter above), and xpay, askrene and renepay know nothing of
+	 * assets.  A node run with allow-deprecated-apis=false answered every
+	 * asset payment with "Command pay is deprecated". */
 
 	p = payment_new(cmd, cmd, NULL /* No parent */, global_hints, paymod_mods);
 	p->invstring = tal_steal(p, b11str);
