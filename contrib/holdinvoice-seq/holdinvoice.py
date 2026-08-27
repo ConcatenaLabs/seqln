@@ -14,6 +14,7 @@ RPC methods match what seqdex's clnLNLeg expects (holdinvoice / holdinvoicelooku
 import hashlib
 import os
 import sys
+import threading
 import types
 import importlib.util
 
@@ -53,9 +54,48 @@ Plugin = _load_pyln_plugin()
 
 plugin = Plugin()
 
-# payment_hash(hex) -> {state, preimage, amount_msat, requests:[Request,...]}
+# payment_hash(hex) -> {state, preimage, amount_msat, requests:[Request,...],
+#                        waiters:[Request,...]}
 HELD = {}
 STATES = ("waiting", "accepted", "settled", "cancelled")
+
+# Guards `waiters`: a holdinvoicewait is answered either by the hook thread
+# that holds the HTLC or by its own expiry timer, never both.
+WAITERS_LOCK = threading.Lock()
+
+
+def _state_of(plugin, ph):
+    """What a caller learns about a hold: the same for lookup and wait."""
+    e = HELD.get(ph)
+    if e is None:
+        return {"payment_hash": ph, "state": "unknown"}
+    return {"payment_hash": ph, "state": e["state"],
+            # amount_msat is the REGISTERED amount, received_msat the summed incoming
+            # HTLCs. These used to be one accumulated field, so a lookup after the payer
+            # paid reported registered+received (a 9999-sat hold read as 19998000 msat)
+            # and looked like a double-pay in every audit that trusted it.
+            "amount_msat": e["amount_msat"],
+            "received_msat": e.get("received_msat", 0),
+            # cltv_expiry is the EARLIEST absolute expiry among the held HTLCs: the
+            # payer chose it, and it is the hard deadline on everything the holder
+            # does with the incoming leg (an outgoing payment it makes against this
+            # hold must resolve before it). None until an HTLC is held.
+            "cltv_expiry": e.get("cltv_expiry"),
+            # The tip the holder measures that expiry against, so it needs no
+            # second round trip to learn it.
+            "blockheight": plugin.rpc.getinfo().get("blockheight")}
+
+
+def _wake_waiters(plugin, ph):
+    """Answer every pending holdinvoicewait for ph with its current state."""
+    e = HELD.get(ph)
+    if e is None:
+        return
+    with WAITERS_LOCK:
+        waiters = e.pop("waiters", [])
+    result = _state_of(plugin, ph)
+    for req in waiters:
+        req.set_result(result)
 
 
 @plugin.method("holdinvoice")
@@ -78,22 +118,38 @@ def holdinvoice(plugin, payment_hash, amount_msat=0, label="", description="", c
 
 @plugin.method("holdinvoicelookup")
 def holdinvoicelookup(plugin, payment_hash):
+    return _state_of(plugin, str(payment_hash).lower())
+
+
+@plugin.async_method("holdinvoicewait")
+def holdinvoicewait(plugin, request, payment_hash, timeout=60):
+    """Block until the hold on payment_hash leaves `waiting` (the HTLC is
+    held, or the hold was settled/cancelled) or `timeout` seconds pass, then
+    answer as holdinvoicelookup would.
+
+    Polling holdinvoicelookup put up to a poll interval between the HTLC
+    landing and the holder acting on it; this answers the moment the hook
+    holds it.
+    """
     ph = str(payment_hash).lower()
     e = HELD.get(ph)
-    if e is None:
-        return {"payment_hash": ph, "state": "unknown"}
-    return {"payment_hash": ph, "state": e["state"],
-            # amount_msat is the REGISTERED amount, received_msat the summed incoming
-            # HTLCs. These used to be one accumulated field, so a lookup after the payer
-            # paid reported registered+received (a 9999-sat hold read as 19998000 msat)
-            # and looked like a double-pay in every audit that trusted it.
-            "amount_msat": e["amount_msat"],
-            "received_msat": e.get("received_msat", 0),
-            # cltv_expiry is the EARLIEST absolute expiry among the held HTLCs: the
-            # payer chose it, and it is the hard deadline on everything the holder
-            # does with the incoming leg (an outgoing payment it makes against this
-            # hold must resolve before it). None until an HTLC is held.
-            "cltv_expiry": e.get("cltv_expiry")}
+    if e is None or e["state"] != "waiting":
+        request.set_result(_state_of(plugin, ph))
+        return
+    with WAITERS_LOCK:
+        e.setdefault("waiters", []).append(request)
+
+    def expire():
+        with WAITERS_LOCK:
+            waiters = e.get("waiters", [])
+            if request not in waiters:
+                return
+            waiters.remove(request)
+        request.set_result(_state_of(plugin, ph))
+
+    t = threading.Timer(float(timeout), expire)
+    t.daemon = True
+    t.start()
 
 
 @plugin.method("holdinvoicesettle")
@@ -112,6 +168,7 @@ def holdinvoicesettle(plugin, payment_hash, preimage):
         req.set_result({"result": "resolve", "payment_key": str(preimage).lower()})
         n += 1
     e["requests"] = []
+    _wake_waiters(plugin, ph)
     plugin.log(f"holdinvoicesettle: resolved {n} htlc(s) for {ph}", level="info")
     return {"payment_hash": ph, "state": "settled", "resolved_htlcs": n}
 
@@ -130,6 +187,7 @@ def holdinvoicecancel(plugin, payment_hash):
         req.set_result({"result": "fail", "failure_message": "2002"})
         n += 1
     e["requests"] = []
+    _wake_waiters(plugin, ph)
     plugin.log(f"holdinvoicecancel: failed {n} htlc(s) for {ph}", level="info")
     return {"payment_hash": ph, "state": "cancelled", "failed_htlcs": n}
 
@@ -161,6 +219,7 @@ def on_htlc_accepted(onion, htlc, request, plugin, **kwargs):
         pass
     e["state"] = "accepted"
     e["requests"].append(request)
+    _wake_waiters(plugin, ph)
     plugin.log(f"holdinvoice: HOLDING htlc for {ph} (now accepted)", level="info")
     # No set_result -> the HTLC stays accepted until settle/cancel.
 
