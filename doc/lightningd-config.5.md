@@ -389,9 +389,11 @@ basis with lightning-setchannel(7).
 
 * **commit-time**=*MILLISECONDS*
 
-  How long to wait before sending commitment messages to the peer: in
-theory increasing this would reduce load, but your node would have to be
-extremely busy node for you to even notice.
+  How long to wait before sending commitment messages to the peer, to
+batch updates that arrive together (default: 0, send at once).  Every
+commitment step of a swap waits on this, and a swap has some two dozen of
+them in a row, so the wait is paid many times per payment; batching only
+pays on a router busy enough to notice the load.
 
 * **force-feerates**==*VALUES*
 
