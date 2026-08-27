@@ -424,7 +424,8 @@ void fulfill_htlc(struct htlc_in *hin, const struct preimage *preimage)
 		 * release its preimage to the peer.  Best-effort on testnet until
 		 * the local keyset is threaded up (returns true); once wired, a
 		 * false return must defer this preimage release. */
-		if (!onchain_presign_htlc_success(channel, hin)) {
+		if (wt_store_enabled(channel->peer->ld)
+		    && !onchain_presign_htlc_success(channel, hin)) {
 			log_debug(channel->log,
 				  "HTLC %"PRIu64" fulfil deferred: success sweep "
 				  "not yet durable", hin->key.id);
@@ -2319,7 +2320,7 @@ void peer_sending_commitsig(struct channel *channel, const u8 *msg)
 	 * point remote_per_commit -- pre-sign the remote_htlc_to_us sweeps of OUR
 	 * HTLC outputs on it so a PEER honest force-close is defended while the
 	 * device is offline. */
-	if (pbase)
+	if (pbase && wt_store_enabled(ld))
 		onchain_presign_remote_htlc_sweeps(channel, &remote_per_commit,
 						   pbase);
 
@@ -2583,8 +2584,10 @@ void peer_got_commitsig(struct channel *channel, const u8 *msg)
 	 * commitnum is the commitment number of local_per_commit (both name the
 	 * commitment that built `tx`), so hsmd re-derives the matching per-
 	 * commitment secret. */
-	sweeps = onchain_presign_current_sweeps(tmpctx, channel, commitnum,
-						&local_per_commit, htlc_infos);
+	sweeps = wt_store_enabled(ld)
+		? onchain_presign_current_sweeps(tmpctx, channel, commitnum,
+						 &local_per_commit, htlc_infos)
+		: NULL;
 
 	/* Specula Phase F (preemptive close, the JBA barrier): store OUR current
 	 * fully-signed local commitment N into the preempt slot HERE -- after the
@@ -2596,12 +2599,14 @@ void peer_got_commitsig(struct channel *channel, const u8 *msg)
 	 * (never a revoked one) -- the Specula-vs-Vigilia guard.  Fail-soft (B6):
 	 * a device REJECT / store failure is logged, never fatal. */
 	preempt_tx = NULL;
-	if (channel->last_tx && !invalid_last_tx(channel->last_tx))
+	if (wt_store_enabled(ld)
+	    && channel->last_tx && !invalid_last_tx(channel->last_tx))
 		preempt_tx = sign_last_tx(tmpctx, channel, channel->last_tx,
 					  &channel->last_sig);
 	/* The sweeps and the preempt commitment go to disk in ONE write: the
 	 * store's flush count is what a commitment step costs. */
-	if (!wt_store_put_advance(ld, channel, commitnum, sweeps, preempt_tx))
+	if (wt_store_enabled(ld)
+	    && !wt_store_put_advance(ld, channel, commitnum, sweeps, preempt_tx))
 		log_broken(channel->log,
 			   "watchtower: failed storing the state advance "
 			   "(sweeps%s, preempt commitment%s) for commit %"PRIu64,
@@ -2791,7 +2796,7 @@ void peer_got_revoke(struct channel *channel, const u8 *msg)
 	 * it.  On any store failure we log but do not block the reply on
 	 * testnet (correctness-focused, no fund-safety blocker); the off-box
 	 * N-of-M quorum gate that HARD-blocks the reply is Phase D. */
-	if (pbase && tal_count(wt_blobs) > 0) {
+	if (pbase && tal_count(wt_blobs) > 0 && wt_store_enabled(ld)) {
 		if (!wt_store_put_justice(ld, channel, &pbase->txid,
 					  pbase->commitment_num, wt_blobs))
 			log_broken(channel->log,

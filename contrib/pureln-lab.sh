@@ -18,6 +18,7 @@
 #   LNLAB_DIR      state directory            (default /tmp/seqln-pureln-lab)
 #   SEQUENTIA_DIR  a built Sequentia checkout  (default ~/Sequentia)
 #   SEQLN_DIR      a built seqln checkout      (default: the one this script is in)
+#   LNLAB_EXTRA    extra config lines for both nodes, e.g. "watchtower-store=on"
 set -euo pipefail
 T=${LNLAB_DIR:-/tmp/seqln-pureln-lab}
 SEQUENTIA_DIR=${SEQUENTIA_DIR:-$HOME/Sequentia}
@@ -53,6 +54,7 @@ dev-bitcoind-poll=1
 funding-confirms=1
 force-feerates=5000
 min-emergency-msat=1000sat
+${LNLAB_EXTRA:-}
 $3
 EOF
 }

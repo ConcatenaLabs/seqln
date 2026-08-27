@@ -65,6 +65,11 @@
  * number of files a commitment step writes: one here, whatever the step.
  */
 
+/* Whether this node keeps the store at all: --watchtower-store, resolved at
+ * startup (auto = only when hsmd is a signer proxy, the keyless case the
+ * store exists for).  Every writer checks it; readers are unaffected. */
+bool wt_store_enabled(const struct lightningd *ld);
+
 #define WT_STATE_VERSION 3
 #define WT_STATE_FILE "state"
 #define WT_BLOB_SET_VERSION 1

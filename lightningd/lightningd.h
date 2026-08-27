@@ -47,6 +47,13 @@ struct config {
 	/* How long between changing commit and sending COMMIT message. */
 	u32 commit_time_ms;
 
+	/* The keyless watchtower store (lightningd/watchtower_store.h):
+	 * "auto" keeps it on a node whose hsmd is a signer proxy and off on
+	 * one holding its own keys; "on" / "off" force it.  Resolved into
+	 * watchtower_store_on once the options are read. */
+	const char *watchtower_store;
+	bool watchtower_store_on;
+
 	/* Do we let the opener set any fee rate they want */
 	bool ignore_fee_limits;
 

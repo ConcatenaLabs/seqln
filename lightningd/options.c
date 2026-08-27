@@ -995,6 +995,8 @@ static const struct config testnet_config = {
 	 * a quarter of a second of each swap. */
 	.commit_time_ms = 0,
 
+	.watchtower_store = "auto",
+
 	/* Allow dust payments */
 	.fee_base = 1,
 	/* Take 0.001% */
@@ -1076,6 +1078,8 @@ static const struct config mainnet_config = {
 	 * a quarter of a second of each swap. */
 	.commit_time_ms = 0,
 
+	.watchtower_store = "auto",
+
 	/* Discourage dust payments */
 	.fee_base = 1000,
 	/* Take 0.001% */
@@ -1112,6 +1116,21 @@ static const struct config mainnet_config = {
 
 static void check_config(struct lightningd *ld)
 {
+	/* The watchtower store exists so speculad can defend a node whose
+	 * keys are on a device that may be away.  A node holding its own
+	 * keys punishes and sweeps through onchaind as it always has, and
+	 * the store only costs it a durable write per commitment step. */
+	if (streq(ld->config.watchtower_store, "auto"))
+		ld->config.watchtower_store_on
+			= strmap_get(&ld->alt_subdaemons, "hsmd") != NULL;
+	else if (streq(ld->config.watchtower_store, "on"))
+		ld->config.watchtower_store_on = true;
+	else if (streq(ld->config.watchtower_store, "off"))
+		ld->config.watchtower_store_on = false;
+	else
+		fatal("--watchtower-store must be auto, on or off, not %s",
+		      ld->config.watchtower_store);
+
 	/* BOLT #2:
 	 *
 	 * The receiving node MUST fail the channel if:
@@ -1646,6 +1665,12 @@ static void register_opts(struct lightningd *ld)
 		       "For example, "
 		       "--subdaemon=hsmd:remote_signer "
 		       "would use a hypothetical remote signing subdaemon.");
+	clnopt_witharg("--watchtower-store=<auto|on|off>", 0,
+		       opt_set_charp, opt_show_charp,
+		       &ld->config.watchtower_store,
+		       "Keep the keyless watchtower store (pre-signed justice "
+		       "and sweep sets for speculad): auto = only when hsmd is "
+		       "a signer proxy, on, or off.");
 
 	opt_register_noarg("--invoices-onchain-fallback",
 			   opt_set_bool, &ld->unified_invoices,

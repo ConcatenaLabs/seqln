@@ -662,9 +662,11 @@ static const char *init(struct command *init_cmd,
 
 static const struct plugin_command commands[] = {
 	{
+		/* Not deprecated here as upstream has it: getroute is the
+		 * route computation that honours a Sequentia asset, which
+		 * askrene's getroutes does not. */
 		"getroute",
 		json_getroute,
-		"v26.06", "v27.03",
 	},
 	{
 		"listchannels",
