@@ -335,10 +335,11 @@ static struct watchtower_blob **build_current_sweeps(const tal_t *ctx,
 	return blobs;
 }
 
-void onchain_presign_current_sweeps(struct channel *channel,
-				    u64 commit_num,
-				    const struct pubkey *local_per_commit,
-				    const struct got_commitsig_htlc_info *htlc_infos)
+struct watchtower_blob **onchain_presign_current_sweeps(const tal_t *ctx,
+							struct channel *channel,
+							u64 commit_num,
+							const struct pubkey *local_per_commit,
+							const struct got_commitsig_htlc_info *htlc_infos)
 {
 	struct lightningd *ld = channel->peer->ld;
 	struct watchtower_blob **blobs;
@@ -355,35 +356,26 @@ void onchain_presign_current_sweeps(struct channel *channel,
 		= tal_dup_talarr(channel, struct got_commitsig_htlc_info,
 				 htlc_infos);
 
-	blobs = build_current_sweeps(tmpctx, channel, commit_num,
+	blobs = build_current_sweeps(ctx, channel, commit_num,
 				     local_per_commit, htlc_infos);
 	if (tal_count(blobs) == 0) {
-		/* Nothing new to sign for OUR commitment; leave the prior stored
-		 * set (which may carry a still-current kind-6) untouched. */
 		log_debug(channel->log,
 			  "onchain_presign: no CLASS-B current-state sweeps for "
 			  "commit %"PRIu64" (no to_local + no offered HTLCs); "
 			  "keeping prior stored set", commit_num);
-		return;
+		return tal_free(blobs);
 	}
-
-	/* wt_store_put_sweeps REPLACES the whole sweeps/ dir, but kind-6
-	 * (remote_htlc_to_us) is keyed to the PEER commitment -- which has NOT
-	 * advanced here (we're receiving THEIR sig on OUR new commitment) -- so
-	 * carry any stored kind-6 blob across the replace so it is not wiped. */
+	/* The caller stores the set: kind-6 REMOTE_HTLC_TO_US sweeps are
+	 * not rebuilt here, so the stored ones are carried over. */
 	{
 		struct watchtower_blob **stored
 			= wt_store_load_sweeps(tmpctx, ld, channel);
 		for (size_t i = 0; i < tal_count(stored); i++) {
 			if (stored[i]->kind == WT_TMPL_REMOTE_HTLC_TO_US)
-				tal_arr_expand(&blobs, stored[i]);
+				tal_arr_expand(&blobs, tal_steal(blobs, stored[i]));
 		}
 	}
-
-	if (!wt_store_put_sweeps(ld, channel, commit_num, blobs))
-		log_broken(channel->log,
-			   "onchain_presign: failed storing %zu CLASS-B sweeps",
-			   tal_count(blobs));
+	return blobs;
 }
 
 /* Our current LOCAL commitment number, used as the meta.current_commit_num guard

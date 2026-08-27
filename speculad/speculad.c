@@ -191,13 +191,69 @@ static struct spd_blob *spd_blob_decode(const tal_t *ctx,
 	return b;
 }
 
-/* Load every blob_* file under dir (mirrors watchtower_store.c:load_blob_dir). */
-static struct spd_blob **load_blob_dir(const tal_t *ctx, const char *dir)
+/* A blob set as watchtower_store.c writes it: u64 version, u64 count, then
+ * the blobs. */
+#define WT_BLOB_SET_VERSION 1
+#define WT_BLOB_SET_FILE "blobs"
+#define WT_STATE_VERSION 3
+#define WT_STATE_FILE "state"
+
+static struct spd_blob **decode_blob_set(const tal_t *ctx, const char *what,
+					 const u8 **cursor, size_t *max)
 {
 	struct spd_blob **out = tal_arr(ctx, struct spd_blob *, 0);
-	DIR *d = opendir(dir);
+	u64 version = fromwire_u64(cursor, max);
+	u64 count = fromwire_u64(cursor, max);
+
+	if (!*cursor || version != WT_BLOB_SET_VERSION) {
+		fprintf(stderr, "speculad: %s: unknown blob set version %"PRIu64"\n",
+			what, version);
+		*cursor = NULL;
+		return out;
+	}
+	for (u64 i = 0; i < count; i++) {
+		struct spd_blob *blob = spd_blob_decode(ctx, cursor, max);
+
+		if (!blob) {
+			fprintf(stderr, "speculad: corrupt blob set %s\n", what);
+			break;
+		}
+		tal_arr_expand(&out, blob);
+	}
+	return out;
+}
+
+/* Load a blob-set FILE. */
+static struct spd_blob **load_blob_file(const tal_t *ctx, const char *path)
+{
+	u8 *contents = grab_file_str(tmpctx, path);
+	const u8 *cursor = contents;
+	size_t max;
+
+	if (!contents) {
+		fprintf(stderr, "speculad: cannot read %s\n", path);
+		return tal_arr(ctx, struct spd_blob *, 0);
+	}
+	/* grab_file NUL-terminates; real length is tal_count-1. */
+	max = tal_count(contents) - 1;
+	return decode_blob_set(ctx, path, &cursor, &max);
+}
+
+/* Load a blob set kept as a DIRECTORY (the layouts before justice sets were
+ * files, mirrors watchtower_store.c:load_blob_dir): its `blobs` set file when
+ * present, else every blob_* file. */
+static struct spd_blob **load_blob_dir(const tal_t *ctx, const char *dir)
+{
+	struct spd_blob **out;
+	char *setpath = path_join(tmpctx, dir, WT_BLOB_SET_FILE);
+	DIR *d;
 	struct dirent *ent;
 
+	if (access(setpath, R_OK) == 0)
+		return load_blob_file(ctx, setpath);
+
+	out = tal_arr(ctx, struct spd_blob *, 0);
+	d = opendir(dir);
 	if (!d)
 		return out;
 
@@ -228,6 +284,51 @@ static struct spd_blob **load_blob_dir(const tal_t *ctx, const char *dir)
 	}
 	closedir(d);
 	return out;
+}
+
+/* The current-state bundle <chandir>/state (watchtower_store.h): meta fields,
+ * the sweep set, the preempt commitment, the armed flag.  Fills the channel's
+ * fields; returns false when there is no bundle (an earlier layout, read by
+ * the caller's fallbacks) or it does not decode. */
+static bool read_state(struct watched_channel *c, const char *chandir)
+{
+	char *path = path_join(tmpctx, chandir, WT_STATE_FILE);
+	u8 *contents = grab_file_str(tmpctx, path);
+	const u8 *cursor;
+	size_t max;
+	u64 version, dbid;
+	u16 to_self_delay;
+
+	if (!contents)
+		return false;
+	cursor = contents;
+	max = tal_count(contents) - 1;
+	version = fromwire_u64(&cursor, &max);
+	dbid = fromwire_u64(&cursor, &max);
+	c->current_commit_num = fromwire_u64(&cursor, &max);
+	fromwire_bitcoin_outpoint(&cursor, &max, &c->funding);
+	to_self_delay = fromwire_u16(&cursor, &max);
+	if (!cursor || version != WT_STATE_VERSION || dbid != c->dbid) {
+		fprintf(stderr, "speculad: %s: bad state file (version %"PRIu64
+			", dbid %"PRIu64")\n", path, version, dbid);
+		return false;
+	}
+	c->remote_to_self_delay = to_self_delay;
+	c->sweeps = decode_blob_set(c, path, &cursor, &max);
+	c->preempt_tx = NULL;
+	c->preempt_commit_num = 0;
+	if (fromwire_bool(&cursor, &max)) {
+		c->preempt_commit_num = fromwire_u64(&cursor, &max);
+		c->preempt_tx = fromwire_bitcoin_tx(c, &cursor, &max);
+	}
+	c->preempt_armed = fromwire_bool(&cursor, &max);
+	c->preempt_armed_commit_num = c->preempt_armed
+		? fromwire_u64(&cursor, &max) : 0;
+	if (!cursor) {
+		fprintf(stderr, "speculad: %s: truncated state file\n", path);
+		return false;
+	}
+	return true;
 }
 
 /* meta = LE u64 version, u64 dbid, u64 current_commit_num[, v2: bitcoin_outpoint
@@ -338,21 +439,23 @@ static struct watched_channel **load_channels(const tal_t *ctx,
 		c = tal(chans, struct watched_channel);
 		c->dbid = strtoull(ent->d_name, NULL, 10);
 		c->chandir = tal_strdup(c, chandir);
-		c->current_commit_num = read_meta(chandir, &c->funding,
-						  &c->remote_to_self_delay);
 		c->revoked = tal_arr(c, struct revoked_commit *, 0);
-
-		/* Phase F preempt slot + arm flag (both inert when absent). */
-		c->preempt_tx = NULL;
-		c->preempt_commit_num = 0;
-		if (read_preempt(c, chandir, &c->preempt_commit_num,
-				 &c->preempt_tx))
-			c->preempt_tx = tal_steal(c, c->preempt_tx);
-		c->preempt_armed = read_preempt_armed(chandir,
-						      &c->preempt_armed_commit_num);
-
-		sweepsdir = path_join(tmpctx, chandir, "sweeps");
-		c->sweeps = load_blob_dir(c, sweepsdir);
+		if (!read_state(c, chandir)) {
+			/* The layout before the state bundle: meta beside
+			 * sweeps/ and preempt/. */
+			c->current_commit_num = read_meta(chandir, &c->funding,
+							  &c->remote_to_self_delay);
+			/* Phase F preempt slot + arm flag (both inert when absent). */
+			c->preempt_tx = NULL;
+			c->preempt_commit_num = 0;
+			if (read_preempt(c, chandir, &c->preempt_commit_num,
+					 &c->preempt_tx))
+				c->preempt_tx = tal_steal(c, c->preempt_tx);
+			c->preempt_armed = read_preempt_armed(chandir,
+							      &c->preempt_armed_commit_num);
+			sweepsdir = path_join(tmpctx, chandir, "sweeps");
+			c->sweeps = load_blob_dir(c, sweepsdir);
+		}
 
 		justice = path_join(tmpctx, chandir, "justice");
 		jd = opendir(justice);
@@ -367,7 +470,12 @@ static struct watched_channel **load_channels(const tal_t *ctx,
 				rc = tal(c, struct revoked_commit);
 				rc->locator = tal_strdup(rc, je->d_name);
 				rc->dir = tal_strdup(rc, cdir);
-				rc->blobs = load_blob_dir(rc, cdir);
+				/* One set file per revoked commitment; a
+				 * directory is the earlier layout. */
+				if (stat(cdir, &st) == 0 && S_ISDIR(st.st_mode))
+					rc->blobs = load_blob_dir(rc, cdir);
+				else
+					rc->blobs = load_blob_file(rc, cdir);
 				rc->confirmations = 0;
 				tal_arr_expand(&c->revoked, rc);
 			}

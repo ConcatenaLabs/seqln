@@ -48,10 +48,11 @@ struct got_commitsig_htlc_info;
  * 1:1 with channel->last_htlc_sigs.  Also stashes the keyset ingredients on the
  * channel for the fulfill-time kind-5 rebuild.  Call at commitment advance,
  * AFTER channel->last_htlc_sigs and channel->last_tx are set. */
-void onchain_presign_current_sweeps(struct channel *channel,
-				    u64 commit_num,
-				    const struct pubkey *local_per_commit,
-				    const struct got_commitsig_htlc_info *htlc_infos);
+struct watchtower_blob **onchain_presign_current_sweeps(const tal_t *ctx,
+							struct channel *channel,
+							u64 commit_num,
+							const struct pubkey *local_per_commit,
+							const struct got_commitsig_htlc_info *htlc_infos);
 
 /* Pre-sign + store the HTLC-success sweep (kind 5) for a just-fulfilled incoming
  * HTLC, using the preimage (only known now) + the stashed local keyset.  The JBA
