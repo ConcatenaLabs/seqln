@@ -196,6 +196,11 @@ static bool write_durable(const char *dir, const char *name,
 	return fsync_dir(dir);
 }
 
+bool wt_store_enabled(const struct lightningd *ld)
+{
+	return ld->config.watchtower_store_on;
+}
+
 /* ---- the state bundle ---------------------------------------------------- */
 
 /* Everything about a channel's CURRENT state that the store holds, as one

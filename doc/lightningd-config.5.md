@@ -182,6 +182,17 @@ working directory. This option may be specified multiple times.
 hypothetical remote signing proxy instead of the standard *lightning\_hsmd*
 binary.
 
+* **watchtower-store**=*auto*|*on*|*off*
+
+  Whether this node keeps the watchtower store: the pre-signed justice
+and sweep sets under *lightning-dir*/*network*/watchtower that speculad
+broadcasts for a node whose keys are on a signing device that may be
+away. *auto* (the default) keeps it only when *hsmd* is replaced by a
+signer proxy (**subdaemon=hsmd:...**); a node holding its own keys
+punishes and sweeps through *onchaind* as it always has, and the store
+would only cost it a durable write per commitment step. *on* and *off*
+force it either way.
+
 * **pid-file**=*PATH*
 
   Specify pid file to write to.

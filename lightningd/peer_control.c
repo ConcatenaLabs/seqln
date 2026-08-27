@@ -3938,6 +3938,10 @@ static struct command_result *json_setpreemptarmed(struct command *cmd,
 		   NULL))
 		return command_param_failed();
 
+	if (!wt_store_enabled(cmd->ld))
+		return command_fail(cmd, LIGHTNINGD,
+				    "this node keeps no watchtower store "
+				    "(watchtower-store is off)");
 	if (!wt_store_set_preempt_armed(cmd->ld, channel, *armed))
 		return command_fail(cmd, LIGHTNINGD,
 				    "failed to persist preempt armed flag");
