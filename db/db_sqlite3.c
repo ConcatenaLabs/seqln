@@ -207,6 +207,29 @@ static bool db_sqlite3_setup(struct db *db, bool create)
 	if (err != SQLITE_DONE)
 		return false;
 
+	/* Write-ahead logging, still synced on every commit.  A commit in the
+	 * default rollback-journal mode is four device flushes (the journal,
+	 * the database, and the directory twice); in WAL mode it is one, the
+	 * WAL append.  Channel state is written a few dozen times per
+	 * Lightning payment, all of it on the payment's critical path, so
+	 * those flushes were most of what a payment cost.  Durability is
+	 * unchanged: synchronous=FULL syncs the WAL before a commit returns,
+	 * and a checkpoint syncs the database before the WAL is recycled.
+	 * (The pragma answers with a row naming the mode now in force.) */
+	sqlite3_prepare_v2(conn2sql(db->conn),
+			   "PRAGMA journal_mode = WAL;", -1, &stmt, NULL);
+	err = sqlite3_step(stmt);
+	sqlite3_finalize(stmt);
+	if (err != SQLITE_ROW && err != SQLITE_DONE)
+		return false;
+
+	sqlite3_prepare_v2(conn2sql(db->conn),
+			   "PRAGMA synchronous = FULL;", -1, &stmt, NULL);
+	err = sqlite3_step(stmt);
+	sqlite3_finalize(stmt);
+	if (err != SQLITE_DONE)
+		return false;
+
 	if (db->developer) {
 		sqlite3_prepare_v2(conn2sql(db->conn),
 				   "PRAGMA trusted_schema = OFF;", -1, &stmt, NULL);
