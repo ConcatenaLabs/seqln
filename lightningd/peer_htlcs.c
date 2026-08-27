@@ -2460,6 +2460,8 @@ void peer_got_commitsig(struct channel *channel, const u8 *msg)
 	 * honest-close pre-sign. */
 	struct pubkey local_per_commit;
 	struct got_commitsig_htlc_info *htlc_infos;
+	struct watchtower_blob **sweeps;
+	struct bitcoin_tx *preempt_tx;
 
 	if (!fromwire_channeld_got_commitsig(msg, msg,
 					    &commitnum,
@@ -2581,8 +2583,8 @@ void peer_got_commitsig(struct channel *channel, const u8 *msg)
 	 * commitnum is the commitment number of local_per_commit (both name the
 	 * commitment that built `tx`), so hsmd re-derives the matching per-
 	 * commitment secret. */
-	onchain_presign_current_sweeps(channel, commitnum, &local_per_commit,
-				       htlc_infos);
+	sweeps = onchain_presign_current_sweeps(tmpctx, channel, commitnum,
+						&local_per_commit, htlc_infos);
 
 	/* Specula Phase F (preemptive close, the JBA barrier): store OUR current
 	 * fully-signed local commitment N into the preempt slot HERE -- after the
@@ -2593,16 +2595,18 @@ void peer_got_commitsig(struct channel *channel, const u8 *msg)
 	 * commitment ALWAYS names a local state whose secret we have NOT revealed
 	 * (never a revoked one) -- the Specula-vs-Vigilia guard.  Fail-soft (B6):
 	 * a device REJECT / store failure is logged, never fatal. */
-	if (channel->last_tx && !invalid_last_tx(channel->last_tx)) {
-		struct bitcoin_tx *preempt_tx
-			= sign_last_tx(tmpctx, channel, channel->last_tx,
-				       &channel->last_sig);
-		if (preempt_tx
-		    && !wt_store_put_preempt(ld, channel, commitnum, preempt_tx))
-			log_broken(channel->log,
-				   "watchtower: failed storing preempt commitment "
-				   "for commit %"PRIu64, commitnum);
-	}
+	preempt_tx = NULL;
+	if (channel->last_tx && !invalid_last_tx(channel->last_tx))
+		preempt_tx = sign_last_tx(tmpctx, channel, channel->last_tx,
+					  &channel->last_sig);
+	/* The sweeps and the preempt commitment go to disk in ONE write: the
+	 * store's flush count is what a commitment step costs. */
+	if (!wt_store_put_advance(ld, channel, commitnum, sweeps, preempt_tx))
+		log_broken(channel->log,
+			   "watchtower: failed storing the state advance "
+			   "(sweeps%s, preempt commitment%s) for commit %"PRIu64,
+			   sweeps ? "" : " unchanged",
+			   preempt_tx ? "" : " unavailable", commitnum);
 
 	/* Now append htlc sigs for inflights */
 	i = 0;

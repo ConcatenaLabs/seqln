@@ -989,8 +989,11 @@ static const struct config testnet_config = {
 	.cltv_expiry_delta = 6,
 	.cltv_final = 10,
 
-	/* Send commit 10msec after receiving; almost immediately. */
-	.commit_time_ms = 10,
+	/* Send commit as soon as there is a change.  Upstream waits 10ms to
+	 * batch updates on a busy router; here every HTLC is a leg of a swap
+	 * whose ~24 commitment steps run back to back, and that wait was
+	 * a quarter of a second of each swap. */
+	.commit_time_ms = 0,
 
 	/* Allow dust payments */
 	.fee_base = 1,
@@ -1067,8 +1070,11 @@ static const struct config mainnet_config = {
 	 *    worst case for the terminal node C is `2R+G+S` blocks */
 	.cltv_final = 18,
 
-	/* Send commit 10msec after receiving; almost immediately. */
-	.commit_time_ms = 10,
+	/* Send commit as soon as there is a change.  Upstream waits 10ms to
+	 * batch updates on a busy router; here every HTLC is a leg of a swap
+	 * whose ~24 commitment steps run back to back, and that wait was
+	 * a quarter of a second of each swap. */
+	.commit_time_ms = 0,
 
 	/* Discourage dust payments */
 	.fee_base = 1000,
