@@ -368,12 +368,19 @@ static void json_add_utxo(struct json_stream *response,
 	json_add_num(response, "output", utxo->outpoint.n);
 	json_add_amount_sat_msat(response, "amount_msat", utxo->amount);
 
-	/* Asset-aware channels: for a non-policy (issued) asset, surface its
-	 * display id (32-byte hex, natural order). Policy-asset outputs omit
-	 * this field, so they are unchanged; the amount is in the asset's atoms. */
-	if (chainparams->is_elements && chainparams->fee_asset_tag
-	    && memcmp(utxo->asset, chainparams->fee_asset_tag,
-		      sizeof(utxo->asset)) != 0) {
+	/* Asset-aware channels: surface EVERY output's asset as its display id
+	 * (32-byte hex, natural order), the policy asset included.  The amount is
+	 * in that asset's atoms.
+	 *
+	 * This field used to be omitted when the output WAS the policy asset, on
+	 * the theory that "no asset" reads as the default.  That made the policy
+	 * asset the one asset that does not name itself, and every caller that
+	 * filters `output.asset == <id>` -- the ordinary way to ask "how much of
+	 * X do I hold?" -- silently dropped all of them and read the balance as
+	 * zero.  A policy-asset channel open then waited forever on a deposit
+	 * that had confirmed in the very next block.  No privileged asset: each
+	 * one answers the same question the same way. */
+	if (chainparams->is_elements && chainparams->fee_asset_tag) {
 		u8 id[32];
 		for (size_t i = 0; i < sizeof(id); i++)
 			id[i] = utxo->asset[sizeof(id) - i]; /* drop 0x01, reverse */
@@ -497,11 +504,12 @@ static struct command_result *json_listfunds(struct command *cmd,
 			json_add_amount_sat_msat(response,
 						 "amount_msat",
 						 c->funding_sats);
-			/* Asset-aware channels: surface a non-policy channel
-			 * asset's display id (amounts are in its atoms). */
-			if (chainparams->is_elements && chainparams->fee_asset_tag
-			    && memcmp(c->channel_asset, chainparams->fee_asset_tag,
-				      sizeof(c->channel_asset)) != 0) {
+			/* Asset-aware channels: surface EVERY channel asset's
+			 * display id, the policy asset included (amounts are in
+			 * its atoms).  Omitting it for the policy asset lost the
+			 * channel's asset identity entirely -- see json_add_utxo
+			 * above for what that costs. */
+			if (chainparams->is_elements && chainparams->fee_asset_tag) {
 				u8 id[32];
 				for (size_t i = 0; i < sizeof(id); i++)
 					id[i] = c->channel_asset[sizeof(id) - i];

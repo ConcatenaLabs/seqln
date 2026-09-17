@@ -93,6 +93,12 @@
               "description": [
                 "Whether this UTXO is currently reserved for an in-flight tx."
               ]
+            },
+            "asset": {
+              "type": "hex",
+              "description": [
+                "On an asset-aware chain, the 32-byte display id of this output's asset, the policy asset included; *amount_msat* is in that asset's atoms."
+              ]
             }
           },
           "allOf": [
@@ -122,6 +128,7 @@
                   "value": {},
                   "redeemscript": {},
                   "status": {},
+                  "asset": {},
                   "reserved": {},
                   "reserved_to_block": {},
                   "blockheight": {
@@ -159,6 +166,7 @@
                   "value": {},
                   "redeemscript": {},
                   "status": {},
+                  "asset": {},
                   "blockheight": {},
                   "reserved": {},
                   "reserved_to_block": {
@@ -253,6 +261,12 @@
                 "The full channel_id (funding txid Xored with output number)."
               ],
               "added": "v23.05"
+            },
+            "asset": {
+              "type": "hex",
+              "description": [
+                "On an asset-aware chain, the 32-byte display id of the channel's asset, the policy asset included; the amounts are in that asset's atoms."
+              ]
             }
           },
           "allOf": [
@@ -283,6 +297,7 @@
                   "funding_output": {},
                   "connected": {},
                   "state": {},
+                  "asset": {},
                   "channel_id": {},
                   "short_channel_id": {
                     "type": "short_channel_id",
@@ -323,6 +338,7 @@
                   "funding_output": {},
                   "connected": {},
                   "state": {},
+                  "asset": {},
                   "channel_id": {},
                   "short_channel_id": {
                     "type": "short_channel_id",
