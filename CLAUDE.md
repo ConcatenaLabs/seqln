@@ -154,9 +154,26 @@ no `claude/*` branch names or session ids, and no mention in source, comments,
 docs or issue text. Agent tooling offers several of these by default; compose the
 message without them rather than stripping them afterwards.
 
-**Author every commit as**
-`GracedEternalKingCabbageMan <151803062+GracedEternalKingCabbageMan@users.noreply.github.com>`.
-Never a personal address.
+**Author every commit as the person the session is working for.** Several people
+commit in these repositories and an agent always runs on behalf of one of them,
+so derive the author from the authenticated GitHub account rather than from a
+list of names that goes stale the moment somebody new arrives:
+
+    git -c user.name="$(gh api user --jq '.name // .login')" \
+        -c user.email="$(gh api user --jq '"\(.id)+\(.login)@users.noreply.github.com"')" \
+        commit ...
+
+That address is the GitHub `noreply` form, which is what links a commit to its
+account and keeps private addresses out of a public history. When `gh` is not
+authenticated as the person the work belongs to, ask them instead of guessing.
+
+**Never infer the author from `git log`.** The clones carry no `user.name` or
+`user.email`, so `git commit` stops with "Author identity unknown" and the
+nearest answer to hand is the author of the last commit — which is whoever
+pushed last and says nothing about who is working now. Attributing a commit to
+someone who did not write it puts their name on code they never reviewed, and
+taking it back costs a history rewrite and a force-push over commits other
+machines have already pulled.
 
 **Every change lands through a pull request that you merge yourself, at once.**
 There is no reviewer on this project; the pull request exists so the reasoning is
