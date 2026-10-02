@@ -42,6 +42,7 @@ testnet unless noted. The precise file-level change list, with known hazards, is
 - **Sequentia as a network.** `--network=sequentia-testnet` selects the live testnet
   (`bitcoin/chainparams.c`). On-chain addresses share Bitcoin's `tb1` bech32 format (Sequentia is
   transparent by default); invoices use the distinct Lightning HRP `tsqt` (`lntsqt...`).
+  `--network=sequentia-regtest` is the local anchored chain the test suite runs on (see Testing).
 - **Anchored block headers.** Sequentia block headers carry a Bitcoin anchor
   (`anchor_height` + `anchor_hash`); the parser (`bitcoin/block.c`) recomputes block hashes that
   match the live chain byte-for-byte.
@@ -58,7 +59,8 @@ testnet unless noted. The precise file-level change list, with known hazards, is
 - **Asset channels.** `fundchannel ... asset=<32-byte hex asset id>` opens a single-funder channel
   denominated in any issued asset (e.g. GOLD): per-asset coin selection and funding, commitment
   transactions and HTLCs in the channel asset, force-close resolution and anchor CPFP in the
-  channel asset, and on-chain fees sized per-asset via the node's `getfeeexchangerates` whitelist
+  channel asset, mutual close in the channel asset, and on-chain fees sized per-asset via the
+  node's `getfeeexchangerates` whitelist
   (Sequentia's open fee market: fees are payable in any accepted asset).
 - **Asset-aware gossip and payments.** Channel gossip records each channel's asset from its
   funding output; `getroute` and `pay` take an `asset=<id>` parameter and route only over channels
@@ -90,8 +92,6 @@ Experimental / known limitations (details and file pointers in
   are asset-blind and can put an HTLC on the wrong-asset channel. One asset per peer, and verify
   per-asset balance movement.
 - BOLT11 invoices carry no asset field yet; the payer chooses the asset with `pay ... asset=<id>`.
-- The upstream CLN integration-test harness has no Sequentia network entries; Sequentia coverage
-  is standalone scripts under `tests/sequentia/` plus the signer conformance harness.
 
 ## Building from source
 
@@ -174,10 +174,19 @@ The same binary, database format, plugins, and RPC surface apply; see the upstre
 
 ## Testing
 
-- **Upstream suites** (Bitcoin regtest / liquid-regtest; no Sequentia entries yet):
-  `make check-units` for unit tests, `make pytest` (or
-  `uv run python -m pytest -v tests/`) for integration tests. See
+- **Upstream suites** (Bitcoin regtest / liquid-regtest): `make check-units` for unit tests,
+  `make pytest` (or `uv run python -m pytest -v tests/`) for integration tests. See
   [doc/contribute-to-core-lightning/testing.md](doc/contribute-to-core-lightning/testing.md).
+- **Sequentia network tests** (`tests/sequentia/test_*.py`): the same harness on a local
+  Sequentia chain with anchored headers, a proof-of-stake committee and a Bitcoin Core regtest
+  parent (`--network=sequentia-regtest`). They need `sequentiad`, `sequentia-cli` and a Bitcoin
+  Core `bitcoind` on `PATH`:
+  ```bash
+  PATH=/path/to/bitcoin/bin:/path/to/Sequentia/src:$PATH TEST_NETWORK=sequentia-regtest \
+    python3 -m pytest tests/sequentia/
+  ```
+  What the network is and what the tests cover:
+  [doc/sequentia-fork.md](doc/sequentia-fork.md#10-tests).
 - **Sequentia live-chain checks** (`tests/sequentia/`): standalone scripts that point at any
   reachable Sequentia node via `ELEMCLI` (path to `sequentia-cli`, the default) and
   `SEQ_RPC_{HOST,PORT,USER,PASS}`:

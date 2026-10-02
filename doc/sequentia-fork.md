@@ -13,12 +13,13 @@ Everything here is testnet software.
 
 ## 1. Networks (`bitcoin/chainparams.c`, `bitcoin/chainparams.h`)
 
-Two Elements-family network entries are added, plus a `has_anchor_header` field on
+Three Elements-family network entries are added, plus a `has_anchor_header` field on
 `struct chainparams` that gates every Sequentia-specific code path:
 
 | network_name | onchain HRP | lightning HRP | bip70 (chain) | is_elements | has_anchor_header |
 | --- | --- | --- | --- | --- | --- |
 | `sequentia-testnet` (live) | `tb` | `tsqt` | `test` | yes | yes |
+| `sequentia-regtest` (local tests) | `bcrt` | `sqrt` | `sequentia-regtest` | yes | yes |
 | `sequentia` (placeholder) | `bc` | `sqt` | `sequentia` | yes | yes |
 
 - The on-chain HRP is shared with Bitcoin (`tb`/`bc`) by design: Sequentia is transparent by
@@ -37,6 +38,11 @@ Two Elements-family network entries are added, plus a `has_anchor_header` field 
   `c8eccacf0953e1931cd31e434d8319101cc36e6c38b0e2104d8687552fae3e40`. Display order here breaks
   wallet detection: `wally_tx_output_get_amount()` returns assets in internal order and
   `amount_asset_is_main()` does a straight memcmp.
+- `sequentia-regtest` is the local custom chain the pytest harness starts (section 10): a
+  `sequentiad -chain=sequentia-regtest` node anchored to a Bitcoin Core regtest parent, sharing
+  the parent's `bcrt` prefix as the testnet shares `tb`. A custom chain's genesis and policy asset
+  follow from its arguments, so the entry carries the values the harness's arguments produce, and
+  the harness refuses to start a node that reports different ones.
 - The `sequentia` mainnet entry is an explicit placeholder (all-zero genesis, NULL
   `fee_asset_tag`); there is no Sequentia mainnet. It must be filled before any use.
 - `cli` is `sequentia-cli` with `cli_args` `-chain=test`: the `bcli` backend drives a Sequentia
@@ -72,10 +78,13 @@ unless its Bitcoin anchor is reorganized away (Bitcoin anchoring is supreme, and
 Bitcoin reorg in real time), and the chain tip is normally certified immediately. SeqLN encodes
 that honestly, all gated on `has_anchor_header`:
 
-- **Certified-frontier confirmations** (`plugins/bcli.c`, `getchaininfo`): `bcli` reports the
-  highest `poscertified` height at or below the node tip as `blockcount`/`headercount`, so every
-  `minimum_depth`/confirmation check in CLN is denominated in certified depth, not raw
-  tip-distance. The walk down is bounded by `SEQUENTIA_CERT_LOOKBACK` (144); a gap that large
+- **Certified-frontier confirmations** (`plugins/bcli.c`, `getchaininfo` and
+  `getrawblockbyheight`): `bcli` reports the highest `poscertified` height at or below the node
+  tip as `blockcount`/`headercount`, and answers a request for a block above that height as "not
+  yet known", so the chain CLN follows ends at the certified frontier and every
+  `minimum_depth`/confirmation check is denominated in certified depth, not raw tip-distance. A
+  block certified below quorum (accepted only under the escaping stall) joins CLN's chain once a
+  certified block lands on top of it. The walk down is bounded by `SEQUENTIA_CERT_LOOKBACK` (144); a gap that large
   means the committee has stalled, and the clamp fails open with a loud warning. A frontier
   retreat (Bitcoin-anchor reorg / tail truncation) is absorbed by CLN's normal reorg handling.
 - **`minimum_depth` = 1 and wall-clock timelocks** (`lightningd/options.c`): a certified funding
@@ -138,6 +147,9 @@ policy asset by default). File-level map of the threading:
   `common/htlc_tx.{c,h}`, `channeld/full_channel.c`, `channeld/channeld.c` +
   `channeld/channeld_wire.csv`: commitment transactions and HTLC transactions denominated in the
   channel asset.
+- `common/close_tx.{c,h}`, `closingd/closingd.c` + `closingd/closingd_wire.csv`,
+  `lightningd/closing_control.c`: the mutual-close transaction in the channel asset (both outputs
+  and the fee), and the closing fee read from the outputs in that asset.
 - `lightningd/channel.{c,h}`, `lightningd/channel_control.c`, `lightningd/peer_control.c`,
   `wallet/wallet.{c,h}`, `wallet/migrations.c`: `channel_asset` on the channel state, persisted
   across restarts (DB migration), surfaced in `listpeerchannels` as `channel_asset` (32-byte
@@ -232,7 +244,7 @@ The Specula design note is not yet published in this repository; the header comm
 | `plugins/pay.c`, `plugins/libplugin-pay.{c,h}` | `asset` parameter, per-asset route filter |
 | `plugins/topology.c` | `getroute` `asset` parameter |
 | `plugins/spender/*` | `fundchannel`/`multifundchannel` `asset` parameter, single-asset funding txs |
-| `channeld`, `openingd`, `onchaind` | Channel asset threading (section 5) |
+| `channeld`, `openingd`, `closingd`, `onchaind` | Channel asset threading (section 5) |
 | `gossipd` | On-chain asset learning + gossip store records (section 6) |
 | `hsmd` | Proxy/signer split (section 7); stock in-process `hsmd` is unchanged and remains the default |
 | `channeld`, `lightningd/onchain_presign.c`, `speculad` | Specula watchtower: pre-signed justice/sweep sets and their offline broadcaster (section 7b) |
@@ -254,6 +266,28 @@ byte-exact; non-issuance inputs are untouched. Build with `git submodule update 
 
 ## 10. Tests
 
+`tests/sequentia/test_*.py` run SeqLN on a local Sequentia chain through the upstream pytest
+harness. With `TEST_NETWORK=sequentia-regtest`, the harness's `bitcoind` fixture is a
+`SequentiaD` (`contrib/pyln-testing/pyln/testing/utils.py`): `sequentiad` on the custom chain
+`sequentia-regtest`, with anchored headers validated against a Bitcoin Core regtest node
+(`bitcoind.parent`), a three-member proof-of-stake committee that certifies every block it
+produces, transparent addresses by default, no block subsidy, and a fee whitelist holding only
+the policy asset at par until a test lists more. `generate_block` mines one parent block before
+each Sequentia block (pass `advance_parent=False` to hold the parent still);
+`generate_uncertified_block` produces a block below quorum once `mine_parent(spacing=600)` has
+opened the escaping stall. Lightning nodes run the network's own timelock and `rescan` defaults.
+The tests cover an asset channel opened, paid over and mutually closed, the anchor-burial gate,
+the certified-frontier clamp, a Bitcoin reorg unwinding Sequentia blocks under a running node,
+and the network defaults. They need `sequentiad`, `sequentia-cli` and a Bitcoin Core `bitcoind`
+on `PATH`:
+
+```sh
+PATH=/path/to/bitcoin/bin:/path/to/Sequentia/src:$PATH TEST_NETWORK=sequentia-regtest \
+  python3 -m pytest tests/sequentia/
+```
+
+Live-chain scripts:
+
 - `tests/sequentia/validate_live_blocks.py`: reimplements the anchored-header parse
   byte-for-byte and checks recomputed block hashes across a sample of live blocks.
 - `tests/sequentia/verify_block_parse.py`: single-block parser regression.
@@ -262,17 +296,15 @@ byte-exact; non-issuance inputs are untouched. Build with `git submodule update 
 - `tests/sequentia/verify_anchor_burial.py`: checks the bounded burial walk against a brute-force
   oracle over real anchor heights plus boundary cases.
 
-All four point at any reachable Sequentia node via `ELEMCLI` (path to `sequentia-cli`, the
+These four point at any reachable Sequentia node via `ELEMCLI` (path to `sequentia-cli`, the
 default) and `SEQ_RPC_{HOST,PORT,USER,PASS}` environment variables; no host or credential is
 baked into the repo.
 
 Signer tests: `cargo test` in `contrib/seqln-signer/` plus the byte-exact conformance harness and
 WASM test scripts (see that README).
 
-Not yet done: the upstream pytest harness (`contrib/pyln-testing`, `tests/utils.py`) has no
-Sequentia network entries, so `make pytest` exercises Bitcoin regtest / liquid-regtest only; and
-there is no `bitcoin/test/run-*.c` unit test for the anchored header (the Python scripts are the
-regression).
+There is no `bitcoin/test/run-*.c` unit test for the anchored header; the Python scripts are the
+regression.
 
 ## Known hazards and limitations
 
@@ -303,7 +335,6 @@ Each verified present in the code as of 2026-07-08:
 7. **Committee-stall fail-open.** If the certified frontier is more than 144 blocks behind the tip
    (a stalled committee), the bcli clamp fails open with a warning rather than halting; operators
    should monitor for that log message.
-8. **Penalty across an induced anchor reorg is untested.** Open/route/mutual-close (live testnet)
-   and force-close resolution of an issued-asset channel have been exercised, but the full
-   adversarial exit (a penalty case across a Bitcoin-anchor tail truncation) has not; it needs a
-   controlled anchor-reorg setup rather than the shared public testnet.
+8. **Penalty across an induced anchor reorg is untested.** Open, payment and mutual close of an
+   issued-asset channel run in `tests/sequentia/`, and force-close resolution has been exercised
+   on the testnet, but no test covers a penalty across a Bitcoin-anchor tail truncation.

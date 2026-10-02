@@ -62,7 +62,16 @@ make check-units
 make pytest                       # or: uv run python -m pytest -v tests/
 ```
 
-Sequentia-specific checks need a node's CLI:
+The Sequentia network tests run the same harness on a local anchored chain (a `sequentiad`
+custom chain with a Bitcoin Core regtest parent; `doc/sequentia-fork.md` section 10). They need
+both daemons on `PATH`:
+
+```sh
+PATH=/path/to/bitcoin/bin:/path/to/Sequentia/src:$PATH TEST_NETWORK=sequentia-regtest \
+  python3 -m pytest tests/sequentia/
+```
+
+The live-chain checks need a node's CLI:
 
 ```sh
 ELEMCLI=/path/to/sequentia-cli python3 tests/sequentia/validate_live_blocks.py
