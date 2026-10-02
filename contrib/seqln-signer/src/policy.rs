@@ -37,6 +37,13 @@
 //! For `WIRE_HSMD_SIGN_COMMITMENT_TX` (our own commitment, msg 5) the request
 //! carries NO HTLC data, so HTLC outputs cannot be reconstructed; see
 //! [`validate_local_commitment_no_htlcs`] for the strongest correct subset there.
+//! lightningd also signs a completed mutual close with msg 5; a transaction
+//! without a commitment's shape ([`is_commitment_shaped`]) is held to
+//! [`validate_mutual_close`] instead, as `WIRE_HSMD_SIGN_MUTUAL_CLOSE_TX` is.
+//! A commitment of ours is never signed once its secret has been revealed:
+//! its number is read off the transaction ([`commitment_number`]) and compared
+//! with the channel's `revoked_through`, which `REVOKE_COMMITMENT_TX` only
+//! moves forward (`dispatch.rs`).
 //!
 //! The watchtower custody fix (Phase A) EXTENDED enforcement to the on-chain
 //! sweep/penalty/HTLC-tx handlers: `sign_*_to_us` + penalties now range-check
@@ -124,6 +131,53 @@ pub struct ChannelState {
     pub remote_funding: [u8; 33],
     pub option_static_remotekey: bool,
     pub option_anchors: bool,
+    /// Whether WE opened the channel (`setup_channel.is_outbound`): it orders
+    /// the two payment basepoints in the commitment-number obscuring factor.
+    /// `None` for a channel restored from a version-1 store, which did not
+    /// record it.
+    pub is_outbound: Option<bool>,
+    /// The upfront shutdown scripts `setup_channel` named (empty: none).
+    /// Recorded once and never replaced: BOLT 2 forbids changing them, and a
+    /// mutual close must pay the peer's share to `remote_shutdown_script` when
+    /// one was given.
+    pub local_shutdown_script: Vec<u8>,
+    pub remote_shutdown_script: Vec<u8>,
+    /// The highest of OUR commitment numbers whose per-commitment secret this
+    /// device has revealed (REVOKE_COMMITMENT_TX). Every commitment numbered
+    /// at or below it is revoked: signing one would hand the peer the channel.
+    pub revoked_through: Option<u64>,
+    /// The highest of OUR commitment numbers this device has validated
+    /// (VALIDATE_COMMITMENT_TX): revoking commitment n needs n + 1 validated,
+    /// or the node would be left with no commitment it may broadcast.
+    pub validated_through: Option<u64>,
+}
+
+impl ChannelState {
+    /// Fold what an earlier record of the same channel knew into a fresh one
+    /// from `setup_channel`, which channeld re-sends at every start and the
+    /// proxy replays after every reconnect: the revocation counters only
+    /// grow, and a recorded upfront shutdown script is never replaced.
+    pub fn merge_from(&mut self, old: &ChannelState) {
+        self.revoked_through = max_opt(self.revoked_through, old.revoked_through);
+        self.validated_through = max_opt(self.validated_through, old.validated_through);
+        if !old.local_shutdown_script.is_empty() {
+            self.local_shutdown_script = old.local_shutdown_script.clone();
+        }
+        if !old.remote_shutdown_script.is_empty() {
+            self.remote_shutdown_script = old.remote_shutdown_script.clone();
+        }
+        if self.is_outbound.is_none() {
+            self.is_outbound = old.is_outbound;
+        }
+    }
+}
+
+fn max_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (x, None) => x,
+        (None, y) => y,
+    }
 }
 
 /// The in-memory store of channel states. A device tracks few channels, so a
@@ -144,6 +198,9 @@ impl ChannelStore {
     }
     pub fn get(&self, node_id: &[u8; 33], dbid: u64) -> Option<&ChannelState> {
         self.map.get(&(*node_id, dbid))
+    }
+    pub fn get_mut(&mut self, node_id: &[u8; 33], dbid: u64) -> Option<&mut ChannelState> {
+        self.map.get_mut(&(*node_id, dbid))
     }
     pub fn contains(&self, node_id: &[u8; 33], dbid: u64) -> bool {
         self.map.contains_key(&(*node_id, dbid))
@@ -193,15 +250,42 @@ impl ChannelStore {
 // ---------------------------------------------------------------------------
 
 pub const CHSTORE_MAGIC: [u8; 4] = *b"SQCH";
-pub const CHSTORE_VERSION: u8 = 1;
+/// Version 2 adds, after each entry's version-1 fields: the opener flag, both
+/// revocation counters and both upfront shutdown scripts. Version 1 blobs
+/// still import (those fields unknown).
+pub const CHSTORE_VERSION: u8 = 2;
+/// The fixed part of an entry, which is the whole of a version-1 entry:
 /// node_id(33) dbid(8) sats(8) txid(32) txout(2) local_delay(2) remote_delay(2)
 /// 5 pubkeys(165) static_remotekey(1) anchors(1)
 pub const CHSTORE_ENTRY_LEN: usize = 33 + 8 + 8 + 32 + 2 + 2 + 2 + 33 * 5 + 1 + 1;
 
+fn push_opt_bool(out: &mut Vec<u8>, v: Option<bool>) {
+    out.push(match v {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    });
+}
+
+fn push_opt_u64(out: &mut Vec<u8>, v: Option<u64>) {
+    match v {
+        None => out.push(0),
+        Some(n) => {
+            out.push(1);
+            out.extend_from_slice(&n.to_le_bytes());
+        }
+    }
+}
+
+fn push_script(out: &mut Vec<u8>, script: &[u8]) {
+    out.extend_from_slice(&(script.len() as u16).to_le_bytes());
+    out.extend_from_slice(script);
+}
+
 /// Encode the whole store (deterministically; no MAC — the dispatcher owns
 /// keying and appends it).
 pub fn encode_channel_store(store: &ChannelStore) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + 1 + 4 + store.len() * CHSTORE_ENTRY_LEN);
+    let mut out = Vec::with_capacity(4 + 1 + 4 + store.len() * (CHSTORE_ENTRY_LEN + 24));
     out.extend_from_slice(&CHSTORE_MAGIC);
     out.push(CHSTORE_VERSION);
     out.extend_from_slice(&(store.len() as u32).to_le_bytes());
@@ -220,33 +304,77 @@ pub fn encode_channel_store(store: &ChannelStore) -> Vec<u8> {
         out.extend_from_slice(&st.remote_funding);
         out.push(st.option_static_remotekey as u8);
         out.push(st.option_anchors as u8);
+        push_opt_bool(&mut out, st.is_outbound);
+        push_opt_u64(&mut out, st.revoked_through);
+        push_opt_u64(&mut out, st.validated_through);
+        push_script(&mut out, &st.local_shutdown_script);
+        push_script(&mut out, &st.remote_shutdown_script);
     }
     out
 }
 
+/// A cursor over a store payload; every read is bounds-checked.
+struct StoreReader<'a> {
+    b: &'a [u8],
+    o: usize,
+}
+
+impl<'a> StoreReader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+        let end = self.o.checked_add(n).filter(|&e| e <= self.b.len())
+            .ok_or_else(|| "channel-store blob is truncated".to_string())?;
+        let s = &self.b[self.o..end];
+        self.o = end;
+        Ok(s)
+    }
+    fn u8(&mut self) -> Result<u8, String> {
+        Ok(self.take(1)?[0])
+    }
+    fn opt_bool(&mut self) -> Result<Option<bool>, String> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(false)),
+            2 => Ok(Some(true)),
+            v => Err(format!("bad opener flag {v} in channel-store blob")),
+        }
+    }
+    fn opt_u64(&mut self) -> Result<Option<u64>, String> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))),
+            v => Err(format!("bad counter flag {v} in channel-store blob")),
+        }
+    }
+    fn script(&mut self) -> Result<Vec<u8>, String> {
+        let len = u16::from_le_bytes(self.take(2)?.try_into().unwrap()) as usize;
+        Ok(self.take(len)?.to_vec())
+    }
+}
+
 /// Decode a channel-store payload (the MAC must already have been verified
-/// and stripped by the caller).
+/// and stripped by the caller). Takes version 1 and version 2.
 pub fn decode_channel_store(
     bytes: &[u8],
 ) -> Result<Vec<(([u8; 33], u64), ChannelState)>, String> {
     if bytes.len() < 9 || bytes[..4] != CHSTORE_MAGIC {
         return Err("not a channel-store blob (bad magic)".to_string());
     }
-    if bytes[4] != CHSTORE_VERSION {
-        return Err(format!("unsupported channel-store version {}", bytes[4]));
+    let version = bytes[4];
+    if version != 1 && version != 2 {
+        return Err(format!("unsupported channel-store version {version}"));
     }
     let count = u32::from_le_bytes(bytes[5..9].try_into().unwrap()) as usize;
-    if bytes.len() != 9 + count * CHSTORE_ENTRY_LEN {
+    if version == 1 && bytes.len() != 9 + count * CHSTORE_ENTRY_LEN {
         return Err("channel-store blob length does not match its count".to_string());
     }
-    let mut out = Vec::with_capacity(count);
-    let mut o = 9;
+    let mut out = Vec::with_capacity(count.min(1024));
+    let mut r = StoreReader { b: bytes, o: 9 };
     let arr33 = |b: &[u8]| -> [u8; 33] { b.try_into().unwrap() };
     for _ in 0..count {
-        let e = &bytes[o..o + CHSTORE_ENTRY_LEN];
+        let e = r.take(CHSTORE_ENTRY_LEN)?;
         let node_id = arr33(&e[0..33]);
         let dbid = u64::from_le_bytes(e[33..41].try_into().unwrap());
-        let st = ChannelState {
+        let mut st = ChannelState {
             funding_sats: u64::from_le_bytes(e[41..49].try_into().unwrap()),
             funding_txid: e[49..81].try_into().unwrap(),
             funding_txout: u16::from_le_bytes(e[81..83].try_into().unwrap()),
@@ -259,9 +387,23 @@ pub fn decode_channel_store(
             remote_funding: arr33(&e[219..252]),
             option_static_remotekey: e[252] != 0,
             option_anchors: e[253] != 0,
+            is_outbound: None,
+            local_shutdown_script: Vec::new(),
+            remote_shutdown_script: Vec::new(),
+            revoked_through: None,
+            validated_through: None,
         };
+        if version >= 2 {
+            st.is_outbound = r.opt_bool()?;
+            st.revoked_through = r.opt_u64()?;
+            st.validated_through = r.opt_u64()?;
+            st.local_shutdown_script = r.script()?;
+            st.remote_shutdown_script = r.script()?;
+        }
         out.push(((node_id, dbid), st));
-        o += CHSTORE_ENTRY_LEN;
+    }
+    if r.o != bytes.len() {
+        return Err("channel-store blob has trailing bytes".to_string());
     }
     Ok(out)
 }
@@ -772,6 +914,106 @@ pub fn validate_local_commitment_no_htlcs(
                 hexstr(&o.script)
             ));
         }
+    }
+    if total > st.funding_sats as u128 {
+        return Err(format!("value created: outputs {total} > funding {}", st.funding_sats));
+    }
+    Ok(())
+}
+
+/// Whether a transaction spending the funding output has the shape BOLT 3
+/// gives a commitment: locktime's upper byte 0x20 and the single input's
+/// sequence's upper byte 0x80, the two halves of the obscured commitment
+/// number. A mutual close (locktime 0, final sequence) does not.
+pub fn is_commitment_shaped(tx: &ElementsTx) -> bool {
+    tx.inputs.len() == 1 && tx.locktime >> 24 == 0x20 && tx.inputs[0].sequence >> 24 == 0x80
+}
+
+/// The commitment number a commitment-shaped transaction carries (BOLT 3:
+/// the lower 48 bits of SHA256(opener payment_basepoint || accepter
+/// payment_basepoint), XORed into sequence and locktime). Read off the
+/// transaction itself, so a host cannot pass an old commitment under the
+/// current number. `None` if the transaction is not commitment-shaped or the
+/// channel's opener is not known.
+pub fn commitment_number(
+    kernel: &Kernel,
+    node_id: &[u8; 33],
+    dbid: u64,
+    st: &ChannelState,
+    tx: &ElementsTx,
+) -> Option<u64> {
+    if !is_commitment_shaped(tx) {
+        return None;
+    }
+    let ours = kernel.channel_basepoints(node_id, dbid)[1];
+    let (opener, accepter) = if st.is_outbound? {
+        (ours, st.remote_payment)
+    } else {
+        (st.remote_payment, ours)
+    };
+    let mut pre = Vec::with_capacity(66);
+    pre.extend_from_slice(&opener);
+    pre.extend_from_slice(&accepter);
+    let h = sha256::Hash::hash(&pre).to_byte_array();
+    let mut obscurer = 0u64;
+    for b in &h[26..32] {
+        obscurer = (obscurer << 8) | *b as u64;
+    }
+    let obscured = ((tx.inputs[0].sequence as u64 & 0x00ff_ffff) << 24)
+        | (tx.locktime as u64 & 0x00ff_ffff);
+    Some(obscured ^ obscurer)
+}
+
+/// Mutual-close validation (enforce mode), for SIGN_MUTUAL_CLOSE_TX and for
+/// a close-shaped transaction under SIGN_COMMITMENT_TX: lightningd signs the
+/// closing transaction it rebroadcasts (`drop_to_chain`, cooperative) with the
+/// same message it uses for its own commitment.
+///
+///  * the single input spends the tracked funding outpoint;
+///  * every value is explicit and the outputs do not exceed the funding;
+///  * besides the fee, at most two outputs: at most one paying one of this
+///    device's own wallet scripts (`own`, our share), and at most one paying
+///    the peer: its recorded upfront shutdown script when `setup_channel`
+///    named one, else any one script.
+///
+/// No balance is checked: the device keeps no balance state, so this bounds
+/// where the funds can go, not how they are split.
+pub fn validate_mutual_close(
+    st: &ChannelState,
+    own: &std::collections::HashSet<Vec<u8>>,
+    tx: &ElementsTx,
+) -> Result<(), String> {
+    if tx.inputs.len() != 1 {
+        return Err(format!("close has {} inputs", tx.inputs.len()));
+    }
+    let inp = &tx.inputs[0];
+    if inp.txhash != st.funding_txid || inp.index as u16 != st.funding_txout {
+        return Err("close input is not the tracked funding outpoint".to_string());
+    }
+    let (mut total, mut ours, mut theirs) = (0u128, 0usize, 0usize);
+    for (i, o) in tx.outputs.iter().enumerate() {
+        let v = output_value(o, tx.network)
+            .ok_or_else(|| format!("output {i} has a non-explicit value"))?;
+        total += v as u128;
+        if o.script.is_empty() {
+            continue; // fee
+        }
+        if own.contains(&o.script) {
+            ours += 1;
+        } else if st.remote_shutdown_script.is_empty()
+            || o.script == st.remote_shutdown_script
+        {
+            theirs += 1;
+        } else {
+            return Err(format!(
+                "output {i} pays neither this wallet nor the peer's recorded \
+                 shutdown script (value {v}, script {})",
+                hexstr(&o.script)
+            ));
+        }
+    }
+    if ours > 1 || theirs > 1 {
+        return Err(format!("close has {ours} outputs to us and {theirs} to the peer"));
     }
     if total > st.funding_sats as u128 {
         return Err(format!("value created: outputs {total} > funding {}", st.funding_sats));

@@ -41,6 +41,11 @@ fn chan(seed: u8) -> ChannelState {
         remote_funding: [seed.wrapping_add(5); 33],
         option_static_remotekey: true,
         option_anchors: seed % 2 == 0,
+        is_outbound: Some(seed % 3 == 0),
+        local_shutdown_script: vec![0x00, 0x14, seed, seed],
+        remote_shutdown_script: if seed % 2 == 0 { vec![0x51, seed] } else { Vec::new() },
+        revoked_through: if seed > 10 { Some(seed as u64 * 7) } else { None },
+        validated_through: Some(seed as u64 * 7 + 1),
     }
 }
 
