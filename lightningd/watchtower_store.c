@@ -603,3 +603,41 @@ struct watchtower_blob **wt_store_load_justice(const tal_t *ctx,
 	closedir(d);
 	return out;
 }
+
+/* ---- forgetting a channel ------------------------------------------------- */
+
+/* Remove dir and everything under it.  The store nests at most three levels
+ * (<dbid>/justice/<txid>/blob_N in the oldest layout). */
+static void remove_tree(const char *dir, int depth)
+{
+	DIR *d = opendir(dir);
+	struct dirent *ent;
+
+	if (!d)
+		return;
+	while ((ent = readdir(d)) != NULL) {
+		char *path;
+		struct stat st;
+
+		if (streq(ent->d_name, ".") || streq(ent->d_name, ".."))
+			continue;
+		path = path_join(tmpctx, dir, ent->d_name);
+		if (lstat(path, &st) != 0)
+			continue;
+		if (S_ISDIR(st.st_mode)) {
+			if (depth > 0)
+				remove_tree(path, depth - 1);
+		} else
+			unlink_noerr(path);
+	}
+	closedir(d);
+	rmdir(dir);
+}
+
+void wt_store_forget_channel(struct lightningd *ld, u64 channel_dbid)
+{
+	char *dir = tal_fmt(tmpctx, "%s/watchtower/%"PRIu64,
+			    ld->config_netdir, channel_dbid);
+
+	remove_tree(dir, 3);
+}

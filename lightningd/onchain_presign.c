@@ -79,11 +79,13 @@ static bool build_final_dest(struct channel *channel,
 
 	/* Same choice onchaind_tx_unsigned makes: p2wpkh on elements, p2tr
 	 * otherwise (so the pre-signed sweep is byte-identical to the live
-	 * node's). */
+	 * node's).  Off tmpctx: the callers copy it into the sweep they build,
+	 * and one allocated off the channel at every commitment step would grow
+	 * the channel for its whole life. */
 	if (chainparams->is_elements)
-		*final_scriptpubkey = scriptpubkey_p2wpkh(channel, &final_key);
+		*final_scriptpubkey = scriptpubkey_p2wpkh(tmpctx, &final_key);
 	else
-		*final_scriptpubkey = scriptpubkey_p2tr(channel, &final_key);
+		*final_scriptpubkey = scriptpubkey_p2tr(tmpctx, &final_key);
 	return true;
 }
 

@@ -22,6 +22,21 @@ struct penalty_base *penalty_base_new(const tal_t *ctx,
 	return pbase;
 }
 
+struct penalty_base *penalty_base_new_htlcs_only(const tal_t *ctx,
+						 u64 commitment_num,
+						 const struct bitcoin_tx *tx)
+{
+	struct penalty_base *pbase = tal(ctx, struct penalty_base);
+
+	pbase->commitment_num = commitment_num;
+	bitcoin_txid(tx, &pbase->txid);
+	pbase->outnum = (u32)-1;
+	pbase->amount = AMOUNT_SAT(0);
+	pbase->htlcs = tal_arr(pbase, struct penalty_htlc, 0);
+
+	return pbase;
+}
+
 void penalty_base_add_htlc(struct penalty_base *pbase,
 			   u32 outnum,
 			   struct amount_sat amount,

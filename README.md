@@ -81,9 +81,10 @@ testnet unless noted. The precise file-level change list, with known hazards, is
   the signing device pre-sign justice and sweep transactions at every commitment advance into a
   secret-free on-disk store (`lightningd/watchtower_store.c`, DB table `penalty_htlcs`);
   `speculad/speculad` is a standalone daemon that watches the chain through the node's CLI and
-  broadcasts them while the signing device is offline. Attaching a fee input to the pre-signed
-  justice transactions is an open seam on testnet (see `speculad/speculad.c`). The design note is
-  not yet published in this repository.
+  broadcasts them while the signing device is offline, paying each breach's justice transaction
+  from a box-owned wallet in the channel asset at the node's exchange rate for it (see
+  `speculad/speculad.c` and [doc/sequentia-fork.md](doc/sequentia-fork.md#7b-specula-keyless-watchtower)).
+  The design note is not yet published in this repository.
 
 Experimental / known limitations (details and file pointers in
 [doc/sequentia-fork.md](doc/sequentia-fork.md#known-hazards-and-limitations)):

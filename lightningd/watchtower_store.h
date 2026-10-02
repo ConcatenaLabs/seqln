@@ -41,7 +41,9 @@
  *                              commitment txid hex (a stable, self-describing
  *                              locator; a revoked state never un-revokes and
  *                              can resurface in a reorg, so these are kept for
- *                              channel life).
+ *                              channel life, and the whole <dbid> directory
+ *                              is removed when lightningd forgets the closed
+ *                              channel: wt_store_forget_channel).
  *
  *   A blob = one pre-signed defensive tx, encoded as the `watchtower_blob`
  *   wire subtype (towire_watchtower_blob): u8 kind, u64 commit_num, u32
@@ -135,5 +137,11 @@ bool wt_store_put_preempt(struct lightningd *ld,
 bool wt_store_set_preempt_armed(struct lightningd *ld,
 				const struct channel *channel,
 				bool armed);
+
+/* The channel is gone from this node (lightningd forgets a closed channel
+ * once every output of its close is irrevocably resolved): remove its whole
+ * directory, so the store holds only channels that can still be breached.
+ * Best effort; a leftover is only disk. */
+void wt_store_forget_channel(struct lightningd *ld, u64 channel_dbid);
 
 #endif /* LIGHTNING_LIGHTNINGD_WATCHTOWER_STORE_H */

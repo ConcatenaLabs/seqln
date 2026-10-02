@@ -29,7 +29,8 @@ struct penalty_base {
 	u64 commitment_num;
 	/* The remote commitment txid. */
 	struct bitcoin_txid txid;
-	/* The remote commitment's "to-local" output. */
+	/* The remote commitment's "to-local" output, or (u32)-1 when it has
+	 * none (penalty_base_new_htlcs_only). */
 	u32 outnum;
 	/* The amount of the remote commitment's "to-local" output. */
 	struct amount_sat amount;
@@ -44,6 +45,12 @@ struct penalty_base *penalty_base_new(const tal_t *ctx,
 				      u64 commitment_num,
 				      const struct bitcoin_tx *tx,
 				      const struct wally_tx_output *txout);
+
+/* A penalty base for a commitment with no to_local output (the owner has
+ * no balance of its own) but HTLC outputs: outnum is (u32)-1, amount 0. */
+struct penalty_base *penalty_base_new_htlcs_only(const tal_t *ctx,
+						 u64 commitment_num,
+						 const struct bitcoin_tx *tx);
 
 /* Record an HTLC output for later steal_htlc justice. */
 void penalty_base_add_htlc(struct penalty_base *pbase,

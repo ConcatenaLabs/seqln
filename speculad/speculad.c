@@ -6,37 +6,46 @@
  *   1. reads the fsync-durable, secret-free watchtower store written by Phase B
  *      (documented on-disk format in lightningd/watchtower_store.h), reaching
  *      defensive posture purely from disk with no hsm_init (survives cold boot);
- *   2. watches the chain via elements-cli RPC (mirroring plugins/bcli.c: shell
- *      out to the configured CLI over the box's elementsd);
+ *   2. watches the chain via the node's CLI (mirroring plugins/bcli.c: shell
+ *      out to the configured CLI over the box's node);
  *   3. on seeing a REVOKED commitment confirm on-chain (a breach), broadcasts
- *      the matching device-pre-signed CLASS-A justice blob(s) via
+ *      the matching device-pre-signed CLASS-A justice blobs via
  *      sendrawtransaction, while the signing device is offline.
+ *
+ * COST PER ROUND: a revoked commitment can only be on chain once its channel's
+ * funding output is spent, so each round looks at each channel's funding
+ * output (gettxout) and polls the stored revoked commitments only while it is
+ * spent.  A justice file is read only when its commitment is on chain.  A
+ * round therefore costs a few calls per channel, however many states the
+ * channel has revoked; lightningd removes a channel's store when it forgets
+ * the closed channel.
  *
  * REORG MODEL (see keyless-watchtower-design-specula): every blob binds only its
  * input outpoint, never a height, so a reorg never expires a blob -- it only
- * changes which stored blob is live and resets the depth clock.  speculad simply
- * re-polls every stored revoked-commitment txid each round: a re-confirm rebroad-
- * casts byte-identically (idempotent); a DIFFERENT revoked commitment surfacing
- * is matched to its own justice dir; the deadline is recomputed as confirmation
- * depth every round.  No finality timelock is ever used (anchoring supremacy).
+ * changes which stored blob is live and resets the depth clock.  Every round
+ * re-reads the UTXO set: a re-confirm rebroadcasts (idempotent); a DIFFERENT
+ * revoked commitment surfacing is matched to its own justice file; the
+ * deadline is recomputed as confirmation depth every round.  No finality
+ * timelock is ever used (anchoring supremacy).
  *
  * FEE (SINGLE|ACP): the CLASS-A justice blobs are SIGHASH_SINGLE|ANYONECANPAY
- * (Phase A) -- output 0 carries the full swept value and pays NO fee, so
- * speculad appends its OWN per-asset fee input (+ change) from a box-owned
- * fee-UTXO wallet in the channel asset and RBF-escalates toward the deadline,
- * never needing the device.  That coin selection needs the box fee wallet
- * (infra, not present on testnet), so it is the single documented SEAM below
- * (attach_fee_and_rbf()); this daemon otherwise runs the breach path end to end.
+ * (Phase A) -- output 0 carries the full swept value and pays NO fee.  speculad
+ * puts every still-unspent blob of one breach into ONE transaction (blob k's
+ * input and output at index k) and appends its OWN fee input (+ change) from a
+ * box-owned wallet (--fee-wallet) holding UTXOs in the channel asset, then
+ * RBF-escalates toward the deadline, never needing the device.  The fee is paid
+ * in the channel asset, so it is converted at the node's exchange rate for that
+ * asset (getfeeexchangerates): the feerates are in reference atoms, the fee in
+ * the asset's own atoms.  An asset the node does not accept for fees cannot pay
+ * one, and its justice is then broadcast unfunded (and refused).
  *
- * CLASS-B honest-force-close sweeps + HTLC 2nd-stage: Phase E2 added the
- * producer -- lightningd/onchain_presign.c device-master-signs the current-state
- * honest-close set (kind 3 to_local-delayed + kind 4 offered-HTLC-timeout) at
- * every commitment advance, and the kind 5 HTLC-success sweep at fulfill (the
- * JBA fulfill hard-gate), writing them to the sweeps/ store slot this daemon
- * already loads.  It drops into the same watch/broadcast loop as the justice
- * set.  STILL A SEAM: kind 6 (remote_htlc_to_us, peer-honest-close HTLC sweep)
- * needs the remote-commitment HTLC outpoints threaded from channeld's
- * SENDING_COMMITSIG path first (lightningd lacks the remote commitment tx).
+ * CLASS-B honest-force-close sweeps + HTLC 2nd-stage: lightningd/onchain_presign.c
+ * device-master-signs the current-state honest-close set (kind 3 to_local-delayed
+ * + kind 4 offered-HTLC-timeout) at every commitment advance, the kind 5
+ * HTLC-success sweep at fulfill (the JBA fulfill hard-gate) and the kind 6
+ * remote_htlc_to_us sweeps of the peer's commitment, writing them to the state
+ * file's sweep set this daemon loads.  They drop into the same watch/broadcast
+ * loop as the justice set.
  */
 #include "config.h"
 #include <bitcoin/chainparams.h>
@@ -54,6 +63,7 @@
 #include <ccan/tal/str/str.h>
 #include <ccan/tal/tal.h>
 #include <common/amount.h>
+#include <common/json_parse_simple.h>
 #include <common/presign_templates.h>	/* enum wt_tmpl_kind (stable on-disk u8) */
 #include <common/setup.h>
 #include <common/utils.h>
@@ -136,7 +146,8 @@ static u32 g_assumed_csv    = 144;		/* deadline window when meta lacks
  * the escalation rung, the last broadcast txid, and the confirmed flag (once the
  * justice tx confirms we STOP re-broadcasting -- the broadcast de-dup). */
 struct justice_state {
-	char *key;			/* "<locator>:<output_index>:<kind>" */
+	char *key;			/* "<locator>:justice" for a breach,
+					 * "sweep:<txid>:<output>:<kind>" */
 	bool have_feeutxo;
 	struct bitcoin_outpoint feeutxo;
 	u64 feeutxo_val;		/* satoshis (exact) */
@@ -186,8 +197,15 @@ static struct spd_blob *spd_blob_decode(const tal_t *ctx,
 	b->wscript = tal_arr(b, u8, wscript_len);
 	fromwire_u8_array(cursor, max, b->wscript, wscript_len);
 	b->tx = fromwire_bitcoin_tx(b, cursor, max);
-	if (!*cursor)
+	if (!*cursor || !b->tx || b->tx->wtx->num_outputs == 0)
 		return tal_free(b);
+	/* A parsed transaction is denominated in the policy asset until told
+	 * otherwise; a blob's is the asset of the output it sweeps to (the
+	 * channel asset), and every amount read from it below is in that. */
+	{
+		struct amount_asset a = bitcoin_tx_output_get_amount(b->tx, 0);
+		bitcoin_tx_set_output_asset(b->tx, a.asset);
+	}
 	return b;
 }
 
@@ -470,12 +488,10 @@ static struct watched_channel **load_channels(const tal_t *ctx,
 				rc = tal(c, struct revoked_commit);
 				rc->locator = tal_strdup(rc, je->d_name);
 				rc->dir = tal_strdup(rc, cdir);
-				/* One set file per revoked commitment; a
-				 * directory is the earlier layout. */
-				if (stat(cdir, &st) == 0 && S_ISDIR(st.st_mode))
-					rc->blobs = load_blob_dir(rc, cdir);
-				else
-					rc->blobs = load_blob_file(rc, cdir);
+				/* Read only when this commitment is on chain
+				 * (load_justice): a round costs the same
+				 * however many states the channel revoked. */
+				rc->blobs = NULL;
 				rc->confirmations = 0;
 				tal_arr_expand(&c->revoked, rc);
 			}
@@ -485,6 +501,20 @@ static struct watched_channel **load_channels(const tal_t *ctx,
 	}
 	closedir(d);
 	return chans;
+}
+
+/* The justice set of a revoked commitment: one set file, or a directory in
+ * the earlier layout. */
+static void load_justice(struct revoked_commit *rc)
+{
+	struct stat st;
+
+	if (rc->blobs)
+		return;
+	if (stat(rc->dir, &st) == 0 && S_ISDIR(st.st_mode))
+		rc->blobs = load_blob_dir(rc, rc->dir);
+	else
+		rc->blobs = load_blob_file(rc, rc->dir);
 }
 
 /* ---- elements-cli RPC (fork/exec/pipe; no shell, box-controlled argv) ----- */
@@ -835,66 +865,170 @@ static u32 spd_feerate_perkw(const struct spd_blob *b, long breach_confs,
 	return (u32)fr;
 }
 
+/* ---- Fee exchange rates ---------------------------------------------------- *
+ * A justice or sweep transaction pays its fee in the channel asset, and every
+ * node values that fee through its own exchange rate for the asset (the open
+ * fee market).  The feerates above are in reference atoms per kw; the fee is
+ * the same value in atoms of the asset: feerate_in_asset() (common/amount.h).
+ * The node's whitelist is read once per round, keys resolved from ticker
+ * labels to display-hex ids as plugins/bcli.c does. */
+struct spd_rate {
+	char *asset_hex;	/* display-hex id */
+	u64 rate;		/* EXCHANGE_RATE_SCALE == par */
+};
+/* NULL until the node has answered once; then the last answer. */
+static struct spd_rate *g_rates;
+
+static void refresh_rates(void)
+{
+	char *res, *labels;
+	const jsmntok_t *toks, *ltoks = NULL, *key;
+	struct spd_rate *rates;
+	size_t i;
+
+	res = run_cli(tmpctx, "getfeeexchangerates", NULL);
+	if (!res) {
+		fprintf(stderr, "speculad: getfeeexchangerates failed; "
+			"keeping the last rates\n");
+		return;
+	}
+	toks = json_parse_simple(tmpctx, res, strlen(res));
+	if (!toks || toks[0].type != JSMN_OBJECT) {
+		fprintf(stderr, "speculad: cannot parse getfeeexchangerates\n");
+		return;
+	}
+	labels = run_cli(tmpctx, "dumpassetlabels", NULL);
+	if (labels) {
+		ltoks = json_parse_simple(tmpctx, labels, strlen(labels));
+		if (ltoks && ltoks[0].type != JSMN_OBJECT)
+			ltoks = NULL;
+	}
+
+	rates = tal_arr(g_state_ctx, struct spd_rate, 0);
+	json_for_each_obj(i, key, toks) {
+		struct spd_rate r;
+		const jsmntok_t *hex;
+
+		if (!json_to_u64(res, key + 1, &r.rate))
+			continue;
+		hex = ltoks ? json_get_member(labels, ltoks,
+					      json_strdup(tmpctx, res, key))
+			: NULL;
+		r.asset_hex = hex ? json_strdup(rates, labels, hex)
+			: json_strdup(rates, res, key);
+		tal_arr_expand(&rates, r);
+	}
+	tal_free(g_rates);
+	g_rates = rates;
+}
+
+/* The node's rate for an asset: 0 when the node does not accept it for fees.
+ * Par when the node has never answered (a backend without the RPC). */
+static u64 asset_rate(const char *asset_hex)
+{
+	if (!g_rates)
+		return EXCHANGE_RATE_SCALE;
+	for (size_t i = 0; i < tal_count(g_rates); i++)
+		if (streq(g_rates[i].asset_hex, asset_hex))
+			return g_rates[i].rate;
+	return 0;
+}
+
 /* ---- Fee attach + sign (the SINGLE|ACP append; box fee wallet) ------------ *
  * A CLASS-A justice blob is SIGHASH_SINGLE|ANYONECANPAY: input 0 (the revoked
  * outpoint, DEVICE-signed) + output 0 (full swept value to the user, no fee).
- * sendrawtransaction rejects it (no fee / unbalanced), so we must append our OWN
- * fee input (+ change + the elements explicit fee output) WITHOUT disturbing
- * input 0 or output 0, then sign ONLY the appended input with the fee-wallet
- * key.  ACP means input 0's signature survives the append.
+ * Such a signature covers its own input and the output at the same index and
+ * nothing else, so the blobs of one breach go into ONE transaction: blob k's
+ * input at index k, its output at index k, then OUR fee input, a change output
+ * and the explicit fee output.  One fee input pays for the whole breach, so a
+ * fee wallet with a single UTXO in the asset defends every output, and the
+ * replacements of a later round replace the whole set at once.  Only the fee
+ * input is signed here, with the fee-wallet key.
  *
  * RPC CHOICE (verified against Sequentia-Core src/):
  *  - fundrawtransaction / walletcreatefundedpsbt CANNOT be used: they re-run
- *    CreateTransaction to balance the tx, but input 0 is EXTERNAL to the fee
- *    wallet (its key is on the device), so the wallet can't value it and would
- *    massively over-fund.  (converttopsbt is separately unusable: it CLEARS
- *    scriptSig + witness -- rawtransaction.cpp:2293/2299 -- destroying the
- *    SINGLE|ACP signature.)
- *  - So we balance the tx OURSELVES (we know input 0's value == output 0's
- *    value, and the fee UTXO's value) and hand it to signrawtransactionwithwallet,
- *    which signs input 1 (a wallet UTXO) and LEAVES input 0 untouched: for an
- *    input whose prevout the wallet doesn't own, ::SignTransaction sets an
- *    input error and `continue`s -- it never rewrites that input's witness
- *    (script/sign.cpp:645).  So input 0's SINGLE|ACP witness is preserved.
+ *    CreateTransaction to balance the tx, but the blob inputs are EXTERNAL to
+ *    the fee wallet (their key is on the device), so the wallet can't value
+ *    them and would massively over-fund.  (converttopsbt is separately
+ *    unusable: it CLEARS scriptSig + witness -- rawtransaction.cpp:2293/2299 --
+ *    destroying the SINGLE|ACP signatures.)
+ *  - So we balance the tx OURSELVES (each blob input's value == its output's
+ *    value, plus the fee UTXO's value) and hand it to
+ *    signrawtransactionwithwallet, which signs the fee input (a wallet UTXO)
+ *    and does not sign the inputs whose prevout the wallet doesn't own
+ *    (script/sign.cpp:645); their witnesses are restored from the blobs below.
  *
- * Requires: fee-wallet UTXOs are segwit-v0 (bech32 p2wpkh) so signing input 1
- * needs only its own BIP143 amount (the taproot sighash would need input 0's
- * spent-output, which we don't feed the wallet).  Returns the fully-signed hex
- * (child of ctx) or NULL (no fee wallet / no suitable UTXO / RPC failure). */
-static char *attach_fee_and_sign(const tal_t *ctx, const struct spd_blob *b,
+ * Requires: fee-wallet UTXOs are segwit-v0 (bech32 p2wpkh) so signing the fee
+ * input needs only its own BIP143 amount.  Every blob must sweep in one asset
+ * under one nVersion and nLocktime (all justice blobs do).  Returns the
+ * fully-signed hex (child of ctx) or NULL (no fee wallet / no suitable UTXO /
+ * RPC failure / blobs that cannot share a transaction). */
+static char *attach_fee_and_sign(const tal_t *ctx,
+				 struct spd_blob *const *blobs,
 				 struct justice_state *st, long breach_confs,
 				 u32 remote_to_self_delay)
 {
+	size_t n = tal_count(blobs);
 	struct amount_asset oa;
 	u8 asset33[33];
 	char *asset_hex, *hex, *signed_hex, *res;
 	struct bitcoin_tx *tx;
-	struct amount_sat out0, feeamt, minfee, maxfee, changeamt;
+	struct amount_sat feeamt, minfee, maxfee, changeamt;
 	u32 feerate;
+	u64 rate;
 	size_t weight;
 	const char **extra;
 	u64 uval;
 	u8 *raw;
 	int change_idx;
+	struct spd_blob *b;
 
-	if (!g_fee_wallet)
+	if (!g_fee_wallet || n == 0)
 		return NULL;			/* no fee wallet on this box (SEAM) */
 
-	/* Asset the blob output is denominated in (Fix B2 set it = channel asset). */
+	/* Asset the blob outputs are denominated in (the channel asset). */
+	b = blobs[0];
 	oa = bitcoin_tx_output_get_amount(b->tx, 0);
 	memcpy(asset33, oa.asset, sizeof(asset33));
 	asset_hex = asset33_to_rpchex(ctx, asset33);
-	out0 = bitcoin_tx_output_get_amount_sat(b->tx, 0);
+	for (size_t k = 0; k < n; k++) {
+		struct amount_asset ok = bitcoin_tx_output_get_amount(blobs[k]->tx, 0);
+		if (memcmp(ok.asset, asset33, sizeof(asset33)) != 0
+		    || blobs[k]->tx->wtx->locktime != b->tx->wtx->locktime
+		    || blobs[k]->tx->wtx->version != b->tx->wtx->version
+		    || blobs[k]->tx->wtx->num_inputs != 1
+		    || !amount_sat_eq(bitcoin_tx_output_get_amount_sat(blobs[k]->tx, 0),
+				      blobs[k]->amount)) {
+			fprintf(stderr, "speculad: blob for output %u cannot "
+				"share a transaction with output %u\n",
+				blobs[k]->output_index, b->output_index);
+			return NULL;
+		}
+	}
+
+	/* The fee is paid in this asset, so it must be worth the feerate at
+	 * the node's rate for it.  An asset the node does not accept for fees
+	 * cannot pay one at all. */
+	rate = asset_rate(asset_hex);
+	if (rate == 0) {
+		fprintf(stderr, "speculad: asset %s is not accepted for fees "
+			"by this node; cannot fund the blob for output %u\n",
+			asset_hex, b->output_index);
+		return NULL;
+	}
 
 	/* Choose the fee UTXO once, then REUSE it for every RBF rung so each
-	 * replacement keeps the same inputs (only fee/change move). */
+	 * replacement keeps the same fee input (only fee/change move). */
 	if (!st->have_feeutxo) {
 		struct bitcoin_outpoint op;
 		u8 *spk;
 		u64 v;
 		struct amount_sat need;
 
-		if (!amount_sat_add(&need, amount_tx_fee(g_fee_base_perkw, 500),
+		if (!amount_sat_add(&need,
+				    amount_tx_fee(feerate_in_asset(g_fee_base_perkw,
+								   rate),
+						  500 * (n + 1)),
 				    SPD_DUST_SAT))
 			return NULL;
 		if (!pick_fee_utxo(ctx, asset_hex, need.satoshis, &op, &v, &spk))
@@ -906,28 +1040,37 @@ static char *attach_fee_and_sign(const tal_t *ctx, const struct spd_blob *b,
 	}
 	uval = st->feeutxo_val;
 
-	/* Clone: never mutate the loaded blob; we only append at index >= 1. */
-	tx = clone_bitcoin_tx(ctx, b->tx);
-	bitcoin_tx_set_output_asset(tx, asset33);	/* change+fee in blob asset */
+	tx = bitcoin_tx(ctx, chainparams, n + 1, n + 1, b->tx->wtx->locktime);
+	tx->wtx->version = b->tx->wtx->version;
+	bitcoin_tx_set_output_asset(tx, asset33);	/* every output in the asset */
+	for (size_t k = 0; k < n; k++) {
+		struct bitcoin_outpoint op;
+		const struct wally_tx_output *o = &blobs[k]->tx->wtx->outputs[0];
+
+		bitcoin_tx_input_get_outpoint(blobs[k]->tx, 0, &op);
+		bitcoin_tx_add_input(tx, &op,
+				     blobs[k]->tx->wtx->inputs[0].sequence, NULL,
+				     blobs[k]->amount, NULL, blobs[k]->wscript);
+		bitcoin_tx_input_copy_witness(tx, k, blobs[k]->tx, 0);
+		bitcoin_tx_add_output(tx, tal_dup_arr(tmpctx, u8, o->script,
+						      o->script_len, 0),
+				      NULL, blobs[k]->amount);
+	}
 	bitcoin_tx_add_input(tx, &st->feeutxo, SPD_RBF_SEQUENCE, NULL,
 			     amount_sat(uval), st->feeutxo_spk, NULL);
-	/* Change output back to the fee wallet (placeholder amount; set below).
-	 * output 0 (user recovery) is left strictly alone; the SINGLE|ACP blob
-	 * already carries a zero-value elements fee output (index 1) that
-	 * bitcoin_tx_finalize() will re-value to the real fee, so the change
-	 * lands at whatever index add_output returns (append). */
-	/* The clone allocates exactly the blob's own outputs; make room for the
-	 * appended change output (else bitcoin_tx_add_output asserts). */
-	bitcoin_tx_reserve_output(tx);
+	/* Change back to the fee wallet (amount set below). */
 	change_idx = bitcoin_tx_add_output(tx, st->feeutxo_spk, NULL,
 					   amount_sat(uval));
+	/* Adds the explicit fee output, so the weight below counts it. */
+	bitcoin_tx_finalize(tx);
 
-	/* Weight incl. the p2wpkh fee-input witness (~108wu), change + fee out. */
-	weight = bitcoin_tx_weight(tx) + 4 + 1 + 108
-		+ elements_tx_overhead(chainparams, 2, 3);
-	feerate = spd_feerate_perkw(b, breach_confs, st->rung, remote_to_self_delay);
+	/* Weight incl. the p2wpkh fee-input witness (~108wu). */
+	weight = bitcoin_tx_weight(tx) + 108;
+	feerate = feerate_in_asset(spd_feerate_perkw(b, breach_confs, st->rung,
+						     remote_to_self_delay),
+				   rate);
 	feeamt = amount_tx_fee(feerate, weight);
-	minfee = amount_tx_fee(FEERATE_FLOOR, weight);
+	minfee = amount_tx_fee(feerate_in_asset(FEERATE_FLOOR, rate), weight);
 	if (amount_sat_less(feeamt, minfee))
 		feeamt = minfee;
 	/* Cap the fee so change stays >= dust (a too-small UTXO caps the max
@@ -939,128 +1082,142 @@ static char *attach_fee_and_sign(const tal_t *ctx, const struct spd_blob *b,
 	if (!amount_sat_sub(&changeamt, amount_sat(uval), feeamt))
 		return NULL;
 	bitcoin_tx_output_set_amount(tx, change_idx, changeamt);
-	/* Re-values the existing explicit elements fee output (empty
-	 * scriptPubKey) in the blob asset to sum(inputs) - sum(non-fee outputs)
-	 * = feeamt.  Exactly one fee output either way. */
+	/* Re-values the explicit fee output (empty scriptPubKey) to
+	 * sum(inputs) - sum(non-fee outputs) = feeamt. */
 	bitcoin_tx_finalize(tx);
 
-	/* NON-CUSTODY GUARD: the user recovery output 0 must be byte-unchanged. */
-	{
-		struct amount_sat now0 = bitcoin_tx_output_get_amount_sat(tx, 0);
-		struct amount_asset a0 = bitcoin_tx_output_get_amount(tx, 0);
-		if (!amount_sat_eq(now0, out0)
-		    || memcmp(a0.asset, asset33, sizeof(asset33)) != 0) {
-			fprintf(stderr, "speculad: REFUSING -- funding altered "
-				"output 0 (user recovery)\n");
+	/* NON-CUSTODY GUARD: output k is byte-for-byte blob k's output 0. */
+	for (size_t k = 0; k < n; k++) {
+		const struct wally_tx_output *want = &blobs[k]->tx->wtx->outputs[0];
+		const struct wally_tx_output *got = &tx->wtx->outputs[k];
+
+		if (got->script_len != want->script_len
+		    || memcmp(got->script, want->script, want->script_len) != 0
+		    || got->asset_len != want->asset_len
+		    || memcmp(got->asset, want->asset, want->asset_len) != 0
+		    || got->value_len != want->value_len
+		    || memcmp(got->value, want->value, want->value_len) != 0) {
+			fprintf(stderr, "speculad: REFUSING -- output %zu is not "
+				"the pre-signed recovery output\n", k);
 			return NULL;
 		}
 	}
 
-	raw = linearize_tx(ctx, tx);		/* keeps input 0's SINGLE|ACP witness */
+	raw = linearize_tx(ctx, tx);
 	hex = tal_hexstr(ctx, raw, tal_bytelen(raw));
 	extra = tal_arr(tmpctx, const char *, 1);
 	extra[0] = hex;
 	res = run_cli_wallet(ctx, "signrawtransactionwithwallet", extra);
 	if (!res)
 		return NULL;
-	/* "complete":false is EXPECTED (the wallet can't verify input 0, whose
-	 * key is on the device). */
+	/* "complete":false is EXPECTED (the wallet can't verify the blob
+	 * inputs, whose key is on the device). */
 	signed_hex = json_find_string(ctx, res, "hex");
 	if (!signed_hex)
 		return NULL;
 
 	/* Elements' signrawtransactionwithwallet re-serializes the tx and STRIPS
-	 * the witness of input 0 (the device pre-signed SINGLE|ACP penalty it
-	 * doesn't own) down to a single element, breaking the revocation spend.
+	 * the witnesses of the inputs it doesn't own down to a single element.
 	 * Re-parse the wallet-signed tx (which now carries our fee input's
-	 * witness at index >= 1) and restore input 0's original pre-signed
-	 * witness from the clone. */
+	 * witness) and restore every blob's pre-signed witness. */
 	{
 		struct bitcoin_tx *stx;
 
 		stx = bitcoin_tx_from_hex(ctx, signed_hex, strlen(signed_hex));
 		if (!stx)
 			return NULL;
-		bitcoin_tx_input_copy_witness(stx, 0, tx, 0);
+		for (size_t k = 0; k < n; k++)
+			bitcoin_tx_input_copy_witness(stx, k, blobs[k]->tx, 0);
 		raw = linearize_tx(ctx, stx);
 		signed_hex = tal_hexstr(ctx, raw, tal_bytelen(raw));
 	}
 	return signed_hex;
 }
 
-/* Defend one justice blob for a confirmed breach: de-dup (stop once our justice
- * tx confirmed), else attach a fee + (re-)broadcast, escalating the feerate each
- * round (RBF) toward the deadline. */
-static void defend_blob(struct revoked_commit *rc, const struct spd_blob *b,
-			long breach_confs, bool may_broadcast,
-			u32 remote_to_self_delay)
+/* Strip trailing whitespace from a CLI answer. */
+static char *trim(char *res)
 {
-	char *key = tal_fmt(tmpctx, "%s:%u:%u",
-			    rc->locator, b->output_index, b->kind);
+	size_t n = strlen(res);
+	while (n && (res[n - 1] == '\n' || res[n - 1] == '\r'
+		     || res[n - 1] == ' '))
+		res[--n] = '\0';
+	return res;
+}
+
+/* Defend a confirmed breach: one justice transaction for every output of the
+ * revoked commitment that is still unspent in the confirmed UTXO set,
+ * re-broadcast each round with a higher fee (RBF) until it confirms. */
+static void defend_breach(struct revoked_commit *rc, long breach_confs,
+			  bool may_broadcast, u32 remote_to_self_delay)
+{
+	char *key = tal_fmt(tmpctx, "%s:justice", rc->locator);
 	struct justice_state *st = spd_get_state(key);
+	struct spd_blob **live = tal_arr(tmpctx, struct spd_blob *, 0);
 	char *signed_hex, *res;
 	const char **extra;
-	enum spd_txout_state ts;
 
-	/* Phase E (seam #2): REORG-SAFE de-dup.  The de-dup gate is the confirmed
-	 * UTXO-set status of the REVOKED outpoint this justice tx spends
-	 * (rc->locator : b->output_index) -- NOT a persistent "confirmed" latch.
-	 * If it is SPENT, justice has landed (our tx or the peer's honest close),
-	 * so we skip THIS round only; a later reorg that re-exposes the outpoint
-	 * flips this back to UNSPENT and broadcasting auto-resumes (principle #1,
-	 * no finality).  UNKNOWN (RPC error) conservatively keeps defending.
+	/* Phase E (seam #2): REORG-SAFE de-dup.  The gate is the confirmed
+	 * UTXO-set status of each REVOKED outpoint (rc->locator :
+	 * b->output_index) -- NOT a persistent "confirmed" latch.  If it is
+	 * SPENT, justice has landed (our tx or the peer's own spend), so we
+	 * leave it out THIS round only; a later reorg that re-exposes the
+	 * outpoint flips this back to UNSPENT and it rejoins the set
+	 * (principle #1, no finality).  UNKNOWN (RPC error) conservatively
+	 * keeps defending.
 	 *
 	 * NOTE: current CLASS-A blobs all spend a commitment output, so
 	 * (locator, output_index) is exactly the spent prevout.  A future
 	 * steal_htlc_tx 2nd-stage blob spends the HTLC-tx, not the commitment,
 	 * so it must instead query its OWN tx's input-0 prevout. */
-	ts = rpc_txout_state(tmpctx, rc->locator, b->output_index);
-	if (ts == SPD_TXOUT_SPENT) {
-		if (st->broadcast_txid) {
-			/* Secondary signal only (needs txindex=1); logged, not gating. */
-			long c = rpc_tx_confirmations(tmpctx, st->broadcast_txid);
+	for (size_t k = 0; k < tal_count(rc->blobs); k++) {
+		struct spd_blob *b = rc->blobs[k];
+
+		if (rpc_txout_state(tmpctx, rc->locator, b->output_index)
+		    == SPD_TXOUT_SPENT) {
 			fprintf(stderr, "speculad: revoked outpoint %s:%u SPENT "
-				"(our justice %s confs %ld) -- done this round\n",
-				rc->locator, b->output_index, st->broadcast_txid, c);
-		} else {
-			fprintf(stderr, "speculad: revoked outpoint %s:%u already "
-				"SPENT -- nothing to defend this round\n",
-				rc->locator, b->output_index);
+				"(our last justice %s) -- done this round\n",
+				rc->locator, b->output_index,
+				st->broadcast_txid ? st->broadcast_txid : "none");
+			continue;
+		}
+		tal_arr_expand(&live, b);
+	}
+	if (tal_count(live) == 0 || !may_broadcast)
+		return;
+
+	signed_hex = attach_fee_and_sign(tmpctx, live, st, breach_confs,
+					 remote_to_self_delay);
+	extra = tal_arr(tmpctx, const char *, 1);
+	if (!signed_hex) {
+		/* Fee wallet absent or no suitable UTXO: broadcast the raw
+		 * zero-fee blobs so the breach is still surfaced/logged.  They
+		 * are typically rejected below-min-relay. */
+		for (size_t k = 0; k < tal_count(live); k++) {
+			u8 *raw = linearize_tx(tmpctx, live[k]->tx);
+			extra[0] = tal_hexstr(tmpctx, raw, tal_bytelen(raw));
+			if (!run_cli(tmpctx, "sendrawtransaction", extra))
+				fprintf(stderr, "speculad: unfunded justice for "
+					"%s:%u rejected\n", rc->locator,
+					live[k]->output_index);
 		}
 		return;
 	}
-	/* UNSPENT or UNKNOWN: the revoked output is (still) claimable -> defend. */
-	if (!may_broadcast)
-		return;
 
-	signed_hex = attach_fee_and_sign(tmpctx, b, st, breach_confs,
-					 remote_to_self_delay);
-	if (!signed_hex) {
-		/* Fee wallet absent (testnet) or no suitable UTXO: broadcast the
-		 * raw zero-fee blob so the breach is still surfaced/logged.  It
-		 * will typically be rejected below-min-relay; this is the SEAM. */
-		u8 *raw = linearize_tx(tmpctx, b->tx);
-		signed_hex = tal_hexstr(tmpctx, raw, tal_bytelen(raw));
-	}
-
-	extra = tal_arr(tmpctx, const char *, 1);
 	extra[0] = signed_hex;
 	res = run_cli(tmpctx, "sendrawtransaction", extra);
 	if (res) {
-		size_t n = strlen(res);
-		while (n && (res[n - 1] == '\n' || res[n - 1] == '\r'
-			     || res[n - 1] == ' '))
-			res[--n] = '\0';
 		tal_free(st->broadcast_txid);
-		st->broadcast_txid = tal_strdup(g_state_ctx, res);
+		st->broadcast_txid = tal_strdup(g_state_ctx, trim(res));
 		st->rung++;		/* next poll escalates the feerate (RBF) */
-		fprintf(stderr, "speculad: broadcast justice %s -> txid %s "
-			"(rung %u, feerate ~%u perkw)\n", key, res, st->rung,
-			spd_feerate_perkw(b, breach_confs, st->rung - 1,
-					  remote_to_self_delay));
+		fprintf(stderr, "speculad: broadcast justice %s for %zu "
+			"output(s) -> txid %s (rung %u, feerate ~%u reference "
+			"atoms/kw)\n", key, tal_count(live), st->broadcast_txid,
+			st->rung, spd_feerate_perkw(live[0], breach_confs,
+						    st->rung - 1,
+						    remote_to_self_delay));
 	} else {
-		fprintf(stderr, "speculad: sendrawtransaction rejected for %s "
-			"(kind %u output %u)\n", key, b->kind, b->output_index);
+		fprintf(stderr, "speculad: sendrawtransaction rejected for "
+			"%s (%zu output(s))\n", key, tal_count(live));
 		/* Re-select the fee UTXO next round: the cached one may have been
 		 * spent / reorged away, or the RBF bump was rejected as too small. */
 		st->have_feeutxo = false;
@@ -1261,7 +1418,9 @@ static void defend_sweep(struct watched_channel *c, const struct spd_blob *b,
 	if (b->kind == WT_TMPL_TO_LOCAL_DELAYED_SWEEP) {
 		/* SINGLE|ACP: append our own fee input (+ change + fee output),
 		 * RBF, non-custody output-0 guard -- reused verbatim from justice. */
-		signed_hex = attach_fee_and_sign(tmpctx, b, st, confs,
+		struct spd_blob **one = tal_arr(tmpctx, struct spd_blob *, 1);
+		one[0] = (struct spd_blob *)b;
+		signed_hex = attach_fee_and_sign(tmpctx, one, st, confs,
 						 c->remote_to_self_delay);
 		if (!signed_hex) {
 			/* No fee wallet (testnet) / no suitable UTXO: surface the
@@ -1386,12 +1545,14 @@ static void usage_and_exit(const char *argv0)
 		"Repeat --cli to build the full elements-cli invocation (path +\n"
 		"connection flags).\n"
 		"\n"
-		"--fee-wallet names the box-owned elementsd wallet holding per-asset\n"
+		"--fee-wallet names the box-owned node wallet holding per-asset\n"
 		"fee UTXOs (bech32/p2wpkh) that speculad appends to SINGLE|ACP justice\n"
-		"blobs (+ change + explicit fee output) and RBFs.  Requires the node\n"
-		"to run with txindex=1 (breach + confirmation detection use\n"
-		"getrawtransaction).  Without --fee-wallet the zero-fee blob is\n"
-		"broadcast as-is (typically below-min-relay: the documented seam).\n",
+		"blobs (+ change + explicit fee output) and RBFs; the fee is paid in\n"
+		"the channel asset, converted at the node's exchange rate for it.\n"
+		"--fee-base-perkw and --fee-max-perkw are in reference atoms.\n"
+		"Requires the node to run with txindex=1 (breach + confirmation\n"
+		"detection use getrawtransaction).  Without --fee-wallet the zero-fee\n"
+		"blob is broadcast as-is (below the relay minimum, so refused).\n",
 		argv0);
 	exit(2);
 }
@@ -1499,6 +1660,9 @@ int main(int argc, char *argv[])
 		/* Sole-broadcaster gate (failover via heartbeat staleness). */
 		may_broadcast = acquire_or_refresh_lease(leasefile, lease_stale);
 
+		/* The fee whitelist, for fees paid in a channel asset. */
+		refresh_rates();
+
 		chans = load_channels(tmpctx, netdir);
 		for (size_t i = 0; i < tal_count(chans); i++) {
 			struct watched_channel *c = chans[i];
@@ -1515,6 +1679,17 @@ int main(int argc, char *argv[])
 			 * skips a commitment that is a revoked locator). */
 			defend_honest_close(c, tip_height, may_broadcast);
 
+			/* A revoked commitment can only be on chain once the
+			 * funding output is spent: while it is unspent there
+			 * is no breach to look for, and the round costs one
+			 * call per channel, not one per revoked state. */
+			if (!outpoint_is_zero(&c->funding)
+			    && rpc_txout_state(tmpctx,
+					       fmt_bitcoin_txid(tmpctx,
+								&c->funding.txid),
+					       c->funding.n) == SPD_TXOUT_UNSPENT)
+				continue;
+
 			for (size_t j = 0; j < tal_count(c->revoked); j++) {
 				struct revoked_commit *rc = c->revoked[j];
 				long confs = rpc_tx_confirmations(tmpctx,
@@ -1522,6 +1697,7 @@ int main(int argc, char *argv[])
 
 				if (confs < 1)
 					continue;	/* not (yet) on-chain */
+				load_justice(rc);
 
 				/* BREACH: a revoked commitment is confirmed.
 				 * justice/ never holds the CURRENT state, so any
@@ -1533,14 +1709,13 @@ int main(int argc, char *argv[])
 					c->dbid, rc->locator, confs,
 					tal_count(rc->blobs),
 					may_broadcast ? "" : " (no lease: de-dup only)");
-				/* Per blob: attach a fee + (re-)broadcast with RBF
-				 * escalation, or stop once the justice tx confirmed
-				 * (de-dup).  defend_blob is safe without the lease
-				 * (it only reads confirmations then). */
-				for (size_t k = 0; k < tal_count(rc->blobs); k++)
-					defend_blob(rc, rc->blobs[k], confs,
-						    may_broadcast,
-						    c->remote_to_self_delay);
+				/* One funded justice tx for every output still
+				 * unspent, (re-)broadcast with RBF escalation;
+				 * outputs already spent drop out (de-dup).
+				 * defend_breach is safe without the lease (it
+				 * only reads the UTXO set then). */
+				defend_breach(rc, confs, may_broadcast,
+					      c->remote_to_self_delay);
 			}
 		}
 

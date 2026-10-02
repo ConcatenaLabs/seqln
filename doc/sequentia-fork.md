@@ -241,21 +241,33 @@ host can defend the channel while the device is offline, without ever holding a 
 
 - `channeld/watchtower.{c,h}`, `common/penalty_base.{c,h}`, `common/presign_templates.{c,h}`: at
   every commitment advance channeld has the signer pre-sign the justice (penalty) set for the
-  newly revoked commitment. The templates are `SIGHASH_SINGLE|ANYONECANPAY`, so output 0 carries
-  the swept value and a fee input can be attached later without the device.
+  newly revoked commitment: one transaction for the peer's `to_local` output and one for each
+  non-dust HTLC output, in the channel asset. A commitment that carries HTLC outputs but no
+  `to_local` (a peer with no balance of its own) gets a justice set too. The templates are
+  `SIGHASH_SINGLE|ANYONECANPAY`, so output 0 carries the swept value and a fee input can be
+  attached later without the device.
 - `lightningd/onchain_presign.{c,h}`: the same for the honest force-close sweeps (delayed
-  `to_local`, offered-HTLC timeout) at every advance, and the HTLC-success sweep at fulfil.
+  `to_local`, offered-HTLC timeout) at every advance, the HTLC-success sweep at fulfil, and the
+  sweeps of our HTLC outputs on the peer's commitment.
 - `lightningd/watchtower_store.{c,h}`: the fsync-durable, secret-free on-disk store they are
-  written to (format documented in the header); `wallet/migrations.c` adds the `penalty_htlcs`
-  table; `lightningd/peer_control.c` adds the `setpreemptarmed` RPC (`id`, `armed`), which
-  persists a per-channel flag in that store.
+  written to (format documented in the header): one file of fixed size per revoked commitment
+  (its size set by the HTLCs that commitment carried) and one state file per channel. Penalty
+  channels need one device signature per revoked state, so a channel's store grows with every
+  state it revokes for as long as it is open; lightningd removes the channel's directory when it
+  forgets the closed channel. `wallet/migrations.c` adds the `penalty_htlcs` table;
+  `lightningd/peer_control.c` adds the `setpreemptarmed` RPC (`id`, `armed`), which persists a
+  per-channel flag in that store. `--watchtower-store=auto|on|off` (default `auto`: kept only
+  when hsmd is a signer proxy).
 - `speculad/speculad.c` (built as `speculad/speculad`, `speculad/Makefile`): a standalone daemon,
-  not a plugin and not spawned by `lightningd`, that loads the store, polls the chain through the
-  node's CLI for a revoked commitment confirming, and broadcasts the matching pre-signed
-  transactions. It never loads a secret. Attaching the per-asset fee input and RBF-escalating it
-  needs a fee-UTXO wallet on the host, which does not exist on testnet, so that step is the
-  documented seam (`attach_fee_and_rbf()`); sweeping the HTLC outputs of a peer's honest close
-  (`remote_htlc_to_us`) is a second seam.
+  not a plugin and not spawned by `lightningd`, that loads the store, watches each channel's
+  funding output through the node's CLI, and on a revoked commitment confirming broadcasts its
+  justice set as one transaction. It never loads a secret. It pays the fee from a box-owned
+  node wallet (`--fee-wallet`) holding UTXOs in the channel asset: it appends one fee input and
+  change, pays the fee in the channel asset at the node's exchange rate for it
+  (`getfeeexchangerates`; `--fee-base-perkw` and `--fee-max-perkw` are in reference atoms), and
+  raises it by replacement each round until the justice confirms. A round costs a few CLI calls
+  per channel; the stored revoked commitments are polled only once a channel's funding output is
+  spent. It needs the node to run with `txindex=1`.
 
 The Specula design note is not yet published in this repository; the header comment of
 `speculad/speculad.c` is the fullest description of the model.
@@ -302,8 +314,9 @@ each Sequentia block (pass `advance_parent=False` to hold the parent still);
 opened the escaping stall. Lightning nodes run the network's own timelock and `rescan` defaults.
 The tests cover an asset channel opened, paid over and mutually closed, the anchor-burial gate,
 the certified-frontier clamp, a Bitcoin reorg unwinding Sequentia blocks under a running node,
-and the network defaults. They need `sequentiad`, `sequentia-cli` and a Bitcoin Core `bitcoind`
-on `PATH`:
+the network defaults, and a breach of an asset channel with a pending HTLC answered by
+`speculad` while the victim is offline (`test_watchtower.py`). They need `sequentiad`,
+`sequentia-cli` and a Bitcoin Core `bitcoind` on `PATH`:
 
 ```sh
 PATH=/path/to/bitcoin/bin:/path/to/Sequentia/src:$PATH TEST_NETWORK=sequentia-regtest \
@@ -355,5 +368,10 @@ Each verified present in the code as of 2026-07-08:
    (a stalled committee), the bcli clamp fails open with a warning rather than halting; operators
    should monitor for that log message.
 8. **Penalty across an induced anchor reorg is untested.** Open, payment and mutual close of an
-   issued-asset channel run in `tests/sequentia/`, and force-close resolution has been exercised
-   on the testnet, but no test covers a penalty across a Bitcoin-anchor tail truncation.
+   issued-asset channel, and a breach of one answered by `speculad`, run in `tests/sequentia/`,
+   and force-close resolution has been exercised on the testnet, but no test covers a penalty
+   across a Bitcoin-anchor tail truncation.
+9. **`speculad` pays a justice transaction's fee only in the channel asset.** If the node stops
+   accepting that asset for fees, the tower cannot fund the justice transaction (it logs the
+   asset and broadcasts it unfunded, which the network refuses). Its fee wallet must also hold a
+   UTXO in each channel asset it defends.
