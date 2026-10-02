@@ -30,6 +30,12 @@ msgdata,openingd_init,dev_temporary_channel_id,?byte,32
 # reasons, but some implementations and users keep asking for it.
 msgdata,openingd_init,allowdustreserve,bool,
 msgdata,openingd_init,dev_accept_any_channel_type,bool,
+# The fee exchange rates this node holds (see common/amount.h): a channel
+# they open in an asset has its feerate limits converted into that asset.
+msgdata,openingd_init,num_asset_rates,u16,
+msgdata,openingd_init,asset_rate_values,u64,num_asset_rates
+msgdata,openingd_init,asset_rate_tags_len,u16,
+msgdata,openingd_init,asset_rate_tags,u8,asset_rate_tags_len
 
 # Openingd->master: they offered channel, should we continue?
 msgtype,openingd_got_offer,6005

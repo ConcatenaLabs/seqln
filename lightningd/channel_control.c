@@ -51,18 +51,28 @@ struct splice_command {
 	struct stfu_req_info *stfu_req_info;
 };
 
+/* A feerate for this channel's transactions, in its asset's atoms (see
+ * channel_asset_feerate()).  0 if unknown. */
+static u32 chan_feerate(struct lightningd *ld, const struct channel *channel,
+			u32 feerate)
+{
+	return channel_asset_feerate(ld->topology, channel->channel_asset,
+				     feerate);
+}
+
 static u32 default_feerate(struct lightningd *ld, const struct channel *channel,
 			   bool add_offset)
 {
 	u32 max_feerate;
 	bool anchors = channel_type_has_anchors(channel->type);
-	u32 feerate = unilateral_feerate(ld->topology, anchors);
+	u32 feerate = chan_feerate(ld, channel,
+				   unilateral_feerate(ld->topology, anchors));
 
 	/* Nothing to do if we don't know feerate. */
 	if (!feerate)
 		return 0;
 
-	max_feerate = feerate_max(ld, NULL);
+	max_feerate = chan_feerate(ld, channel, feerate_max(ld, NULL));
 
 	/* The channel opener should use a slightly higher than minimal feerate
 	 * in order to avoid excessive feerate disagreements */
@@ -92,7 +102,8 @@ void channel_update_feerates(struct lightningd *ld, const struct channel *channe
 		min_feerate = get_feerate_floor(ld->topology);
 	else
 		min_feerate = feerate_min(ld, NULL);
-	max_feerate = feerate_max(ld, NULL);
+	min_feerate = chan_feerate(ld, channel, min_feerate);
+	max_feerate = chan_feerate(ld, channel, feerate_max(ld, NULL));
 
 	if (channel->ignore_fee_limits || ld->config.ignore_fee_limits) {
 		min_feerate = 1;
@@ -104,16 +115,16 @@ void channel_update_feerates(struct lightningd *ld, const struct channel *channe
 		  " opening=%u, splicing: %u",
 		  feerate,
 		  min_feerate,
-		  feerate_max(ld, NULL),
-		  penalty_feerate(ld->topology),
-		  opening_feerate(ld->topology),
+		  max_feerate,
+		  chan_feerate(ld, channel, penalty_feerate(ld->topology)),
+		  chan_feerate(ld, channel, opening_feerate(ld->topology)),
 		  feerate_splice);
 
 	msg = towire_channeld_feerates(NULL, feerate,
 				       min_feerate,
 				       max_feerate,
-				       penalty_feerate(ld->topology),
-				       opening_feerate(ld->topology),
+				       chan_feerate(ld, channel, penalty_feerate(ld->topology)),
+				       chan_feerate(ld, channel, opening_feerate(ld->topology)),
 				       feerate_splice);
 	subd_send_msg(channel->owner, take(msg));
 }
@@ -1842,9 +1853,13 @@ bool peer_start_channeld(struct channel *channel,
 		min_feerate = get_feerate_floor(ld->topology);
 	else
 		min_feerate = feerate_min(ld, NULL);
-	max_feerate = feerate_max(ld, NULL);
+	min_feerate = chan_feerate(ld, channel, min_feerate);
+	max_feerate = chan_feerate(ld, channel, feerate_max(ld, NULL));
 
-	if (channel->ignore_fee_limits || ld->config.ignore_fee_limits) {
+	/* An asset without a rate here yet: no limits until the next feerate
+	 * update brings one. */
+	if (channel->ignore_fee_limits || ld->config.ignore_fee_limits
+	    || !max_feerate) {
 		min_feerate = 1;
 		max_feerate = 0xFFFFFFFF;
 	}
@@ -1921,8 +1936,8 @@ bool peer_start_channeld(struct channel *channel,
 				       feerate_splice,
 				       min_feerate,
 				       max_feerate,
-				       penalty_feerate(ld->topology),
-				       opening_feerate(ld->topology),
+				       chan_feerate(ld, channel, penalty_feerate(ld->topology)),
+				       chan_feerate(ld, channel, opening_feerate(ld->topology)),
 				       &channel->last_sig,
 				       &channel->channel_info.remote_fundingkey,
 				       &channel->channel_info.theirbase,

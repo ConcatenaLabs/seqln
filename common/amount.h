@@ -231,6 +231,18 @@ struct amount_msat amount_msat_sub_fee(struct amount_msat input,
 /* What is the fee for this tx weight? */
 struct amount_sat amount_tx_fee(u32 fee_per_kw, size_t weight);
 
+/* Fixed-point scale of the any-asset fee exchange rates (the node's
+ * `exchange_rate_scale`, COIN = 1e8).  A rate R for an asset means one atom
+ * of it is worth R / EXCHANGE_RATE_SCALE reference (policy) atoms, so a fee
+ * of F reference atoms is ceil(F * EXCHANGE_RATE_SCALE / R) atoms of the
+ * asset.  The policy asset is always at par (R == EXCHANGE_RATE_SCALE). */
+#define EXCHANGE_RATE_SCALE ((u64)100000000)
+
+/* A feerate in reference atoms per kw, expressed in atoms per kw of an
+ * asset at rate `rate`: worth at least as much, rounded up, saturating at
+ * UINT32_MAX.  A rate of 0 (an asset with no rate) is returned unchanged. */
+u32 feerate_in_asset(u32 feerate_per_kw, u64 rate);
+
 /* What is the feerate given this fee and (non-zero!) weight? */
 WARN_UNUSED_RESULT bool amount_feerate(u32 *feerate, struct amount_sat fee, size_t weight);
 

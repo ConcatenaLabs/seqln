@@ -11,6 +11,7 @@
 #include <bitcoin/script.h>
 #include <ccan/array_size/array_size.h>
 #include <ccan/breakpoint/breakpoint.h>
+#include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
 #include <common/fee_states.h>
 #include <common/initial_channel.h>
@@ -49,6 +50,10 @@ struct state {
 	/* Constraints on a channel they open. */
 	u32 minimum_depth;
 	u32 min_feerate, max_feerate;
+	/* Fee exchange rates: rate i is for the 33-byte tag at
+	 * asset_rate_tags + 33*i. */
+	u64 *asset_rate_values;
+	u8 *asset_rate_tags;
 	struct amount_msat min_effective_htlc_capacity;
 
 	/* Limits on what remote config we accept. */
@@ -916,6 +921,32 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 		       sizeof(state->channel_asset));
 	}
 
+	/* The funder states its feerate in the channel asset's atoms (every
+	 * fee of the channel is paid in that asset), so judge it against our
+	 * limits converted at our own rate for the asset.  An asset we hold no
+	 * rate for cannot pay a fee we would relay. */
+	if (chainparams->is_elements && chainparams->fee_asset_tag
+	    && !memeq(state->channel_asset, sizeof(state->channel_asset),
+		      chainparams->fee_asset_tag, sizeof(state->channel_asset))) {
+		u64 rate = 0;
+		for (size_t i = 0; i < tal_count(state->asset_rate_values); i++) {
+			if (memeq(state->asset_rate_tags + i * sizeof(state->channel_asset),
+				  sizeof(state->channel_asset),
+				  state->channel_asset,
+				  sizeof(state->channel_asset)))
+				rate = state->asset_rate_values[i];
+		}
+		if (!rate) {
+			negotiation_failed(state,
+					   "channel asset %s has no fee exchange rate here",
+					   tal_hexstr(tmpctx, state->channel_asset,
+						      sizeof(state->channel_asset)));
+			return NULL;
+		}
+		state->min_feerate = feerate_in_asset(state->min_feerate, rate);
+		state->max_feerate = feerate_in_asset(state->max_feerate, rate);
+	}
+
 	/* BOLT #2:
 	 *  - if the message doesn't include a `channel_type`:
 	 *    - fail the channel.
@@ -1505,7 +1536,12 @@ int main(int argc, char *argv[])
 				    &state->min_feerate, &state->max_feerate,
 				    &state->dev_force_tmp_channel_id,
 				    &state->allowdustreserve,
-				    &state->dev_accept_any_channel_type))
+				    &state->dev_accept_any_channel_type,
+				    &state->asset_rate_values,
+				    &state->asset_rate_tags))
+		master_badmsg(WIRE_OPENINGD_INIT, msg);
+	if (tal_bytelen(state->asset_rate_tags)
+	    != tal_count(state->asset_rate_values) * sizeof(state->channel_asset))
 		master_badmsg(WIRE_OPENINGD_INIT, msg);
 
 	/* Default to the policy asset; funder_start / the open_channel TLV

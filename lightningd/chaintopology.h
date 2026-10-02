@@ -15,11 +15,7 @@ struct wallet;
 /* We keep the last three in case there are outliers (for min/max) */
 #define FEE_HISTORY_NUM 3
 
-/* Fixed-point scale for the any-asset fee exchange rates (must match the
- * node's `exchange_rate_scale`, i.e. COIN = 1e8).  A rate R for an asset means
- * R atoms of that asset are worth EXCHANGE_RATE_SCALE reference (policy) fee
- * atoms; the policy asset itself is always 1:1 (R == EXCHANGE_RATE_SCALE). */
-#define EXCHANGE_RATE_SCALE ((u64)100000000)
+/* EXCHANGE_RATE_SCALE and the meaning of a rate: common/amount.h. */
 
 /* One entry of the fee-asset whitelist, keyed by the 33-byte elements asset
  * tag (0x01 || byte-reversed display id).  Fed by the node's
@@ -189,6 +185,15 @@ u32 get_feerate_floor(const struct chain_topology *topo);
  * rate R for a whitelisted asset, or 0 if the asset is unknown / not
  * whitelisted / the cache has not been populated yet. */
 u64 topo_asset_fee_rate(const struct chain_topology *topo, const u8 *asset_tag);
+
+/* A feerate (reference atoms per kw) re-expressed for a channel in `asset`:
+ * every feerate a channel's subdaemons see, and every fee of its
+ * transactions, is in the channel asset's own atoms, worth what the network
+ * asks through this node's exchange rate.  Returns 0 when `feerate` is 0 or
+ * the asset has no rate here (not whitelisted, or the cache is not filled
+ * yet): callers treat that as "feerate unknown". */
+u32 channel_asset_feerate(const struct chain_topology *topo, const u8 *asset,
+			  u32 feerate);
 
 /* This is the number of blocks which would have to be mined to invalidate
  * the tx */

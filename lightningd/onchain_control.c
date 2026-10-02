@@ -948,16 +948,24 @@ static struct bitcoin_tx *onchaind_tx_unsigned(const tal_t *ctx,
 	/* FIXME: We don't combine! */
 	block_target = info->deadline_block;
 	for (;;) {
-		u32 feerate;
+		u32 feerate, asset_feerate;
 
 		feerate = feerate_for_target(ld->topology, block_target);
-		*fee = amount_tx_fee(feerate, weight);
+		/* The sweep pays its fee in the channel asset: in that
+		 * asset's atoms, at this node's rate.  With no rate for the
+		 * asset there is nothing better than the reference feerate. */
+		asset_feerate = channel_asset_feerate(ld->topology,
+						      channel->channel_asset,
+						      feerate);
+		if (!asset_feerate)
+			asset_feerate = feerate;
+		*fee = amount_tx_fee(asset_feerate, weight);
 
 		log_debug(channel->log,
-			  "Feerate for target %"PRIu64" (%+"PRId64" blocks) is %u, fee %s of %s",
+			  "Feerate for target %"PRIu64" (%+"PRId64" blocks) is %u (%u in the channel asset), fee %s of %s",
 			  block_target,
 			  block_target - get_block_height(ld->topology),
-			  feerate,
+			  feerate, asset_feerate,
 			  fmt_amount_sat(tmpctx, *fee),
 			  fmt_amount_sat(tmpctx, info->out_sats));
 
