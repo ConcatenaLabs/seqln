@@ -232,7 +232,9 @@ a user device while a host runs the node:
   `SEQLN_HOST_PRIVKEY[_FILE]` + `SEQLN_SIGNER_PEER_PUBKEY`.
 - `hsmd/Makefile`: build wiring for the two daemons.
 - `contrib/seqln-signer/`: the Rust device signer (native + WASM) that replaces `signerd` on the
-  device side. See [its README](../contrib/seqln-signer/README.md).
+  device side. It keeps a per-channel store (revocation counters, the balance its latest
+  commitments give this side) on the device, and holds each close and revocation to it. See
+  [its README](../contrib/seqln-signer/README.md).
 - A device that refuses a request on lightningd's own connection is dropped and the request is
   sent again when a device reconnects (a device that was missing state is re-primed then); a
   request refused three times ends the node, with the request named in its log, rather than
@@ -319,8 +321,8 @@ opened the escaping stall. Lightning nodes run the network's own timelock and `r
 The tests cover an asset channel opened, paid over and mutually closed, the anchor-burial gate,
 the certified-frontier clamp, a Bitcoin reorg unwinding Sequentia blocks under a running node,
 the network defaults, a breach of an asset channel with a pending HTLC answered by `speculad`
-while the victim is offline (`test_watchtower.py`), and a keyless node closing a channel and
-restarting with it closing (`test_keyless_close.py`). They need `sequentiad`, `sequentia-cli`
+while the victim is offline (`test_watchtower.py`), and a keyless node, as either side of a
+channel, closing it and restarting with it closing (`test_keyless_close.py`). They need `sequentiad`, `sequentia-cli`
 and a Bitcoin Core `bitcoind` on `PATH`, and the keyless test needs the device signer built
 (`cargo build --release` in `contrib/seqln-signer`, or `SEQLN_SIGNER=/path/to/seqln-signer`):
 

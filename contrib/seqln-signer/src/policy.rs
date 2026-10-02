@@ -34,6 +34,9 @@
 //!  * every output value is explicit (transparent-by-default channels; a blinded
 //!    commitment output is rejected as anomalous).
 //!
+//! A validated commitment also yields what it pays this side ([`Split`]),
+//! which the dispatcher records and [`validate_mutual_close`] holds a close to.
+//!
 //! For `WIRE_HSMD_SIGN_COMMITMENT_TX` (our own commitment, msg 5) the request
 //! carries NO HTLC data, so HTLC outputs cannot be reconstructed; see
 //! [`validate_local_commitment_no_htlcs`] for the strongest correct subset there.
@@ -150,6 +153,51 @@ pub struct ChannelState {
     /// (VALIDATE_COMMITMENT_TX): revoking commitment n needs n + 1 validated,
     /// or the node would be left with no commitment it may broadcast.
     pub validated_through: Option<u64>,
+    /// What the latest of OUR commitments this device validated pays this
+    /// side, with that commitment's number (VALIDATE_COMMITMENT_TX).
+    pub local_split: Option<(u64, Split)>,
+    /// The same for the latest of the PEER's commitments it signed
+    /// (SIGN_REMOTE_COMMITMENT_TX). A mutual close is held to the balance
+    /// these two give this side ([`validate_mutual_close`]).
+    pub remote_split: Option<(u64, Split)>,
+}
+
+/// What one commitment pays this side, in the channel asset's atoms, read off
+/// a commitment whose every output the device has matched to the channel's
+/// scripts. HTLC outputs belong to neither side yet and are not counted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Split {
+    /// This side's main output: `to_local` on our commitment, `to_remote` on
+    /// the peer's. 0 when it was trimmed as dust.
+    pub ours: u64,
+    /// The commitment's fee: the funding amount less every output that is
+    /// not the fee (on Elements, the explicit fee output).
+    pub fee: u64,
+    /// The anchor outputs (option_anchors), which the opener funds.
+    pub anchors: u64,
+}
+
+impl Split {
+    /// This side's share of the channel by this commitment: its main output,
+    /// plus the fee and anchors when this side opened the channel (the opener
+    /// pays both out of its share; a close returns the anchors to it and
+    /// takes its own fee from it instead). With the opener unknown (a store
+    /// from before it was recorded), the fee is not counted as ours.
+    pub fn share(&self, is_outbound: Option<bool>) -> u64 {
+        match is_outbound {
+            Some(true) => self.ours.saturating_add(self.fee).saturating_add(self.anchors),
+            _ => self.ours,
+        }
+    }
+}
+
+/// The newer of two (commitment number, split) records.
+fn newer(a: Option<(u64, Split)>, b: Option<(u64, Split)>) -> Option<(u64, Split)> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(if y.0 > x.0 { y } else { x }),
+        (x, None) => x,
+        (None, y) => y,
+    }
 }
 
 impl ChannelState {
@@ -160,6 +208,8 @@ impl ChannelState {
     pub fn merge_from(&mut self, old: &ChannelState) {
         self.revoked_through = max_opt(self.revoked_through, old.revoked_through);
         self.validated_through = max_opt(self.validated_through, old.validated_through);
+        self.local_split = newer(self.local_split, old.local_split);
+        self.remote_split = newer(self.remote_split, old.remote_split);
         if !old.local_shutdown_script.is_empty() {
             self.local_shutdown_script = old.local_shutdown_script.clone();
         }
@@ -251,9 +301,10 @@ impl ChannelStore {
 
 pub const CHSTORE_MAGIC: [u8; 4] = *b"SQCH";
 /// Version 2 adds, after each entry's version-1 fields: the opener flag, both
-/// revocation counters and both upfront shutdown scripts. Version 1 blobs
-/// still import (those fields unknown).
-pub const CHSTORE_VERSION: u8 = 2;
+/// revocation counters and both upfront shutdown scripts. Version 3 adds,
+/// after those, the latest local and remote commitment splits. Versions 1
+/// and 2 still import (the fields they lack unknown).
+pub const CHSTORE_VERSION: u8 = 3;
 /// The fixed part of an entry, which is the whole of a version-1 entry:
 /// node_id(33) dbid(8) sats(8) txid(32) txout(2) local_delay(2) remote_delay(2)
 /// 5 pubkeys(165) static_remotekey(1) anchors(1)
@@ -280,6 +331,19 @@ fn push_opt_u64(out: &mut Vec<u8>, v: Option<u64>) {
 fn push_script(out: &mut Vec<u8>, script: &[u8]) {
     out.extend_from_slice(&(script.len() as u16).to_le_bytes());
     out.extend_from_slice(script);
+}
+
+/// flag(1) then, when present, commit_num(8) ours(8) fee(8) anchors(8).
+fn push_opt_split(out: &mut Vec<u8>, v: Option<(u64, Split)>) {
+    match v {
+        None => out.push(0),
+        Some((n, s)) => {
+            out.push(1);
+            for x in [n, s.ours, s.fee, s.anchors] {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+    }
 }
 
 /// Encode the whole store (deterministically; no MAC — the dispatcher owns
@@ -309,6 +373,8 @@ pub fn encode_channel_store(store: &ChannelStore) -> Vec<u8> {
         push_opt_u64(&mut out, st.validated_through);
         push_script(&mut out, &st.local_shutdown_script);
         push_script(&mut out, &st.remote_shutdown_script);
+        push_opt_split(&mut out, st.local_split);
+        push_opt_split(&mut out, st.remote_split);
     }
     out
 }
@@ -349,10 +415,24 @@ impl<'a> StoreReader<'a> {
         let len = u16::from_le_bytes(self.take(2)?.try_into().unwrap()) as usize;
         Ok(self.take(len)?.to_vec())
     }
+    fn u64(&mut self) -> Result<u64, String> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    fn opt_split(&mut self) -> Result<Option<(u64, Split)>, String> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => {
+                let n = self.u64()?;
+                let s = Split { ours: self.u64()?, fee: self.u64()?, anchors: self.u64()? };
+                Ok(Some((n, s)))
+            }
+            v => Err(format!("bad split flag {v} in channel-store blob")),
+        }
+    }
 }
 
 /// Decode a channel-store payload (the MAC must already have been verified
-/// and stripped by the caller). Takes version 1 and version 2.
+/// and stripped by the caller). Takes versions 1, 2 and 3.
 pub fn decode_channel_store(
     bytes: &[u8],
 ) -> Result<Vec<(([u8; 33], u64), ChannelState)>, String> {
@@ -360,7 +440,7 @@ pub fn decode_channel_store(
         return Err("not a channel-store blob (bad magic)".to_string());
     }
     let version = bytes[4];
-    if version != 1 && version != 2 {
+    if !(1..=3).contains(&version) {
         return Err(format!("unsupported channel-store version {version}"));
     }
     let count = u32::from_le_bytes(bytes[5..9].try_into().unwrap()) as usize;
@@ -392,6 +472,8 @@ pub fn decode_channel_store(
             remote_shutdown_script: Vec::new(),
             revoked_through: None,
             validated_through: None,
+            local_split: None,
+            remote_split: None,
         };
         if version >= 2 {
             st.is_outbound = r.opt_bool()?;
@@ -399,6 +481,10 @@ pub fn decode_channel_store(
             st.validated_through = r.opt_u64()?;
             st.local_shutdown_script = r.script()?;
             st.remote_shutdown_script = r.script()?;
+        }
+        if version >= 3 {
+            st.local_split = r.opt_split()?;
+            st.remote_split = r.opt_split()?;
         }
         out.push(((node_id, dbid), st));
     }
@@ -809,8 +895,9 @@ fn expected_scripts(ks: &Keyset, st: &ChannelState, side: Side, htlcs: &[Htlc]) 
 }
 
 /// FULL commitment validation (used for the peer's commitment and — since it
-/// also carries the HTLC set — our own local commitment). Returns Ok(()) if the
-/// tx is a legitimate commitment for the tracked channel, else Err(reason).
+/// also carries the HTLC set — our own local commitment). Returns what the
+/// commitment pays this side if the tx is a legitimate commitment for the
+/// tracked channel, else Err(reason).
 #[allow(clippy::too_many_arguments)]
 pub fn validate_commitment(
     kernel: &Kernel,
@@ -821,7 +908,7 @@ pub fn validate_commitment(
     point: &[u8; 33],
     htlcs: &[Htlc],
     tx: &ElementsTx,
-) -> Result<(), String> {
+) -> Result<Split, String> {
     let static_remotekey = st.option_static_remotekey || st.option_anchors;
     let our_bp = kernel.channel_basepoints(node_id, dbid);
     let ks = build_keyset(kernel, st, &our_bp, side, point, static_remotekey)?;
@@ -839,8 +926,19 @@ pub fn validate_commitment(
         return Err("commitment input is not the tracked funding outpoint".to_string());
     }
 
+    // This side's main output: to_local on our commitment, to_remote (the
+    // OTHER side's payment script) on the peer's. expected_scripts puts
+    // to_local first, to_remote second, then the two anchors.
+    let ours_script = match side {
+        Side::Local => &whitelist[0],
+        Side::Remote => &whitelist[1],
+    };
+    let anchor_scripts: &[Vec<u8>] = if st.option_anchors { &whitelist[2..4] } else { &[] };
+
     // Every output pays to an expected script; total value is conserved.
     let mut total: u128 = 0;
+    let mut not_fee: u128 = 0;
+    let mut split = Split::default();
     for (i, o) in tx.outputs.iter().enumerate() {
         let v = output_value(o, tx.network)
             .ok_or_else(|| format!("output {i} has a non-explicit (blinded) value"))?;
@@ -855,6 +953,12 @@ pub fn validate_commitment(
                 hexstr(&o.script)
             ));
         }
+        not_fee += v as u128;
+        if o.script == *ours_script {
+            split.ours = split.ours.saturating_add(v);
+        } else if anchor_scripts.iter().any(|s| *s == o.script) {
+            split.anchors = split.anchors.saturating_add(v);
+        }
     }
     if total > st.funding_sats as u128 {
         return Err(format!(
@@ -862,7 +966,8 @@ pub fn validate_commitment(
             st.funding_sats
         ));
     }
-    Ok(())
+    split.fee = (st.funding_sats as u128 - not_fee) as u64;
+    Ok(split)
 }
 
 /// Strongest CORRECT subset for `WIRE_HSMD_SIGN_COMMITMENT_TX` (msg 5, OUR own
@@ -964,6 +1069,18 @@ pub fn commitment_number(
     Some(obscured ^ obscurer)
 }
 
+/// The dust limit Core Lightning gives its own side of every channel
+/// (`chainparams->dust_limit`, 546 on every network it knows): an honest close
+/// leaves this side's output out only when it is worth less than that.
+pub const CLOSE_DUST_TOLERANCE: u64 = 546;
+
+/// The ceiling on a close fee the device lets the opener's balance pay, as a
+/// multiple of the latest validated commitment's fee plus anchors. A close is
+/// a smaller transaction than a commitment, so at the commitment's own
+/// feerate it costs less than the commitment's fee; four times leaves room
+/// for a feerate that rose since the last `update_fee`.
+pub const CLOSE_FEE_CEILING_FACTOR: u64 = 4;
+
 /// Mutual-close validation (enforce mode), for SIGN_MUTUAL_CLOSE_TX and for
 /// a close-shaped transaction under SIGN_COMMITMENT_TX: lightningd signs the
 /// closing transaction it rebroadcasts (`drop_to_chain`, cooperative) with the
@@ -974,10 +1091,8 @@ pub fn commitment_number(
 ///  * besides the fee, at most two outputs: at most one paying one of this
 ///    device's own wallet scripts (`own`, our share), and at most one paying
 ///    the peer: its recorded upfront shutdown script when `setup_channel`
-///    named one, else any one script.
-///
-/// No balance is checked: the device keeps no balance state, so this bounds
-/// where the funds can go, not how they are split.
+///    named one, else any one script;
+///  * the split: see [`check_close_balance`].
 pub fn validate_mutual_close(
     st: &ChannelState,
     own: &std::collections::HashSet<Vec<u8>>,
@@ -991,6 +1106,7 @@ pub fn validate_mutual_close(
         return Err("close input is not the tracked funding outpoint".to_string());
     }
     let (mut total, mut ours, mut theirs) = (0u128, 0usize, 0usize);
+    let (mut ours_value, mut theirs_value) = (0u64, 0u64);
     for (i, o) in tx.outputs.iter().enumerate() {
         let v = output_value(o, tx.network)
             .ok_or_else(|| format!("output {i} has a non-explicit value"))?;
@@ -1000,10 +1116,12 @@ pub fn validate_mutual_close(
         }
         if own.contains(&o.script) {
             ours += 1;
+            ours_value = v;
         } else if st.remote_shutdown_script.is_empty()
             || o.script == st.remote_shutdown_script
         {
             theirs += 1;
+            theirs_value = v;
         } else {
             return Err(format!(
                 "output {i} pays neither this wallet nor the peer's recorded \
@@ -1017,6 +1135,75 @@ pub fn validate_mutual_close(
     }
     if total > st.funding_sats as u128 {
         return Err(format!("value created: outputs {total} > funding {}", st.funding_sats));
+    }
+    let fee = st.funding_sats - ours_value - theirs_value;
+    check_close_balance(st, (ours == 1).then_some(ours_value), theirs_value, fee)
+}
+
+/// Hold a close to this side's balance: the larger of the shares
+/// ([`Split::share`]) that the latest of our commitments the device validated
+/// and the latest of the peer's it signed give us. A close is negotiated only
+/// once neither commitment carries an HTLC (BOLT 2), when the two agree, so a
+/// stale record cannot lower the figure an honest close is held to.
+///
+///  * When this side opened the channel it pays the close fee from its share,
+///    up to [`CLOSE_FEE_CEILING_FACTOR`] times the commitment's fee and
+///    anchors; the fundee pays none of it. With the opener unknown the fee
+///    is deducted (the permissive reading).
+///  * The output to this wallet must be at least that share less the fee;
+///    it may be absent only when what is due is under
+///    [`CLOSE_DUST_TOLERANCE`].
+///  * The peer's output may not exceed the funding less our share: dust
+///    trimmed from us goes to the fee, never to the peer.
+///  * With no balance known yet (a store from before balances were
+///    recorded, or a channel armed from the node), a close that pays this
+///    wallet nothing is refused.
+pub fn check_close_balance(
+    st: &ChannelState,
+    ours_out: Option<u64>,
+    theirs_out: u64,
+    close_fee: u64,
+) -> Result<(), String> {
+    let mut known: Option<(u64, u64)> = None; // (share, fee ceiling)
+    for (_, sp) in [st.local_split, st.remote_split].into_iter().flatten() {
+        let share = sp.share(st.is_outbound);
+        let ceiling = CLOSE_FEE_CEILING_FACTOR.saturating_mul(sp.fee.saturating_add(sp.anchors));
+        known = Some(match known {
+            None => (share, ceiling),
+            Some((s, c)) => (s.max(share), c.max(ceiling)),
+        });
+    }
+    let (share, ceiling) = match known {
+        Some(k) => k,
+        None if ours_out.is_some() => return Ok(()),
+        None => {
+            return Err("the close pays this wallet nothing and no balance is known \
+                        for the channel yet"
+                .to_string())
+        }
+    };
+    let fee_share = if st.is_outbound == Some(false) { 0 } else { close_fee.min(ceiling) };
+    let due = share.saturating_sub(fee_share);
+    match ours_out {
+        Some(v) if v < due => {
+            return Err(format!(
+                "the close pays this wallet {v}, below its balance {share} less \
+                 {fee_share} of close fee"
+            ))
+        }
+        None if due > CLOSE_DUST_TOLERANCE => {
+            return Err(format!(
+                "the close pays this wallet nothing, but its balance is {share} \
+                 ({due} after {fee_share} of close fee)"
+            ))
+        }
+        _ => {}
+    }
+    let theirs_max = st.funding_sats.saturating_sub(share);
+    if theirs_out > theirs_max {
+        return Err(format!(
+            "the close pays the peer {theirs_out}, above its share {theirs_max}"
+        ));
     }
     Ok(())
 }

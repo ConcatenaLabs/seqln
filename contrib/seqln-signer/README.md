@@ -59,24 +59,43 @@ signing. Messages outside the subset return an error sentinel rather than a wron
 
 What enforce mode checks:
 
-- **Commitments**, ours and the peer's: every output is one the channel's keys produce.
+- **Commitments**, ours and the peer's: every output is one the channel's keys produce. A
+  commitment of ours counts as validated only when the peer's signature on it verifies against
+  the channel's remote funding key. From the latest of our commitments it validated, and the
+  latest of the peer's it signed, the device records this side's balance: its own output, plus
+  the fee and anchors when this side opened the channel.
 - **Mutual closes** (closingd's request, and the closing transaction lightningd signs again with
   the commitment message when a close completes and whenever it starts with a channel closing):
   one input, the funding output; at most one output to this device's own wallet and at most one
   to the peer, which must be the peer's upfront shutdown script when the channel named one; no
   value created. A close paying our share anywhere but our own wallet is refused, whatever local
-  shutdown script the host supplied.
+  shutdown script the host supplied. The output to our wallet must be at least the recorded
+  balance (the larger of the two commitments' figures), less the close fee when this side
+  opened the channel, and that fee is counted only up to four times the commitment's fee and
+  anchors. It may be left out only when what is due is under the 546-atom dust limit, and the
+  peer's output may not exceed the funding less our balance. While no balance is recorded, a
+  close that pays this wallet nothing is refused.
 - **Revocations**: the device reveals the secret of our commitment n only when n is the next to
   revoke (or already revealed: channeld re-sends a revocation after a reconnect) and commitment
   n + 1 has been validated; and it never signs a commitment of ours numbered at or below the
   highest it revealed. The number is read off the transaction's obscured locktime and sequence,
-  not taken from the request. A device with no record of the channel's revocations (a fresh
-  session with no persisted store) takes the first revocation it is asked for as its starting
-  point.
+  not taken from the request. A device with no record of the channel's commitments (a store from
+  before they were recorded, or a channel armed from the node's own data) reveals only
+  commitment 0 until it has validated a later commitment.
 - **Sweeps, penalties and HTLC transactions**: they pay only the node's own outputs.
 
-Not checked: how a commitment or a close splits the channel between the two sides (the device
-keeps no balance state), and there is no rate limiting.
+Not checked: how a commitment splits the channel between the two sides, and which payments are
+made: the device approves every invoice and keysend, and there is no rate limiting. So the
+device does not protect a user from a host that also runs the channel's peer. Such a host can
+pay the peer, or broadcast a commitment the device signed for the watchtower's preempt slot
+before the device revoked it, which the peer then takes whole with the revocation secret.
+
+The channel store (each channel's parameters, revocation counters and recorded balance) carries
+no secret and is authenticated by a MAC keyed from the seed. The native signer keeps it in
+`seqln-signer-channels` in its working directory (or the path in `SEQLN_SIGNER_STORE`): it
+loads the file at start and rewrites it durably (temporary file, sync, rename) after every
+request that changed it, before the reply leaves, refusing the request if the file cannot be
+written. The WASM build hands the same blob to the wallet's `channelStore` to keep.
 
 ## Layout
 
@@ -95,7 +114,8 @@ keeps no balance state), and there is no rate limiting.
 | `src/bin/ecdh_latency.rs` | ECDH hot-path latency probe (in-process vs transport round-trip). |
 | `src/bin/emit_elements_vector.rs` | Emits an Elements v2 PSET `sign_withdrawal` vector for the conformance harness's `SEQLN_WITHDRAWAL_VECTOR` mode. |
 | `tests/tamper.rs` | Enforce-mode theft-rejection test (skips without a captured corpus). |
-| `tests/chstore.rs` | Channel-store persistence contract (`export_channels`/`import_channels` round-trip, MAC refusal, merge semantics). The store carries each channel's opener, upfront shutdown scripts and revocation counters, and imports an older store without them. |
+| `tests/chstore.rs` | Channel-store persistence contract (`export_channels`/`import_channels` round-trip, MAC refusal, merge semantics). The store carries each channel's opener, upfront shutdown scripts, revocation counters and recorded balance, and imports an older store without them. |
+| `tests/native_store.rs` | The native binary keeps its store across a restart: a new process refuses a revoked commitment and a close below the recorded balance, which a signer with an empty store signs. |
 | `wasm/` | `wasm-bindgen` build of the same library for browsers/Node, plus SDK, relay, tests, demo page. |
 | `wasm/test/enforce.mjs` | WASM enforce-mode proof: corpus replay byte-exact, tampered commitment refused. |
 | `wasm/test/ws_device.mjs` | The browser-shaped device path over a real WebSocket, driven by the wallet SDK. |
@@ -140,7 +160,8 @@ out-of-band first (`seqln-signer --genkey` prints a keypair):
   host proxy with `SEQLN_SIGNER_LISTEN=<bind:port>` (reconnect-tolerant), same key pinning.
 
 Other environment knobs: `SEQLN_SIGNER_POLICY=enforce|permissive` (default enforce),
-`SEQLN_SIGNER_TRACE` (per-request trace logging), `SEQLN_SIGNER_CONNECT` (the env form of
+`SEQLN_SIGNER_TRACE` (per-request trace logging), `SEQLN_SIGNER_STORE` (the channel store's path,
+default `seqln-signer-channels` in the working directory), `SEQLN_SIGNER_CONNECT` (the env form of
 `--connect`), and `SEQLN_SIGNER_NETWORK=bitcoin|elements`, which selects the sighash family when one
 binary serves both a Bitcoin and a Sequentia node (unset: sniffed from the request's witness UTXO,
 defaulting to Elements; `src/wire.rs`). On the proxy side: `SEQLN_SIGNER_HS_TIMEOUT_MS` (Noise

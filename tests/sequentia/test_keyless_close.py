@@ -5,7 +5,8 @@ device signer (`contrib/seqln-signer`) in enforce mode, connecting in the way a
 browser device does.  When a mutual close completes, and again whenever it
 starts with a channel closing, lightningd signs the closing transaction with
 the message it uses for its own commitment.  The node must get that signature
-and keep running.  Run with TEST_NETWORK=sequentia-regtest (README.md,
+and keep running, whichever side opened the channel (the opener pays the close
+fee out of its balance, which the device holds the close to).  Run with TEST_NETWORK=sequentia-regtest (README.md,
 "Testing"); the signer binary is SEQLN_SIGNER, by default
 contrib/seqln-signer/target/release/seqln-signer.
 """
@@ -134,7 +135,8 @@ def channel(node, peer):
 
 
 @pytest.mark.skipif(not os.path.exists(SIGNER), reason='needs the seqln-signer binary')
-def test_keyless_node_closes_and_restarts(node_factory, bitcoind, directory):
+@pytest.mark.parametrize('opener', ['hub', 'keyless'])
+def test_keyless_node_closes_and_restarts(node_factory, bitcoind, directory, opener):
     """A hub closes a channel in an asset with a keyless node.  The keyless
     node completes the close and keeps answering; restarted while the close
     is still unconfirmed, it comes back with the channel still closing and
@@ -144,18 +146,21 @@ def test_keyless_node_closes_and_restarts(node_factory, bitcoind, directory):
     device, l1 = keyless_node(node_factory, directory)
     try:
         l2 = node_factory.get_node()
-        addr = l2.rpc.newaddr('bech32')['bech32']
+        funder, fundee = (l2, l1) if opener == 'hub' else (l1, l2)
+        addr = funder.rpc.newaddr('bech32')['bech32']
         txid = bitcoind.send_and_mine_block(addr, 2 * 10**8, asset)
-        wait_for(lambda: any(o['txid'] == txid for o in l2.rpc.listfunds()['outputs']))
-        l2.rpc.connect(l1.info['id'], 'localhost', l1.port)
-        res = l2.rpc.call('fundchannel', {'id': l1.info['id'], 'amount': 10**8,
-                                          'asset': asset, 'announce': True})
+        wait_for(lambda: any(o['txid'] == txid for o in funder.rpc.listfunds()['outputs']))
+        funder.rpc.connect(fundee.info['id'], 'localhost', fundee.port)
+        res = funder.rpc.call('fundchannel', {'id': fundee.info['id'], 'amount': 10**8,
+                                              'asset': asset, 'announce': True})
         bitcoind.generate_block(1, wait_for_mempool=res['txid'])
         for a, b in ((l1, l2), (l2, l1)):
             wait_for(lambda: channel(a, b)['state'] == 'CHANNELD_NORMAL')
-        inv = l1.rpc.invoice(10**7 * 1000, 'to-l1', 'to l1')['bolt11']
-        l2.rpc.pay(inv)
+        inv = fundee.rpc.invoice(10**7 * 1000, 'to-fundee', 'to the fundee')['bolt11']
+        funder.rpc.pay(inv)
         wait_for(lambda: channel(l1, l2)['htlcs'] == [])
+        # The device keeps its channel store (counters, balance) on disk.
+        assert os.path.exists(os.path.join(device.dir, 'seqln-signer-channels'))
 
         # The hub closes; no block is produced, so the close stays pending.
         l2.rpc.close(l1.info['id'])

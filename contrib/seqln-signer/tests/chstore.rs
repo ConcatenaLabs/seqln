@@ -9,7 +9,7 @@
 
 use seqln_signer::dispatch::Signer;
 use seqln_signer::hsm_secret;
-use seqln_signer::policy::{ChannelState, Policy};
+use seqln_signer::policy::{ChannelState, Policy, Split};
 
 const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 const OTHER_MNEMONIC: &str = "legal winner thank year wave sausage worth useful legal winner thank yellow";
@@ -46,6 +46,12 @@ fn chan(seed: u8) -> ChannelState {
         remote_shutdown_script: if seed % 2 == 0 { vec![0x51, seed] } else { Vec::new() },
         revoked_through: if seed > 10 { Some(seed as u64 * 7) } else { None },
         validated_through: Some(seed as u64 * 7 + 1),
+        local_split: if seed > 10 {
+            Some((seed as u64 * 7 + 1, Split { ours: 500_000 + seed as u64, fee: 900, anchors: 0 }))
+        } else {
+            None
+        },
+        remote_split: Some((seed as u64 * 7, Split { ours: 400_000, fee: 800 + seed as u64, anchors: 660 })),
     }
 }
 

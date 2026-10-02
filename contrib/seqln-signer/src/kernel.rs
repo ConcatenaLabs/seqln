@@ -622,6 +622,21 @@ impl Kernel {
         Some(sig.serialize_der().to_vec())
     }
 
+    /// Whether `compact` (64-byte r || s; a high S is normalized first, as
+    /// libsecp's own verify does not) is a valid ECDSA signature of `hash`
+    /// by `pubkey`.
+    pub fn verify_hash(&self, hash: &[u8; 32], compact: &[u8; 64], pubkey: &[u8; 33]) -> bool {
+        let (Ok(mut sig), Ok(pk)) =
+            (ecdsa::Signature::from_compact(compact), PublicKey::from_slice(pubkey))
+        else {
+            return false;
+        };
+        sig.normalize_s();
+        self.secp
+            .verify_ecdsa(&Message::from_digest(*hash), &sig, &pk)
+            .is_ok()
+    }
+
     /// Taproot BIP-86 KEY-PATH withdrawal signing — the Schnorr sibling of
     /// [`sign_low_r_der_checked`] for a native P2TR (`OP_1 <32-byte x-only>`)
     /// wallet input. This is the path a MODERN mnemonic (bip86) node's on-chain
