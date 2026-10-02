@@ -967,6 +967,9 @@ bool peer_start_openingd(struct peer *peer, struct peer_fd *peer_fd)
 	struct uncommitted_channel *uc;
 	const u8 *msg;
 	u32 minrate, maxrate;
+	const struct asset_fee_rate *rates;
+	u64 *rate_values;
+	u8 *rate_tags;
 
 	assert(peer->uncommitted_channel);
 	uc = peer->uncommitted_channel;
@@ -1015,6 +1018,17 @@ bool peer_start_openingd(struct peer *peer, struct peer_fd *peer_fd)
 		maxrate = feerate_max(peer->ld, NULL);
 	}
 
+	/* The rates openingd converts those limits with, should they open a
+	 * channel in an issued asset. */
+	rates = peer->ld->topology->asset_fee_rates;
+	rate_values = tal_arr(tmpctx, u64, tal_count(rates));
+	rate_tags = tal_arr(tmpctx, u8, tal_count(rates) * sizeof(rates->asset));
+	for (size_t i = 0; i < tal_count(rates); i++) {
+		rate_values[i] = rates[i].scaled_value;
+		memcpy(rate_tags + i * sizeof(rates->asset), rates[i].asset,
+		       sizeof(rates->asset));
+	}
+
 	msg = towire_openingd_init(NULL,
 				   chainparams,
 				   peer->ld->our_features,
@@ -1028,7 +1042,8 @@ bool peer_start_openingd(struct peer *peer, struct peer_fd *peer_fd)
 				   minrate, maxrate,
 				   peer->ld->dev_force_tmp_channel_id,
 				   peer->ld->config.allowdustreserve,
-				   peer->ld->dev_any_channel_type);
+				   peer->ld->dev_any_channel_type,
+				   rate_values, rate_tags);
 	subd_send_msg(uc->open_daemon, take(msg));
 	return true;
 }
@@ -1429,6 +1444,20 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 		return command_fail(cmd, LIGHTNINGD,
 				    "Feerate for non-anchor (%u perkw) below feerate floor %u perkw",
 				    *feerate_non_anchor, get_feerate_floor(cmd->ld->topology));
+	}
+
+	/* Every fee of the channel is paid in its asset: the commitment
+	 * feerate is stated in that asset's atoms, at this node's rate. */
+	if (chainparams->is_elements) {
+		u32 asset_feerate
+			= channel_asset_feerate(cmd->ld->topology,
+						fc->channel_asset,
+						*feerate_non_anchor);
+		if (!asset_feerate)
+			return command_fail(cmd, LIGHTNINGD,
+					    "Channel asset has no fee exchange"
+					    " rate on this node");
+		*feerate_non_anchor = asset_feerate;
 	}
 
 	peer = peer_by_id(cmd->ld, id);

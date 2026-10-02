@@ -610,10 +610,20 @@ static void update_feeexchangerates(struct lightningd *ld,
 				    void *arg UNUSED)
 {
 	struct chain_topology *topo = ld->topology;
+	bool changed;
 
+	changed = tal_count(rates) != tal_count(topo->asset_fee_rates)
+		|| (tal_count(rates)
+		    && memcmp(rates, topo->asset_fee_rates,
+			      tal_bytelen(rates)) != 0);
 	tal_free(topo->asset_fee_rates);
 	topo->asset_fee_rates = tal_dup_talarr(topo, struct asset_fee_rate,
 					       rates);
+
+	/* An asset channel's feerates are in its asset's atoms: a new rate
+	 * moves them as a new feerate estimate would. */
+	if (changed)
+		notify_feerate_change(ld);
 }
 
 static void start_fee_estimate(struct chain_topology *topo)
@@ -641,6 +651,19 @@ u64 topo_asset_fee_rate(const struct chain_topology *topo, const u8 *asset_tag)
 
 	/* Unknown / not whitelisted / cache not yet populated. */
 	return 0;
+}
+
+u32 channel_asset_feerate(const struct chain_topology *topo, const u8 *asset,
+			  u32 feerate)
+{
+	u64 rate;
+
+	if (!chainparams->is_elements || !feerate)
+		return feerate;
+	rate = topo_asset_fee_rate(topo, asset);
+	if (!rate)
+		return 0;
+	return feerate_in_asset(feerate, rate);
 }
 
 struct rate_conversion {

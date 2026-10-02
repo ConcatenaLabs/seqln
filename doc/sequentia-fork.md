@@ -119,14 +119,24 @@ privileged fee asset), so a node returns no `estimatesmartfee`-style feerate:
   still `--force-feerates`. Fee-rate units are always the chosen fee asset's own units per vByte.
 - `plugins/bcli.c` `getfeeexchangerates`: a thin passthrough of the Sequentia node's
   `getfeeexchangerates` RPC, exposing the producer's any-asset fee whitelist (for each accepted
-  asset, how many atoms are worth `EXCHANGE_RATE_SCALE` = 1e8 policy-asset atoms). A plain
-  `bitcoind` backend yields an empty whitelist rather than an error.
-- `lightningd/bitcoind.c`, `lightningd/chaintopology.{c,h}`: plumb and cache those exchange rates
-  (`EXCHANGE_RATE_SCALE`, per-asset rate lookup; the policy asset is always 1:1).
+  asset a rate R: one atom of it is worth R / `EXCHANGE_RATE_SCALE` (1e8) reference atoms). A
+  plain `bitcoind` backend yields an empty whitelist rather than an error.
+- `lightningd/bitcoind.c`, `lightningd/chaintopology.{c,h}`, `common/amount.{c,h}`: plumb and
+  cache those exchange rates (`EXCHANGE_RATE_SCALE`, per-asset rate lookup; the policy asset is
+  always 1:1), refreshed on the feerate poll.
 - `wallet/reservation.c` `asset_tx_fee()`: when funding in a non-policy asset, the on-chain fee is
   converted from the policy fee into asset atoms preserving fee *value*:
   `asset_fee_atoms = ceil(policy_fee_atoms * 1e8 / rate)`. The policy asset takes the identity
   path, byte-for-byte the upstream behaviour.
+- Channel transactions pay their fee in the channel asset, so every feerate a channel uses is
+  stated in that asset's atoms per kw, converted the same way (`feerate_in_asset()`,
+  `channel_asset_feerate()`): the commitment feerate the opener proposes at open and in
+  `update_fee`, the limits each side judges the other's feerate by, the mutual-close feerates and
+  the onchaind sweep fees. HTLC transactions take the commitment feerate, so they follow. The
+  fundee converts its limits at its own rate for the asset (`openingd_init` carries the node's
+  rates) and refuses a channel in an asset it holds no rate for; a rate change moves an open
+  channel's feerates as a new estimate would. No peer-wire change: `update_fee` already carries a
+  number the receiver checks against its own limits.
 
 ## 5. Asset-aware channels
 

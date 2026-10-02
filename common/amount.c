@@ -706,6 +706,18 @@ struct amount_sat amount_tx_fee(u32 fee_per_kw, size_t weight)
 	return fee;
 }
 
+u32 feerate_in_asset(u32 feerate_per_kw, u64 rate)
+{
+	__uint128_t v;
+
+	if (rate == 0 || rate == EXCHANGE_RATE_SCALE)
+		return feerate_per_kw;
+	v = ((__uint128_t)feerate_per_kw * EXCHANGE_RATE_SCALE + rate - 1) / rate;
+	if (v > UINT32_MAX)
+		return UINT32_MAX;
+	return (u32)v;
+}
+
 bool amount_feerate(u32 *feerate, struct amount_sat fee, size_t weight)
 {
 	assert(weight);

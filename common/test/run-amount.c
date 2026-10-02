@@ -455,5 +455,15 @@ int main(int argc, char *argv[])
 
 	test_amount_with_fee();
 	test_amount_div();
+	/* feerate_in_asset: value-preserving, rounded up, saturating. */
+	assert(feerate_in_asset(253, EXCHANGE_RATE_SCALE) == 253);
+	assert(feerate_in_asset(253, 0) == 253);
+	/* An atom worth a thousandth of a reference atom: 1000x the atoms. */
+	assert(feerate_in_asset(11005, 100000) == 11005000);
+	/* An atom worth a hundred reference atoms: a hundredth, rounded up. */
+	assert(feerate_in_asset(11005, 10000000000ULL) == 111);
+	assert(feerate_in_asset(1, 10000000000ULL) == 1);
+	assert(feerate_in_asset(15000, 1) == UINT32_MAX);
+
 	common_shutdown();
 }

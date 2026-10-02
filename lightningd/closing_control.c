@@ -221,8 +221,11 @@ static bool closing_fee_is_acceptable(struct lightningd *ld,
 		struct amount_sat min_fee;
 		u32 min_feerate;
 
-		/* If we don't have a feerate estimate, this gives feerate_floor */
-		min_feerate = feerate_min(ld, NULL);
+		/* If we don't have a feerate estimate, this gives feerate_floor.
+		 * In the channel asset's atoms, like the fee itself. */
+		min_feerate = channel_asset_feerate(ld->topology,
+						    channel->channel_asset,
+						    feerate_min(ld, NULL));
 
 		min_fee = amount_tx_fee(min_feerate, weight);
 		if (amount_sat_less(fee, min_fee)) {
@@ -412,20 +415,31 @@ void peer_start_closingd(struct channel *channel, struct peer_fd *peer_fd)
 	final_commit_feerate = get_feerate(channel->fee_states,
 					   channel->opener, LOCAL);
 
+	/* The closing fee is paid in the channel asset, so every feerate here
+	 * is in that asset's atoms (the commitment feerate already is).  An
+	 * asset with no rate here reads as an unknown estimate. */
 	/* If we can't determine feerate, start at half unilateral feerate. */
-	feerate = mutual_close_feerate(ld->topology);
+	feerate = channel_asset_feerate(ld->topology, channel->channel_asset,
+					mutual_close_feerate(ld->topology));
 	if (!feerate) {
+		u32 floor = channel_asset_feerate(ld->topology,
+						  channel->channel_asset,
+						  get_feerate_floor(ld->topology));
 		feerate = final_commit_feerate / 2;
-		if (feerate < get_feerate_floor(ld->topology))
-			feerate = get_feerate_floor(ld->topology);
+		if (feerate < floor)
+			feerate = floor;
 	}
 
 	/* Aim for reasonable max, but use final if we don't know. */
-	max_feerate = unilateral_feerate(ld->topology, false);
+	max_feerate = channel_asset_feerate(ld->topology, channel->channel_asset,
+					    unilateral_feerate(ld->topology, false));
 	if (!max_feerate)
 		max_feerate = final_commit_feerate;
 
-	min_feerate = feerate_min(ld, NULL);
+	min_feerate = channel_asset_feerate(ld->topology, channel->channel_asset,
+					    feerate_min(ld, NULL));
+	if (!min_feerate)
+		min_feerate = 1;
 
 	/* If they specified feerates in `close`, they apply now! */
 	if (channel->closing_feerate_range) {
