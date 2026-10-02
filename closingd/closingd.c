@@ -24,6 +24,10 @@
 
 /* stdin == requests, 3 == peer, 4 = hsmd */
 #define REQ_FD STDIN_FILENO
+
+/* The channel's asset (33 bytes, version + tag): the close tx is built in it.
+ * Set once from closingd_init. */
+static u8 channel_asset[33];
 #define HSM_FD 4
 
 static void notify(enum log_level level, const char *fmt, ...)
@@ -92,7 +96,8 @@ static struct bitcoin_tx *close_tx(const tal_t *ctx,
 			     funding_sats,
 			     out_minus_fee[LOCAL],
 			     out_minus_fee[REMOTE],
-			     dust_limit);
+			     dust_limit,
+			     channel_asset);
 	if (!tx)
 		peer_failed_err(pps, channel_id,
 				"Both outputs below dust limit:"
@@ -577,7 +582,8 @@ static size_t closing_tx_weight_estimate(u8 *scriptpubkey[NUM_SIDES],
 			     funding_sats,
 			     out[LOCAL],
 			     out[REMOTE],
-			     dust_limit);
+			     dust_limit,
+			     channel_asset);
 
 	/* We will have to append the witness */
 	return bitcoin_tx_weight(tx) + bitcoin_tx_2of2_input_witness_weight();
@@ -860,7 +866,8 @@ int main(int argc, char *argv[])
 				    &fee_negotiation_step,
 				    &fee_negotiation_step_unit,
 				    &use_quickclose,
-				    &wrong_funding))
+				    &wrong_funding,
+				    channel_asset))
 		master_badmsg(WIRE_CLOSINGD_INIT, msg);
 
 	/* stdin == requests, 3 == peer, 4 = hsmd */

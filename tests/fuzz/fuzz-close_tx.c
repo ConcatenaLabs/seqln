@@ -81,7 +81,7 @@ void run(const uint8_t *data, size_t size)
 
 	create_close_tx(tmpctx, chainparams, NULL, NULL, our_script,
 			their_script, funding_script, &outpoint,
-			funding, to_us, to_them, dust_limit);
+			funding, to_us, to_them, dust_limit, NULL);
 
 	clean_tmpctx();
 }
