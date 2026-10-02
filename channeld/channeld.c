@@ -1236,38 +1236,51 @@ static u8 *send_commit_part(const tal_t *ctx,
 			    remote_index, remote_per_commit, &commit_sig,
 			    remote_funding_pubkey);
 
-	if (direct_outputs[LOCAL] != NULL) {
+	/* The penalty base names what we can take if the peer ever broadcasts
+	 * this commitment after revoking it: its to_local output and every
+	 * non-dust HTLC output.  A commitment with HTLC outputs but no to_local
+	 * (a peer with no balance of its own) still needs one, or nothing
+	 * defends those HTLCs; its outnum is then (u32)-1. */
+	pbase = NULL;
+	if (direct_outputs[LOCAL] != NULL)
 		pbase = penalty_base_new(tmpctx, remote_index,
 					 txs[0], direct_outputs[LOCAL]);
 
-		/* Watchtower Phase B: also capture every non-dust HTLC output
-		 * on this (soon-to-be-revoked) remote commitment, so that at
-		 * revoke_and_ack we can pre-sign a steal_htlc penalty per HTLC
-		 * output (not just the to_local penalty).  htlc_map is indexed
-		 * by output index of txs[0]; a non-NULL entry is an HTLC
-		 * output.  The keyset is re-derived from the revealed secret at
-		 * revoke time, so we only need the per-HTLC identity here. */
-		for (size_t hi = 0; hi < tal_count(htlc_map); hi++) {
-			const struct htlc *h = htlc_map[hi];
-			struct amount_asset asset;
-			struct amount_sat hsat;
+	/* Watchtower Phase B: also capture every non-dust HTLC output
+	 * on this (soon-to-be-revoked) remote commitment, so that at
+	 * revoke_and_ack we can pre-sign a steal_htlc penalty per HTLC
+	 * output (not just the to_local penalty).  htlc_map is indexed
+	 * by output index of txs[0]; a non-NULL entry is an HTLC
+	 * output.  The keyset is re-derived from the revealed secret at
+	 * revoke time, so we only need the per-HTLC identity here.
+	 * Every output of the commitment is in the channel asset, which
+	 * is the policy asset only on a policy-asset channel. */
+	for (size_t hi = 0; hi < tal_count(htlc_map); hi++) {
+		const struct htlc *h = htlc_map[hi];
+		struct amount_asset asset;
 
-			if (!h)
-				continue;
-			asset = wally_tx_output_get_amount(&txs[0]->wtx->outputs[hi]);
-			if (!amount_asset_is_main(&asset))
-				continue;
-			hsat = amount_asset_to_sat(&asset);
-			penalty_base_add_htlc(pbase, hi, hsat, &h->rhash,
-					      h->expiry.locktime,
-					      htlc_state_owner(h->state) == REMOTE);
+		if (!h)
+			continue;
+		asset = wally_tx_output_get_amount(&txs[0]->wtx->outputs[hi]);
+		if (!amount_asset_is(&asset, peer->channel->channel_asset)) {
+			status_broken("watchtower: HTLC output %zu of commitment"
+				      " %"PRIu64" is not in the channel asset;"
+				      " no justice for it", hi, remote_index);
+			continue;
 		}
+		if (!pbase)
+			pbase = penalty_base_new_htlcs_only(tmpctx,
+							    remote_index,
+							    txs[0]);
+		penalty_base_add_htlc(pbase, hi, amount_sat(asset.value),
+				      &h->rhash, h->expiry.locktime,
+				      htlc_state_owner(h->state) == REMOTE);
+	}
 
-		/* Add the penalty_base to our in-memory list as well, so we
-		 * can find it again later. */
+	/* Add the penalty_base to our in-memory list as well, so we
+	 * can find it again later. */
+	if (pbase)
 		tal_arr_expand(&peer->pbases, tal_steal(peer, pbase));
-	}  else
-		pbase = NULL;
 
 	if (local_anchor_outnum == -1) {
 		*anchor = NULL;

@@ -2846,8 +2846,16 @@ void peer_got_revoke(struct channel *channel, const u8 *msg)
 	}
 	wallet_channel_save(ld->wallet, channel);
 
-	if (penalty_tx == NULL)
+	/* With no penalty transaction there is nothing to hand to the
+	 * commitment_revocation hook, whose callback is what drops a used
+	 * penalty base; drop it here, or the table grows with every such
+	 * revocation and channeld reloads all of them at every start. */
+	if (penalty_tx == NULL) {
+		if (pbase)
+			wallet_penalty_base_delete(ld->wallet, channel->dbid,
+						   pbase->commitment_num);
 		return;
+	}
 
 	payload = tal(tmpctx, struct commitment_revocation_payload);
 	payload->commitment_txid = pbase->txid;

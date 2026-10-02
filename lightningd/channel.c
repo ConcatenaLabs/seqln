@@ -16,6 +16,7 @@
 #include <lightningd/notification.h>
 #include <lightningd/opening_common.h>
 #include <lightningd/subd.h>
+#include <lightningd/watchtower_store.h>
 #include <wallet/txfilter.h>
 
 void channel_set_owner(struct channel *channel, struct subd *owner)
@@ -95,6 +96,9 @@ void delete_channel(struct channel *channel STEALS,
 	if (channel->dbid != 0) {
 		/* We no longer care about the funding transaction */
 		channel_unwatch_funding(ld, channel);
+
+		/* Nor about breaches of it: drop its watchtower store. */
+		wt_store_forget_channel(ld, channel->dbid);
 
 		wallet_channel_close(ld->wallet, channel);
 		/* Never open at all, not ours. */
