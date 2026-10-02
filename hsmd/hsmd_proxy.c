@@ -1211,12 +1211,21 @@ static void listen_remote_signer(const char *addr)
  * the device's error/reject sentinel: for a per-channel op it is returned as-is
  * (the caller closes just that channeld client); for a MASTER-fd op (dbid==0) it
  * is handled HERE (B6 fail-soft) — the rejecting device is dropped and the op
- * re-sent on the next reconnect, so a device reject never fatally kills the node. */
+ * re-sent on the next reconnect, so that a device is asked at most
+ * MAX_MASTER_REJECTS times: a device that was missing state (it is re-primed
+ * on reconnect) signs on a later try, while one whose policy refuses the
+ * request will refuse it every time.  The last reject is returned like any
+ * other, which stops the node with the request named in its log rather than
+ * holding it, unanswering, until a device that will never sign appears. */
+#define MAX_MASTER_REJECTS 3
+
 static u8 *listen_roundtrip(const tal_t *ctx, bool is_main,
 			    const struct node_id *id, u64 dbid,
 			    u64 capabilities, const u8 *msg_in,
 			    enum hsmd_wire reqt)
 {
+	unsigned int rejects = 0;
+
 	for (;;) {
 		struct timemono deadline;
 		enum signer_noise_status st;
@@ -1262,17 +1271,23 @@ static u8 *listen_roundtrip(const tal_t *ctx, bool is_main,
 			 * busy loop.  PER-CHANNEL rejects (dbid!=0) are returned
 			 * as-is so an enforce theft-rejection still fails just that
 			 * channel's signing (closing only that channeld client). */
-			if (is_main && tal_bytelen(reply) == 0) {
+			if (is_main && tal_bytelen(reply) == 0
+			    && ++rejects < MAX_MASTER_REJECTS) {
 				status_broken("hsmd-proxy: device REJECTED master op"
-					      " %s (zero-length): NOT killing the"
-					      " node; dropping this device and"
-					      " re-sending on the next reconnect"
-					      " (B6 fail-soft)",
-					      hsmd_wire_name(reqt));
+					      " %s (zero-length, %u of %u): NOT"
+					      " killing the node; dropping this"
+					      " device and re-sending on the next"
+					      " reconnect (B6 fail-soft)",
+					      hsmd_wire_name(reqt), rejects,
+					      MAX_MASTER_REJECTS);
 				reply = tal_free(reply);
 				signer_noise = tal_free(signer_noise);
 				continue;
 			}
+			if (is_main && tal_bytelen(reply) == 0)
+				status_broken("hsmd-proxy: device REJECTED master op"
+					      " %s %u times: giving up on it",
+					      hsmd_wire_name(reqt), rejects);
 			return reply;
 		}
 

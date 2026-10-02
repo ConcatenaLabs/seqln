@@ -34,12 +34,13 @@ directory.
   framed requests, and compares reply bytes exactly; `wasm/test/conformance.mjs` repeats the
   comparison for the WASM build against captured oracle replies. The `shadow` binary is a
   `signerd` drop-in that byte-compares live channel traffic and captures a replay corpus.
-- **Validating signer (enforce mode).** With `SEQLN_SIGNER_POLICY=enforce`, before signing a
-  commitment the device reconstructs every legitimate output script from the channel keys and the
-  request's per-commitment point (`src/policy.rs`), and refuses if any output pays elsewhere or
-  value is created. `tests/tamper.rs` proves a redirected-output commitment is rejected in
-  enforce mode and signed in permissive mode (i.e. the policy, not a parse error, blocks it).
-  The default is `permissive` (sign any well-formed request, mirroring libhsmd's stub validator).
+- **Validating signer (enforce mode, the default).** Before signing a commitment the device
+  reconstructs every legitimate output script from the channel keys and the request's
+  per-commitment point (`src/policy.rs`), and refuses if any output pays elsewhere or value is
+  created. `tests/tamper.rs` proves a redirected-output commitment is rejected in enforce mode
+  and signed in permissive mode (i.e. the policy, not a parse error, blocks it).
+  `SEQLN_SIGNER_POLICY=permissive` (or `enforce=false` in the WASM build) is the kill-switch:
+  sign any well-formed request, as libhsmd's stub validator does.
 - **Fail-closed remote transport.** The TCP modes run BOLT-8 Noise_XK (`src/noise.rs`, pure state
   machine, WASM-ready): encryption, integrity, and mutual authentication against pinned static
   keys. Listen mode refuses to start without its own private key and the pinned peer key; an
@@ -55,8 +56,27 @@ derivation (BIP39/32/86, basepoints, per-commitment points, shachain), ECDH, com
 signing, withdrawal/funding signing for both Elements/Sequentia (explicit, unblinded outputs) and
 Bitcoin (BIP-143 segwit v0 and BIP-86 taproot key-path wallet inputs), and BOLT11 invoice
 signing. Messages outside the subset return an error sentinel rather than a wrong answer.
-Enforce-mode validation currently covers commitment signs; HTLC-transaction and sweep signs are
-signed as requested (a VLS-parity follow-up), and there is no rate limiting.
+
+What enforce mode checks:
+
+- **Commitments**, ours and the peer's: every output is one the channel's keys produce.
+- **Mutual closes** (closingd's request, and the closing transaction lightningd signs again with
+  the commitment message when a close completes and whenever it starts with a channel closing):
+  one input, the funding output; at most one output to this device's own wallet and at most one
+  to the peer, which must be the peer's upfront shutdown script when the channel named one; no
+  value created. A close paying our share anywhere but our own wallet is refused, whatever local
+  shutdown script the host supplied.
+- **Revocations**: the device reveals the secret of our commitment n only when n is the next to
+  revoke (or already revealed: channeld re-sends a revocation after a reconnect) and commitment
+  n + 1 has been validated; and it never signs a commitment of ours numbered at or below the
+  highest it revealed. The number is read off the transaction's obscured locktime and sequence,
+  not taken from the request. A device with no record of the channel's revocations (a fresh
+  session with no persisted store) takes the first revocation it is asked for as its starting
+  point.
+- **Sweeps, penalties and HTLC transactions**: they pay only the node's own outputs.
+
+Not checked: how a commitment or a close splits the channel between the two sides (the device
+keeps no balance state), and there is no rate limiting.
 
 ## Layout
 
@@ -75,7 +95,7 @@ signed as requested (a VLS-parity follow-up), and there is no rate limiting.
 | `src/bin/ecdh_latency.rs` | ECDH hot-path latency probe (in-process vs transport round-trip). |
 | `src/bin/emit_elements_vector.rs` | Emits an Elements v2 PSET `sign_withdrawal` vector for the conformance harness's `SEQLN_WITHDRAWAL_VECTOR` mode. |
 | `tests/tamper.rs` | Enforce-mode theft-rejection test (skips without a captured corpus). |
-| `tests/chstore.rs` | Channel-store persistence contract (`export_channels`/`import_channels` round-trip, MAC refusal, merge semantics). |
+| `tests/chstore.rs` | Channel-store persistence contract (`export_channels`/`import_channels` round-trip, MAC refusal, merge semantics). The store carries each channel's opener, upfront shutdown scripts and revocation counters, and imports an older store without them. |
 | `wasm/` | `wasm-bindgen` build of the same library for browsers/Node, plus SDK, relay, tests, demo page. |
 | `wasm/test/enforce.mjs` | WASM enforce-mode proof: corpus replay byte-exact, tampered commitment refused. |
 | `wasm/test/ws_device.mjs` | The browser-shaped device path over a real WebSocket, driven by the wallet SDK. |
@@ -119,7 +139,7 @@ out-of-band first (`seqln-signer --genkey` prints a keypair):
 - Device connects out (browser topology; also `seqln-signer --connect` for native testing):
   host proxy with `SEQLN_SIGNER_LISTEN=<bind:port>` (reconnect-tolerant), same key pinning.
 
-Other environment knobs: `SEQLN_SIGNER_POLICY=enforce|permissive` (default permissive),
+Other environment knobs: `SEQLN_SIGNER_POLICY=enforce|permissive` (default enforce),
 `SEQLN_SIGNER_TRACE` (per-request trace logging), `SEQLN_SIGNER_CONNECT` (the env form of
 `--connect`), and `SEQLN_SIGNER_NETWORK=bitcoin|elements`, which selects the sighash family when one
 binary serves both a Bitcoin and a Sequentia node (unset: sniffed from the request's witness UTXO,

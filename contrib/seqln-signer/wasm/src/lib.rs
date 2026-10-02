@@ -229,6 +229,13 @@ impl Signer {
             remote_funding: arr33(remote_funding, "remote_funding")?,
             option_static_remotekey,
             option_anchors,
+            // Not among the parameters a host reads off the node: learned
+            // from the next setup_channel (ChannelState::merge_from).
+            is_outbound: None,
+            local_shutdown_script: Vec::new(),
+            remote_shutdown_script: Vec::new(),
+            revoked_through: None,
+            validated_through: None,
         };
         self.inner
             .arm_channel(arr33(node_id, "node_id")?, dbid, st)
