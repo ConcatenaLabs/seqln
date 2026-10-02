@@ -121,7 +121,7 @@
       "asset": {
         "type": "hex",
         "description": [
-          "On an asset-aware chain, the 32-byte display id of the asset to pay in: only channels in that asset are used, and the invoice amount is read in its atoms."
+          "On an asset-aware chain, the 32-byte display id of the asset to pay in: only channels in that asset are used, and the invoice amount is read in its atoms. On a Sequentia network the default is the asset of this node's channels when they all hold one; a node with channels in several assets must name it."
         ]
       }
     }

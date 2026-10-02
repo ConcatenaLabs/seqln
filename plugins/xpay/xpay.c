@@ -3292,6 +3292,13 @@ static struct command_result *handle_rpc_command(struct command *cmd,
 	if (!xpay->take_over_pay)
 		goto dont_redirect;
 
+	/* Sequentia: a channel holds one asset of many, and pay is the path
+	 * that keeps a payment in one (its `asset` parameter, or the asset of
+	 * this node's channels).  xpay routes over channels of any asset, and
+	 * would drop `asset` as an unknown argument. */
+	if (chainparams->has_anchor_header)
+		goto dont_redirect;
+
 	rpc_tok = json_get_member(buf, params, "rpc_command");
 	method_tok = json_get_member(buf, rpc_tok, "method");
 	params_tok = json_get_member(buf, rpc_tok, "params");

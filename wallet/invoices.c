@@ -125,6 +125,10 @@ static struct invoice_details *wallet_stmt2invoice_details(const tal_t *ctx,
 	dtl->description = db_col_strdup_optional(dtl, stmt, "description");
 	dtl->features = db_col_arr(dtl, stmt, "features", u8);
 	dtl->local_offer_id = db_col_optional(dtl, stmt, "local_offer_id", sha256);
+	if (db_col_is_null(stmt, "asset"))
+		dtl->asset = NULL;
+	else
+		dtl->asset = db_col_arr(dtl, stmt, "asset", u8);
 	dtl->created_index = db_col_u64(stmt, "id");
 	dtl->updated_index = db_col_u64(stmt, "updated_index");
 	return dtl;
@@ -720,6 +724,18 @@ void invoices_waitone(const tal_t *ctx,
 			   false, inv_dbid, cb, cbarg);
 }
 
+void invoices_set_asset(struct invoices *invoices, u64 inv_dbid,
+			const u8 *asset)
+{
+	struct db_stmt *stmt;
+
+	stmt = db_prepare_v2(invoices->wallet->db,
+			     SQL("UPDATE invoices SET asset = ? WHERE id = ?;"));
+	db_bind_talarr(stmt, asset);
+	db_bind_u64(stmt, inv_dbid);
+	db_exec_prepared_v2(take(stmt));
+}
+
 struct invoice_details *invoices_get_details(const tal_t *ctx,
 					     struct invoices *invoices,
 					     u64 inv_dbid)
@@ -744,6 +760,7 @@ struct invoice_details *invoices_get_details(const tal_t *ctx,
 					       ", description"
 					       ", features"
 					       ", local_offer_id"
+					       ", asset"
 					       ", id"
 					       ", updated_index"
 					       " FROM invoices"

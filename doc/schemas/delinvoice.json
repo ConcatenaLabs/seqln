@@ -121,6 +121,12 @@
         "description": [
           "UNIX timestamp when invoice expires (or expired)."
         ]
+      },
+      "asset": {
+        "type": "hex",
+        "description": [
+          "On an asset-aware chain, the 32-byte display id of the asset this invoice is to be paid in, if it names one."
+        ]
       }
     },
     "allOf": [
@@ -159,7 +165,8 @@
               "description": [
                 "The optional *invreq_payer_note* from invoice_request which created this invoice."
               ]
-            }
+            },
+            "asset": {}
           }
         },
         "else": {
@@ -182,7 +189,8 @@
             "amount_received_msat": {},
             "msatoshi_received": {},
             "paid_at": {},
-            "payment_preimage": {}
+            "payment_preimage": {},
+            "asset": {}
           }
         }
       },
@@ -243,7 +251,8 @@
               "description": [
                 "SHA256 of this is the *payment_hash* offered in the invoice."
               ]
-            }
+            },
+            "asset": {}
           }
         },
         "else": {
@@ -262,7 +271,8 @@
             "updated_index": {},
             "pay_index": {},
             "invreq_payer_note": {},
-            "local_offer_id": {}
+            "local_offer_id": {},
+            "asset": {}
           }
         }
       }

@@ -40,6 +40,8 @@ struct invoice_details {
 	u8 *features;
 	/* The offer this refers to, if any. */
 	struct sha256 *local_offer_id;
+	/* The asset it is to be paid in (33-byte tag), or NULL for any. */
+	const u8 *asset;
 	/* Index values */
 	u64 created_index, updated_index;
 };
@@ -52,6 +54,8 @@ struct invoice_details {
  * @msat: amount they offer to pay.
  * @expected_msat_override: if set: overrides the amount we expect to be payed.
  * @payment_secret: they payment secret they sent, if any.
+ * @asset: the asset of the channel it arrives on (33-byte tag), or NULL
+ *	   when it arrives on none (paying ourselves).
  * @err: error string if it returns NULL.
  *
  * Returns NULL if there's a problem, otherwise returns the invoice details.
@@ -62,6 +66,7 @@ const struct invoice_details *invoice_check_payment(const tal_t *ctx,
 						    const struct amount_msat msat,
 						    const struct amount_msat *expected_msat_override,
 						    const struct secret *payment_secret,
+						    const u8 *asset,
 						    const char **err);
 
 /**

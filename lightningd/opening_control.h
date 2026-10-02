@@ -21,4 +21,12 @@ bool peer_start_openingd(struct peer *peer,
 
 struct subd *peer_get_owning_subd(struct peer *peer);
 
+/* Parse a display asset id (32-byte hex) into the 33-byte elements asset
+ * tag (0x01 || byte-reversed id). */
+struct command_result *param_asset_tag(struct command *cmd,
+				       const char *name,
+				       const char *buffer,
+				       const jsmntok_t *tok,
+				       const u8 **asset);
+
 #endif /* LIGHTNING_LIGHTNINGD_OPENING_CONTROL_H */

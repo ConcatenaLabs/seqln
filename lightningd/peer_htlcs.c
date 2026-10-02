@@ -558,6 +558,8 @@ static void handle_localpay(struct htlc_in *hin,
 		     invoice_msat_override,
 		     &hin->payment_hash,
 		     payment_secret,
+		     chainparams->is_elements
+		     ? hin->key.channel->channel_asset : NULL,
 		     local_fail_in_htlc,
 		     htlc_set_fulfill_htlc,
 		     hin);
@@ -809,6 +811,14 @@ struct channel *best_channel(struct lightningd *ld,
 		if (hint) {
 			if (hint->feerate_base != channel->feerate_base
 			    || hint->feerate_ppm != channel->feerate_ppm)
+				continue;
+			/* ... or if it holds another asset: the HTLC's amount
+			 * is in the hint's asset, and would be read at par in
+			 * this one's (the forward backstop then refuses it, so
+			 * the payment fails although its own channel could
+			 * carry it). */
+			if (memcmp(hint->channel_asset, channel->channel_asset,
+				   sizeof(channel->channel_asset)) != 0)
 				continue;
 		}
 

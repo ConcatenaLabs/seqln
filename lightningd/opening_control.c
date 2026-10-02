@@ -1303,9 +1303,9 @@ static void fundchannel_start_after_sync(struct chain_topology *topo,
  * json_fundchannel_start - Entrypoint for funding a channel
  */
 /* Parse a display asset id (32-byte hex, "natural" order) into the 33-byte
- * elements asset tag (0x01 || byte-reversed id). Asset-aware channels.
- * FIXME: shared with wallet/reservation.c's copy; consolidate. */
-static struct command_result *param_asset_tag(struct command *cmd,
+ * elements asset tag (0x01 || byte-reversed id). Asset-aware channels and
+ * invoices.  FIXME: shared with wallet/reservation.c's copy; consolidate. */
+struct command_result *param_asset_tag(struct command *cmd,
 					      const char *name,
 					      const char *buffer,
 					      const jsmntok_t *tok,

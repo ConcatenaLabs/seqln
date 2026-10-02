@@ -100,6 +100,12 @@
           "If True, then the bolt11 returned contains a hash of the *description*, rather than the *description* itself: this allows much longer descriptions, but they must be communicated via some other mechanism."
         ],
         "default": "False"
+      },
+      "asset": {
+        "type": "hex",
+        "description": [
+          "On an asset-aware chain, the 32-byte display id of the asset the invoice is to be paid in: an HTLC arriving on a channel in any other asset is refused. The default is the asset of this node's channels when they all hold one; on a node with channels in several assets, or none, the invoice names no asset and accepts any."
+        ]
       }
     }
   },

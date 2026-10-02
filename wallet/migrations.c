@@ -1114,6 +1114,11 @@ static const struct db_migration dbmigrations[] = {
 	 ", PRIMARY KEY (channel_id, commitnum, outnum)"
 	 ");"), NULL,
      SQL("DROP TABLE penalty_htlcs"), NULL},
+    /* Asset-aware payments: the asset an invoice is to be paid in (33-byte
+     * version+tag).  NULL: any asset (invoices from before, or from a node
+     * that held no channel when it issued them). */
+    {SQL("ALTER TABLE invoices ADD asset BLOB DEFAULT NULL;"), NULL,
+     SQL("ALTER TABLE invoices DROP COLUMN asset"), NULL},
 };
 
 const struct db_migration *get_db_migrations(size_t *num)

@@ -951,6 +951,10 @@ struct channel *channel_by_cid(struct lightningd *ld,
 struct channel *find_channel_by_id(const struct peer *peer,
 				   const struct channel_id *cid);
 
+/* Do this peer's channels that can take an HTLC hold more than one asset?
+ * Then "any channel to this peer" does not say which asset a payment is in. */
+bool peer_channels_in_several_assets(const struct peer *peer);
+
 /* Find this channel within peer */
 struct channel *find_channel_by_scid(const struct peer *peer,
 				     struct short_channel_id scid);

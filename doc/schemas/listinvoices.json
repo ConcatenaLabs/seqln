@@ -177,6 +177,12 @@
               "description": [
                 "1-based index indicating order this invoice was changed (only present if it has changed since creation)."
               ]
+            },
+            "asset": {
+              "type": "hex",
+              "description": [
+                "On an asset-aware chain, the 32-byte display id of the asset this invoice is to be paid in, if it names one."
+              ]
             }
           },
           "allOf": [
@@ -265,7 +271,8 @@
                     "description": [
                       "Proof of payment."
                     ]
-                  }
+                  },
+                  "asset": {}
                 }
               },
               "else": {
@@ -283,7 +290,8 @@
                   "invreq_payer_note": {},
                   "created_index": {},
                   "updated_index": {},
-                  "expires_at": {}
+                  "expires_at": {},
+                  "asset": {}
                 }
               }
             }

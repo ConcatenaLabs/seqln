@@ -905,6 +905,22 @@ struct channel *find_channel_by_id(const struct peer *peer,
 	return NULL;
 }
 
+bool peer_channels_in_several_assets(const struct peer *peer)
+{
+	const struct channel *c, *first = NULL;
+
+	list_for_each(&peer->channels, c, list) {
+		if (!channel_state_can_add_htlc(c->state))
+			continue;
+		if (!first)
+			first = c;
+		else if (memcmp(first->channel_asset, c->channel_asset,
+				sizeof(c->channel_asset)) != 0)
+			return true;
+	}
+	return false;
+}
+
 struct channel *find_channel_by_scid(const struct peer *peer,
 				     struct short_channel_id scid)
 {

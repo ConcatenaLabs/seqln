@@ -868,7 +868,14 @@ find_channel_for_htlc_add(struct lightningd *ld,
 		goto found;
 	}
 
-	/* All-zero means "any" */
+	/* All-zero means "any": not when the peer's channels hold several
+	 * assets, since the amount would be read in whichever we picked. */
+	if (!channel && memeqzero(&scid_or_alias, sizeof(scid_or_alias))
+	    && peer_channels_in_several_assets(peer)) {
+		log_debug(ld->log, "No \"any channel\" to %s: its channels hold"
+			  " several assets", fmt_node_id(tmpctx, node));
+		return NULL;
+	}
 	if (!channel && memeqzero(&scid_or_alias, sizeof(scid_or_alias))) {
 		list_for_each(&peer->channels, channel, list) {
 			if (channel_state_can_add_htlc(channel->state) &&
@@ -1109,6 +1116,15 @@ send_payment_core(struct lightningd *ld,
 	ret = check_invoice_request_usage(cmd, local_invreq_id);
 	if (ret)
 		return ret;
+
+	if (memeqzero(&first_hop->scid, sizeof(first_hop->scid))) {
+		struct peer *peer = peer_by_id(ld, &first_hop->node_id);
+		if (peer && peer_channels_in_several_assets(peer))
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "Channels with the first peer hold"
+					    " several assets: name the first"
+					    " hop's channel");
+	}
 
 	channel = find_channel_for_htlc_add(ld, cmd, &first_hop->node_id,
 					    first_hop->scid, &msat);
@@ -1507,7 +1523,8 @@ static struct command_result *self_payment(struct lightningd *ld,
 				     local_invreq_id);
 
 	/* Now, resolve the invoice */
-	inv = invoice_check_payment(tmpctx, ld, rhash, msat, NULL, payment_secret, &err);
+	inv = invoice_check_payment(tmpctx, ld, rhash, msat, NULL, payment_secret,
+				    NULL, &err);
 	if (!inv) {
 		struct routing_failure *fail;
 		wallet_payment_set_status(ld->wallet, rhash, partid, groupid,
@@ -1995,6 +2012,7 @@ static struct command_result *json_injectpaymentonion(struct command *cmd,
 		fixme_ignore(command_still_pending(cmd));
 		htlc_set_add(cmd->ld, cmd->ld->log, payload->amt_to_forward, *payload->total_msat,
 			     NULL, payment_hash, payload->payment_secret,
+			     NULL,
 			     selfpay_mpp_fail, selfpay_mpp_succeeded,
 			     selfpay);
 		return command_its_complicated("htlc_set_add may have immediately succeeded or failed");
@@ -2033,6 +2051,12 @@ static struct command_result *json_injectpaymentonion(struct command *cmd,
 					    "Unknown peer %s",
 					    fmt_node_id(tmpctx, &nid));
 
+		if (peer_channels_in_several_assets(next_peer))
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "Channels with peer %s hold several"
+					    " assets: name the first hop's"
+					    " channel",
+					    fmt_node_id(tmpctx, &nid));
 		next = best_channel(cmd->ld, next_peer, payload->amt_to_forward, NULL);
 		if (!next)
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,

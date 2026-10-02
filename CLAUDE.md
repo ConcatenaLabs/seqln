@@ -106,8 +106,9 @@ strings puts a node in a re-exec loop.
 - **Asset channels must use single-funder `fundchannel`.** Dual-funded (v2) opens and splicing are
   not asset-aware: `amount_asset_to_sat()` still asserts the policy asset, and the interactive-tx
   and dualopend paths abort the daemon on a non-policy output.
-- **At most one asset per peer.** Origin-side channel selection is asset-blind, so two channels of
-  different assets to the same peer can misroute.
+- **Only `pay` keeps a payment in one asset.** xpay, askrene, renepay and keysend are
+  asset-blind, and xpay does not take over `pay` on Sequentia networks for that reason. Invoices
+  record their asset on the payee (`invoice ... asset=`); the BOLT11 string does not carry it.
 - **Policy-asset asserts fire on asset channels and take the whole daemon down.** Reading an output
   amount with the policy-asset-asserting helper on an asset-denominated channel SIGABRTs
   `lightningd` on *both* sides the moment a commitment is negotiated. Read amounts asset-agnostically.

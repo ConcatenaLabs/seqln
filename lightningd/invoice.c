@@ -3,6 +3,7 @@
 #include <ccan/array_size/array_size.h>
 #include <ccan/asort/asort.h>
 #include <ccan/json_escape/json_escape.h>
+#include <ccan/mem/mem.h>
 #include <ccan/str/hex/hex.h>
 #include <ccan/tal/str/str.h>
 #include <common/blindedpath.h>
@@ -19,6 +20,7 @@
 #include <lightningd/hsm_control.h>
 #include <lightningd/invoice.h>
 #include <lightningd/notification.h>
+#include <lightningd/opening_control.h>
 #include <lightningd/peer_htlcs.h>
 #include <lightningd/plugin_hook.h>
 #include <lightningd/routehint.h>
@@ -36,6 +38,31 @@ const char *invoice_status_str(enum invoice_status state)
 		return "unpaid";
 	}
 	abort();
+}
+
+/* The single asset this node's usable channels hold, or NULL if they hold
+ * none or several. */
+static const u8 *invoice_default_asset(const tal_t *ctx,
+				       struct lightningd *ld)
+{
+	struct peer *peer;
+	struct peer_node_id_map_iter it;
+	const u8 *found = NULL;
+
+	for (peer = peer_node_id_map_first(ld->peers, &it);
+	     peer;
+	     peer = peer_node_id_map_next(ld->peers, &it)) {
+		struct channel *c;
+		list_for_each(&peer->channels, c, list) {
+			if (!channel_state_can_add_htlc(c->state))
+				continue;
+			if (!found)
+				found = c->channel_asset;
+			else if (!memeq(found, 33, c->channel_asset, 33))
+				return NULL;
+		}
+	}
+	return found ? tal_dup_arr(ctx, u8, found, 33, 0) : NULL;
 }
 
 static void json_add_invoice_fields(struct json_stream *response,
@@ -81,6 +108,9 @@ static void json_add_invoice_fields(struct json_stream *response,
 					 tinv->invreq_payer_note,
 					 tal_bytelen(tinv->invreq_payer_note));
 	}
+	if (inv->asset)
+		json_add_string(response, "asset",
+				fmt_asset_id(tmpctx, inv->asset));
 	json_add_u64(response, "created_index", inv->created_index);
 	if (inv->updated_index)
 		json_add_u64(response, "updated_index", inv->updated_index);
@@ -335,6 +365,7 @@ invoice_check_payment(const tal_t *ctx,
 		      const struct amount_msat msat,
 		      const struct amount_msat *expected_msat_override,
 		      const struct secret *payment_secret,
+		      const u8 *asset,
 		      const char **err)
 {
 	u64 inv_dbid;
@@ -363,6 +394,20 @@ invoice_check_payment(const tal_t *ctx,
 
 	details = invoices_get_details(ctx, ld->wallet->invoices, inv_dbid);
 	bolt12_payment = details->invstring && strstarts(details->invstring, "lni1");
+
+	/* Nothing in an invoice or an onion names an asset: an HTLC's amount
+	 * is read in the atoms of whatever its channel holds.  So an invoice
+	 * issued in one asset must refuse an HTLC in another, or it would be
+	 * settled at par in whatever the payer chose. */
+	if (asset && details->asset
+	    && !memeq(asset, 33,
+		      details->asset, tal_bytelen(details->asset))) {
+		*err = tal_fmt(ctx, "%s paid in asset %s, invoice wants %s",
+			       fmt_sha256(tmpctx, &details->rhash),
+			       fmt_asset_id(tmpctx, asset),
+			       fmt_asset_id(tmpctx, details->asset));
+		return tal_free(details);
+	}
 
 	/* BOLT #4:
 	 *  - if the `payment_secret` doesn't match the expected value for that
@@ -692,6 +737,8 @@ struct invoice_info {
 	struct json_escape *label;
 	struct chanhints *chanhints;
 	bool custom_fallbacks;
+	/* The asset to be paid in (33-byte tag), or NULL for any. */
+	const u8 *asset;
 };
 
 /* Add routehints based on listincoming results: NULL means success. */
@@ -875,6 +922,9 @@ invoice_complete(struct invoice_info *info,
 				    "Duplicate label '%s'",
 				    info->label->s);
 	}
+
+	if (info->asset)
+		invoices_set_asset(wallet->invoices, inv_dbid, info->asset);
 
 	if (info->cmd->ld->unified_invoices && info->b11->fallbacks && !info->custom_fallbacks) {
 		for (size_t i = 0; i < tal_count(info->b11->fallbacks); i++) {
@@ -1144,8 +1194,16 @@ static struct command_result *json_invoice(struct command *cmd,
 				   cmd->ld->config.cltv_final),
 			 p_opt_def("deschashonly", param_bool, &hashonly, false),
 			 p_opt("dev-routes", param_array, &dev_routes),
+			 p_opt("asset", param_asset_tag, &info->asset),
 			 NULL))
 		return command_param_failed();
+
+	/* With no asset named, an invoice is paid in the asset of this node's
+	 * channels when they all hold one.  With channels in several it names
+	 * none and accepts any, as it always has: picking one would be our
+	 * choice, not the caller's. */
+	if (!info->asset && chainparams->has_anchor_header)
+		info->asset = invoice_default_asset(cmd, cmd->ld);
 
 	if (dev_routes && !cmd->ld->developer)
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
