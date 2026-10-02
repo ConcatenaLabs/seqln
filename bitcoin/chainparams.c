@@ -39,6 +39,18 @@ static u8 sequentia_testnet_fee_asset[] = {
     0x1e, 0xd3, 0x1c, 0x93, 0xe1, 0x53, 0x09, 0xcf, 0xca, 0xec, 0xc8,
 };
 
+/* SEQUENTIA regtest policy asset, same convention as above.  A custom chain
+ * derives its policy asset from its own arguments, so this is the asset of
+ * the chain the test harness starts (SequentiaD in
+ * contrib/pyln-testing/pyln/testing/utils.py); the harness refuses to run if
+ * the node reports a different one.  Display id
+ * 4d1b177ce67c24263c8a8f756b4e3525ec16fa5dd225e333c1d2d3d3ffe5e57f. */
+static u8 sequentia_regtest_fee_asset[] = {
+    0x01, 0x7f, 0xe5, 0xe5, 0xff, 0xd3, 0xd3, 0xd2, 0xc1, 0x33, 0xe3,
+    0x25, 0xd2, 0x5d, 0xfa, 0x16, 0xec, 0x25, 0x35, 0x4e, 0x6b, 0x75,
+    0x8f, 0x8a, 0x3c, 0x26, 0x24, 0x7c, 0xe6, 0x7c, 0x17, 0x1b, 0x4d,
+};
+
 const struct chainparams networks[] = {
     {.network_name = "bitcoin",
      .onchain_hrp = "bc",
@@ -255,6 +267,37 @@ const struct chainparams networks[] = {
      .p2sh_version = 196,
      .testnet = true,
      .fee_asset_tag = sequentia_testnet_fee_asset,
+     .has_anchor_header = true,
+     .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_TEST_PUBLIC,
+			   .bip32_privkey_version = BIP32_VER_TEST_PRIVATE},
+     .is_elements = true},
+    /* SEQUENTIA regtest: a local custom chain (`sequentiad
+     * -chain=sequentia-regtest`) whose headers carry Bitcoin anchors, run
+     * beside a Bitcoin Core regtest node as its parent chain.  It exists for
+     * the test harness (TEST_NETWORK=sequentia-regtest), which starts the
+     * node with the arguments this entry assumes: on-chain HRP `bcrt` (shared
+     * with the Bitcoin regtest parent, as `tb` is on the testnet), base58
+     * versions 111/196, and the genesis and policy asset those arguments
+     * produce.  The lightning HRP `sqrt` gives invoices `lnsqrt...`. */
+    {.network_name = "sequentia-regtest",
+     .onchain_hrp = "bcrt",
+     .lightning_hrp = "sqrt",
+     .bip70_name = "sequentia-regtest",
+     /* display 48471cda14077e1e1a530e3ae6e90a1cd8b1ae4fa2d2ee326687f2e479972505 */
+     .genesis_blockhash = {{{.u.u8 = {0x05, 0x25, 0x97, 0x79, 0xe4, 0xf2, 0x87, 0x66, 0x32, 0xee, 0xd2, 0xa2, 0x4f, 0xae, 0xb1, 0xd8, 0x1c, 0x0a, 0xe9, 0xe6, 0x3a, 0x0e, 0x53, 0x1a, 0x1e, 0x7e, 0x07, 0x14, 0xda, 0x1c, 0x47, 0x48}}}},
+     .rpc_port = 18884,
+     .ln_port = 19946,
+     .cli = "sequentia-cli",
+     .cli_args = "-chain=sequentia-regtest",
+     .dust_limit = {546},
+     .max_funding = AMOUNT_SAT_INIT((1 << 24) - 1),
+     .max_payment = AMOUNT_MSAT_INIT(0xFFFFFFFFULL),
+     .max_supply = AMOUNT_SAT_INIT(2100000000000000),
+     .when_lightning_became_cool = 1,
+     .p2pkh_version = 111,
+     .p2sh_version = 196,
+     .testnet = true,
+     .fee_asset_tag = sequentia_regtest_fee_asset,
      .has_anchor_header = true,
      .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_TEST_PUBLIC,
 			   .bip32_privkey_version = BIP32_VER_TEST_PRIVATE},
