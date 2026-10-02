@@ -889,6 +889,53 @@ static struct command_result *param_asset_tag(struct command *cmd,
 	return NULL;
 }
 
+/* Sequentia: with no `asset=`, the asset of this node's usable channels when
+ * they hold one (a 33-byte tag), else NULL.  When they hold several, which
+ * one to pay in is the caller's choice: NULL with *why set. */
+static const u8 *pay_default_asset(const tal_t *ctx, struct command *cmd,
+				   const char **why)
+{
+	const char *buf;
+	const jsmntok_t *result, *chans, *t;
+	const u8 *found = NULL;
+	size_t i;
+
+	*why = NULL;
+	result = jsonrpc_request_sync(tmpctx, cmd, "listpeerchannels",
+				      NULL, &buf);
+	chans = json_get_member(buf, result, "channels");
+	json_for_each_arr(i, t, chans) {
+		const jsmntok_t *state = json_get_member(buf, t, "state");
+		const jsmntok_t *atok = json_get_member(buf, t, "channel_asset");
+		u8 *tag;
+
+		if (!state || !json_tok_streq(buf, state, "CHANNELD_NORMAL"))
+			continue;
+		/* listpeerchannels names the asset of a channel that is not
+		 * in the policy asset. */
+		if (atok) {
+			u8 id[32];
+			if (!hex_decode(buf + atok->start, atok->end - atok->start,
+					id, sizeof(id)))
+				continue;
+			tag = tal_arr(tmpctx, u8, 33);
+			tag[0] = 0x01;
+			for (size_t j = 0; j < sizeof(id); j++)
+				tag[1 + j] = id[sizeof(id) - 1 - j];
+		} else
+			tag = tal_dup_arr(tmpctx, u8, chainparams->fee_asset_tag,
+					  33, 0);
+		if (!found)
+			found = tag;
+		else if (memcmp(found, tag, 33) != 0) {
+			*why = "This node holds channels in several assets:"
+				" name the one to pay in with asset=";
+			return NULL;
+		}
+	}
+	return found ? tal_dup_arr(ctx, u8, found, 33, 0) : NULL;
+}
+
 static struct command_result *json_pay(struct command *cmd,
 				       const char *buf,
 				       const jsmntok_t *params)
@@ -959,6 +1006,15 @@ static struct command_result *json_pay(struct command *cmd,
 	p->description = tal_steal(p, description);
 	/* Sequentia: route this payment only over channels of the given asset. */
 	p->asset = asset ? tal_steal(p, asset) : NULL;
+	/* No asset named: the payment is in the asset of this node's
+	 * channels.  Left unset, routes would mix channels of any asset. */
+	if (!p->asset && chainparams->has_anchor_header && chainparams->fee_asset_tag) {
+		const char *why;
+		p->asset = pay_default_asset(p, cmd, &why);
+		if (why)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "%s", why);
+	}
 	/* Overridded by bolt12 if present */
 	p->blindedpath = NULL;
 	p->blindedpay = NULL;

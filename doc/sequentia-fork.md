@@ -186,16 +186,30 @@ policy asset by default). File-level map of the threading:
 - `plugins/topology.c`: `getroute ... asset=<id>` filters pathfinding to channels of that asset.
 - `plugins/pay.c`, `plugins/libplugin-pay.{c,h}`: `pay ... asset=<id>` stores the asset on the
   root payment; `payment_route_check()` (the single choke point for all routing variants,
-  including MPP splits) skips any channel whose gossip-recorded asset differs.
+  including MPP splits) skips any channel whose gossip-recorded asset differs, and a routehint
+  through a channel the gossip records in another asset is dropped. Without `asset=`, `pay`
+  pays in the asset of this node's channels when they all hold one, and refuses when they hold
+  several: which asset to pay in is then the caller's choice. On Sequentia networks xpay does not
+  take over `pay` (`plugins/xpay/xpay.c`): xpay, askrene and renepay route over channels of any
+  asset.
+- `lightningd/peer_htlcs.c` `best_channel()`: a forwarding node may move an HTLC to another
+  channel with the same peer, but only one in the same asset.
+- `lightningd/pay.c`: an all-zero first hop ("any channel to this peer") in `sendpay`, and a first
+  hop by node in `injectpaymentonion`, are refused when the peer's channels hold several assets.
 - `lightningd/peer_htlcs.c` `forward_htlc()`: the backstop. A node refuses to forward an HTLC
   across an asset boundary (incoming and outgoing `channel_asset` must match), failing with
   `unknown_next_peer`, so a hand-crafted or buggy cross-asset route can never swap one asset for
   another at par.
+- `lightningd/invoice.c`, `wallet/invoices.c` (column `invoices.asset`): `invoice ... asset=<id>`
+  records the asset an invoice is to be paid in, and `invoice_check_payment()` refuses an HTLC
+  arriving on a channel in any other asset (`incorrect_or_unknown_payment_details`, logged as
+  "paid in asset X, invoice wants Y"). Without `asset=`, the invoice records the asset of this
+  node's channels when they all hold one; on a node with channels in several assets, or none, it
+  names no asset and accepts any. `listinvoices` and the `wait*invoice` results show it.
 
-Invoices: standard BOLT11 with the `tsqt` HRP. There is no asset field in the invoice yet; the
-payer selects the asset via `pay ... asset=<id>`, and invoice amounts are numeric msat fields
-reinterpreted as thousandths of the payment asset's atoms. Asset-tagged invoice fields are a
-pending design decision.
+Invoices: standard BOLT11 with the `tsqt` HRP, and no asset field: the asset an invoice wants is
+known to the payee, which enforces it, and is told to the payer out of band (`pay ... asset=`).
+Invoice amounts are numeric msat fields read as thousandths of the payment asset's atoms.
 
 ## 7. Signer split (hsmd proxy + out-of-process signer)
 
@@ -324,20 +338,15 @@ Each verified present in the code as of 2026-07-08:
    asserts the policy asset (`common/amount.c`), and the interactive-tx path calls it on arbitrary
    PSBT outputs (`common/interactivetx.c`, `openingd/dualopend.c`), so a non-policy output there
    aborts the daemon. Asset channels must use the ordinary single-funder `fundchannel`.
-2. **Same-peer multi-asset channels can misroute at the origin.** `lightningd`'s channel selection
-   is asset-blind: `best_channel()` (`lightningd/peer_htlcs.c`) picks the largest-spendable
-   channel to a peer regardless of `channel_asset`, and `find_channel_for_htlc_add()`
-   (`lightningd/pay.c`) falls back to "any usable channel" for an all-zero SCID. With two
-   channels to the same peer in different assets, the first-hop HTLC can land on the wrong-asset
-   channel, where the amount is read at par in that channel's asset. The `forward_htlc()` backstop
-   protects intermediate hops (the payment fails rather than swapping value) but not the origin's
-   own first hop. Until fixed: hold at most one asset per peer, and verify per-asset balance
-   movement after payments.
+2. **Payment paths other than `pay` are asset-blind.** xpay, askrene, renepay and keysend know
+   no asset, and the `htlc_accepted` hook payload carries none, so a plugin that settles HTLCs
+   itself (`contrib/holdinvoice-seq`) cannot check the asset an HTLC arrived in. Use `pay` with
+   `asset=` and invoices that name their asset.
 3. **Local/private channels have no asset record in pathfinding.** The gossmap local
    modifications (`common/gossmods_listpeerchannels.c`) carry no asset, so unannounced channels
    are treated as policy-asset channels by the `pay`/`getroute` asset filter.
-4. **No asset field in invoices.** A payee cannot yet demand a specific asset in the BOLT11
-   invoice; asset selection is payer-side (`pay ... asset=<id>`).
+4. **No asset field in invoices.** A payee enforces the asset its invoice was issued in, but the
+   BOLT11 string does not carry it: the payer learns it out of band and passes `pay ... asset=`.
 5. **Mainnet chainparams are placeholders.** All-zero genesis, NULL fee asset; the `sequentia`
    network entry must not be used.
 6. **`holdinvoice-seq` state is in-memory only** (no persistence across plugin restart); see its

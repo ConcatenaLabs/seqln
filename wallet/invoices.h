@@ -62,6 +62,18 @@ bool invoices_create(struct invoices *invoices,
 		     const struct sha256 *local_offer_id);
 
 /**
+ * invoices_set_asset - Record the asset an invoice is to be paid in.
+ *
+ * @param invoices - the invoice handler.
+ * @param inv_dbid - the invoice.
+ * @param asset - the 33-byte asset tag (a tal array).
+ *
+ * An HTLC in any other asset is refused by invoice_check_payment().
+ */
+void invoices_set_asset(struct invoices *invoices, u64 inv_dbid,
+			const u8 *asset);
+
+/**
  * invoices_find_by_label - Search for an invoice by label
  *
  * @param invoices - the invoice handler.

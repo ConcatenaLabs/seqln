@@ -2699,6 +2699,24 @@ static void trim_route(struct route_info **route, size_t n)
 	tal_resize(route, n);
 }
 
+/* Does this routehint use a channel the gossip says holds an asset other
+ * than `asset`?  A channel we have no asset record for (private, as hint
+ * channels usually are) is left to the payee's own check. */
+static bool routehint_other_asset(struct gossmap *map, const u8 *asset,
+				  const struct route_info *hint)
+{
+	for (size_t i = 0; i < tal_count(hint); i++) {
+		struct gossmap_chan *c;
+		u8 chan_asset[33];
+
+		c = gossmap_find_chan(map, &hint[i].short_channel_id);
+		if (c && gossmap_chan_get_asset(map, c, chan_asset)
+		    && memcmp(chan_asset, asset, sizeof(chan_asset)) != 0)
+			return true;
+	}
+	return false;
+}
+
 /* Make sure routehints are reasonable length, and (since we assume we
  * can append), not directly to us.  Note: untrusted data! */
 static struct route_info **filter_routehints(struct gossmap *map,
@@ -2744,6 +2762,21 @@ static struct route_info **filter_routehints(struct gossmap *map,
 		if (tal_count(hints[i]) == 0) {
 			tal_append_fmt(&mods,
 				       "Removed empty routehint %zu. ", i);
+			tal_arr_remove(&hints, i);
+			i--;
+			continue;
+		}
+
+		/* Sequentia: a routehint over a channel we know to be in
+		 * another asset would carry the payment out of its asset
+		 * (the forwarding node refuses it, and the failure disables
+		 * that channel for every payment that follows). */
+		if (payment_root(p)->asset
+		    && routehint_other_asset(map, payment_root(p)->asset,
+					     hints[i])) {
+			tal_append_fmt(&mods,
+				       "Removed routehint %zu: a channel in"
+				       " another asset. ", i);
 			tal_arr_remove(&hints, i);
 			i--;
 			continue;

@@ -243,6 +243,10 @@ struct amount_sat amount_tx_fee(u32 fee_per_kw, size_t weight);
  * UINT32_MAX.  A rate of 0 (an asset with no rate) is returned unchanged. */
 u32 feerate_in_asset(u32 feerate_per_kw, u64 rate);
 
+/* The display id (32-byte hex, as the node shows it) of a 33-byte elements
+ * asset tag (0x01 || id in internal byte order). */
+char *fmt_asset_id(const tal_t *ctx, const u8 *asset_tag);
+
 /* What is the feerate given this fee and (non-zero!) weight? */
 WARN_UNUSED_RESULT bool amount_feerate(u32 *feerate, struct amount_sat fee, size_t weight);
 

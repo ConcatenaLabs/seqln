@@ -64,8 +64,10 @@ testnet unless noted. The precise file-level change list, with known hazards, is
   (Sequentia's open fee market: fees are payable in any accepted asset).
 - **Asset-aware gossip and payments.** Channel gossip records each channel's asset from its
   funding output; `getroute` and `pay` take an `asset=<id>` parameter and route only over channels
-  of that asset. Nodes refuse to forward an HTLC across an asset boundary (no silent at-par
-  asset swaps).
+  of that asset (a node whose channels hold one asset pays in it without the parameter). A node
+  may hold channels in several assets, to one peer or many: it forwards each HTLC in the asset it
+  arrived in and refuses to forward across an asset boundary (no silent at-par asset swaps), and
+  `invoice ... asset=<id>` makes the payee refuse an HTLC in any other asset.
 - **Pure-Lightning swap primitive.** `contrib/holdinvoice-seq/` is a hold-invoice plugin (hold an
   externally-supplied payment hash until settle/cancel), the safety primitive for pure-Lightning
   asset↔BTC swaps. The swap orchestration itself lives in
@@ -88,10 +90,10 @@ Experimental / known limitations (details and file pointers in
 
 - Dual-funded (v2) channel opens and splicing are not asset-aware; asset channels must use the
   ordinary single-funder `fundchannel`.
-- Holding channels of *different* assets to the *same* peer is unsafe: parts of channel selection
-  are asset-blind and can put an HTLC on the wrong-asset channel. One asset per peer, and verify
-  per-asset balance movement.
-- BOLT11 invoices carry no asset field yet; the payer chooses the asset with `pay ... asset=<id>`.
+- `pay` is the payment command that keeps a payment in one asset; xpay, renepay and keysend
+  route over channels of any asset.
+- BOLT11 invoices carry no asset field: the payee records and enforces the asset, and the payer
+  names it with `pay ... asset=<id>`.
 
 ## Building from source
 

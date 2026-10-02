@@ -706,6 +706,15 @@ struct amount_sat amount_tx_fee(u32 fee_per_kw, size_t weight)
 	return fee;
 }
 
+char *fmt_asset_id(const tal_t *ctx, const u8 *asset_tag)
+{
+	u8 id[32];
+
+	for (size_t i = 0; i < sizeof(id); i++)
+		id[i] = asset_tag[sizeof(id) - i];
+	return tal_hexstr(ctx, id, sizeof(id));
+}
+
 u32 feerate_in_asset(u32 feerate_per_kw, u64 rate)
 {
 	__uint128_t v;

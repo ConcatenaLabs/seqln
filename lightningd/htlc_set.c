@@ -140,6 +140,7 @@ void htlc_set_add_(struct lightningd *ld,
 		   const struct amount_msat *invoice_msat_override,
 		   const struct sha256 *payment_hash,
 		   const struct secret *payment_secret,
+		   const u8 *asset,
 		   void (*fail)(void *, const u8 *),
 		   void (*succeeded)(void *, const struct preimage *),
 		   void *arg)
@@ -157,7 +158,7 @@ void htlc_set_add_(struct lightningd *ld,
 	 */
 	details = invoice_check_payment(tmpctx, ld, payment_hash, total_msat,
 					invoice_msat_override, payment_secret,
-					&err);
+					asset, &err);
 	if (!details) {
 		log_debug(log, "payment failed: %s", err);
 		fail(arg, take(failmsg_incorrect_or_unknown(NULL, ld, msat)));
