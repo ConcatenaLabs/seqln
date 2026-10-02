@@ -102,6 +102,12 @@
             "description": [
               "If it is not set, an internal address is generated."
             ]
+          },
+          "asset": {
+            "type": "hex",
+            "description": [
+              "On an asset-aware chain, the 32-byte display id of the output's asset; *satoshi* is then in that asset's atoms. The default is the chain's policy asset."
+            ]
           }
         }
       },
@@ -14185,6 +14191,12 @@
                 "```"
               ]
             }
+          },
+          "asset": {
+            "type": "hex",
+            "description": [
+              "On an asset-aware chain, the 32-byte display id of the asset to fund the channel in; *amount* is then in that asset's atoms, and the funding transaction pays its fee in the same asset. The default is the chain's policy asset."
+            ]
           }
         }
       },
@@ -14658,6 +14670,12 @@
                 "Bit number."
               ]
             }
+          },
+          "asset": {
+            "type": "hex",
+            "description": [
+              "On an asset-aware chain, the 32-byte display id of the asset the channel is funded in; *amount* is then in that asset's atoms. The default is the chain's policy asset."
+            ]
           }
         },
         "pairedWith": [
@@ -15254,6 +15272,12 @@
             "type": "boolean",
             "description": [
               "To signel that it needs emergency reserve for anchors so that we can lowball our commitment tx fees, and min-emergency-msat for reserving some sats for closing anchor channels."
+            ]
+          },
+          "asset": {
+            "type": "hex",
+            "description": [
+              "On an asset-aware chain, the 32-byte display id of the asset to select inputs in; *satoshi* is then in that asset's atoms, and change and fee are in the same asset. The default is the chain's policy asset."
             ]
           }
         }
@@ -16284,6 +16308,12 @@
               "The maximum number of channels to return."
             ],
             "default": "20"
+          },
+          "asset": {
+            "type": "hex",
+            "description": [
+              "On an asset-aware chain, the 32-byte display id of an asset: only channels in that asset are used."
+            ]
           }
         }
       },
@@ -22726,6 +22756,12 @@
                   "description": [
                     "Whether this UTXO is currently reserved for an in-flight tx."
                   ]
+                },
+                "asset": {
+                  "type": "hex",
+                  "description": [
+                    "On an asset-aware chain, the 32-byte display id of this output's asset, the policy asset included; *amount_msat* is in that asset's atoms."
+                  ]
                 }
               },
               "allOf": [
@@ -22755,6 +22791,7 @@
                       "value": {},
                       "redeemscript": {},
                       "status": {},
+                      "asset": {},
                       "reserved": {},
                       "reserved_to_block": {},
                       "blockheight": {
@@ -22792,6 +22829,7 @@
                       "value": {},
                       "redeemscript": {},
                       "status": {},
+                      "asset": {},
                       "blockheight": {},
                       "reserved": {},
                       "reserved_to_block": {
@@ -22886,6 +22924,12 @@
                     "The full channel_id (funding txid Xored with output number)."
                   ],
                   "added": "v23.05"
+                },
+                "asset": {
+                  "type": "hex",
+                  "description": [
+                    "On an asset-aware chain, the 32-byte display id of the channel's asset, the policy asset included; the amounts are in that asset's atoms."
+                  ]
                 }
               },
               "allOf": [
@@ -22916,6 +22960,7 @@
                       "funding_output": {},
                       "connected": {},
                       "state": {},
+                      "asset": {},
                       "channel_id": {},
                       "short_channel_id": {
                         "type": "short_channel_id",
@@ -22956,6 +23001,7 @@
                       "funding_output": {},
                       "connected": {},
                       "state": {},
+                      "asset": {},
                       "channel_id": {},
                       "short_channel_id": {
                         "type": "short_channel_id",
@@ -25836,6 +25882,12 @@
                       }
                     ]
                   }
+                },
+                "channel_asset": {
+                  "type": "hex",
+                  "description": [
+                    "On an asset-aware chain, the 32-byte display id of the channel's asset when it is not the policy asset; the channel's amounts are in that asset's atoms."
+                  ]
                 }
               },
               "allOf": [
@@ -25956,7 +26008,8 @@
                         "description": [
                           "The bitcoin address we will close to (present if close_to_addr is a standardized address)."
                         ]
-                      }
+                      },
+                      "channel_asset": {}
                     }
                   }
                 },
@@ -26055,7 +26108,8 @@
                         "description": [
                           "Fee attached to this the current tx."
                         ]
-                      }
+                      },
+                      "channel_asset": {}
                     }
                   }
                 },
@@ -26155,7 +26209,8 @@
                         "description": [
                           "0 if we're the lesser node_id, 1 if we're the greater (as used in BOLT #7 channel_update)."
                         ]
-                      }
+                      },
+                      "channel_asset": {}
                     }
                   }
                 },
@@ -26266,7 +26321,8 @@
                         "description": [
                           "The minimum feerate for the next funding transaction in per-1000-weight, with `kpw` appended."
                         ]
-                      }
+                      },
+                      "channel_asset": {}
                     }
                   }
                 }
@@ -28237,6 +28293,12 @@
                     "Amount we want the peer to maintain on its side of the channel. It can be a whole number, a whole number ending in *sat*, a whole number ending in *000msat*, or a number with 1 to 8 decimal places ending in *btc*."
                   ],
                   "default": "1% of the funding amount"
+                },
+                "asset": {
+                  "type": "hex",
+                  "description": [
+                    "On an asset-aware chain, the 32-byte display id of the asset to fund this channel in; *amount* is then in that asset's atoms. Every destination of one call must use the same asset. The default is the chain's policy asset."
+                  ]
                 }
               }
             }
@@ -30440,6 +30502,12 @@
             "added": "v23.05",
             "description": [
               "Explicitly state that you are only paying some part of the invoice.  Presumably someone else is paying the rest (otherwise the payment will time out at the recipient).  Note that this is currently not supported for self-payment (please file an issue if you need this)"
+            ]
+          },
+          "asset": {
+            "type": "hex",
+            "description": [
+              "On an asset-aware chain, the 32-byte display id of the asset to pay in: only channels in that asset are used, and the invoice amount is read in its atoms."
             ]
           }
         }

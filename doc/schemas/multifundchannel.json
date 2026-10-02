@@ -84,6 +84,12 @@
                 "Amount we want the peer to maintain on its side of the channel. It can be a whole number, a whole number ending in *sat*, a whole number ending in *000msat*, or a number with 1 to 8 decimal places ending in *btc*."
               ],
               "default": "1% of the funding amount"
+            },
+            "asset": {
+              "type": "hex",
+              "description": [
+                "On an asset-aware chain, the 32-byte display id of the asset to fund this channel in; *amount* is then in that asset's atoms. Every destination of one call must use the same asset. The default is the chain's policy asset."
+              ]
             }
           }
         }
