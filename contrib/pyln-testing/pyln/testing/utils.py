@@ -692,6 +692,231 @@ class ElementsD(BitcoinD):
         return info['unconfidential']
 
 
+SEQUENTIA_NETWORKS = ('sequentia-regtest',)
+ELEMENTS_NETWORKS = ('liquid-regtest',) + SEQUENTIA_NETWORKS
+
+
+class SequentiaD(BitcoinD):
+    """A Sequentia node on a custom chain whose headers carry Bitcoin anchors.
+
+    Beside it runs a Bitcoin Core regtest node, `self.parent`, as the parent
+    chain: every Sequentia block anchors to that node's best block, and the
+    Sequentia node validates the anchor against it and reorganizes when the
+    parent does.  Blocks are produced by a three-member proof-of-stake
+    committee (quorum two), so every block `generate_block` makes is
+    committee-certified, which is what SeqLN's certified-frontier clamp counts.
+
+    The chain is set up as the public testnet has it where that matters to
+    Lightning: addresses are transparent by default and share the parent
+    chain's bech32 prefix, the fee whitelist lists the policy asset at 1:1
+    and nothing else, there is no block subsidy, and the coins come from a
+    pre-mine in the genesis block.
+
+    `generate_block` mines one parent block before each Sequentia block, so
+    anchors advance one Bitcoin block per Sequentia block (the real ratio is
+    about one per ten); pass `advance_parent=False` to hold the parent still.
+
+    The genesis block and the policy asset are functions of the arguments
+    below, and SeqLN's `sequentia-regtest` chainparams entry carries both;
+    `start()` refuses to continue when the node disagrees with them.
+    """
+
+    CHAIN = 'sequentia-regtest'
+    # Bitcoin regtest genesis: the parent the custom chain commits to.
+    PARENT_GENESIS = '0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206'
+    # What bitcoin/chainparams.c expects of this chain (display byte order).
+    GENESIS = '48471cda14077e1e1a530e3ae6e90a1cd8b1ae4fa2d2ee326687f2e479972505'
+    POLICY_ASSET = '4d1b177ce67c24263c8a8f756b4e3525ec16fa5dd225e333c1d2d3d3ffe5e57f'
+    # Committee keys (WIF, pubkey) of the raw secrets 0x11.., 0x22.., 0x33..:
+    # this is a local test chain.
+    STAKERS = [
+        ('cN9spWsvaxA8taS7DFMxnk1yJD2gaF2PX1npuTpy3vuZFJdwavaw',
+         '034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa'),
+        ('cNj3zTdrLAMQtUhdFPPVJtRY7a3TdUF38ShW5MrJkVh1CVaeuEGU',
+         '02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27'),
+        ('cPJEAQPn5NYgtNy9HXR1q2q6vw4EghTgjscBFFseT4UT9gbpoDY9',
+         '023c72addb4fdf09af94f0c94d7fe92a386a7e70cf8a1d85916386bb2535c7b1b1'),
+    ]
+
+    def __init__(self, bitcoin_dir="/tmp/bitcoind-test", rpcport=None):
+        self.parent = BitcoinD(bitcoin_dir=os.path.join(bitcoin_dir, 'parent'))
+        self.parent.prefix = 'bitcoind-parent'
+        BitcoinD.__init__(self, bitcoin_dir, rpcport)
+        self.advance_parent = True
+
+        config = BITCOIND_CONFIG.copy()
+        del config['regtest']
+        config['chain'] = self.CHAIN
+        config['rpcport'] = self.rpcport
+
+        self.conf_file = os.path.join(bitcoin_dir, 'sequentia.conf')
+        self.cmd_line = [
+            'sequentiad',
+            '-datadir={}'.format(bitcoin_dir),
+            '-conf={}'.format(self.conf_file),
+            '-printtoconsole',
+            '-server',
+            '-logtimestamps',
+            '-nolisten',
+            '-nowallet',
+            '-txindex',
+            '-debug=mempool',
+            '-debug=mempoolrej',
+            '-debug=rpc',
+            '-rpcthreads=20',
+            '-validatepegin=0',
+            # Coins: a genesis pre-mine and no subsidy.
+            '-initialfreecoins=2100000000000000',
+            '-anyonecanspendaremine=1',
+            '-con_blocksubsidy=0',
+            # Transparent by default, one bech32 prefix with the parent.
+            '-con_default_blinded_addresses=0',
+            '-bech32_hrp=bcrt',
+            '-pubkeyprefix=111',
+            '-scriptprefix=196',
+            # Every header carries a Bitcoin anchor, checked against the parent.
+            '-con_bitcoin_anchor=1',
+            '-validateanchor=1',
+            '-anchorpollinterval=1',
+            '-mainchainrpchost=127.0.0.1',
+            '-mainchainrpcport={}'.format(self.parent.rpcport),
+            '-mainchainrpcuser={}'.format(BITCOIND_CONFIG['rpcuser']),
+            '-mainchainrpcpassword={}'.format(BITCOIND_CONFIG['rpcpassword']),
+            '-parentgenesisblockhash={}'.format(self.PARENT_GENESIS),
+            # Proof of stake with a committee of three, quorum two.
+            '-con_pos=1',
+            '-posvrf=1',
+            '-posaggcommittee=1',
+            '-poscommitteesize=3',
+            '-posslotinterval=1',
+        ] + ['-staker={}:1'.format(pub) for _, pub in self.STAKERS]
+        write_config(self.conf_file, config, {'rpcport': self.rpcport},
+                     section_name=self.CHAIN)
+        self.rpc = SimpleBitcoinProxy(btc_conf_file=self.conf_file)
+        self.prefix = 'sequentiad'
+
+    def start(self, wallet_file=None):
+        self.parent.start()
+        self.mine_parent(1)
+
+        TailableProc.start(self)
+        self.wait_for_log("Done loading", timeout=TIMEOUT)
+        logging.info("SequentiaD started")
+
+        genesis = self.rpc.getblockhash(0)
+        policy = self.rpc.dumpassetlabels()['bitcoin']
+        if (genesis, policy) != (self.GENESIS, self.POLICY_ASSET):
+            raise ValueError("sequentiad made genesis {} with policy asset {}, "
+                             "but SeqLN's sequentia-regtest chainparams expect "
+                             "{} and {}: update one to match the other"
+                             .format(genesis, policy, self.GENESIS, self.POLICY_ASSET))
+
+        # A legacy wallet counts the anyone-can-spend pre-mine as its own.
+        self.rpc.createwallet("lightningd-tests", False, False, "", False, False)
+        self.rpc.rescanblockchain()
+
+    def stop(self):
+        try:
+            BitcoinD.stop(self)
+        finally:
+            try:
+                self.parent.stop()
+            except Exception:
+                self.parent.proc.kill()
+            self.parent.proc.wait()
+            self.parent.cleanup_files()
+
+    def mine_parent(self, numblocks=1, spacing=None):
+        """Mine parent-chain blocks.  With `spacing` (seconds), each block is
+        stamped that long after the previous one through the parent's mock
+        clock, giving the anchors the real-time gaps the escaping-stall rule
+        asks for.  Each block pays a fresh address, so a branch mined after
+        `invalidateblock` never repeats the hash of the block it replaces."""
+        hashes = []
+        for _ in range(numblocks):
+            if spacing is not None:
+                prev = self.parent.rpc.getblockheader(self.parent.rpc.getbestblockhash())
+                self.parent.rpc.setmocktime(prev['time'] + spacing)
+            hashes += self.parent.rpc.generatetoaddress(1, self.parent.rpc.getnewaddress())
+        return hashes
+
+    def _produce(self, members):
+        """Produce one block with some staker as leader and `members` (count)
+        of the others countersigning.  The VRF decides which staker may lead a
+        slot, so try each until one is eligible."""
+        deadline = time.time() + TIMEOUT
+        while True:
+            for i, (wif, _) in enumerate(self.STAKERS):
+                others = [w for j, (w, _) in enumerate(self.STAKERS) if j != i]
+                try:
+                    return self.rpc.generateposblock(wif, others[:members])['hash']
+                except JSONRPCError as e:
+                    last = e
+            if time.time() > deadline:
+                raise last
+            time.sleep(0.1)
+
+    def generate_block(self, numblocks=1, wait_for_mempool=0, to_addr=None,
+                       needfeerate=None, advance_parent=None):
+        """Produce `numblocks` committee-certified blocks.  `to_addr` is
+        ignored: a block's fees go to the leader that produced it."""
+        if needfeerate is not None:
+            raise NotImplementedError("needfeerate is not supported on {}".format(self.CHAIN))
+        if wait_for_mempool:
+            if isinstance(wait_for_mempool, str):
+                wait_for_mempool = [wait_for_mempool]
+            if isinstance(wait_for_mempool, list):
+                wait_for(lambda: all(txid in self.rpc.getrawmempool() for txid in wait_for_mempool))
+            else:
+                wait_for(lambda: len(self.rpc.getrawmempool()) >= wait_for_mempool)
+        if advance_parent is None:
+            advance_parent = self.advance_parent
+
+        hashes = []
+        for _ in range(numblocks):
+            if advance_parent:
+                self.mine_parent(1)
+            hashes.append(self._produce(len(self.STAKERS) - 1))
+        return hashes
+
+    def generate_uncertified_block(self):
+        """Produce a block countersigned below quorum.  Consensus accepts one
+        only under the escaping stall: the parent must have advanced three
+        blocks, 600 s apart, past the last certified block's anchor (see
+        `mine_parent(spacing=...)`)."""
+        return self._produce(0)
+
+    def getnewaddress(self):
+        # Transparent by default: a plain bech32 address.
+        return self.rpc.getnewaddress()
+
+    def send(self, addr, sats, asset=None):
+        """Send `sats` atoms of `asset` (default: the policy asset) to `addr`,
+        paying the fee in the asset being sent: the open fee market names a
+        fee asset on every transaction and defaults to none."""
+        asset = asset or self.POLICY_ASSET
+        return self.rpc.sendtoaddress(addr, sats / 10**8, "", "", False, None,
+                                      None, "unset", None, asset, None, None,
+                                      asset)
+
+    def send_and_mine_block(self, addr, sats, asset=None):
+        txid = self.send(addr, sats, asset)
+        self.generate_block(1, wait_for_mempool=txid)
+        return txid
+
+    def issue_asset(self, amount):
+        """Issue `amount` (whole units) of a new unblinded asset, paying the
+        fee in the policy asset, confirm it, and return its id."""
+        res = self.rpc.issueasset(amount, 0, False, None, self.POLICY_ASSET)
+        self.generate_block(1, wait_for_mempool=res['txid'])
+        return res['asset']
+
+    def set_fee_rates(self, rates):
+        """Set this node's fee whitelist: {asset id or label: rate}, where
+        100000000 is par with the reference unit."""
+        self.rpc.setfeeexchangerates(rates)
+
+
 def mnemonic_from_seed(seed):
     m = mnemonic.Mnemonic('english')
     mnem = m.to_mnemonic(seed)
@@ -747,6 +972,13 @@ class LightningD(TailableProc):
 
         for k, v in opts.items():
             self.opts[k] = v
+
+        # A Sequentia network has its own timelock and rescan defaults,
+        # sized for its block cadence and for reorgs that follow the Bitcoin
+        # anchor: test what a node really runs with.
+        if TEST_NETWORK in SEQUENTIA_NETWORKS:
+            for k in ('cltv-delta', 'cltv-final', 'watchtime-blocks', 'rescan'):
+                del self.opts[k]
 
         if not os.path.exists(os.path.join(lightning_dir, TEST_NETWORK)):
             os.makedirs(os.path.join(lightning_dir, TEST_NETWORK))

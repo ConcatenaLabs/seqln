@@ -2,7 +2,7 @@ from pyln.testing.utils import TEST_NETWORK, TIMEOUT, VALGRIND, DEPRECATED_APIS 
 from pyln.testing.utils import env, only_one, wait_for, write_config, TailableProc, sync_blockheight, wait_channel_quiescent, get_tx_p2wsh_outnum, mine_funding_to_announce, scid_to_int  # noqa: F401
 import bitstring
 from pyln.client import Millisatoshi
-from pyln.testing.utils import EXPERIMENTAL_DUAL_FUND
+from pyln.testing.utils import EXPERIMENTAL_DUAL_FUND, ELEMENTS_NETWORKS
 from pyln.proto.onion import TlvPayload
 import struct
 import subprocess
@@ -25,6 +25,7 @@ def default_ln_port(network: str) -> int:
         "liquid-regtest": 20735,
         "liquid": 9735,
         "testnet4": 49735,
+        "sequentia-regtest": 19946,
     }
     return network_map[network]
 
@@ -45,7 +46,7 @@ def expected_peer_features(extra=[]):
     if EXPERIMENTAL_DUAL_FUND:
         # option_dual_fund
         features += [29]
-    if TEST_NETWORK != 'liquid-regtest':
+    if TEST_NETWORK not in ELEMENTS_NETWORKS:
         # Anchors, except for elements
         features += [23]
     return hex_bits(features + extra)
@@ -59,7 +60,7 @@ def expected_node_features(extra=[]):
     if EXPERIMENTAL_DUAL_FUND:
         # option_dual_fund
         features += [29]
-    if TEST_NETWORK != 'liquid-regtest':
+    if TEST_NETWORK not in ELEMENTS_NETWORKS:
         # Anchors, except for elements
         features += [23]
     return hex_bits(features + extra)
