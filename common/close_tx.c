@@ -16,7 +16,8 @@ struct bitcoin_tx *create_close_tx(const tal_t *ctx,
 				   struct amount_sat funding_sats,
 				   struct amount_sat to_us,
 				   struct amount_sat to_them,
-				   struct amount_sat dust_limit)
+				   struct amount_sat dust_limit,
+				   const u8 *channel_asset)
 {
 	struct bitcoin_tx *tx;
 	size_t num_outputs = 0;
@@ -52,6 +53,10 @@ struct bitcoin_tx *create_close_tx(const tal_t *ctx,
 	 */
 	/* Now create close tx: one input, two outputs. */
 	tx = bitcoin_tx(ctx, chainparams, 1, 2, 0);
+
+	/* An asset channel closes in its own asset: the funding input, both
+	 * outputs and the explicit fee.  Must precede the input and outputs. */
+	bitcoin_tx_set_output_asset(tx, channel_asset);
 
 	/* Our input spends the anchor tx output. */
 	bitcoin_tx_add_input(tx, funding,

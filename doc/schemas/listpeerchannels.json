@@ -992,6 +992,12 @@
                   }
                 ]
               }
+            },
+            "channel_asset": {
+              "type": "hex",
+              "description": [
+                "On an asset-aware chain, the 32-byte display id of the channel's asset when it is not the policy asset; the channel's amounts are in that asset's atoms."
+              ]
             }
           },
           "allOf": [
@@ -1112,7 +1118,8 @@
                     "description": [
                       "The bitcoin address we will close to (present if close_to_addr is a standardized address)."
                     ]
-                  }
+                  },
+                  "channel_asset": {}
                 }
               }
             },
@@ -1211,7 +1218,8 @@
                     "description": [
                       "Fee attached to this the current tx."
                     ]
-                  }
+                  },
+                  "channel_asset": {}
                 }
               }
             },
@@ -1311,7 +1319,8 @@
                     "description": [
                       "0 if we're the lesser node_id, 1 if we're the greater (as used in BOLT #7 channel_update)."
                     ]
-                  }
+                  },
+                  "channel_asset": {}
                 }
               }
             },
@@ -1422,7 +1431,8 @@
                     "description": [
                       "The minimum feerate for the next funding transaction in per-1000-weight, with `kpw` appended."
                     ]
-                  }
+                  },
+                  "channel_asset": {}
                 }
               }
             }

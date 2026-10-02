@@ -6,7 +6,8 @@
 struct ext_key;
 
 /* Create close tx to spend the anchor tx output; doesn't fill in
- * input scriptsig. */
+ * input scriptsig.  On elements, every output and the fee are in
+ * `channel_asset` (33 bytes; NULL means the policy asset). */
 struct bitcoin_tx *create_close_tx(const tal_t *ctx,
 				   const struct chainparams *chainparams,
 				   u32 *local_wallet_index,
@@ -18,5 +19,6 @@ struct bitcoin_tx *create_close_tx(const tal_t *ctx,
 				   struct amount_sat funding_sats,
 				   struct amount_sat to_us,
 				   struct amount_sat to_them,
-				   struct amount_sat dust_limit);
+				   struct amount_sat dust_limit,
+				   const u8 *channel_asset);
 #endif /* LIGHTNING_COMMON_CLOSE_TX_H */

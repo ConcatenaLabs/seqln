@@ -78,6 +78,12 @@
         "description": [
           "To signel that it needs emergency reserve for anchors so that we can lowball our commitment tx fees, and min-emergency-msat for reserving some sats for closing anchor channels."
         ]
+      },
+      "asset": {
+        "type": "hex",
+        "description": [
+          "On an asset-aware chain, the 32-byte display id of the asset to select inputs in; *satoshi* is then in that asset's atoms, and change and fee are in the same asset. The default is the chain's policy asset."
+        ]
       }
     }
   },

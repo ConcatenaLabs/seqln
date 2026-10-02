@@ -116,6 +116,12 @@
             "```"
           ]
         }
+      },
+      "asset": {
+        "type": "hex",
+        "description": [
+          "On an asset-aware chain, the 32-byte display id of the asset to fund the channel in; *amount* is then in that asset's atoms, and the funding transaction pays its fee in the same asset. The default is the chain's policy asset."
+        ]
       }
     }
   },

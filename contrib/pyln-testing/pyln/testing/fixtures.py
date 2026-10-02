@@ -4,6 +4,7 @@ from pyln.testing.utils import (
     NodeFactory,
     BitcoinD,
     ElementsD,
+    SequentiaD,
     env,
     LightningNode,
     TEST_DEBUG,
@@ -143,6 +144,7 @@ def test_name(request):
 network_daemons = {
     "regtest": BitcoinD,
     "liquid-regtest": ElementsD,
+    "sequentia-regtest": SequentiaD,
 }
 
 
@@ -869,6 +871,15 @@ def chainparams():
             "example_addr": "ert1qjsesxflhs3632syhcz7llpfx20p5tr0kpllfve",
             "feeoutput": True,
             "chain_hash": "9f87eb580b9e5f11dc211e9fb66abb3699999044f8fe146801162393364286c6",
+        },
+        "sequentia-regtest": {
+            "bip173_prefix": "bcrt",
+            "elements": True,
+            "name": "sequentia-regtest",
+            "p2sh_prefix": "2",
+            "example_addr": "bcrt1qeyyk6sl5pr49ycpqyckvmttus5ttj25pd0zpvg",
+            "feeoutput": True,
+            "chain_hash": "05259779e4f2876632eed2a24faeb1d81c0ae9e63a0e531a1e7e0714da1c4748",
         },
     }
 

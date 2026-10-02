@@ -168,7 +168,8 @@ register_close_command(struct lightningd *ld,
 			     &close_command_timeout, cc);
 }
 
-static struct amount_sat calc_tx_fee(struct amount_sat sat_in,
+static struct amount_sat calc_tx_fee(const struct channel *channel,
+				     struct amount_sat sat_in,
 				     const struct bitcoin_tx *tx)
 {
 	struct amount_asset amt;
@@ -179,13 +180,13 @@ static struct amount_sat calc_tx_fee(struct amount_sat sat_in,
 		if (chainparams->is_elements && !txout->script_len)
 			continue;
 
-		/* Ignore outputs that are not denominated in our main
-		 * currency. */
+		/* Ignore outputs that are not denominated in the channel's
+		 * asset (the fee is the rest of the funding, in that asset). */
 		amt = bitcoin_tx_output_get_amount(tx, i);
-		if (!amount_asset_is_main(&amt))
+		if (!amount_asset_is(&amt, channel->channel_asset))
 			continue;
 
-		if (!amount_sat_sub(&fee, fee, amount_asset_to_sat(&amt)))
+		if (!amount_sat_sub(&fee, fee, amount_sat(amt.value)))
 			fatal("Tx spends more than input %s? %s",
 			      fmt_amount_sat(tmpctx, sat_in),
 			      fmt_bitcoin_tx(tmpctx, tx));
@@ -202,8 +203,8 @@ static bool closing_fee_is_acceptable(struct lightningd *ld,
 	u64 weight;
 
 	/* Calculate actual fee (adds in eliminated outputs) */
-	fee = calc_tx_fee(channel->funding_sats, tx);
-	last_fee = calc_tx_fee(channel->funding_sats, channel->last_tx);
+	fee = calc_tx_fee(channel, channel->funding_sats, tx);
+	last_fee = calc_tx_fee(channel, channel->funding_sats, channel->last_tx);
 
 	/* Weight once we add in sigs. */
 	assert(!tx->wtx->inputs[0].witness
@@ -498,7 +499,8 @@ void peer_start_closingd(struct channel *channel, struct peer_fd *peer_fd)
 				       /* Always use quickclose with anchors */
 				       || option_anchor_outputs
 				       || option_anchors_zero_fee_htlc_tx,
-				       channel->shutdown_wrong_funding);
+				       channel->shutdown_wrong_funding,
+				       channel->channel_asset);
 
 	/* We don't expect a response: it will give us feedback on
 	 * signatures sent and received, then closing_complete. */

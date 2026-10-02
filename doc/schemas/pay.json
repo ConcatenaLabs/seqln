@@ -117,6 +117,12 @@
         "description": [
           "Explicitly state that you are only paying some part of the invoice.  Presumably someone else is paying the rest (otherwise the payment will time out at the recipient).  Note that this is currently not supported for self-payment (please file an issue if you need this)"
         ]
+      },
+      "asset": {
+        "type": "hex",
+        "description": [
+          "On an asset-aware chain, the 32-byte display id of the asset to pay in: only channels in that asset are used, and the invoice amount is read in its atoms."
+        ]
       }
     }
   },

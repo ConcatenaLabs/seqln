@@ -79,6 +79,12 @@
           "The maximum number of channels to return."
         ],
         "default": "20"
+      },
+      "asset": {
+        "type": "hex",
+        "description": [
+          "On an asset-aware chain, the 32-byte display id of an asset: only channels in that asset are used."
+        ]
       }
     }
   },
