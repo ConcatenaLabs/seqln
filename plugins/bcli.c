@@ -340,6 +340,9 @@ static int *get_fullnode_peers(const tal_t *ctx, struct command *cmd)
 	return peers;
 }
 
+static bool sequentia_block_in_view(struct command *cmd, u32 height,
+				    const char *blockhash);
+
 /* Get a raw block given its height.
  * Calls `getblockhash` then `getblock` to retrieve it from bitcoin_cli.
  * Will return early with null fields if block isn't known (yet).
@@ -373,6 +376,12 @@ static struct command_result *getrawblockbyheight(struct command *cmd,
 		return command_err(cmd, res, "bad JSON: bad blockhash");
 
 	block_hash = tal_strdup(cmd, res->output);
+
+	/* SEQUENTIA (spec 6.1): a block above the certified frontier is not
+	 * part of the chain CLN sees yet, exactly as getchaininfo reports. */
+	if (chainparams->has_anchor_header
+	    && !sequentia_block_in_view(cmd, *height, block_hash))
+		return getrawblockbyheight_notfound(cmd);
 
 	for (;;) {
 		res = run_bitcoin_cli(cmd, cmd->plugin, "getblock",
@@ -517,6 +526,63 @@ static u32 sequentia_certified_frontier(struct command *cmd, u32 tip,
 		   "reporting raw tip (committee stalled?)",
 		   SEQUENTIA_CERT_LOOKBACK, tip);
 	return tip;
+}
+
+/* The highest certified frontier this plugin has seen.  It can be stale-high
+ * after an anchor reorg, which is why it is only trusted far below itself. */
+static u32 sequentia_frontier_hint;
+
+/* Is the block at `height` (hash `blockhash`) at or below the certified
+ * frontier?  getchaininfo clamps the tip CLN starts from, but CLN then
+ * follows the chain by asking for tip+1 here, so the same clamp must hold
+ * here or a block certified below quorum (accepted only under the escaping
+ * stall) would become CLN's tip.
+ *
+ * A block below quorum can only sit at the top of the chain: anything with a
+ * certified block above it is inside the frontier.  So a block more than
+ * SEQUENTIA_CERT_LOOKBACK below the last frontier seen needs no check (a
+ * rescan from genesis costs one frontier walk in all), a block below it is in
+ * view if it is certified itself, and anything else costs the frontier walk:
+ * normally two calls, getblockchaininfo and the tip's header. */
+static bool sequentia_block_in_view(struct command *cmd, u32 height,
+				    const char *blockhash)
+{
+	struct bcli_result *res;
+	const jsmntok_t *tokens;
+	const char *bestblockhash;
+	bool certified;
+	u32 blocks;
+
+	if (height + SEQUENTIA_CERT_LOOKBACK <= sequentia_frontier_hint)
+		return true;
+
+	if (height <= sequentia_frontier_hint
+	    && sequentia_block_certified(cmd, blockhash, &certified)
+	    && certified)
+		return true;
+
+	res = run_bitcoin_cli(cmd, cmd->plugin, "getblockchaininfo", NULL);
+	if (res->exitstatus != 0)
+		return false;
+	tokens = json_parse_simple(res->output, res->output, res->output_len);
+	if (!tokens)
+		return false;
+	if (json_scan(tmpctx, res->output, tokens,
+		      "{blocks:%,bestblockhash:%}",
+		      JSON_SCAN(json_to_number, &blocks),
+		      JSON_SCAN_TAL(tmpctx, json_strdup, &bestblockhash)) != NULL)
+		return false;
+
+	sequentia_frontier_hint = sequentia_certified_frontier(cmd, blocks,
+							       bestblockhash);
+	if (height > sequentia_frontier_hint) {
+		plugin_log(cmd->plugin, LOG_DBG,
+			   "Sequentia: block %u is above the certified "
+			   "frontier %u; holding it back", height,
+			   sequentia_frontier_hint);
+		return false;
+	}
+	return true;
 }
 
 /* Get infos about the block chain.
