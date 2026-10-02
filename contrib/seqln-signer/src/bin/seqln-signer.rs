@@ -20,6 +20,13 @@
 //! Either way the `hsm_secret` is loaded from the current working directory
 //! (mnemonic format).
 //!
+//! The channel store (each channel's parameters, its revocation counters and
+//! the balance its latest commitments give this side) is persisted to
+//! `seqln-signer-channels` in the same directory, or the path in
+//! `SEQLN_SIGNER_STORE`: loaded at start, and rewritten durably after every
+//! request that changed it, before the reply leaves. A restarted signer
+//! therefore never forgets which commitments it revoked.
+//!
 //! ============================ SECURITY ====================================
 //! listen mode is fail-closed: it REFUSES to start without both its own static
 //! privkey (SEQLN_SIGNER_PRIVKEY[_FILE]) and the pinned host static pubkey
@@ -34,6 +41,7 @@ use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::FromRawFd;
 use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 
 use seqln_signer::dispatch::{Outcome, Signer};
 use seqln_signer::noise::{
@@ -108,10 +116,15 @@ fn main() {
         .open("seqln-signer.log")
         .ok();
 
+    let store = PathBuf::from(
+        std::env::var("SEQLN_SIGNER_STORE").unwrap_or_else(|_| STORE_FILE.to_string()),
+    );
+    load_store(&store, &mut signer, &mut log);
+
     match (listen_addr, connect_addr) {
         (Some(_), Some(_)) => fatal("choose one of --listen or --connect, not both"),
-        (Some(addr), None) => serve_listen(&addr, &mut signer, &mut log),
-        (None, Some(addr)) => serve_connect(&addr, &mut signer, &mut log),
+        (Some(addr), None) => serve_listen(&addr, &mut signer, &store, &mut log),
+        (None, Some(addr)) => serve_connect(&addr, &mut signer, &store, &mut log),
         (None, None) => {
             // fd mode (fork+socketpair): argv[1] is the connected socket fd.
             let fd_str = fd_arg.unwrap_or_else(|| {
@@ -129,16 +142,67 @@ fn main() {
                     std::process::id()
                 ),
             );
-            serve(&mut stream, &mut signer, &mut log);
+            serve(&mut stream, &mut signer, &store, &mut log);
         }
     }
+}
+
+/// The channel store's file name, in the working directory, unless
+/// `SEQLN_SIGNER_STORE` names another path.
+const STORE_FILE: &str = "seqln-signer-channels";
+
+/// Restore the persisted channel store, if there is one. A blob that fails
+/// its seed-keyed MAC or does not parse is logged and left out: the signer
+/// then starts with no record of those channels, and its store-miss rules
+/// (no revocation past commitment 0, no close paying this wallet nothing,
+/// until it validates a commitment) keep it safe.
+fn load_store(path: &Path, signer: &mut Signer, log: &mut Option<File>) {
+    match std::fs::read(path) {
+        Ok(bytes) => match signer.import_channels(&bytes) {
+            Ok(n) => logline(
+                log,
+                &format!("seqln-signer: restored {n} channel(s) from {}", path.display()),
+            ),
+            Err(e) => {
+                logline(log, &format!("seqln-signer: channel store {} NOT restored: {e}", path.display()));
+                eprintln!("seqln-signer: channel store {} not restored: {e}", path.display());
+            }
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => {
+            logline(log, &format!("seqln-signer: channel store {} unreadable: {e}", path.display()));
+            eprintln!("seqln-signer: channel store {} unreadable: {e}", path.display());
+        }
+    }
+    // What was just read is what the file holds.
+    let _ = signer.take_channels_dirty();
+}
+
+/// Write the channel store durably: a temporary file beside it, synced, then
+/// renamed over it, and the directory synced, so a crash leaves either the
+/// old store or the new one.
+fn save_store(path: &Path, blob: &[u8]) -> io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(blob)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    File::open(dir)?.sync_all()
 }
 
 /// listen mode: bind, then accept connections; SECURE each with a Noise_XK
 /// handshake before serving. A failed/rejected handshake is logged, the
 /// connection is dropped (zero frames served) and we keep listening; a
 /// successful handshake is served until it closes, then we exit.
-fn serve_listen(addr: &str, signer: &mut Signer, log: &mut Option<File>) {
+fn serve_listen(addr: &str, signer: &mut Signer, store: &Path, log: &mut Option<File>) {
     // Fail closed: no keys => refuse to run in listen mode.
     let static_priv = load_static_priv().unwrap_or_else(|e| {
         fatal(&format!(
@@ -197,7 +261,7 @@ fn serve_listen(addr: &str, signer: &mut Signer, log: &mut Option<File>) {
                 );
                 eprintln!("seqln-signer: hosted node {peer} authenticated; serving");
                 let mut secure = NoiseStream::new(tcp, transport);
-                serve(&mut secure, signer, log);
+                serve(&mut secure, signer, store, log);
                 // One authenticated hosted node per process; done.
                 logline(log, "seqln-signer: authenticated session closed; exiting");
                 return;
@@ -246,7 +310,7 @@ fn responder_handshake<S: Read + Write>(
 /// Noise_XK INITIATOR (the browser role, native). SECURE the link, then serve
 /// until it closes. Fail closed: no keys => refuse to run, wrong host key =>
 /// Act Two fails and we abort. Serves one session per process, like listen mode.
-fn serve_connect(addr: &str, signer: &mut Signer, log: &mut Option<File>) {
+fn serve_connect(addr: &str, signer: &mut Signer, store: &Path, log: &mut Option<File>) {
     let static_priv = load_static_priv().unwrap_or_else(|e| {
         fatal(&format!(
             "connect mode requires the device transport privkey: {e}"
@@ -281,7 +345,7 @@ fn serve_connect(addr: &str, signer: &mut Signer, log: &mut Option<File>) {
     );
     eprintln!("seqln-signer: proxy {addr} authenticated; serving");
     let mut secure = NoiseStream::new(tcp, transport);
-    serve(&mut secure, signer, log);
+    serve(&mut secure, signer, store, log);
     logline(log, "seqln-signer: session closed; exiting");
 }
 
@@ -378,7 +442,15 @@ impl<S: Read + Write> Write for NoiseStream<S> {
 /// signer, write framed replies back. Transport-agnostic — `stream` is a local
 /// `UnixStream` (fd mode) or a `NoiseStream` over TCP (listen mode); both are
 /// `Read + Write` and the signer frame protocol is identical over either.
-fn serve<S: Read + Write>(stream: &mut S, signer: &mut Signer, log: &mut Option<File>) {
+/// A request that changed the channel store is answered only once the store
+/// is on disk; if it cannot be written the request is refused, so a revealed
+/// secret is never ahead of the record of having revealed it.
+fn serve<S: Read + Write>(
+    stream: &mut S,
+    signer: &mut Signer,
+    store: &Path,
+    log: &mut Option<File>,
+) {
     let trace = std::env::var("SEQLN_SIGNER_TRACE").is_ok();
     loop {
         let req = match frame::read_request(stream) {
@@ -417,6 +489,25 @@ fn serve<S: Read + Write>(stream: &mut S, signer: &mut Signer, log: &mut Option<
                 eprintln!("seqln-signer: FATAL: {m}");
                 std::process::exit(2);
             }
+        };
+
+        let reply = if signer.take_channels_dirty() {
+            match save_store(store, &signer.export_channels()) {
+                Ok(()) => reply,
+                Err(e) => {
+                    logline(
+                        log,
+                        &format!(
+                            "seqln-signer: REFUSED: channel store {} not written: {e}",
+                            store.display()
+                        ),
+                    );
+                    eprintln!("seqln-signer: channel store {} not written: {e}", store.display());
+                    Vec::new()
+                }
+            }
+        } else {
+            reply
         };
 
         if let Err(e) = frame::write_reply(stream, &reply) {

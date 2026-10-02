@@ -236,6 +236,8 @@ impl Signer {
             remote_shutdown_script: Vec::new(),
             revoked_through: None,
             validated_through: None,
+            local_split: None,
+            remote_split: None,
         };
         self.inner
             .arm_channel(arr33(node_id, "node_id")?, dbid, st)
