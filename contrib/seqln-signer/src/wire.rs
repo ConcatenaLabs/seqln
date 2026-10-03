@@ -608,6 +608,63 @@ fn parse_tx_with_txid(lin: &[u8], network: Network) -> Option<(ElementsTx, [u8; 
     Some((tx, crate::kernel::double_sha256(&ser)))
 }
 
+/// The txid of a linearized Bitcoin transaction (a v0 PSBT's unsigned tx).
+pub fn bitcoin_txid(lin: &[u8]) -> Option<[u8; 32]> {
+    parse_tx_with_txid(lin, Network::Bitcoin).map(|(_, txid)| txid)
+}
+
+/// The txid of `tx` as it will be once signed, for a transaction whose
+/// inputs are all segregated-witness spends (an empty scriptSig): its
+/// serialization without witnesses, as [`parse_tx_with_txid`] hashes it.
+/// `None` for an Elements input that carries an issuance, whose fields a
+/// parsed transaction does not keep. A transaction with an input that is not
+/// a witness spend (a P2SH-wrapped one, say) gets another txid on chain.
+pub fn unsigned_txid(tx: &ElementsTx) -> Option<[u8; 32]> {
+    fn varint(out: &mut Vec<u8>, n: usize) {
+        match n {
+            0..=0xfc => out.push(n as u8),
+            0xfd..=0xffff => {
+                out.push(0xfd);
+                out.extend_from_slice(&(n as u16).to_le_bytes());
+            }
+            _ => {
+                out.push(0xfe);
+                out.extend_from_slice(&(n as u32).to_le_bytes());
+            }
+        }
+    }
+    let elements = tx.network == Network::Elements;
+    let mut ser = Vec::new();
+    ser.extend_from_slice(&tx.version.to_le_bytes());
+    if elements {
+        ser.push(0x00); // the flag byte, clear: no witness
+    }
+    varint(&mut ser, tx.inputs.len());
+    for i in &tx.inputs {
+        if i.is_issuance {
+            return None;
+        }
+        ser.extend_from_slice(&i.txhash);
+        ser.extend_from_slice(&i.index.to_le_bytes());
+        ser.push(0x00); // empty scriptSig
+        ser.extend_from_slice(&i.sequence.to_le_bytes());
+    }
+    varint(&mut ser, tx.outputs.len());
+    for o in &tx.outputs {
+        if elements {
+            ser.extend_from_slice(&o.asset);
+            ser.extend_from_slice(&o.value);
+            ser.extend_from_slice(&o.nonce);
+        } else {
+            ser.extend_from_slice(&o.value);
+        }
+        varint(&mut ser, o.script.len());
+        ser.extend_from_slice(&o.script);
+    }
+    ser.extend_from_slice(&tx.locktime.to_le_bytes());
+    Some(crate::kernel::double_sha256(&ser))
+}
+
 /// Decide whether a `bitcoin_tx` wire object is a Bitcoin or an Elements tx.
 ///
 /// FORMAT SELECTION (documented mechanism). One `seqln-signer` process serves
@@ -1430,5 +1487,11 @@ mod tests {
         bt_w.extend_from_slice(&[0x02, 0x01, 0xaa, 0x02, 0xbb, 0xcc]);
         bt_w.extend_from_slice(&bt[bt.len() - 4..]);
         assert_eq!(display(parse_tx_with_txid(&bt_w, Network::Bitcoin).unwrap().1), bt_txid);
+        // A parsed transaction, serialized again: the same txids.
+        let (eltx, _) = parse_tx_with_txid(&el, Network::Elements).unwrap();
+        assert_eq!(display(unsigned_txid(&eltx).unwrap()), el_txid);
+        let (bttx, _) = parse_tx_with_txid(&bt, Network::Bitcoin).unwrap();
+        assert_eq!(display(unsigned_txid(&bttx).unwrap()), bt_txid);
+        assert_eq!(display(bitcoin_txid(&bt).unwrap()), bt_txid);
     }
 }

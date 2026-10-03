@@ -314,11 +314,15 @@ a user device while a host runs the node:
   it: no commitment of either side, no revocation, no close. The channel moves no more and its
   peer closes it (the cutover closes them from the hubs). The device reports these channels to the
   wallet (`predatingChannels`).
-- What a channel close pays a keyless node (the output the peer's commitment pays it, to the
-  channel's payment key; what a mutual close pays it; its own commitment's `to_local` once its
-  delay is over) the device signs a spend of only to its own wallet scripts, with a fee within
-  its payment limit for the asset (the signer README, "Close outputs"). A withdrawal it declines
-  comes back unsigned, so the node cannot finalize it and sends nothing.
+- A keyless node's device signs a spend of the node's wallet (a withdrawal, a channel funding,
+  an anchor fee bump, and what a channel close paid it) only when every output but the fee pays
+  one of its own wallet scripts or is the funding output of a channel this side is opening, with
+  the fee, and anything the channel's first commitment gives the peer, within its payment limit
+  for the asset (the signer README, "Withdrawals"). A spend to any other address waits for a way
+  to approve an address on the device. A withdrawal it declines comes back unsigned, so the node
+  cannot finalize it and sends nothing. The fee of every other transaction it signs that this
+  side pays (a commitment or a close of a channel it opened, a sweep, a penalty, an HTLC claim) is
+  at most that limit.
 
 ## 7b. Specula keyless watchtower
 
@@ -410,6 +414,10 @@ database that recorded it without one (`test_asset_withdraw.py`), a keyless node
 output only to its own address and within its device's payment limit
 (`test_close_output_spend.py`, on Bitcoin regtest too, with the redirected spend forced into a
 block there; `SEQLN_DEVICE=wasm` runs the keyless tests on the browser build), a keyless node
+whose device moves what a close paid it to the node's own address and funds a channel from it,
+and refuses that coin's spend to any other address (`test_withdrawal_rule.py`, on Bitcoin
+regtest too, with the redirected spend and the redirected funding forced into a block there), a
+keyless node
 started on a version-1 store, whose device signs no step of the channels in it while the hub
 closes them, moves what the closes paid it to its own address, and pays both ways over a channel
 opened afterwards (`test_predating_store.py`), a breach of an asset channel with a pending HTLC
@@ -423,10 +431,12 @@ fees of channels in assets of any value and between peers that value an asset di
 and the asset plugins see on an HTLC, with `holdinvoice-seq` holding only the asset it was
 registered in, across a restart (`test_hold_asset.py`). They need `sequentiad`, `sequentia-cli`
 and a Bitcoin Core `bitcoind` on `PATH`, and the keyless tests need the device signer built
-(`cargo build --release` in `contrib/seqln-signer`, or `SEQLN_SIGNER=/path/to/seqln-signer`):
+(`cargo build --release` in `contrib/seqln-signer`, or `SEQLN_SIGNER=/path/to/seqln-signer`).
+The test plugins run under the `python3` on `PATH`, which needs the `pyln` packages, so the
+`uv` environment's `bin` goes first:
 
 ```sh
-PATH=/path/to/bitcoin/bin:/path/to/Sequentia/src:$PATH TEST_NETWORK=sequentia-regtest \
+PATH=$PWD/.venv/bin:/path/to/bitcoin/bin:/path/to/Sequentia/src:$PATH TEST_NETWORK=sequentia-regtest \
   python3 -m pytest tests/sequentia/
 ```
 

@@ -76,9 +76,9 @@ impl AssetKey {
     }
 }
 
-/// The default limit, in atoms of each asset per period: the largest channel
-/// the hosted service sells (`INBOUND_MAX_SAT`, 10,000,000 units), so a day's
-/// payments can never move more than one such channel holds.
+/// The default limit, in atoms of each asset per period: a default for a
+/// day's spending. A channel can hold more; a wallet sets its own limits per
+/// asset (`SEQLN_SIGNER_PAY_LIMITS`, or `setPaymentLimit` in the WASM build).
 pub const DEFAULT_LIMIT_ATOMS: u64 = 10_000_000;
 /// The default period: a day.
 pub const DEFAULT_PERIOD_SECS: u64 = 86_400;

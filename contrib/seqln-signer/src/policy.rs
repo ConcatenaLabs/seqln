@@ -315,7 +315,7 @@ pub struct ChannelStore {
     /// The txids of the mutual closes this device signed, oldest first, at
     /// most [`MAX_CLOSE_TXIDS`]. What such a close pays this wallet is a
     /// close output: the device signs its spend only to its own scripts
-    /// (`dispatch.rs`, `check_close_spend`). Kept apart from the channel
+    /// (`dispatch.rs`, `check_withdrawal`). Kept apart from the channel
     /// records, which `FORGET_CHANNEL` drops long before the output is spent.
     pub close_txids: Vec<[u8; 32]>,
 }

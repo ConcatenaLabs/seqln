@@ -31,6 +31,7 @@ from utils import TEST_NETWORK, only_one, sync_blockheight, wait_for
 
 import os
 import pytest
+import re
 
 import test_keyless_close as kc
 import test_keyless_start as ks
@@ -44,9 +45,11 @@ needs_device = pytest.mark.skipif(
 
 SEQ = TEST_NETWORK == 'sequentia-regtest'
 # The device's payment limit here, in atoms of each asset: above what a spend
-# at the lowest feerate pays, below what one at 7,500 perkw pays.
-LIMIT = 1000
-CHEAP, DEAR = '253perkw', '7500perkw'
+# at the lowest feerate pays, and above the fee of the penalty the watchtower
+# has the device pre-sign at every commitment step (about 7,200 atoms at this
+# chain's feerate), below what a spend at 200,000 perkw pays.
+LIMIT = 20000
+CHEAP, DEAR = '253perkw', '200000perkw'
 # The delay the hub asks of the keyless node's own commitment, in blocks.
 DELAY = 6
 REFUSED = 'POLICY REJECT: SIGN_WITHDRAWAL refused: '
@@ -168,8 +171,9 @@ def check_refusals(bitcoind, node, device, txid, asset):
     """What `txid` paid the node: to another script, refused; over the
     limit, refused; still unspent."""
     refused_spend(bitcoind, node, device, asset, bitcoind.getnewaddress(), CHEAP, FOREIGN)
-    refused_spend(bitcoind, node, device, asset, own_address(node), DEAR,
-                  "is over this device's payment limit for that asset ({} atoms)".format(LIMIT))
+    line = refused_spend(bitcoind, node, device, asset, own_address(node), DEAR,
+                         "payment limit for that asset has left this period")
+    assert re.search(r'\(\d+ of {} atoms\)'.format(LIMIT), line), line
     assert any(o['txid'] == txid for o in node.rpc.listfunds()['outputs'])
 
 
