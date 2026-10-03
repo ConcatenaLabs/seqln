@@ -86,8 +86,9 @@ What enforce mode checks:
   with a `feerange` far above the channel's feerate, say) is refused, lightningd keeps running,
   and `close` falls back to a unilateral close after its `unilateraltimeout`. Our output may be
   left out only when what is due is under the 546-atom dust limit, and the peer's output may not
-  exceed the funding less our balance. While no balance is recorded, a close that pays this
-  wallet nothing is refused.
+  exceed the funding less our balance. While no balance is recorded, every close is refused,
+  however much it pays this wallet: the device cannot tell an honest close from one paying it a
+  single atom.
 - **Revocations**: the device reveals the secret of our commitment n only when n is the next to
   revoke (or already revealed: channeld re-sends a revocation after a reconnect) and commitment
   n + 1 has been validated; and it never signs a commitment of ours numbered at or below the
@@ -135,7 +136,17 @@ the payment limits) carries no secret and is authenticated by a MAC keyed from t
 loads the file at start and rewrites it durably (temporary file, sync, rename) after every
 request that changed it, before the reply leaves. If the file cannot be written it refuses the
 request, and every request after it until a write succeeds, so channeld asking again for what
-was refused gets no answer the store does not record. The WASM build hands the same blob to the wallet's `channelStore` to keep.
+was refused gets no answer the store does not record. The WASM build hands the same blob to the
+wallet's `channelStore` to keep.
+
+A channel whose record has no balance and no validated commitments (a store written by a device
+that did not keep them, or a lost store) can neither close mutually nor be closed unilaterally by
+the device until its next commitment step: a payment either way, or an `update_fee`, which the
+opener sends when its feerate changes. A device moved onto such a store therefore needs one
+commitment step on every channel before those channels can close. A channel already closing
+(`CLOSINGD_COMPLETE` or `AWAITING_UNILATERAL`) when the store lacks them stops the node at its
+next start, because lightningd signs the closing transaction again then: let such closes
+confirm first.
 
 ## Layout
 
