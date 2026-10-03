@@ -63,7 +63,10 @@ What enforce mode checks:
   commitment of ours counts as validated only when the peer's signature on it verifies against
   the channel's remote funding key. From the latest of our commitments it validated, and the
   latest of the peer's it signed, the device records this side's balance: its own output, plus
-  the fee and anchors when this side opened the channel.
+  the fee and anchors when this side opened the channel. When this side opened the channel, and
+  so pays the commitment's fee, that fee is at most the payment limit of the channel's asset: a
+  host that also ran the peer could otherwise raise the feerate (`update_fee`, which the opener
+  sends) until our balance was the fee, and on Sequentia a fee goes to the block proposer.
 - **Broadcasting a commitment of ours** (`SIGN_COMMITMENT_TX`, the signature that lets the host
   put it on chain): the device signs only a transaction whose txid is one of our commitments it
   validated and has not revoked. That request carries no HTLC list, so the device could not
@@ -75,7 +78,8 @@ What enforce mode checks:
   the commitment message when a close completes and whenever it starts with a channel closing):
   one input, the funding output; at most one output to this device's own wallet and at most one
   to the peer, which must be the peer's upfront shutdown script when the channel named one; no
-  value created. A close paying our share anywhere but our own wallet is refused. The local
+  value created. A close paying our share anywhere but our own wallet is refused, and so is one
+  whose fee, when this side opened the channel and pays it, is over the payment limit. The local
   upfront shutdown script (`fundchannel close_to=`) counts as our wallet only when it is one of
   this device's wallet addresses at the key index `setup_channel` gives for it, because the host
   supplies that script: a channel opened with `close_to` an address outside this wallet cannot be
@@ -106,7 +110,7 @@ What enforce mode checks:
   such a channel's state before it, and does not take the host's word for it: it signs no
   commitment step for the channel, neither side's commitment, no revocation (not even of
   commitment 0) and no close, so the channel moves no more. Its peer closes it, and the device
-  signs the spends of what that close pays this node (the "Close outputs" rule below). The mark is
+  signs the spends of what that close pays this node (the "Withdrawals" rule below). The mark is
   kept in the store and never cleared. The native signer logs each such channel when it loads its
   store; the WASM build reports them (`predatingChannels()`, and the SDK's `predatingChannels()`
   and `onPredating`) so the wallet can tell the user the channel is not carried over.
@@ -116,23 +120,41 @@ What enforce mode checks:
   request names). These are signed `SIGHASH_SINGLE|ANYONECANPAY` (a watchtower attaches its own
   fee input), which commits to the swept input and output 0 only: whatever the input carries
   beyond output 0, a host could take with an output it adds. So the sweep of our own commitment's
-  `to_local` once its delay is over, a close output, is signed only when that difference is within
-  the payment limit of the channel's asset. A penalty or an HTLC claim races the peer, and is never
-  refused over its fee. lightningd has the `to_local` sweep signed as soon as the commitment
-  confirms and cannot start without it, so a device whose limit is below that sweep's fee stops the
-  node until the limit is raised; the default limit is thousands of times any sweep's fee.
-- **Close outputs**: what a channel close paid this node goes only to the device's own wallet
-  scripts (P2WPKH or BIP-86 P2TR of its wallet keys at indices below 5,000), unblinded, with a fee
-  within the payment limit of its asset. A close output is the output a peer's commitment pays
-  this node, which the wallet holds with its channel noted and the device signs with that channel's
-  payment key, or what a mutual close this device signed pays it (the device keeps the txids of the
-  closes it signs). On Sequentia the fee is the explicit fee output, which the signature commits
-  to with every other output; on Bitcoin it is what the inputs the device signs carry beyond the
-  outputs. A withdrawal that breaks the rule is returned unsigned: the node cannot finalize it
-  (`withdraw` and `sendpsbt` fail with "not finalizeable"), sends nothing and keeps running, and
-  the device logs why (native: its log; WASM: `lastReject` and the SDK's `onReject`). Any other
-  wallet output (a deposit, change, what the device swept to its own wallet) is signed to any
-  destination: channel funding spends those.
+  `to_local` once its delay is over, a penalty and an HTLC claim are each signed only when what the
+  signature lets leave the node's outputs (that difference, or under `SIGHASH_ALL` the fee) is
+  within the payment limit of the channel's asset, and so is our own HTLC transaction. A penalty
+  and an HTLC claim race the peer, and their fee is held to the limit all the same: on Sequentia a
+  fee goes to the block proposer, so an unbounded one would move the value rather than burn it.
+  Each output is spent once, so the bound is per transaction, not against what payments left of
+  the period. lightningd has the `to_local` sweep signed as soon as the commitment confirms and
+  cannot start without it, and channeld has the watchtower's penalty set pre-signed at every
+  commitment step: a device whose limit is below such a fee refuses it, and the node, or the
+  channel at that step, stops until the limit is raised. A limit set for a day's spending is far
+  above such a fee at ordinary feerates.
+- **Withdrawals** (every spend of the node's wallet: `withdraw`, `signpsbt`, a channel funding, an
+  anchor fee bump): every output but the fee pays one of the device's own wallet scripts (P2WPKH or
+  BIP-86 P2TR of its wallet keys at indices below 5,000), unblinded, or is the funding output of a
+  channel this side is opening. A spend to any other address is refused until the device has a way
+  for its user to approve an address on it: the host's word is not that. A funding output counts
+  only at the outpoint `setup_channel` named for a channel this side opened, paying exactly that
+  channel's 2-of-2 (the device's funding key for it and the peer's), unblinded, its whole funding
+  amount in the asset of its commitments, and only once the device holds a commitment of ours for
+  it that the peer signed (openingd validates commitment 0 before the funding is signed), so the
+  coins can always come back by a unilateral close. The txid is the one the unsigned transaction
+  gives, so a funding from a P2SH-wrapped input, whose txid its scriptSig changes, is refused.
+  What leaves the device is the fee (on Sequentia the explicit fee outputs, which the signature
+  commits to with every other output; on Bitcoin what the inputs the device signs carry beyond the
+  outputs) and what the channel's first commitments give the peer (a `push_msat`). For a
+  withdrawal it counts against what the payment limit has left for the period, as a payment does,
+  and is charged once signed: wallet coins come back to the wallet, so a bound per transaction
+  would let a host spend the wallet on fees through a chain of transfers to itself. An anchor fee
+  bump spends its anchor once, so its fee is held to the limit itself. A spend that breaks the
+  rule is returned unsigned: the node cannot finalize it (`withdraw` and `sendpsbt` fail with "not
+  finalizeable"), sends nothing and keeps running, and the device logs why (native: its log; WASM:
+  `lastReject` and the SDK's `onReject`). This covers what a channel close paid the node: the
+  output a peer's commitment pays it, which the wallet holds with its channel noted and the device
+  signs with that channel's payment key, and what a mutual close this device signed pays it (the
+  device keeps the txids of the closes it signs).
 - **Payments** (`src/payments.rs`): `pay` and `keysend` ask the device to approve each payment
   (`PREAPPROVE_INVOICE`, `PREAPPROVE_KEYSEND`) before offering an HTLC. The device approves the
   payment hash when the amount, with a routing-fee allowance (half a percent, at least 5,000
@@ -148,8 +170,8 @@ What enforce mode checks:
   `preapprovekeysend` first.
 
 The payment limit is an amount of each asset, in its own atoms, over a sliding period: by default
-10,000,000 atoms of each asset (Bitcoin included) a day, the largest channel the hosted service
-sells. Native: `SEQLN_SIGNER_PAY_LIMIT` (atoms, or `none`), `SEQLN_SIGNER_PAY_LIMITS`
+10,000,000 atoms of each asset (Bitcoin included) a day: a default for a day's spending, which a
+channel can hold more than. What withdrawals let leave (their fees) counts against it too. Native: `SEQLN_SIGNER_PAY_LIMIT` (atoms, or `none`), `SEQLN_SIGNER_PAY_LIMITS`
 (`<asset>=<atoms|none>,...`, each asset `btc` or a display-order asset id) and
 `SEQLN_SIGNER_PAY_PERIOD` (seconds); the signer refuses to start on a malformed value. WASM:
 `setPaymentLimit(asset, atoms)` and `setPaymentPeriod(seconds)`, or the SDK's `paymentLimits`

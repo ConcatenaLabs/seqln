@@ -274,12 +274,13 @@ def spend_all(bitcoind, node, addr, asset):
 
 def sweep_to_address(bitcoind, node, txid, asset):
     """The node's wallet spends what `txid` paid it, with its device's
-    signature, to an outside address; returns the spending txid and the
-    output, once the spend confirms."""
+    signature, to a new address of its own (the device moves the node's
+    coins to nothing else but a channel the node opens); returns the spending
+    txid and the output, once the spend confirms."""
     wait_for(lambda: any(o['txid'] == txid and o['status'] == 'confirmed'
                          for o in node.rpc.listfunds()['outputs']))
     out = only_one([o for o in node.rpc.listfunds()['outputs'] if o['txid'] == txid])
-    addr = bitcoind.getnewaddress()
+    addr = node.rpc.newaddr('bech32')['bech32']
     for _ in range(5):
         try:
             spent = spend_all(bitcoind, node, addr, asset)
@@ -463,7 +464,7 @@ def test_keyless_start_closing_sigexchange(node_factory, bitcoind, directory):
         wait_for(lambda: chan(l1, closing)['state'] == 'ONCHAIN')
         bitcoind.generate_block(1)
         swept, out = sweep_to_address(bitcoind, l1, close, asset)
-        print('the close {} paid {} to the keyless node, which sent it on in {}'
+        print('the close {} paid {} to the keyless node, which moved it to its own address in {}'
               .format(close, out['amount_msat'], swept))
         assert out['amount_msat'] >= PAY * 1000 * 9 // 10
         pays_both_ways(bitcoind, l2, l1, asset)
@@ -515,7 +516,7 @@ def test_keyless_start_closing_complete(node_factory, bitcoind, directory):
         wait_for(lambda: chan(l1, closing)['state'] == 'ONCHAIN')
         bitcoind.generate_block(1)
         swept, out = sweep_to_address(bitcoind, l1, close, asset)
-        print('the close {} paid {} to the keyless node, which sent it on in {}'
+        print('the close {} paid {} to the keyless node, which moved it to its own address in {}'
               .format(close, out['amount_msat'], swept))
         check_device_signed_none(device, asked, refused)
         pays_both_ways(bitcoind, l2, l1, asset)
@@ -592,7 +593,7 @@ def test_keyless_start_onchain_htlc(node_factory, bitcoind, directory):
         holds(bitcoind, l1, theirs, asset)
         set_aside(l1, theirs)
         swept, out = sweep_to_address(bitcoind, l1, timeout_tx, asset)
-        print('the HTLC timeout {} returned {} to the keyless node, which sent it on in {}'
+        print('the HTLC timeout {} returned {} to the keyless node, which moved it to its own address in {}'
               .format(timeout_tx, out['amount_msat'], swept))
         assert device.requests(5) == asked
         pays_both_ways(bitcoind, l2, l1, asset)

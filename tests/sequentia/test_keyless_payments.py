@@ -26,7 +26,9 @@ def test_keyless_node_pays_only_approved_payments(node_factory, bitcoind, direct
     """With a limit of 20,000,000 atoms a day: a payment of 5,000,000 is
     approved and paid; one of 30,000,000 is declined before any HTLC is
     offered; an HTLC sent with `sendpay`, which asks for no approval, is
-    refused by the device and never reaches the payee."""
+    refused by the device and never reaches the payee.  When the keyless
+    node opened the channel, the fee of its funding counts against the same
+    limit."""
     asset = bitcoind.issue_asset(1000)
     bitcoind.set_fee_rates({bitcoind.POLICY_ASSET: kc.PAR, asset: kc.PAR})
     device, l1 = kc.keyless_node(node_factory, directory, pay_limit='20000000',
@@ -61,7 +63,14 @@ def test_keyless_node_pays_only_approved_payments(node_factory, bitcoind, direct
         with pytest.raises(RpcError, match='declined'):
             l1.rpc.pay(inv)
         assert 'PREAPPROVE declined: a payment of 30000000000 msat' in device.output()
-        assert 'does not fit in the 15000000000 msat left this period' in device.output()
+        fee = 0
+        if opener == 'keyless':
+            funding = bitcoind.rpc.getrawtransaction(res['txid'], True)
+            fee = sum(round(v['value'] * 10**8) for v in funding['vout']
+                      if v['scriptPubKey'].get('type') == 'fee')
+            assert fee > 0
+        left = 15000000000 - fee * 1000
+        assert 'does not fit in the {} msat left this period'.format(left) in device.output()
         assert only_one(l2.rpc.listinvoices('big')['invoices'])['status'] == 'unpaid'
 
         inv = l2.rpc.invoice(10**6 * 1000, 'bypass', 'bypass')['bolt11']

@@ -565,6 +565,42 @@ impl Kernel {
         s
     }
 
+    /// The node's wallet scripts at key indices [0, n), three per index: the
+    /// P2WPKH of its BIP-86 key (m/86'/0'/0'/0/i), that key's BIP-86 P2TR
+    /// output, and the P2WPKH of its legacy key (m/0/0/i). The same scripts
+    /// as [`Self::p2wpkh_scriptpubkey`] of [`Self::bip86_child_pubkey`],
+    /// [`Self::bip86_p2tr_scriptpubkey`] and the P2WPKH of
+    /// [`Self::bip32_child_pubkey`], derived publicly from the two chain keys
+    /// (one point multiplication per key, not a private derivation each), so
+    /// a device in a browser derives the whole set in a fraction of the time.
+    pub fn wallet_scripts(&self, n: u32) -> Vec<Vec<u8>> {
+        use bitcoin::bip32::Xpub;
+        use bitcoin::key::TapTweak;
+        let bip86_chain = Xpub::from_priv(
+            &self.secp,
+            &self
+                .bip86_base
+                .derive_priv(&self.secp, &[ChildNumber::Normal { index: 0 }])
+                .expect("m/86'/0'/0'/0 derivation"),
+        );
+        let legacy_chain = Xpub::from_priv(&self.secp, &self.bip32);
+        let mut out = Vec::with_capacity(n as usize * 3);
+        for index in 0..n.min(HARDENED) {
+            let i = ChildNumber::Normal { index };
+            let pk = bip86_chain.ckd_pub(&self.secp, i).expect("public derivation").public_key;
+            out.push(self.p2wpkh_scriptpubkey(&pk.serialize()));
+            let (tweaked, _) = pk.x_only_public_key().0.tap_tweak(&self.secp, None);
+            let mut tr = Vec::with_capacity(34);
+            tr.push(0x51); // OP_1
+            tr.push(0x20); // push 32
+            tr.extend_from_slice(&tweaked.serialize());
+            out.push(tr);
+            let legacy = legacy_chain.ckd_pub(&self.secp, i).expect("public derivation").public_key;
+            out.push(self.p2wpkh_scriptpubkey(&legacy.serialize()));
+        }
+        out
+    }
+
     /// `bip86_key()` PRIVATE key for a wallet output at `index`:
     /// m/86'/0'/0'/0/index. This is the key `hsm_key_for_utxo()` uses for EVERY
     /// wallet UTXO on a mnemonic (BIP86) node — note the OUTPUT can still be a
@@ -1068,6 +1104,22 @@ pub fn hash_u5(hrp: &[u8], u5: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wallet scripts derived publicly are the ones the per-index
+    /// functions give.
+    #[test]
+    fn wallet_scripts_match_the_per_index_keys() {
+        let seed = bip39_seed("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", "");
+        let k = Kernel::new(seed.to_vec(), BIP32_VER_TEST_PUBLIC, BIP32_VER_TEST_PRIVATE);
+        let set = k.wallet_scripts(64);
+        assert_eq!(set.len(), 64 * 3);
+        for i in 0..64u32 {
+            let j = i as usize * 3;
+            assert_eq!(set[j], k.p2wpkh_scriptpubkey(&k.bip86_child_pubkey(i)), "p2wpkh {i}");
+            assert_eq!(set[j + 1], k.bip86_p2tr_scriptpubkey(i), "p2tr {i}");
+            assert_eq!(set[j + 2], k.p2wpkh_scriptpubkey(&k.bip32_child_pubkey(i)), "legacy {i}");
+        }
+    }
 
     fn unhex(s: &str) -> Vec<u8> {
         (0..s.len())
