@@ -92,6 +92,20 @@ void resolve_close_command(struct lightningd *ld, struct channel *channel,
 	}
 }
 
+void fail_close_command(struct lightningd *ld, struct channel *channel,
+			const char *why)
+{
+	struct close_command *cc;
+	struct close_command *n;
+
+	list_for_each_safe(&ld->close_commands, cc, n, list) {
+		if (cc->channel != channel)
+			continue;
+		/* Freeing the command frees cc, which leaves the list. */
+		was_pending(command_fail(cc->cmd, LIGHTNINGD, "%s", why));
+	}
+}
+
 /* Destroy the close command structure in reaction to the
  * channel being destroyed. */
 static void

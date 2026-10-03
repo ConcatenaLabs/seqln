@@ -1215,7 +1215,9 @@ static void listen_remote_signer(const char *addr)
  * MAX_MASTER_REJECTS times: a device that was missing state (it is re-primed
  * on reconnect) signs on a later try, while one whose policy refuses the
  * request will refuse it every time.  The last reject is returned like any
- * other, which stops the node with the request named in its log rather than
+ * other: forward_to_signer() tells lightningd of a refused SIGN_COMMITMENT_TX,
+ * which then sends nothing for that transaction, and any other refused
+ * request stops the node with the request named in its log rather than
  * holding it, unanswering, until a device that will never sign appears. */
 #define MAX_MASTER_REJECTS 3
 
@@ -1352,10 +1354,28 @@ static struct io_plan *forward_to_signer(struct io_conn *conn,
 			      hsmd_wire_name(reqt));
 
 	/* Zero-length reply is signerd's error sentinel. */
-	if (tal_bytelen(reply) == 0)
+	if (tal_bytelen(reply) == 0) {
+		/*~ lightningd asks for its own commitment's signature (and for
+		 * a mutual close's, with the same message) only to send that
+		 * transaction: when a channel closes, and again at every start
+		 * for a channel still closing.  A device whose store does not
+		 * record it refuses, rightly.  That must not stop the node (a
+		 * keyless node that cannot start cannot follow the close on
+		 * chain or spend what it pays), so lightningd is told, and
+		 * sends nothing.  Every other refusal of lightningd's own
+		 * requests still ends the node below. */
+		if (is_lightningd(c) && reqt == WIRE_HSMD_SIGN_COMMITMENT_TX) {
+			status_broken("hsmd-proxy: device REFUSED %s: telling"
+				      " lightningd, which sends nothing for that"
+				      " transaction",
+				      hsmd_wire_name(reqt));
+			return req_reply(conn, c,
+					 take(towire_hsmd_sign_commitment_tx_refused(NULL)));
+		}
 		return bad_req_fmt(conn, c, msg_in,
 				   "signerd rejected request %s",
 				   hsmd_wire_name(reqt));
+	}
 
 	/* LISTEN mode: cache the state-establishing requests so a reconnecting
 	 * device can be re-primed to serve this client again. */
@@ -1626,6 +1646,7 @@ static struct io_plan *handle_client(struct io_conn *conn, struct client *c)
 	case WIRE_HSMD_DERIVE_SECRET_REPLY:
 	case WIRE_HSMSTATUS_CLIENT_BAD_REQUEST:
 	case WIRE_HSMD_SIGN_COMMITMENT_TX_REPLY:
+	case WIRE_HSMD_SIGN_COMMITMENT_TX_REFUSED:
 	case WIRE_HSMD_VALIDATE_COMMITMENT_TX_REPLY:
 	case WIRE_HSMD_REVOKE_COMMITMENT_TX_REPLY:
 	case WIRE_HSMD_VALIDATE_REVOCATION_REPLY:

@@ -975,8 +975,8 @@ impl Signer {
     /// commitment it did not validate could pay anything to a P2WSH.
     /// Anything else spending the funding output is held to the mutual-close
     /// policy: lightningd signs the closing transaction it rebroadcasts with
-    /// this message, and refusing it leaves a closing channel's node unable
-    /// to start.
+    /// this message. A refusal of either reaches lightningd, which logs it
+    /// and sends nothing for that transaction.
     fn check_own_commitment(&self, m: &[u8]) -> Result<(), String> {
         let (peer_id, dbid, bt, remote_funding, commit_num) =
             parse_own_commitment(m).ok_or_else(|| "malformed request".to_string())?;

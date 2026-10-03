@@ -144,9 +144,10 @@ that did not keep them, or a lost store) can neither close mutually nor be close
 the device until its next commitment step: a payment either way, or an `update_fee`, which the
 opener sends when its feerate changes. A device moved onto such a store therefore needs one
 commitment step on every channel before those channels can close. A channel already closing
-(`CLOSINGD_COMPLETE` or `AWAITING_UNILATERAL`) when the store lacks them stops the node at its
-next start, because lightningd signs the closing transaction again then: let such closes
-confirm first.
+(`CLOSINGD_COMPLETE` or `AWAITING_UNILATERAL`) when the store lacks them stays closing:
+lightningd signs its closing transaction again at every start, the device refuses it, and
+lightningd logs the refusal and sends nothing. The channel closes when the peer's transaction
+confirms, and onchaind resolves it from the chain as it does any channel.
 
 ## Layout
 
