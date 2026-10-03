@@ -147,6 +147,21 @@ export class SeqlnSigner {
     // normally. Used by the reconnect stress harness to exercise the proxy's
     // B6 fail-soft path (a device reject on a master-fd op must not kill the node).
     this._rejectOnce = opts.rejectOnce ? new Set(opts.rejectOnce.map(Number)) : null;
+    // Payment limits (enforce mode): `paymentLimits` = { default: atoms|null,
+    // period: seconds, assets: { <asset id or 'btc'>: atoms|null } }. The
+    // device approves a payment only within what the limit leaves for the
+    // period, per asset in the asset's own atoms; null means no limit. Unset,
+    // the default is 10,000,000 atoms of each asset per day.
+    if (opts.paymentLimits) this.setPaymentLimits(opts.paymentLimits);
+  }
+
+  // Set the payment limits; see the constructor's `paymentLimits`.
+  setPaymentLimits({ default: dflt, period, assets } = {}) {
+    if (dflt !== undefined) this._inner.setPaymentLimit(undefined, dflt === null ? undefined : dflt);
+    if (period !== undefined) this._inner.setPaymentPeriod(period);
+    for (const [asset, atoms] of Object.entries(assets || {}))
+      this._inner.setPaymentLimit(asset, atoms === null ? undefined : atoms);
+    return this;
   }
 
   // Build from a BIP-39 mnemonic (no passphrase). `opts.wasm` overrides the wasm

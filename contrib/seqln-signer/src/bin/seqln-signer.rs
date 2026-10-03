@@ -110,6 +110,11 @@ fn main() {
         hsm_secret::parse(&bytes).unwrap_or_else(|e| fatal(&format!("bad hsm_secret: {e}")));
 
     let mut signer = Signer::new(secret);
+    // Payment limits: refuse to start on a malformed setting rather than run
+    // without the limit the operator meant to set.
+    let limits = seqln_signer::payments::Limits::from_env()
+        .unwrap_or_else(|e| fatal(&format!("bad payment limit: {e}")));
+    signer.set_limits(limits);
 
     // A per-process log next to the running dir; best effort, never fatal.
     let mut log = std::fs::OpenOptions::new()
@@ -478,6 +483,11 @@ fn serve<S: Read + Write>(
             );
         }
 
+        signer.set_now(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+        );
         let reply: Vec<u8> = match signer.handle(&req) {
             Outcome::Reply(bytes) => bytes,
             Outcome::Sentinel => Vec::new(), // zero-length error sentinel

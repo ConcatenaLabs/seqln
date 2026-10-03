@@ -31,6 +31,9 @@ SIGNER = os.environ.get('SEQLN_SIGNER', os.path.abspath(os.path.join(
     REPO, 'contrib', 'seqln-signer', 'target', 'release', 'seqln-signer')))
 MNEMONIC = ' '.join(['abandon'] * 11 + ['about'])
 PAR = 10**8
+# The device's payment limit (atoms of each asset a day) in these tests: their
+# payments are larger than the default of 10,000,000.
+TEST_PAY_LIMIT = '1000000000'
 
 
 def genkey():
@@ -49,7 +52,7 @@ def free_port():
 class Device(object):
     """The device signer, reconnecting whenever its session ends, as a
     browser does."""
-    def __init__(self, directory, port, priv, host_pub, trace=False):
+    def __init__(self, directory, port, priv, host_pub, trace=False, pay_limit=TEST_PAY_LIMIT):
         self.dir = os.path.join(directory, 'device')
         os.makedirs(self.dir, exist_ok=True)
         with open(os.path.join(self.dir, 'hsm_secret'), 'wb') as f:
@@ -57,7 +60,8 @@ class Device(object):
         self.log = os.path.join(self.dir, 'device.log')
         self.env = dict(os.environ, SEQLN_SIGNER_PRIVKEY=priv,
                         SEQLN_HOST_PEER_PUBKEY=host_pub,
-                        SEQLN_SIGNER_POLICY='enforce')
+                        SEQLN_SIGNER_POLICY='enforce',
+                        SEQLN_SIGNER_PAY_LIMIT=pay_limit)
         if trace:
             self.env['SEQLN_SIGNER_TRACE'] = '1'
         self.cmd = [SIGNER, '--connect', '127.0.0.1:{}'.format(port)]
@@ -92,15 +96,15 @@ class Device(object):
             return f.read().count('TRACE req type=Some({}) '.format(msgtype))
 
 
-def keyless_node(node_factory, directory, trace=False):
+def keyless_node(node_factory, directory, trace=False, pay_limit=TEST_PAY_LIMIT, **node_opts):
     """A node whose hsmd is the proxy, served by a device in enforce mode."""
     port = free_port()
     host_priv, host_pub = genkey()
     dev_priv, dev_pub = genkey()
-    device = Device(directory, port, dev_priv, host_pub, trace)
+    device = Device(directory, port, dev_priv, host_pub, trace, pay_limit)
     device.start()
     node = node_factory.get_node(start=False, may_fail=True,
-                                 options={'subdaemon': 'hsmd:' + PROXY})
+                                 options={'subdaemon': 'hsmd:' + PROXY}, **node_opts)
     node.daemon.env.update({'SEQLN_SIGNER_LISTEN': '127.0.0.1:{}'.format(port),
                             'SEQLN_HOST_PRIVKEY': host_priv,
                             'SEQLN_SIGNER_PEER_PUBKEY': dev_pub,

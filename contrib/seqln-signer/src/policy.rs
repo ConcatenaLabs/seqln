@@ -57,10 +57,11 @@
 //! the committed output against the node's own cached wallet scripts, and the
 //! two HTLC-tx signs (`sign_remote_htlc_tx`, `sign_any_local_htlc_tx`) against
 //! the reconstructed to_local P2WSH — see `dispatch.rs::check_sweep_outputs`.
-//! Still deferred to a VLS-parity follow-up (signed as today, even in enforce):
-//! rate-limiting and per-state velocity checks.
+//! Payment approval and the per-asset payment limits are checked on the same
+//! two commitment requests, in `crate::payments`.
 
 use crate::kernel::{ElementsTx, Kernel, Network, TxOutput};
+use crate::payments::{AssetKey, Ledger, Offered, PayTrack, SideTrack};
 use bitcoin::hashes::{hash160, ripemd160, sha256, Hash};
 
 /// Signing policy. DEFAULT is now `Enforce` (the watchtower custody guard: the
@@ -108,6 +109,7 @@ pub enum Side {
 }
 
 /// One HTLC from a commitment request (`hsm_htlc` subtype).
+#[derive(Clone, Copy, Debug)]
 pub struct Htlc {
     /// `htlc_owner`: LOCAL(0) or REMOTE(1) — decides offered vs received.
     pub side: u8,
@@ -171,6 +173,10 @@ pub struct ChannelState {
     /// kept (an honest channel holds two at most: the current commitment and
     /// its replacement, between validating one and revoking the other).
     pub validated: Vec<(u64, [u8; 32])>,
+    /// What the channel's commitments pay away: its asset, the latest
+    /// commitment on each side, and the loss charged so far
+    /// (`crate::payments`).
+    pub pay: PayTrack,
 }
 
 /// How many unrevoked validated commitments a channel record keeps.
@@ -228,6 +234,9 @@ impl ChannelState {
             self.record_validated(n, txid);
         }
         self.drop_revoked();
+        if self.pay == PayTrack::default() {
+            self.pay = old.pay.clone();
+        }
         if !old.local_shutdown_script.is_empty() {
             self.local_shutdown_script = old.local_shutdown_script.clone();
         }
@@ -281,17 +290,27 @@ fn max_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
 }
 
 /// The in-memory store of channel states. A device tracks few channels, so a
-/// flat map is ample; lookups are by (node_id, dbid).
+/// flat map is ample; lookups are by (node_id, dbid). The payment ledger
+/// (approvals and charges across every channel) is kept and persisted with it.
 #[derive(Default)]
 pub struct ChannelStore {
     map: std::collections::HashMap<([u8; 33], u64), ChannelState>,
+    pub ledger: Ledger,
 }
 
 impl ChannelStore {
     pub fn new() -> Self {
         ChannelStore {
             map: std::collections::HashMap::new(),
+            ledger: Ledger::default(),
         }
+    }
+    /// The assets of every channel whose asset is known.
+    pub fn assets(&self) -> Vec<AssetKey> {
+        let mut v: Vec<AssetKey> = self.map.values().filter_map(|st| st.pay.asset).collect();
+        v.sort();
+        v.dedup();
+        v
     }
     pub fn insert(&mut self, node_id: [u8; 33], dbid: u64, st: ChannelState) {
         self.map.insert((node_id, dbid), st);
@@ -354,9 +373,11 @@ pub const CHSTORE_MAGIC: [u8; 4] = *b"SQCH";
 /// revocation counters and both upfront shutdown scripts. Version 3 adds,
 /// after those, the latest local and remote commitment splits. Version 4
 /// adds, after those, the unrevoked validated commitments (count(1), then
-/// number(8) and txid(32) each). Versions 1 to 3 still import (the fields
-/// they lack unknown).
-pub const CHSTORE_VERSION: u8 = 4;
+/// number(8) and txid(32) each). Version 5 adds, after those, the channel's
+/// payment tracking ([`PayTrack`]), and after the last entry the payment
+/// ledger ([`Ledger`]). Versions 1 to 4 still import (the fields they lack
+/// unknown).
+pub const CHSTORE_VERSION: u8 = 5;
 /// The fixed part of an entry, which is the whole of a version-1 entry:
 /// node_id(33) dbid(8) sats(8) txid(32) txout(2) local_delay(2) remote_delay(2)
 /// 5 pubkeys(165) static_remotekey(1) anchors(1)
@@ -398,6 +419,54 @@ fn push_opt_split(out: &mut Vec<u8>, v: Option<(u64, Split)>) {
     }
 }
 
+fn push_side(out: &mut Vec<u8>, side: &Option<SideTrack>) {
+    match side {
+        None => out.push(0),
+        Some(t) => {
+            out.push(1);
+            for x in [t.n, t.value, t.lost] {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+            out.extend_from_slice(&(t.offered.len() as u16).to_le_bytes());
+            for h in &t.offered {
+                out.extend_from_slice(&h.amount_msat.to_le_bytes());
+                out.extend_from_slice(&h.hash);
+                out.extend_from_slice(&h.cltv.to_le_bytes());
+            }
+        }
+    }
+}
+
+/// flag(1) [asset(33)], local side, remote side, charged_lost(8).
+fn push_pay(out: &mut Vec<u8>, p: &PayTrack) {
+    match &p.asset {
+        None => out.push(0),
+        Some(a) => {
+            out.push(1);
+            out.extend_from_slice(&a.encode());
+        }
+    }
+    push_side(out, &p.local);
+    push_side(out, &p.remote);
+    out.extend_from_slice(&p.charged_lost.to_le_bytes());
+}
+
+/// approvals: count(2) then hash(32) at(8); charges: count(2) then
+/// asset(33) at(8) msat(8).
+fn push_ledger(out: &mut Vec<u8>, l: &Ledger) {
+    out.extend_from_slice(&(l.approvals.len() as u16).to_le_bytes());
+    for a in &l.approvals {
+        out.extend_from_slice(&a.hash);
+        out.extend_from_slice(&a.at.to_le_bytes());
+    }
+    out.extend_from_slice(&(l.spends.len() as u16).to_le_bytes());
+    for s in &l.spends {
+        out.extend_from_slice(&s.asset.encode());
+        out.extend_from_slice(&s.at.to_le_bytes());
+        out.extend_from_slice(&s.msat.to_le_bytes());
+    }
+}
+
 /// Encode the whole store (deterministically; no MAC — the dispatcher owns
 /// keying and appends it).
 pub fn encode_channel_store(store: &ChannelStore) -> Vec<u8> {
@@ -432,7 +501,9 @@ pub fn encode_channel_store(store: &ChannelStore) -> Vec<u8> {
             out.extend_from_slice(&n.to_le_bytes());
             out.extend_from_slice(txid);
         }
+        push_pay(&mut out, &st.pay);
     }
+    push_ledger(&mut out, &store.ledger);
     out
 }
 
@@ -475,6 +546,63 @@ impl<'a> StoreReader<'a> {
     fn u64(&mut self) -> Result<u64, String> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
+    fn u16(&mut self) -> Result<u16, String> {
+        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+    }
+    fn side(&mut self) -> Result<Option<SideTrack>, String> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => {
+                let (n, value, lost) = (self.u64()?, self.u64()?, self.u64()?);
+                let count = self.u16()? as usize;
+                if count > crate::payments::MAX_OFFERED {
+                    return Err(format!("{count} offered HTLCs in a channel-store entry"));
+                }
+                let mut offered = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let amount_msat = self.u64()?;
+                    let hash: [u8; 32] = self.take(32)?.try_into().unwrap();
+                    let cltv = u32::from_le_bytes(self.take(4)?.try_into().unwrap());
+                    offered.push(Offered { amount_msat, hash, cltv });
+                }
+                Ok(Some(SideTrack { n, value, offered, lost }))
+            }
+            v => Err(format!("bad side flag {v} in channel-store blob")),
+        }
+    }
+    fn pay(&mut self) -> Result<PayTrack, String> {
+        let asset = match self.u8()? {
+            0 => None,
+            1 => Some(AssetKey::decode(self.take(33)?)?),
+            v => return Err(format!("bad asset flag {v} in channel-store blob")),
+        };
+        let local = self.side()?;
+        let remote = self.side()?;
+        let charged_lost = self.u64()?;
+        Ok(PayTrack { asset, local, remote, charged_lost })
+    }
+    fn ledger(&mut self) -> Result<Ledger, String> {
+        use crate::payments::{Approval, Spend, MAX_APPROVALS, MAX_SPENDS};
+        let mut l = Ledger::default();
+        let n = self.u16()? as usize;
+        if n > MAX_APPROVALS {
+            return Err(format!("{n} approvals in a channel-store blob"));
+        }
+        for _ in 0..n {
+            let hash: [u8; 32] = self.take(32)?.try_into().unwrap();
+            l.approvals.push(Approval { hash, at: self.u64()? });
+        }
+        let n = self.u16()? as usize;
+        if n > MAX_SPENDS {
+            return Err(format!("{n} charges in a channel-store blob"));
+        }
+        for _ in 0..n {
+            let asset = AssetKey::decode(self.take(33)?)?;
+            let at = self.u64()?;
+            l.spends.push(Spend { asset, at, msat: self.u64()? });
+        }
+        Ok(l)
+    }
     fn opt_split(&mut self) -> Result<Option<(u64, Split)>, String> {
         match self.u8()? {
             0 => Ok(None),
@@ -488,16 +616,18 @@ impl<'a> StoreReader<'a> {
     }
 }
 
+/// A decoded channel-store payload: its entries and its payment ledger
+/// (empty before version 5).
+pub type DecodedStore = (Vec<(([u8; 33], u64), ChannelState)>, Ledger);
+
 /// Decode a channel-store payload (the MAC must already have been verified
-/// and stripped by the caller). Takes versions 1 to 4.
-pub fn decode_channel_store(
-    bytes: &[u8],
-) -> Result<Vec<(([u8; 33], u64), ChannelState)>, String> {
+/// and stripped by the caller). Takes versions 1 to 5.
+pub fn decode_channel_store(bytes: &[u8]) -> Result<DecodedStore, String> {
     if bytes.len() < 9 || bytes[..4] != CHSTORE_MAGIC {
         return Err("not a channel-store blob (bad magic)".to_string());
     }
     let version = bytes[4];
-    if !(1..=4).contains(&version) {
+    if !(1..=5).contains(&version) {
         return Err(format!("unsupported channel-store version {version}"));
     }
     let count = u32::from_le_bytes(bytes[5..9].try_into().unwrap()) as usize;
@@ -532,6 +662,7 @@ pub fn decode_channel_store(
             local_split: None,
             remote_split: None,
             validated: Vec::new(),
+            pay: PayTrack::default(),
         };
         if version >= 2 {
             st.is_outbound = r.opt_bool()?;
@@ -556,12 +687,16 @@ pub fn decode_channel_store(
             }
             st.drop_revoked();
         }
+        if version >= 5 {
+            st.pay = r.pay()?;
+        }
         out.push(((node_id, dbid), st));
     }
+    let ledger = if version >= 5 { r.ledger()? } else { Ledger::default() };
     if r.o != bytes.len() {
         return Err("channel-store blob has trailing bytes".to_string());
     }
-    Ok(out)
+    Ok((out, ledger))
 }
 
 /// Decode a BOLT/BOLT channel_type feature bitfield (BOLT-1 big-endian: the
@@ -1259,6 +1394,23 @@ pub fn expected_htlc_tx_to_local(
         &ks.self_revocation_key,
         &ks.self_delayed_key,
     )))
+}
+
+/// The script of `htlc`'s output on the commitment of `side` at per-commitment
+/// `point`, for harnesses that build commitments carrying HTLCs.
+pub fn htlc_output_script(
+    kernel: &Kernel,
+    node_id: &[u8; 33],
+    dbid: u64,
+    st: &ChannelState,
+    side: Side,
+    point: &[u8; 33],
+    htlc: &Htlc,
+) -> Result<Vec<u8>, String> {
+    let static_remotekey = st.option_static_remotekey || st.option_anchors;
+    let our_bp = kernel.channel_basepoints(node_id, dbid);
+    let ks = build_keyset(kernel, st, &our_bp, side, point, static_remotekey)?;
+    Ok(expected_scripts(&ks, st, side, std::slice::from_ref(htlc)).pop().expect("one HTLC"))
 }
 
 fn hexstr(b: &[u8]) -> String {

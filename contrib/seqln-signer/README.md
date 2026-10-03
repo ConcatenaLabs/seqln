@@ -90,15 +90,41 @@ What enforce mode checks:
   before they were recorded, or a channel armed from the node's own data) reveals only
   commitment 0 until it has validated a later commitment.
 - **Sweeps, penalties and HTLC transactions**: they pay only the node's own outputs.
+- **Payments** (`src/payments.rs`): `pay` and `keysend` ask the device to approve each payment
+  (`PREAPPROVE_INVOICE`, `PREAPPROVE_KEYSEND`) before offering an HTLC. The device approves the
+  payment hash when the amount, with a routing-fee allowance (half a percent, at least 5,000
+  msat), fits in what the payment limit leaves for the period; the request does not name the
+  asset, so it must fit for every asset the device has channels in. A commitment, ours or the
+  peer's, that lists for the first time an HTLC this node offers is signed only when that HTLC's
+  payment hash was approved, and its amount is charged to the channel asset. Value that leaves
+  this side without a listed HTLC (an HTLC trimmed as dust has no output, so the request does not
+  list it) is charged too, once the commitments show it gone. A commitment that would take the
+  asset over its limit is refused. A payment sent without approval (`sendpay`, `sendonion` or
+  `xpay` on their own) is therefore refused at the commitment: channeld stops, lightningd fails
+  the HTLC back, and the channel is idle until the peer reconnects. Call `preapproveinvoice` or
+  `preapprovekeysend` first.
 
-Not checked: how a commitment splits the channel between the two sides, and which payments are
-made: the device approves every invoice and keysend, and there is no rate limiting. So the
-device does not protect a user from a host that also runs the channel's peer. Such a host can
-pay the peer, or broadcast a commitment the device signed for the watchtower's preempt slot
-before the device revoked it, which the peer then takes whole with the revocation secret.
+The payment limit is an amount of each asset, in its own atoms, over a sliding period: by default
+10,000,000 atoms of each asset (Bitcoin included) a day, the largest channel the hosted service
+sells. Native: `SEQLN_SIGNER_PAY_LIMIT` (atoms, or `none`), `SEQLN_SIGNER_PAY_LIMITS`
+(`<asset>=<atoms|none>,...`, each asset `btc` or a display-order asset id) and
+`SEQLN_SIGNER_PAY_PERIOD` (seconds); the signer refuses to start on a malformed value. WASM:
+`setPaymentLimit(asset, atoms)` and `setPaymentPeriod(seconds)`, or the SDK's `paymentLimits`
+option. An HTLC is charged when it is first committed, so an attempt that then fails still counts
+until the period has passed; one whose amount lies between the two commitments' dust thresholds
+(listed on one, trimmed on the other: a few hundred atoms wide at floor feerates) is charged twice. A channel the device tracked before it kept payment records takes
+its first commitment as the baseline, whatever HTLCs it carries.
 
-The channel store (each channel's parameters, revocation counters, recorded balance and the
-unrevoked commitments it validated) carries no secret and is authenticated by a MAC keyed from the seed. The native signer keeps it in
+Not checked: how a commitment splits the channel between the two sides beyond what the payment
+accounting sees. So the device does not protect a user from a host that also runs the channel's
+peer. Such a host can broadcast a commitment the device signed for the watchtower's preempt slot
+before the device revoked it, which the peer then takes whole with the revocation secret; and the
+peer can sign commitments that move the balance without any HTLC, which the device charges to the
+limit but cannot tell from a payment.
+
+The channel store (each channel's parameters, revocation counters, recorded balance, the
+unrevoked commitments it validated and its payment tracking, and the approvals and charges against
+the payment limits) carries no secret and is authenticated by a MAC keyed from the seed. The native signer keeps it in
 `seqln-signer-channels` in its working directory (or the path in `SEQLN_SIGNER_STORE`): it
 loads the file at start and rewrites it durably (temporary file, sync, rename) after every
 request that changed it, before the reply leaves, refusing the request if the file cannot be
@@ -113,6 +139,7 @@ written. The WASM build hands the same blob to the wallet's `channelStore` to ke
 | `src/frame.rs` | Little-endian signer-split transport framing (`hsmd/signer_frame.h`). |
 | `src/noise.rs` | BOLT-8 Noise_XK transport state machine (no sockets). |
 | `src/policy.rs` | Enforce-mode commitment validation. |
+| `src/payments.rs` | Payment approval, the per-asset payment limits and their accounting, BOLT 11 decoding. |
 | `src/dispatch.rs` | Request -> reply dispatch; channel-state tracking for the policy. |
 | `src/hsm_secret.rs` | On-disk mnemonic `hsm_secret` parsing. |
 | `src/bin/seqln-signer.rs` | The device signer binary (fd / `--listen` / `--connect` modes, `--genkey`). |
@@ -166,7 +193,9 @@ out-of-band first (`seqln-signer --genkey` prints a keypair):
 - Device connects out (browser topology; also `seqln-signer --connect` for native testing):
   host proxy with `SEQLN_SIGNER_LISTEN=<bind:port>` (reconnect-tolerant), same key pinning.
 
-Other environment knobs: `SEQLN_SIGNER_POLICY=enforce|permissive` (default enforce),
+Other environment knobs: `SEQLN_SIGNER_POLICY=enforce|permissive` (default enforce), the payment
+limits `SEQLN_SIGNER_PAY_LIMIT`, `SEQLN_SIGNER_PAY_LIMITS` and `SEQLN_SIGNER_PAY_PERIOD` (see
+"Scope"),
 `SEQLN_SIGNER_TRACE` (per-request trace logging), `SEQLN_SIGNER_STORE` (the channel store's path,
 default `seqln-signer-channels` in the working directory), `SEQLN_SIGNER_CONNECT` (the env form of
 `--connect`), and `SEQLN_SIGNER_NETWORK=bitcoin|elements`, which selects the sighash family when one
