@@ -250,6 +250,10 @@ bool depthcb_update_scid(struct channel *channel UNNEEDED,
 /* Generated stub for dev_disconnect_permanent */
 bool dev_disconnect_permanent(struct lightningd *ld UNNEEDED)
 { fprintf(stderr, "dev_disconnect_permanent called!\n"); abort(); }
+/* Generated stub for fail_close_command */
+void fail_close_command(struct lightningd *ld UNNEEDED, struct channel *channel UNNEEDED,
+			const char *why UNNEEDED)
+{ fprintf(stderr, "fail_close_command called!\n"); abort(); }
 /* Generated stub for fatal */
 void   fatal(const char *fmt UNNEEDED, ...)
 { fprintf(stderr, "fatal called!\n"); abort(); }
@@ -357,6 +361,9 @@ bool fromwire_hsmd_node_announcement_sig_reply(const void *p UNNEEDED, secp256k1
 /* Generated stub for fromwire_hsmd_sign_any_cannouncement_reply */
 bool fromwire_hsmd_sign_any_cannouncement_reply(const void *p UNNEEDED, secp256k1_ecdsa_signature *node_signature UNNEEDED, secp256k1_ecdsa_signature *bitcoin_signature UNNEEDED)
 { fprintf(stderr, "fromwire_hsmd_sign_any_cannouncement_reply called!\n"); abort(); }
+/* Generated stub for fromwire_hsmd_sign_commitment_tx_refused */
+bool fromwire_hsmd_sign_commitment_tx_refused(const void *p UNNEEDED)
+{ fprintf(stderr, "fromwire_hsmd_sign_commitment_tx_refused called!\n"); abort(); }
 /* Generated stub for fromwire_hsmd_sign_commitment_tx_reply */
 bool fromwire_hsmd_sign_commitment_tx_reply(const void *p UNNEEDED, struct bitcoin_signature *sig UNNEEDED)
 { fprintf(stderr, "fromwire_hsmd_sign_commitment_tx_reply called!\n"); abort(); }

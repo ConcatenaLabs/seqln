@@ -16,6 +16,10 @@ const char *cmd_id_from_close_command(const tal_t *ctx,
 void resolve_close_command(struct lightningd *ld, struct channel *channel,
 			   bool cooperative, const struct bitcoin_tx **close_txs);
 
+/* Fail a close command for a channel whose closing transaction was not sent. */
+void fail_close_command(struct lightningd *ld, struct channel *channel,
+			const char *why);
+
 void peer_start_closingd(struct channel *channel,
 			 struct peer_fd *peer_fd);
 

@@ -287,6 +287,21 @@ a user device while a host runs the node:
   sent again when a device reconnects (a device that was missing state is re-primed then); a
   request refused three times ends the node, with the request named in its log, rather than
   holding the node unanswering.
+- The one exception is the signature of the node's own closing transaction. lightningd asks
+  for it (`SIGN_COMMITMENT_TX`, for its commitment and for a mutual close alike) when a channel
+  closes, and again at every start for each channel in `CLOSINGD_COMPLETE` or
+  `AWAITING_UNILATERAL`. A device whose store does not record that transaction (a store an
+  older device wrote, or a lost one) refuses it. The proxy then answers
+  `hsmd_sign_commitment_tx_refused` (`hsmd/hsmd_wire.csv`, `hsmd/hsmd_proxy.c`), and lightningd
+  (`lightningd/peer_control.c`) logs the refusal with the channel and the transaction, sends
+  nothing, and goes on starting. The channel stays in its state; once its funding is spent,
+  onchaind resolves it from the chain. What a mutual close or an HTLC sweep pays the node is a
+  wallet output the device signs a spend of like any other; the output the peer's commitment
+  pays the node (to the channel's payment key) is held in the wallet, but the device signs
+  withdrawals only from the wallet's own keys and leaves it unsigned. A `close` waiting on that
+  transaction fails with the refusal
+  (`lightningd/closing_control.c`). A node with its own keys is never refused, and signs and
+  sends the transaction as before.
 
 ## 7b. Specula keyless watchtower
 
@@ -371,12 +386,15 @@ the certified-frontier clamp, a Bitcoin reorg unwinding Sequentia blocks under a
 the network defaults, the output a peer's commitment pays this node listed and spent in the
 channel's asset (`test_close_output_asset.py`), a breach of an asset channel with a pending HTLC
 answered by `speculad` while the victim is offline (`test_watchtower.py`), a keyless node, as
-either side of a channel, closing it and restarting with it closing (`test_keyless_close.py`), the
+either side of a channel, closing it and restarting with it closing (`test_keyless_close.py`), a
+keyless node whose device, moved onto an older store, refuses its closing transaction, at start
+in each closing state and after `close` times out, and one with an HTLC on chain
+(`test_keyless_start.py`, which runs on Bitcoin regtest too, with `TEST_NETWORK=regtest`), the
 fees of channels in assets of any value and between peers that value an asset differently
 (`test_fee_market.py`),
 and the asset plugins see on an HTLC, with `holdinvoice-seq` holding only the asset it was
 registered in, across a restart (`test_hold_asset.py`). They need `sequentiad`, `sequentia-cli`
-and a Bitcoin Core `bitcoind` on `PATH`, and the keyless test needs the device signer built
+and a Bitcoin Core `bitcoind` on `PATH`, and the keyless tests need the device signer built
 (`cargo build --release` in `contrib/seqln-signer`, or `SEQLN_SIGNER=/path/to/seqln-signer`):
 
 ```sh

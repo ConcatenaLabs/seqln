@@ -246,6 +246,12 @@ msgdata,hsmd_sign_commitment_tx,commit_num,u64,
 msgtype,hsmd_sign_commitment_tx_reply,105
 msgdata,hsmd_sign_commitment_tx_reply,sig,bitcoin_signature,
 
+# Sequentia: the hsmd proxy's reply when the signing device refused
+# hsmd_sign_commitment_tx from lightningd (the device's refusal carries no
+# reason; its own log has it).  lightningd then sends nothing for that
+# transaction.
+msgtype,hsmd_sign_commitment_tx_refused,1105
+
 #include <common/htlc_wire.h> // For enum side and towire_side
 subtype,hsm_htlc
 subtypedata,hsm_htlc,side,enum side,

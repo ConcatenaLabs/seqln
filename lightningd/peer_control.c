@@ -237,10 +237,13 @@ u8 *p2tr_for_keyidx(const tal_t *ctx, struct lightningd *ld, u64 keyidx)
  *   them (due to a failed connection),
  *     - Note: this is to reduce the above risk.
  */
-struct bitcoin_tx *sign_last_tx(const tal_t *ctx,
-				const struct channel *channel,
-				const struct bitcoin_tx *last_tx,
-				const struct bitcoin_signature *last_sig)
+/* NULL when hsmd says the signing device refused: only a keyless node's
+ * proxy says that, of a device whose store does not record this
+ * transaction. */
+static struct bitcoin_tx *sign_last_tx_unless_refused(const tal_t *ctx,
+						      const struct channel *channel,
+						      const struct bitcoin_tx *last_tx,
+						      const struct bitcoin_signature *last_sig)
 {
 	struct lightningd *ld = channel->peer->ld;
 	struct bitcoin_signature sig;
@@ -259,6 +262,8 @@ struct bitcoin_tx *sign_last_tx(const tal_t *ctx,
 					     commit_index);
 
 	msg = hsm_sync_req(tmpctx, ld, take(msg));
+	if (fromwire_hsmd_sign_commitment_tx_refused(msg))
+		return tal_free(tx);
 	if (!fromwire_hsmd_sign_commitment_tx_reply(msg, &sig))
 		fatal("HSM gave bad sign_commitment_tx_reply %s",
 		      tal_hex(tmpctx, msg));
@@ -269,6 +274,24 @@ struct bitcoin_tx *sign_last_tx(const tal_t *ctx,
 				 &channel->local_funding_pubkey);
 
 	bitcoin_tx_input_set_witness(tx, 0, take(witness));
+	return tx;
+}
+
+struct bitcoin_tx *sign_last_tx(const tal_t *ctx,
+				const struct channel *channel,
+				const struct bitcoin_tx *last_tx,
+				const struct bitcoin_signature *last_sig)
+{
+	struct bitcoin_tx *tx = sign_last_tx_unless_refused(ctx, channel,
+							     last_tx, last_sig);
+	if (!tx) {
+		struct bitcoin_txid txid;
+		bitcoin_txid(last_tx, &txid);
+		fatal("The signing device refused to sign transaction %s"
+		      " of channel %s",
+		      fmt_bitcoin_txid(tmpctx, &txid),
+		      fmt_channel_id(tmpctx, &channel->cid));
+	}
 	return tx;
 }
 
@@ -305,6 +328,17 @@ static bool commit_tx_send_finished(struct channel *channel,
 	return false;
 }
 
+/* BOLT #3: a commitment transaction's locktime carries 0x20 in its upper 8
+ * bits, and its one input's sequence 0x80; a mutual close carries neither. */
+static bool is_commitment_shaped(const struct bitcoin_tx *tx)
+{
+	return (tx->wtx->locktime >> 24) == 0x20
+		&& tx->wtx->num_inputs == 1
+		&& (tx->wtx->inputs[0].sequence >> 24) == 0x80;
+}
+
+/* NULL when the signing device refused to sign it: nothing is sent, and
+ * the channel stays in its state. */
 static struct bitcoin_tx *sign_and_send_last(const tal_t *ctx,
 					     struct lightningd *ld,
 					     struct channel *channel,
@@ -316,7 +350,32 @@ static struct bitcoin_tx *sign_and_send_last(const tal_t *ctx,
 	struct anchor_details *adet;
 	struct bitcoin_tx *tx;
 
-	tx = sign_last_tx(ctx, channel, last_tx, last_sig);
+	tx = sign_last_tx_unless_refused(ctx, channel, last_tx, last_sig);
+	if (!tx) {
+		/* A keyless node's device that does not record this
+		 * transaction (a store an older device wrote, or a lost one)
+		 * refuses it, and is right to.  The node goes on: if the
+		 * funding is spent, the funding_spend_watch hands the close to
+		 * onchaind like any other. */
+		bitcoin_txid(last_tx, &txid);
+		log_broken(channel->log,
+			   "The signing device refused to sign our %s transaction"
+			   " %s%s in state %s: not broadcasting it. The channel%s%s"
+			   " stays in that state; once its funding is spent,"
+			   " onchaind resolves it from the chain.",
+			   is_commitment_shaped(last_tx)
+			   ? "commitment" : "mutual close",
+			   fmt_bitcoin_txid(tmpctx, &txid),
+			   is_commitment_shaped(last_tx)
+			   ? tal_fmt(tmpctx, " (number %"PRIu64")",
+				     channel->next_index[LOCAL] - 1)
+			   : "",
+			   channel_state_name(channel),
+			   channel->scid ? " " : "",
+			   channel->scid
+			   ? fmt_short_channel_id(tmpctx, *channel->scid) : "");
+		return NULL;
+	}
 	bitcoin_txid(tx, &txid);
 	wallet_transaction_add(ld->wallet, tx->wtx, 0, 0);
 	wallet_extract_owned_outputs(ld->wallet, tx->wtx, false, NULL, NULL);
@@ -463,26 +522,43 @@ void drop_to_chain(struct lightningd *ld, struct channel *channel,
 		resolve_close_command(ld, channel, cooperative, txs);
 	} else {
 		const struct bitcoin_tx **txs = tal_arr(tmpctx, const struct bitcoin_tx*, 0);
+		bool refused = false;
+		struct bitcoin_tx *tx;
 
 		/* We need to drop *every* commitment transaction to chain */
 		if (!cooperative && !list_empty(&channel->inflights)) {
 			list_for_each(&channel->inflights, inflight, list) {
 				if (!inflight->last_tx)
 					continue;
-				tal_arr_expand(&txs, sign_and_send_last(tmpctx,
-									ld,
-									channel,
-									cmd_id,
-									inflight->last_tx,
-									&inflight->last_sig));
+				tx = sign_and_send_last(tmpctx, ld, channel,
+							cmd_id,
+							inflight->last_tx,
+							&inflight->last_sig);
+				if (tx)
+					tal_arr_expand(&txs, tx);
+				else
+					refused = true;
 			}
-		} else
-			tal_arr_expand(&txs, sign_and_send_last(tmpctx, ld,
-								channel, cmd_id,
-								channel->last_tx,
-								&channel->last_sig));
+		} else {
+			tx = sign_and_send_last(tmpctx, ld, channel,
+						cmd_id,
+						channel->last_tx,
+						&channel->last_sig);
+			if (tx)
+				tal_arr_expand(&txs, tx);
+			else
+				refused = true;
+		}
 
-		resolve_close_command(ld, channel, cooperative, txs);
+		/* A `close` waiting on this gets an error, not a success
+		 * naming no transaction. */
+		if (refused && tal_count(txs) == 0)
+			fail_close_command(ld, channel,
+					   "The signing device refused to sign"
+					   " the closing transaction: it was not"
+					   " broadcast");
+		else
+			resolve_close_command(ld, channel, cooperative, txs);
 	}
 
 	/* In cooperative mode, we're assuming that we closed the right one:
