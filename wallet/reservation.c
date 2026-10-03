@@ -223,16 +223,16 @@ AUTODATA(json_command, &unreserveinputs_command);
 
 /**
  * asset_tx_fee - the on-chain fee for @weight, denominated in the funding asset.
- * @feerate_per_kw: feerate we have to pay (policy-asset feerate).
+ * @feerate_per_kw: feerate we have to pay, in reference atoms per kw.
  * @weight: weight of transaction so far.
  * @rate: the funding asset's exchange rate R (atoms of the asset worth
- *        EXCHANGE_RATE_SCALE reference/policy fee atoms); EXCHANGE_RATE_SCALE
- *        for the policy asset itself.
+ *        EXCHANGE_RATE_SCALE reference fee atoms); EXCHANGE_RATE_SCALE at
+ *        par (and on a chain without assets).
  *
- * The policy fee (in policy atoms) is amount_tx_fee(feerate, weight).  For a
- * non-policy funding asset we convert it into asset atoms preserving fee VALUE,
- * exactly as the node does in ConvertValueToAmount:
- *   asset_fee_atoms = ceil(policy_fee_atoms * EXCHANGE_RATE_SCALE / R).
+ * The reference fee is amount_tx_fee(feerate, weight).  We convert it into
+ * asset atoms preserving fee VALUE, exactly as the node does in
+ * ConvertValueToAmount:
+ *   asset_fee_atoms = ceil(reference_fee_atoms * EXCHANGE_RATE_SCALE / R).
  * Using the same integer R and the same ceil guarantees the node's re-valuation
  * of the fee agrees with ours by construction (first principle #4).
  */
@@ -241,7 +241,7 @@ static struct amount_sat asset_tx_fee(u32 feerate_per_kw, size_t weight,
 {
 	struct amount_sat pol = amount_tx_fee(feerate_per_kw, weight);
 
-	/* Policy asset (or non-elements): identity, byte-for-byte the old path. */
+	/* At par: identity, byte-for-byte the upstream path. */
 	if (rate == EXCHANGE_RATE_SCALE)
 		return pol;
 
@@ -634,20 +634,21 @@ static struct command_result *json_fundpsbt(struct command *cmd,
 	if (have_anchor_channel(cmd->ld))
 		*keep_emergency_funds = true;
 
-	/* Resolve the funding-asset fee exchange rate up front: the policy
-	 * asset (or non-elements) is 1:1 (EXCHANGE_RATE_SCALE); a whitelisted
-	 * asset uses the rate the backend advertises; anything else cannot pay
-	 * fees.  We size every on-chain fee below via this rate so the node's
-	 * re-valuation of the fee agrees with ours (first principle #4). */
-	bool is_policy = !is_elements(chainparams) || asset == NULL
-			 || memcmp(asset, chainparams->fee_asset_tag, 33) == 0;
-	u64 rate = is_policy ? EXCHANGE_RATE_SCALE
-			     : topo_asset_fee_rate(cmd->ld->topology, asset);
-	if (!is_policy && rate == 0) {
+	/* Resolve the funding-asset fee exchange rate up front: a whitelisted
+	 * asset uses the rate the backend advertises (the policy asset too, on
+	 * a Sequentia network; topo_asset_fee_rate() gives it par elsewhere);
+	 * anything else cannot pay fees.  We size every on-chain fee below via
+	 * this rate so the node's re-valuation of the fee agrees with ours
+	 * (first principle #4).  A chain without assets is 1:1. */
+	const u8 *fee_asset = asset ? asset : chainparams->fee_asset_tag;
+	u64 rate = !is_elements(chainparams) || !fee_asset
+		? EXCHANGE_RATE_SCALE
+		: topo_asset_fee_rate(cmd->ld->topology, fee_asset);
+	if (rate == 0) {
 		/* Recover the display id from the 33-byte tag for the message. */
 		u8 id[32];
 		for (size_t i = 0; i < sizeof(id); i++)
-			id[i] = asset[sizeof(id) - i];
+			id[i] = fee_asset[sizeof(id) - i];
 		return command_fail(cmd, FUND_CANNOT_AFFORD,
 				    "asset %s is not accepted for fees by the"
 				    " backend",

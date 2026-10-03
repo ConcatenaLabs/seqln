@@ -122,21 +122,40 @@ privileged fee asset), so a node returns no `estimatesmartfee`-style feerate:
   asset a rate R: one atom of it is worth R / `EXCHANGE_RATE_SCALE` (1e8) reference atoms). A
   plain `bitcoind` backend yields an empty whitelist rather than an error.
 - `lightningd/bitcoind.c`, `lightningd/chaintopology.{c,h}`, `common/amount.{c,h}`: plumb and
-  cache those exchange rates (`EXCHANGE_RATE_SCALE`, per-asset rate lookup; the policy asset is
-  always 1:1), refreshed on the feerate poll.
-- `wallet/reservation.c` `asset_tx_fee()`: when funding in a non-policy asset, the on-chain fee is
-  converted from the policy fee into asset atoms preserving fee *value*:
-  `asset_fee_atoms = ceil(policy_fee_atoms * 1e8 / rate)`. The policy asset takes the identity
-  path, byte-for-byte the upstream behaviour.
+  cache those exchange rates (`EXCHANGE_RATE_SCALE`, per-asset rate lookup), read once before any
+  channel starts and refreshed on the feerate poll. The policy asset, the Sequence token, is one
+  asset among equals: `bcli` resolves the node's labels (its "bitcoin" among them) to hex ids, so
+  it arrives at the rate its node gives it, and a node that does not list it does not accept it
+  for fees. On Liquid the policy asset stays at par.
+- `wallet/reservation.c` `asset_tx_fee()`: the on-chain fee of a wallet transaction is converted
+  from the reference fee into atoms of the funding asset preserving fee *value*:
+  `asset_fee_atoms = ceil(reference_fee_atoms * 1e8 / rate)`, the Sequence token included.
+- `common/amount.c` `amount_tx_fee()`: on a Sequentia network every fee is rounded up rather than
+  down, so a positive feerate never yields a fee of 0 atoms (which consensus refuses) and a fee is
+  always worth at least its feerate times the weight. An atom of a valuable asset can be worth
+  thousands of reference atoms, so the relay floor can be 1 atom per kw. Both sides of a channel
+  size its commitment and HTLC transactions with this, and onchaind also matches HTLC signatures
+  made by a build that rounded down.
 - Channel transactions pay their fee in the channel asset, so every feerate a channel uses is
   stated in that asset's atoms per kw, converted the same way (`feerate_in_asset()`,
   `channel_asset_feerate()`): the commitment feerate the opener proposes at open and in
   `update_fee`, the limits each side judges the other's feerate by, the mutual-close feerates and
-  the onchaind sweep fees. HTLC transactions take the commitment feerate, so they follow. The
-  fundee converts its limits at its own rate for the asset (`openingd_init` carries the node's
-  rates) and refuses a channel in an asset it holds no rate for; a rate change moves an open
-  channel's feerates as a new estimate would. No peer-wire change: `update_fee` already carries a
-  number the receiver checks against its own limits.
+  the onchaind sweep fees. HTLC transactions take the commitment feerate, so they follow. A rate
+  change moves an open channel's feerates as a new estimate would. No peer-wire change:
+  `update_fee` carries a number in the channel asset's atoms, and each side values it at its own
+  rate:
+  - the opener proposes at least one and a half times its relay floor
+    (`commitment_feerate_floor()`), so a peer that values the asset up to a third lower still
+    sees the feerate clear its own floor;
+  - the receiver's limits are its relay floor and `feerate_max()` (ten times its highest
+    estimate), each converted at its own rate (`peer_commitment_feerate_min()`; `openingd_init`
+    carries the node's rates for an open). An `update_fee` outside them is refused with a warning,
+    and lightningd refreshes its rates at once (each node polls its own, so the receiver may have
+    judged by a rate older than the opener's). Refused again within ten minutes by the refreshed
+    rates, it fails the channel, saying why, instead of disconnecting at every reconnect;
+  - a fundee with no rate for the channel asset refuses a channel in it, and in an open channel
+    holds the opener to the last limits its rate gave, or, with none since it started, to the
+    current feerate.
 
 ## 5. Asset-aware channels
 

@@ -438,6 +438,8 @@ struct channel *new_unsaved_channel(struct peer *peer,
 
 	channel->lease_commit_sig = NULL;
 	channel->ignore_fee_limits = ld->config.ignore_fee_limits;
+	channel->have_feerate_limits = false;
+	channel->update_fee_refused = false;
 	channel->last_stable_connection = 0;
 	channel->stable_conn_timer = NULL;
 	channel->onchaind_replay_watches = NULL;
@@ -742,6 +744,8 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 	channel->close_blockheight = NULL;
 	channel->state_change_cause = reason;
 	channel->ignore_fee_limits = ignore_fee_limits;
+	channel->have_feerate_limits = false;
+	channel->update_fee_refused = false;
 	channel->last_stable_connection = last_stable_connection;
 	channel->stable_conn_timer = NULL;
 	channel->onchaind_replay_watches = NULL;

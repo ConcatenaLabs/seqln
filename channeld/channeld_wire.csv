@@ -393,6 +393,13 @@ msgdata,channeld_dev_memleak_reply,leak,bool,
 # Peer presented proof it was from the future.
 msgtype,channeld_fail_fallen_behind,1028
 
+# Channeld tells the master it refused the peer's update_fee as out of
+# range (on a Sequentia network), just before it warns and disconnects.
+msgtype,channeld_update_fee_refused,1029
+msgdata,channeld_update_fee_refused,feerate,u32,
+msgdata,channeld_update_fee_refused,feerate_min,u32,
+msgdata,channeld_update_fee_refused,feerate_max,u32,
+
 # When we receive announcement_signatures for channel announce
 msgtype,channeld_got_announcement,1017
 msgdata,channeld_got_announcement,scid,short_channel_id,

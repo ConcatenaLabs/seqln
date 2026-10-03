@@ -1014,7 +1014,9 @@ bool peer_start_openingd(struct peer *peer, struct peer_fd *peer_fd)
 		minrate = 1;
 		maxrate = 0xFFFFFFFF;
 	} else {
-		minrate = feerate_min(peer->ld, NULL);
+		/* The relay floor on a Sequentia network; feerate_min()
+		 * elsewhere, by which upstream judges every channel type. */
+		minrate = peer_commitment_feerate_min(peer->ld, false);
 		maxrate = feerate_max(peer->ld, NULL);
 	}
 
@@ -1429,6 +1431,9 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 			return command_fail(cmd, LIGHTNINGD,
 					    "Cannot estimate fees");
 		}
+		/* Leave the peer room to value the channel asset differently. */
+		if (*feerate_non_anchor < commitment_feerate_floor(cmd->ld->topology))
+			*feerate_non_anchor = commitment_feerate_floor(cmd->ld->topology);
 	}
 
 	feerate_anchor = unilateral_feerate(cmd->ld->topology, true);

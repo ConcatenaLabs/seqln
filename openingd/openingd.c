@@ -926,8 +926,10 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	 * limits converted at our own rate for the asset.  An asset we hold no
 	 * rate for cannot pay a fee we would relay. */
 	if (chainparams->is_elements && chainparams->fee_asset_tag
-	    && !memeq(state->channel_asset, sizeof(state->channel_asset),
-		      chainparams->fee_asset_tag, sizeof(state->channel_asset))) {
+	    && (chainparams->has_anchor_header
+		|| !memeq(state->channel_asset, sizeof(state->channel_asset),
+			  chainparams->fee_asset_tag,
+			  sizeof(state->channel_asset)))) {
 		u64 rate = 0;
 		for (size_t i = 0; i < tal_count(state->asset_rate_values); i++) {
 			if (memeq(state->asset_rate_tags + i * sizeof(state->channel_asset),

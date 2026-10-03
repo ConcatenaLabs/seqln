@@ -228,14 +228,20 @@ struct amount_msat amount_msat_sub_fee(struct amount_msat input,
 				       u32 fee_base_msat,
 				       u32 fee_proportional_millionths);
 
-/* What is the fee for this tx weight? */
+/* What is the fee for this tx weight?  BOLT 3 rounds down; on a Sequentia
+ * network (fees paid in assets whose atom may be worth many reference
+ * atoms) it rounds up, so a positive feerate never yields a 0-atom fee. */
 struct amount_sat amount_tx_fee(u32 fee_per_kw, size_t weight);
+
+/* The BOLT 3 fee, rounded down on every network. */
+struct amount_sat amount_tx_fee_rounded_down(u32 fee_per_kw, size_t weight);
 
 /* Fixed-point scale of the any-asset fee exchange rates (the node's
  * `exchange_rate_scale`, COIN = 1e8).  A rate R for an asset means one atom
- * of it is worth R / EXCHANGE_RATE_SCALE reference (policy) atoms, so a fee
- * of F reference atoms is ceil(F * EXCHANGE_RATE_SCALE / R) atoms of the
- * asset.  The policy asset is always at par (R == EXCHANGE_RATE_SCALE). */
+ * of it is worth R / EXCHANGE_RATE_SCALE reference atoms, so a fee of F
+ * reference atoms is ceil(F * EXCHANGE_RATE_SCALE / R) atoms of the asset.
+ * On a Sequentia network the policy asset has a rate like any other asset;
+ * on Liquid it is the fee asset itself, at par (R == EXCHANGE_RATE_SCALE). */
 #define EXCHANGE_RATE_SCALE ((u64)100000000)
 
 /* A feerate in reference atoms per kw, expressed in atoms per kw of an

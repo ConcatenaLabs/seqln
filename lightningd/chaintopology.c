@@ -612,6 +612,7 @@ static void update_feeexchangerates(struct lightningd *ld,
 	struct chain_topology *topo = ld->topology;
 	bool changed;
 
+	topo->asset_fee_rates_gen++;
 	changed = tal_count(rates) != tal_count(topo->asset_fee_rates)
 		|| (tal_count(rates)
 		    && memcmp(rates, topo->asset_fee_rates,
@@ -624,6 +625,25 @@ static void update_feeexchangerates(struct lightningd *ld,
 	 * moves them as a new feerate estimate would. */
 	if (changed)
 		notify_feerate_change(ld);
+}
+
+static void get_feeexchangerates_once(struct lightningd *ld,
+				      const struct asset_fee_rate *rates,
+				      void *arg UNUSED)
+{
+	struct chain_topology *topo = ld->topology;
+
+	tal_free(topo->asset_fee_rates);
+	topo->asset_fee_rates = tal_dup_talarr(topo, struct asset_fee_rate,
+					       rates);
+	topo->asset_fee_rates_gen++;
+	io_break(topo);
+}
+
+void topo_refresh_feeexchangerates(struct chain_topology *topo)
+{
+	bitcoind_get_feeexchangerates(topo->request_ctx, topo->bitcoind,
+				      update_feeexchangerates, NULL);
 }
 
 static void start_fee_estimate(struct chain_topology *topo)
@@ -639,8 +659,12 @@ static void start_fee_estimate(struct chain_topology *topo)
 
 u64 topo_asset_fee_rate(const struct chain_topology *topo, const u8 *asset_tag)
 {
-	/* Policy asset is always 1:1 (never stored in the whitelist). */
-	if (chainparams->fee_asset_tag
+	/* A Sequentia node prices its policy asset, the Sequence token, like
+	 * any other: its rate is in the whitelist, and a node that does not
+	 * list it does not accept it for fees.  Elsewhere (Liquid) the policy
+	 * asset is the fee asset itself, at par. */
+	if (!chainparams->has_anchor_header
+	    && chainparams->fee_asset_tag
 	    && memcmp(asset_tag, chainparams->fee_asset_tag, 33) == 0)
 		return EXCHANGE_RATE_SCALE;
 
@@ -754,6 +778,22 @@ u32 penalty_feerate(struct chain_topology *topo)
 u32 get_feerate_floor(const struct chain_topology *topo)
 {
 	return topo->feerate_floor;
+}
+
+u32 commitment_feerate_floor(const struct chain_topology *topo)
+{
+	u32 floor = get_feerate_floor(topo);
+
+	if (!chainparams->has_anchor_header)
+		return 0;
+	return floor + floor / 2;
+}
+
+u32 peer_commitment_feerate_min(struct lightningd *ld, bool anchors)
+{
+	if (chainparams->has_anchor_header || anchors)
+		return get_feerate_floor(ld->topology);
+	return feerate_min(ld, NULL);
 }
 
 static struct command_result *json_feerates(struct command *cmd,
@@ -1391,6 +1431,7 @@ struct chain_topology *new_topology(struct lightningd *ld, struct logger *log)
 	memset(topo->feerates, 0, sizeof(topo->feerates));
 	topo->smoothed_feerates = NULL;
 	topo->asset_fee_rates = NULL;
+	topo->asset_fee_rates_gen = 0;
 	topo->root = NULL;
 	topo->sync_waiters = tal(topo, struct list_head);
 	topo->extend_timer = NULL;
@@ -1644,6 +1685,17 @@ void setup_topology(struct chain_topology *topo)
 
 	/* It's very useful to have feerates early */
 	update_feerates(topo->ld, feerates->feerate_floor, feerates->rates, NULL);
+
+	/* On a Sequentia network every channel's feerates are in its asset at
+	 * this node's rate: have the rates before any channel starts, so a
+	 * missing rate means the node does not accept the asset, never that
+	 * the cache is still empty. */
+	if (chainparams->has_anchor_header) {
+		bitcoind_get_feeexchangerates(topo, topo->bitcoind,
+					      get_feeexchangerates_once, NULL);
+		ret = io_loop_with_timers(topo->ld);
+		assert(ret == topo);
+	}
 
 	/* Get the first block, so we can initialize topography. */
 	bitcoind_getrawblockbyheight(topo, topo->bitcoind, blockscan_start,

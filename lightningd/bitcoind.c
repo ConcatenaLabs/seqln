@@ -325,15 +325,14 @@ void bitcoind_estimate_fees_(const tal_t *ctx,
  * Plugin response:
  * {
  *	"rates": {
- *		"<32-byte display hex id>": <rate>,   (a non-policy asset)
- *		"bitcoin": <EXCHANGE_RATE_SCALE>,      (the policy asset, by label)
+ *		"<32-byte display hex id>": <rate>,
  *		...
  *	}
  * }
  *
- * Keys that are not a 32-byte hex id (e.g. the policy asset's "bitcoin"
- * label) are skipped: the policy asset is always 1:1 and handled specially by
- * topo_asset_fee_rate().
+ * Keys that are not a 32-byte hex id are skipped.  bcli resolves the node's
+ * labels (the policy asset's "bitcoin" among them) to their ids, so the
+ * policy asset arrives at the rate its node gives it, like any other asset.
  */
 struct feeexchangerates_call {
 	struct bitcoind *bitcoind;
@@ -362,9 +361,7 @@ static void feeexchangerates_callback(const char *buf, const jsmntok_t *toks,
 			u8 id[32];
 			u64 v;
 
-			/* @t is the asset key.  Non-policy assets are 32-byte
-			 * display-hex ids; the policy asset comes back as its
-			 * label ("bitcoin"), which we skip (handled 1:1). */
+			/* @t is the asset key, a 32-byte display-hex id. */
 			if (!hex_decode(buf + t->start, t->end - t->start,
 					id, sizeof(id)))
 				continue;
