@@ -14,8 +14,16 @@ use crate::policy::{self, ChannelState, ChannelStore, Htlc, Policy, Side, Split}
 use crate::wire::{self, msg, BitcoinTx, Writer};
 use bitcoin::secp256k1::SecretKey;
 
-/// Our supported hsmd wire version range, matching `signerd_init`.
-const OUR_MIN_VERSION: u32 = 4;
+/// The hsmd wire version this device speaks, and the only one it accepts.
+/// Below version 6, GET_PER_COMMITMENT_POINT(n) also returns the secret of
+/// commitment n - 2, with no revocation behind it: a host that re-initialised
+/// the device at an older version could read the secret of a commitment the
+/// device has not revoked and still signs for broadcast, and hand it to the
+/// peer. So an INIT whose highest offered version is below 6 is refused, the
+/// first one and any later one alike, and the device never returns an old
+/// secret with a point: a commitment's secret leaves it only through a
+/// revocation it validated (REVOKE_COMMITMENT_TX). lightningd offers 5 to 6.
+const OUR_MIN_VERSION: u32 = 6;
 const OUR_MAX_VERSION: u32 = 6;
 
 /// `enum sighash_type` (`bitcoin/signature.h`).
@@ -289,9 +297,12 @@ impl Signer {
             Some(f) => f,
             None => return Outcome::Sentinel,
         };
+        // Checked before anything changes: a refused INIT, the first or a
+        // later one, leaves the device as it was.
         if OUR_MIN_VERSION > f.max_version || OUR_MAX_VERSION < f.min_version {
             return Outcome::Fatal(format!(
-                "version {}-{} not valid: we need {}-{}",
+                "version {}-{} not valid: we need {}-{} (below version 6 a commitment \
+                 point carries an old commitment's secret)",
                 f.min_version, f.max_version, OUR_MIN_VERSION, OUR_MAX_VERSION
             ));
         }
@@ -342,18 +353,11 @@ impl Signer {
             None => return Outcome::Sentinel,
         };
         // Uses the frame's client context (c->id, c->dbid), not the message.
-        let (point, old) =
-            self.kernel()
-                .per_commitment_point(&req.node_id, req.dbid, n, self.hsm_version);
+        let point = self.kernel().per_commitment_point(&req.node_id, req.dbid, n);
         let mut w = Writer::new(msg::HSMD_GET_PER_COMMITMENT_POINT_REPLY);
         w.bytes(&point);
-        match old {
-            Some(secret) => {
-                w.bool(true);
-                w.bytes(&secret);
-            }
-            None => w.bool(false),
-        }
+        // old_commitment_secret: never present (version 6; see OUR_MIN_VERSION).
+        w.bool(false);
         Outcome::Reply(w.into_vec())
     }
 
@@ -4532,6 +4536,153 @@ mod close_and_revocation_tests {
         let mut p = signer(Policy::Permissive);
         p.import_channels(&blob).unwrap();
         assert!(matches!(validate(&mut p, 3, 300_000, 699_000, 1_000), Outcome::Reply(_)));
+    }
+
+    // ---- R9 F1: the hsmd version is not the host's to lower ----
+
+    /// HSMD_INIT as the host sends it, offering versions min..=max.
+    fn init_msg(min: u32, max: u32) -> Vec<u8> {
+        let mut w = Writer::new(msg::HSMD_INIT);
+        w.u32(BIP32_VER_TEST_PUBLIC);
+        w.u32(BIP32_VER_TEST_PRIVATE);
+        w.bytes(&[0u8; 32]); // genesis
+        for _ in 0..5 {
+            w.u8(0); // the five optional dev fields, absent
+        }
+        w.u32(min);
+        w.u32(max);
+        w.into_vec()
+    }
+
+    fn main_req(msg: Vec<u8>) -> Request {
+        Request { is_main: true, node_id: [0; 33], dbid: 0, capabilities: 0, hsmd_msg: msg }
+    }
+
+    /// GET_PER_COMMITMENT_POINT(n): the point, and the reply's old secret if
+    /// it carries one.
+    fn point_reply(s: &mut Signer, n: u64) -> ([u8; 33], Option<[u8; 32]>) {
+        let mut w = Writer::new(msg::HSMD_GET_PER_COMMITMENT_POINT);
+        w.u64(n);
+        match s.handle(&req(w.into_vec())) {
+            Outcome::Reply(r) => {
+                assert_eq!(u16::from_be_bytes([r[0], r[1]]), msg::HSMD_GET_PER_COMMITMENT_POINT_REPLY);
+                assert_eq!(r.len(), 2 + 33 + 1 + if r[2 + 33] == 1 { 32 } else { 0 });
+                let point = r[2..2 + 33].try_into().unwrap();
+                let old = (r[2 + 33] == 1).then(|| r[2 + 33 + 1..2 + 33 + 1 + 32].try_into().unwrap());
+                (point, old)
+            }
+            o => panic!("not answered: {}", verdict(&o)),
+        }
+    }
+
+    /// Every INIT whose highest version is below 6 is refused, as the first
+    /// INIT and as a later one, and a refused INIT changes nothing.
+    #[test]
+    fn init_below_version_6_is_refused() {
+        // A fresh device: refused before it has a kernel.
+        let seed = crate::kernel::bip39_seed(MNEMONIC, "");
+        for (min, max) in [(4, 4), (4, 5), (5, 5), (1, 3)] {
+            let mut fresh = Signer::with_policy(
+                HsmSecret { seed, secret_type: 2, mnemonic: String::new() },
+                Policy::Enforce,
+            );
+            match fresh.handle(&main_req(init_msg(min, max))) {
+                Outcome::Fatal(m) => {
+                    println!("first INIT {min}..{max}: FATAL: {m}");
+                    assert!(m.starts_with(&format!("version {min}-{max} not valid: we need 6-6")), "{m}");
+                }
+                o => panic!("INIT {min}..{max} accepted: {}", verdict(&o)),
+            }
+            assert!(fresh.kernel.is_none());
+        }
+        // What lightningd offers (5..6), and any range reaching 6, gives 6.
+        for (min, max) in [(5, 6), (4, 6), (6, 6), (6, 9)] {
+            let mut fresh = Signer::with_policy(
+                HsmSecret { seed, secret_type: 2, mnemonic: String::new() },
+                Policy::Enforce,
+            );
+            match fresh.handle(&main_req(init_msg(min, max))) {
+                Outcome::Reply(r) => {
+                    assert_eq!(u16::from_be_bytes([r[0], r[1]]), msg::HSMD_INIT_REPLY_V4);
+                    assert_eq!(u32::from_be_bytes(r[2..6].try_into().unwrap()), 6);
+                }
+                o => panic!("INIT {min}..{max} refused: {}", verdict(&o)),
+            }
+        }
+        // A second INIT at a lower version, after the device served one.
+        let mut s = signer(Policy::Enforce);
+        assert!(matches!(s.handle(&main_req(init_msg(5, 6))), Outcome::Reply(_)));
+        let before = point_reply(&mut s, 3);
+        for (min, max) in [(4, 4), (5, 5), (4, 5)] {
+            match s.handle(&main_req(init_msg(min, max))) {
+                Outcome::Fatal(m) => println!("second INIT {min}..{max}: FATAL: {m}"),
+                o => panic!("second INIT {min}..{max} accepted: {}", verdict(&o)),
+            }
+            assert_eq!(s.hsm_version, 6);
+            assert_eq!(point_reply(&mut s, 3), before);
+        }
+    }
+
+    /// R9 F1, the reviewer's attack turned around: the host re-sends INIT
+    /// offering only version 4 and asks for the point of commitment n + 2.
+    /// The INIT is refused, the point comes alone, the current commitment's
+    /// secret stays on the device, and its record is unchanged. The secret
+    /// comes out only through the revocation the device validated.
+    #[test]
+    fn r9_version4_init_reveals_no_secret() {
+        let mut s = signer(Policy::Enforce);
+        track(&mut s, false, &peer_script());
+        for n in 0..2 {
+            assert!(matches!(validate(&mut s, n, 300_000, 699_000, 1_000), Outcome::Reply(_)));
+        }
+        assert!(matches!(revoke(&mut s, 0), Outcome::Reply(_)));
+        let r = verdict(&revoke(&mut s, 1));
+        assert!(r.starts_with("REFUSED: REVOKE_COMMITMENT_TX refused: commitment 2 is not validated"), "{r}");
+        let shaseed = s.kernel().channel_secrets(&PEER, DBID).shaseed;
+        assert!(matches!(s.handle(&main_req(init_msg(4, 4))), Outcome::Fatal(_)));
+        for n in 0..8u64 {
+            let (point, old) = point_reply(&mut s, n);
+            assert_eq!(old, None, "GET_PER_COMMITMENT_POINT({n}) carried a secret");
+            assert_eq!(point, s.kernel().per_commit_point_at(&shaseed, n));
+        }
+        println!("after INIT 4..4: GET_PER_COMMITMENT_POINT(0..7) carry no secret");
+        assert_eq!(st(&s).revoked_through, Some(0));
+        // Commitment 1 is still the one the device signs for broadcast, and
+        // its secret is still refused.
+        let c1 = local_commitment(&s, 1, 300_000, 699_000, 1_000);
+        assert_eq!(verdict(&s.handle(&req(sign_commitment_msg(&s, &c1, 1)))), "SIGNED");
+        assert!(verdict(&revoke(&mut s, 1)).starts_with("REFUSED"));
+        // Once commitment 2 is validated, the revocation of 1 gives its secret.
+        assert!(matches!(validate(&mut s, 2, 300_000, 699_000, 1_000), Outcome::Reply(_)));
+        match revoke(&mut s, 1) {
+            Outcome::Reply(r) => {
+                assert_eq!(&r[2..34], &s.kernel().per_commit_secret_at(&shaseed, 1));
+            }
+            o => panic!("REVOKE(1) after 2 validated: {}", verdict(&o)),
+        }
+    }
+
+    /// The same for a channel from a version-1 store: no commitment step,
+    /// and no secret through GET_PER_COMMITMENT_POINT at any number.
+    #[test]
+    fn r9_predating_channel_reveals_no_secret() {
+        let mut s = signer(Policy::Enforce);
+        track(&mut s, false, &peer_script());
+        for n in 0..3 {
+            assert!(matches!(validate(&mut s, n, 300_000, 699_000, 1_000), Outcome::Reply(_)));
+        }
+        let blob = as_v1_blob(&s);
+        let mut d = signer(Policy::Enforce);
+        assert_eq!(d.import_channels(&blob), Ok(1));
+        assert!(st(&d).predates_validation);
+        assert!(matches!(d.handle(&main_req(init_msg(4, 4))), Outcome::Fatal(_)));
+        for n in 0..8u64 {
+            assert_eq!(point_reply(&mut d, n).1, None, "GET_PER_COMMITMENT_POINT({n}) carried a secret");
+        }
+        for n in 0..3 {
+            assert!(verdict(&revoke(&mut d, n)).contains("predates validation"));
+        }
+        println!("predating channel: no secret at any number, every revocation refused");
     }
 
     /// A version-6 store came from a validating device: its channels go on.

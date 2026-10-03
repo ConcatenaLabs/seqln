@@ -51,7 +51,7 @@ directory.
 
 ## Scope
 
-Implements hsmd wire versions 4-6 and the message subset a running SeqLN node exercises:
+Implements hsmd wire version 6 and the message subset a running SeqLN node exercises:
 derivation (BIP39/32/86, basepoints, per-commitment points, shachain), ECDH, commitment and HTLC
 signing, withdrawal/funding signing for both Elements/Sequentia (explicit, unblinded outputs) and
 Bitcoin (BIP-143 segwit v0 and BIP-86 taproot key-path wallet inputs), and BOLT11 invoice
@@ -89,7 +89,12 @@ What enforce mode checks:
   exceed the funding less our balance. While no balance is recorded, every close is refused,
   however much it pays this wallet: the device cannot tell an honest close from one paying it a
   single atom.
-- **Revocations**: the device reveals the secret of our commitment n only when n is the next to
+- **Revocations**: a commitment's secret leaves the device only through its revocation. The
+  device speaks hsmd version 6 alone and refuses an INIT whose highest version is below it, the
+  first INIT and any later one (lightningd offers 5 to 6): below version 6 a commitment point
+  comes with the secret of the commitment two before it, which a host that lowered the version
+  could read for a commitment the device has not revoked. The device reveals the secret of our
+  commitment n only when n is the next to
   revoke (or already revealed: channeld re-sends a revocation after a reconnect) and commitment
   n + 1 has been validated; and it never signs a commitment of ours numbered at or below the
   highest it revealed. The number is read off the transaction's obscured locktime and sequence,
@@ -202,6 +207,7 @@ any channel.
 | `tests/chstore.rs` | Channel-store persistence contract (`export_channels`/`import_channels` round-trip, MAC refusal, merge semantics). The store carries each channel's opener, upfront shutdown scripts (and the local one's wallet index), revocation counters, recorded balance and unrevoked validated commitments, and imports an older store without them. |
 | `tests/native_store.rs` | The native binary keeps its store across a restart: a new process refuses a revoked commitment and a close below the recorded balance, which a signer with an empty store signs (the commitment once it has validated it itself). With the store unwritable it refuses every request, a re-sent revocation included, until a write succeeds. |
 | `wasm/` | `wasm-bindgen` build of the same library for browsers/Node, plus SDK, relay, tests, demo page. |
+| `wasm/test/version_floor.mjs` | The WASM build refuses an INIT below version 6, first or later, and returns no secret with a commitment point. |
 | `wasm/test/enforce.mjs` | WASM enforce-mode proof: corpus replay byte-exact, tampered commitment refused. |
 | `wasm/test/ws_device.mjs` | The browser-shaped device path over a real WebSocket, driven by the wallet SDK. |
 | `wasm/test/device_serve.mjs` | The WASM build as a drop-in for `seqln-signer --connect` (same files and environment), so the node's keyless tests run on it with `SEQLN_DEVICE=wasm`. |
