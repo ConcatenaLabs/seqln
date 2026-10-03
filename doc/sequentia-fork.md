@@ -304,6 +304,11 @@ a user device while a host runs the node:
   onchaind resolves it from the chain. A `close` waiting on that transaction fails with the
   refusal (`lightningd/closing_control.c`). A node with its own keys is never refused, and signs
   and sends the transaction as before.
+- The device speaks hsmd version 6 only and refuses an INIT whose highest version is below
+  it, at any time (lightningd offers 5 to 6). Below version 6 a commitment point comes with the
+  secret of the commitment two before it, so a host that lowered the version could read the
+  secret of a commitment the device has not revoked; at 6 a secret leaves the device only
+  through a revocation it validated.
 - A device moved onto a store older than version 6 (written by a device that validated
   nothing) marks every channel in it as predating validation and signs no commitment step for
   it: no commitment of either side, no revocation, no close. The channel moves no more and its

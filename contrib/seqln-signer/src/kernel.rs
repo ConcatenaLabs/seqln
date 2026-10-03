@@ -311,25 +311,14 @@ impl Kernel {
         Self::shachain_from_seed(shaseed, index)
     }
 
-    /// `handle_get_per_commitment_point()`: the per-commitment point for index
-    /// `n`, and (only when `hsm_version < 6` and `n >= 2`) the n-2 secret.
-    pub fn per_commitment_point(
-        &self,
-        peer_id: &[u8; 33],
-        dbid: u64,
-        n: u64,
-        hsm_version: u32,
-    ) -> ([u8; 33], Option<[u8; 32]>) {
+    /// `handle_get_per_commitment_point()` at version 6: the per-commitment
+    /// point for index `n`. Never a secret: libhsmd returns the n-2 secret
+    /// below version 6, which this device does not speak.
+    pub fn per_commitment_point(&self, peer_id: &[u8; 33], dbid: u64, n: u64) -> [u8; 33] {
         let seed = self.channel_seed(peer_id, dbid);
         let shaseed = self.channel_keys(&seed).shaseed;
         let secret = Self::per_commit_secret(&shaseed, n);
-        let point = self.pubkey(&SecretKey::from_slice(&secret).expect("valid per-commit secret"));
-        let old = if hsm_version < 6 && n >= 2 {
-            Some(Self::per_commit_secret(&shaseed, n - 2))
-        } else {
-            None
-        };
-        (point, old)
+        self.pubkey(&SecretKey::from_slice(&secret).expect("valid per-commit secret"))
     }
 
     /// `handle_ecdh()`: secp256k1 ECDH (default SHA256-of-compressed-point hash)
