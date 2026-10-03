@@ -166,10 +166,25 @@ const STORE_FILE: &str = "seqln-signer-channels";
 fn load_store(path: &Path, signer: &mut Signer, log: &mut Option<File>) {
     match std::fs::read(path) {
         Ok(bytes) => match signer.import_channels(&bytes) {
-            Ok(n) => logline(
-                log,
-                &format!("seqln-signer: restored {n} channel(s) from {}", path.display()),
-            ),
+            Ok(n) => {
+                logline(
+                    log,
+                    &format!("seqln-signer: restored {n} channel(s) from {}", path.display()),
+                );
+                for (node_id, dbid, txid, outnum, sats) in signer.predating_channels() {
+                    let mut display = txid;
+                    display.reverse();
+                    let line = format!(
+                        "seqln-signer: channel {dbid} of peer {} (funding {}:{outnum}, {sats}) \
+                         predates validation: no commitment step is signed for it; its peer \
+                         closes it",
+                        hex(&node_id),
+                        hex(&display)
+                    );
+                    logline(log, &line);
+                    eprintln!("{line}");
+                }
+            }
             Err(e) => {
                 logline(log, &format!("seqln-signer: channel store {} NOT restored: {e}", path.display()));
                 eprintln!("seqln-signer: channel store {} not restored: {e}", path.display());
@@ -181,7 +196,8 @@ fn load_store(path: &Path, signer: &mut Signer, log: &mut Option<File>) {
             eprintln!("seqln-signer: channel store {} unreadable: {e}", path.display());
         }
     }
-    // What was just read is what the file holds.
+    // What was just read is what the file holds; a store older than this
+    // signer's is rewritten in its format at the next change.
     let _ = signer.take_channels_dirty();
 }
 

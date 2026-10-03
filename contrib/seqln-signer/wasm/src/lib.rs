@@ -244,6 +244,34 @@ impl Signer {
         })
     }
 
+    /// The channels that predate validation (they came from the store of a
+    /// device that validated nothing, and this device signs no commitment
+    /// step for them; their peer closes them), as JSON: an array of
+    /// `{peerId, dbid, fundingTxid, fundingOutnum, fundingSats}`, the txid in
+    /// display order, hex strings throughout. `[]` when there are none.
+    #[wasm_bindgen(js_name = predatingChannels)]
+    pub fn predating_channels(&self) -> String {
+        let items: Vec<String> = self
+            .inner
+            .predating_channels()
+            .into_iter()
+            .map(|(node_id, dbid, txid, outnum, sats)| {
+                let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+                let mut display = txid;
+                display.reverse();
+                format!(
+                    "{{\"peerId\":\"{}\",\"dbid\":{},\"fundingTxid\":\"{}\",\"fundingOutnum\":{},\"fundingSats\":{}}}",
+                    hex(&node_id),
+                    dbid,
+                    hex(&display),
+                    outnum,
+                    sats
+                )
+            })
+            .collect();
+        format!("[{}]", items.join(","))
+    }
+
     /// Is this (peer, dbid) tracked?
     #[wasm_bindgen(js_name = hasChannel)]
     pub fn has_channel(&self, node_id: &[u8], dbid: u64) -> Result<bool, JsError> {
@@ -301,6 +329,7 @@ impl Signer {
             remote_split: None,
             validated: Vec::new(),
             pay: Default::default(),
+            predates_validation: false,
         };
         self.inner
             .arm_channel(arr33(node_id, "node_id")?, dbid, st)

@@ -304,6 +304,11 @@ a user device while a host runs the node:
   onchaind resolves it from the chain. A `close` waiting on that transaction fails with the
   refusal (`lightningd/closing_control.c`). A node with its own keys is never refused, and signs
   and sends the transaction as before.
+- A device moved onto a store older than version 6 (written by a device that validated
+  nothing) marks every channel in it as predating validation and signs no commitment step for
+  it: no commitment of either side, no revocation, no close. The channel moves no more and its
+  peer closes it (the cutover closes them from the hubs). The device reports these channels to the
+  wallet (`predatingChannels`).
 - What a channel close pays a keyless node (the output the peer's commitment pays it, to the
   channel's payment key; what a mutual close pays it; its own commitment's `to_local` once its
   delay is over) the device signs a spend of only to its own wallet scripts, with a fee within
@@ -399,7 +404,10 @@ channel's asset (`test_close_output_asset.py`), and moved by `withdraw`, `txprep
 database that recorded it without one (`test_asset_withdraw.py`), a keyless node spending each kind of close
 output only to its own address and within its device's payment limit
 (`test_close_output_spend.py`, on Bitcoin regtest too, with the redirected spend forced into a
-block there; `SEQLN_DEVICE=wasm` runs the keyless tests on the browser build), a breach of an asset channel with a pending HTLC
+block there; `SEQLN_DEVICE=wasm` runs the keyless tests on the browser build), a keyless node
+started on a version-1 store, whose device signs no step of the channels in it while the hub
+closes them, moves what the closes paid it to its own address, and pays both ways over a channel
+opened afterwards (`test_predating_store.py`), a breach of an asset channel with a pending HTLC
 answered by `speculad` while the victim is offline (`test_watchtower.py`), a keyless node, as
 either side of a channel, closing it and restarting with it closing (`test_keyless_close.py`), a
 keyless node whose device, moved onto an older store, refuses its closing transaction, at start

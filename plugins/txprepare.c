@@ -1,6 +1,7 @@
 #include "config.h"
 #include <bitcoin/psbt.h>
 #include <ccan/array_size/array_size.h>
+#include <ccan/tal/str/str.h>
 #include <common/json_param.h>
 #include <common/json_stream.h>
 #include <common/memleak.h>
@@ -211,11 +212,26 @@ static struct command_result *signpsbt_done(struct command *cmd,
 	}
 
 	/* Finalize the signed PSBT and extract the fully signed tx,
-	 * so that utx->tx contains witness data for the response. */
-	if (!psbt_finalize(utx->psbt))
-		return command_fail(cmd, LIGHTNINGD,
-				    "Signed PSBT not finalizeable: %s",
-				    fmt_wally_psbt(tmpctx, utx->psbt));
+	 * so that utx->tx contains witness data for the response.  A signer
+	 * that declines a transaction (a device signs a close output's spend
+	 * only to its own scripts) returns it unsigned: release the inputs,
+	 * so they are not held reserved for a transaction that never goes. */
+	if (!psbt_finalize(utx->psbt)) {
+		struct out_req *req;
+		struct txprepare_cleanup *cleanup = tal(cmd, struct txprepare_cleanup);
+
+		cleanup->error_json = tal_fmt(cleanup,
+					      "{\"code\":%d,\"message\":\"Signed PSBT not"
+					      " finalizeable: the signer did not sign every"
+					      " input\"}",
+					      LIGHTNINGD);
+		req = jsonrpc_request_start(cmd, "unreserveinputs",
+					    txprepare_cleanup_done,
+					    txprepare_cleanup_done,
+					    cleanup);
+		json_add_psbt(req->js, "psbt", utx->psbt);
+		return send_outreq(req);
+	}
 
 	utx->tx = psbt_final_tx(utx, utx->psbt);
 	if (!utx->tx)

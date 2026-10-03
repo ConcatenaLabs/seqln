@@ -182,6 +182,14 @@ pub struct ChannelState {
     /// commitment on each side, and the loss charged so far
     /// (`crate::payments`).
     pub pay: PayTrack,
+    /// The channel came from the store of a device that validated nothing
+    /// (a store older than version 6): its state before this device is
+    /// unknown, and the device never takes it on the host's word. In enforce
+    /// mode it signs no commitment step for the channel (no commitment, ours
+    /// or the peer's, no revocation, no close); the peer closes it, and the
+    /// device signs only the spends of what that close pays it. Never
+    /// cleared.
+    pub predates_validation: bool,
 }
 
 /// How many unrevoked validated commitments a channel record keeps.
@@ -252,6 +260,7 @@ impl ChannelState {
         if self.is_outbound.is_none() {
             self.is_outbound = old.is_outbound;
         }
+        self.predates_validation |= old.predates_validation;
     }
 }
 
@@ -377,7 +386,12 @@ impl ChannelStore {
     pub fn insert_if_absent(&mut self, node_id: [u8; 33], dbid: u64, st: ChannelState) -> bool {
         use std::collections::hash_map::Entry;
         match self.map.entry((node_id, dbid)) {
-            Entry::Occupied(_) => false,
+            // The live record stays, but a channel the snapshot says
+            // predates validation does (the flag only spreads).
+            Entry::Occupied(mut o) => {
+                o.get_mut().predates_validation |= st.predates_validation;
+                false
+            }
             Entry::Vacant(v) => {
                 v.insert(st);
                 true
@@ -386,6 +400,10 @@ impl ChannelStore {
     }
     pub fn len(&self) -> usize {
         self.map.len()
+    }
+    /// The channels that predate validation, in key order.
+    pub fn predating(&self) -> Vec<(&([u8; 33], u64), &ChannelState)> {
+        self.entries_sorted().into_iter().filter(|(_, st)| st.predates_validation).collect()
     }
     /// Entries in key order, so the encoding (and therefore its MAC) is
     /// deterministic for a given store.
@@ -420,9 +438,15 @@ pub const CHSTORE_MAGIC: [u8; 4] = *b"SQCH";
 /// ledger ([`Ledger`]). Version 6 adds, after the payment tracking, the
 /// local shutdown script's wallet index (flag(1), then index(4)). Version 7
 /// adds, after the ledger, the txids of the mutual closes the device signed
-/// (count(2), then txid(32) each). Versions 1 to 6 still import (the fields
-/// they lack unknown).
-pub const CHSTORE_VERSION: u8 = 7;
+/// (count(2), then txid(32) each). Version 8 adds, after each entry's wallet
+/// index, whether the channel predates validation (1 byte). Versions 1 to 7
+/// still import (the fields they lack unknown); each channel of a store older
+/// than version 6, written by a device that validated nothing, predates
+/// validation.
+pub const CHSTORE_VERSION: u8 = 8;
+
+/// The first store version a validating device wrote.
+pub const CHSTORE_FIRST_VALIDATING: u8 = 6;
 /// The fixed part of an entry, which is the whole of a version-1 entry:
 /// node_id(33) dbid(8) sats(8) txid(32) txout(2) local_delay(2) remote_delay(2)
 /// 5 pubkeys(165) static_remotekey(1) anchors(1)
@@ -554,6 +578,7 @@ pub fn encode_channel_store(store: &ChannelStore) -> Vec<u8> {
                 out.extend_from_slice(&i.to_le_bytes());
             }
         }
+        out.push(st.predates_validation as u8);
     }
     push_ledger(&mut out, &store.ledger);
     out.extend_from_slice(&(store.close_txids.len() as u16).to_le_bytes());
@@ -678,7 +703,7 @@ impl<'a> StoreReader<'a> {
 pub type DecodedStore = (Vec<(([u8; 33], u64), ChannelState)>, Ledger, Vec<[u8; 32]>);
 
 /// Decode a channel-store payload (the MAC must already have been verified
-/// and stripped by the caller). Takes versions 1 to 7.
+/// and stripped by the caller). Takes versions 1 to 8.
 pub fn decode_channel_store(bytes: &[u8]) -> Result<DecodedStore, String> {
     if bytes.len() < 9 || bytes[..4] != CHSTORE_MAGIC {
         return Err("not a channel-store blob (bad magic)".to_string());
@@ -721,6 +746,7 @@ pub fn decode_channel_store(bytes: &[u8]) -> Result<DecodedStore, String> {
             remote_split: None,
             validated: Vec::new(),
             pay: PayTrack::default(),
+            predates_validation: version < CHSTORE_FIRST_VALIDATING,
         };
         if version >= 2 {
             st.is_outbound = r.opt_bool()?;
@@ -753,6 +779,13 @@ pub fn decode_channel_store(bytes: &[u8]) -> Result<DecodedStore, String> {
                 0 => None,
                 1 => Some(u32::from_le_bytes(r.take(4)?.try_into().unwrap())),
                 v => return Err(format!("bad wallet-index flag {v} in channel-store blob")),
+            };
+        }
+        if version >= 8 {
+            st.predates_validation = match r.u8()? {
+                0 => false,
+                1 => true,
+                v => return Err(format!("bad predates-validation flag {v} in channel-store blob")),
             };
         }
         out.push(((node_id, dbid), st));

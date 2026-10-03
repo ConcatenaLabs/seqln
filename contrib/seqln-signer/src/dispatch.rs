@@ -458,6 +458,38 @@ impl Signer {
         "no tracked channel (setup_channel not seen)".to_string()
     }
 
+    /// In enforce mode, the refusal for a commitment step on a channel that
+    /// predates validation (`ChannelState::predates_validation`): the device
+    /// does not know the channel's state before it, and does not take the
+    /// host's word for it, so it signs no commitment, ours or the peer's, no
+    /// revocation and no close for it. Its peer closes it.
+    fn predating(&self, peer_id: &[u8; 33], dbid: u64) -> Option<String> {
+        if !self.policy.is_enforce() {
+            return None;
+        }
+        let st = self.store.get(peer_id, dbid)?;
+        st.predates_validation.then(|| {
+            format!(
+                "channel {} of peer {} predates validation: it came from the store of a \
+                 device that validated nothing, so this device signs no commitment step for \
+                 it; its peer closes it",
+                dbid,
+                hexbytes(&peer_id[..4])
+            )
+        })
+    }
+
+    /// The channels that predate validation: (peer node_id, dbid, funding
+    /// txid in internal order, funding output, funding amount). The host
+    /// tells the user these channels are not carried over.
+    pub fn predating_channels(&self) -> Vec<([u8; 33], u64, [u8; 32], u16, u64)> {
+        self.store
+            .predating()
+            .into_iter()
+            .map(|(&(node_id, dbid), st)| (node_id, dbid, st.funding_txid, st.funding_txout, st.funding_sats))
+            .collect()
+    }
+
     // =================================================================
     // Channel-store persistence + recovery (the host's restart contract).
     //
@@ -584,6 +616,11 @@ impl Signer {
     /// same message). Validate by shape, then sign. Reply bytes are unchanged
     /// from M2b on accept.
     fn sign_commitment_tx_checked(&mut self, req: &Request) -> Outcome {
+        if let Some((peer, dbid, ..)) = parse_own_commitment(&req.hsmd_msg) {
+            if let Some(reason) = self.predating(&peer, dbid) {
+                return Outcome::Reject(format!("SIGN_COMMITMENT_TX refused: {reason}"));
+            }
+        }
         if self.policy.is_enforce() {
             if let Err(reason) = self.check_own_commitment(&req.hsmd_msg) {
                 return Outcome::Reject(format!("SIGN_COMMITMENT_TX refused: {reason}"));
@@ -604,6 +641,9 @@ impl Signer {
 
     /// SIGN_MUTUAL_CLOSE_TX (21): closingd's signature on a closing proposal.
     fn sign_mutual_close_tx_checked(&mut self, req: &Request) -> Outcome {
+        if let Some(reason) = self.predating(&req.node_id, req.dbid) {
+            return Outcome::Reject(format!("SIGN_MUTUAL_CLOSE_TX refused: {reason}"));
+        }
         if self.policy.is_enforce() {
             let check = (|| {
                 let st = self
@@ -654,6 +694,9 @@ impl Signer {
             (Some(_), Some(n)) => n,
             _ => return Outcome::Sentinel,
         };
+        if let Some(reason) = self.predating(&req.node_id, req.dbid) {
+            return Outcome::Reject(format!("REVOKE_COMMITMENT_TX refused: {reason}"));
+        }
         if self.policy.is_enforce() {
             let refusal = match self.store.get(&req.node_id, req.dbid) {
                 None => Some(self.untracked(&req.node_id, req.dbid)),
@@ -695,6 +738,9 @@ impl Signer {
     /// fundee's theft vector). Full validation, then sign, and record what it
     /// pays this side (in permissive mode too, when it validates).
     fn sign_remote_commitment_tx_checked(&mut self, req: &Request) -> Outcome {
+        if let Some(reason) = self.predating(&req.node_id, req.dbid) {
+            return Outcome::Reject(format!("SIGN_REMOTE_COMMITMENT_TX refused: {reason}"));
+        }
         let split = self.check_remote_commitment(req);
         let plan = match (&split, parse_remote_commitment(&req.hsmd_msg)) {
             (Ok((n, sp)), Some((bt, _, _, htlcs, _))) => {
@@ -736,6 +782,9 @@ impl Signer {
     /// and record the commitment's number, its txid (the one transaction
     /// SIGN_COMMITMENT_TX may sign for it) and what it pays this side.
     fn validate_commitment_tx_checked(&mut self, req: &Request) -> Outcome {
+        if let Some(reason) = self.predating(&req.node_id, req.dbid) {
+            return Outcome::Reject(format!("VALIDATE_COMMITMENT_TX refused: {reason}"));
+        }
         let split = self.check_local_commitment(req);
         let plan = match (&split, parse_local_commitment(&req.hsmd_msg)) {
             (Ok((n, sp)), Some((bt, htlcs, _))) => {
@@ -1432,6 +1481,10 @@ impl Signer {
         let wscript = r.u16_prefixed()?;
         let remote_per_commit = r.arr33()?;
         let anchor = r.bool()?;
+        if let Some(reason) = self.predating(&req.node_id, req.dbid) {
+            self.refuse(format!("SIGN_REMOTE_HTLC_TX refused: {reason}"));
+            return None;
+        }
         let s = self.kernel().channel_secrets(&req.node_id, req.dbid);
         let htlc_privkey = self.kernel().derive_simple_privkey(&s.htlc, &remote_per_commit);
         let sighash = if anchor { SIGHASH_SINGLE_ACP } else { SIGHASH_ALL };
@@ -2311,6 +2364,7 @@ fn parse_setup_channel(m: &[u8]) -> Option<ChannelState> {
         remote_split: None,
         validated: Vec::new(),
         pay: Default::default(),
+        predates_validation: false,
     })
 }
 
@@ -3353,11 +3407,29 @@ mod close_and_revocation_tests {
         assert!(matches!(revoke(&mut s, 0), Outcome::Reply(_)));
         assert!(s.store.record_close([0x99; 32]));
         assert!(!s.store.record_close([0x99; 32]));
-        let v7 = policy::encode_channel_store(&s.store);
-        assert_eq!(v7[4], 7);
-        let (back, ledger, closes) = policy::decode_channel_store(&v7).unwrap();
+        let v8 = policy::encode_channel_store(&s.store);
+        assert_eq!(v8[4], 8);
+        let (back, ledger, closes) = policy::decode_channel_store(&v8).unwrap();
         assert_eq!(closes, vec![[0x99; 32]]);
         assert_eq!(back[0].1.validated, st(&s).validated);
+        assert!(!back[0].1.predates_validation);
+        // The flag round-trips.
+        let mut marked = ChannelStore::new();
+        let mut m = st(&s).clone();
+        m.predates_validation = true;
+        marked.insert(PEER, DBID, m);
+        let (back, _, _) = policy::decode_channel_store(&policy::encode_channel_store(&marked)).unwrap();
+        assert!(back[0].1.predates_validation);
+        // A version-7 payload: the same, without the entry's flag (the byte
+        // before the ledger and the close record).
+        let ledger_len = 2 + 40 * ledger.approvals.len() + 2 + 49 * ledger.spends.len();
+        let at = v8.len() - (2 + 32) - ledger_len - 1;
+        assert_eq!(v8[at], 0);
+        let mut v7 = [&v8[..at], &v8[at + 1..]].concat();
+        v7[4] = 7;
+        let (back, l7, closes) = policy::decode_channel_store(&v7).unwrap();
+        assert_eq!((l7, closes), (ledger.clone(), vec![[0x99; 32]]));
+        assert!(!back[0].1.predates_validation);
         // A version-6 payload: the same, without the close record.
         let mut v6 = v7[..v7.len() - (2 + 32)].to_vec();
         v6[4] = 6;
@@ -3365,6 +3437,8 @@ mod close_and_revocation_tests {
         assert!(closes.is_empty());
         assert_eq!(l6, ledger);
         let (_, b) = &back[0];
+        // Version 6 was written by a device that validated: carried over.
+        assert!(!b.predates_validation);
         assert_eq!(b.revoked_through, Some(0));
         assert_eq!(b.is_outbound, Some(false));
         assert_eq!(b.remote_shutdown_script, peer_script());
@@ -3385,6 +3459,8 @@ mod close_and_revocation_tests {
         v5[4] = 5;
         let (back, l5, _) = policy::decode_channel_store(&v5).unwrap();
         assert_eq!((&back[0].1.pay, &l5), (&b.pay, &ledger));
+        // Older stores were written by devices that validated nothing.
+        assert!(back[0].1.predates_validation);
         // A version-4 payload: the same entry without the payment tracking,
         // and no ledger.
         let side_len = |t: &Option<crate::payments::SideTrack>| {
@@ -3419,17 +3495,19 @@ mod close_and_revocation_tests {
         let (back, _, _) = policy::decode_channel_store(&v1).unwrap();
         let (_, b) = &back[0];
         assert_eq!(b.funding_sats, FUNDING);
+        assert!(b.predates_validation);
         assert_eq!((b.is_outbound, b.revoked_through), (None, None));
         assert!(b.remote_shutdown_script.is_empty());
-        // Truncated or padded payloads are refused, as is a version 8.
+        // Truncated or padded payloads are refused, as is a version 9.
+        assert!(policy::decode_channel_store(&v8[..v8.len() - 1]).is_err());
         assert!(policy::decode_channel_store(&v7[..v7.len() - 1]).is_err());
         assert!(policy::decode_channel_store(&v6[..v6.len() - 1]).is_err());
         let mut padded = v6.clone();
         padded.push(0);
         assert!(policy::decode_channel_store(&padded).is_err());
-        let mut v8 = v7.clone();
-        v8[4] = 8;
-        assert!(policy::decode_channel_store(&v8).is_err());
+        let mut v9 = v8.clone();
+        v9[4] = 9;
+        assert!(policy::decode_channel_store(&v9).is_err());
     }
 
     // ---- Balance-held closes and store-miss revocations ----
@@ -4363,14 +4441,119 @@ mod close_and_revocation_tests {
         println!("M3 one-atom close, same channel imported from a v2 store: {}", verdict(&o2));
         assert!(matches!(&o3, Outcome::Reject(r) if r.contains("pays this wallet 1, below its balance 601000")),
                 "{}", verdict(&o3));
-        assert!(matches!(&o2, Outcome::Reject(r) if r.contains("no balance is known for the channel yet \
-            (the close pays this wallet 1)")), "{}", verdict(&o2));
-        // The honest close too, until the next commitment.
+        assert!(matches!(&o2, Outcome::Reject(r) if r.contains("predates validation")),
+                "{}", verdict(&o2));
+        // The honest close too; and no later commitment teaches the device
+        // the balance: the channel predates validation, and the device never
+        // takes its state on the host's word.
         let honest = close(FUNDING_TXID, &[(ours, 600_500), (peer_script(), 399_000), (Vec::new(), 500)]);
         assert!(matches!(s2.handle(&req(mutual_close_msg(&s2, &honest))), Outcome::Reject(_)));
-        assert!(matches!(validate(&mut s2, 2, 600_000, 399_000, 1_000), Outcome::Reply(_)));
-        assert!(matches!(s2.handle(&req(mutual_close_msg(&s2, &honest))), Outcome::Reply(_)));
+        assert!(matches!(validate(&mut s2, 2, 600_000, 399_000, 1_000),
+                         Outcome::Reject(r) if r.contains("predates validation")));
+        assert!(matches!(s2.handle(&req(mutual_close_msg(&s2, &honest))), Outcome::Reject(_)));
         assert!(matches!(s2.handle(&req(mutual_close_msg(&s2, &theft))), Outcome::Reject(_)));
+    }
+
+    // ---- A store from a device that validated nothing ----
+
+    /// The store a version-1 device would have written for `s`'s channels
+    /// (each entry's fixed part only, no ledger), MAC'd for `s`'s seed.
+    fn as_v1_blob(s: &Signer) -> Vec<u8> {
+        let full = policy::encode_channel_store(&s.store);
+        let n = u32::from_le_bytes(full[5..9].try_into().unwrap()) as usize;
+        assert_eq!(n, 1);
+        let mut payload = full[..9].to_vec();
+        payload[4] = 1;
+        payload.extend_from_slice(&full[9..9 + policy::CHSTORE_ENTRY_LEN]);
+        let mac = s.chstore_mac(&payload);
+        payload.extend_from_slice(&mac);
+        payload
+    }
+
+    /// D39: a channel imported from a version-1 store is marked as predating
+    /// validation, and the device signs no commitment step for it, however
+    /// far the channel has moved: no commitment of the peer's, no
+    /// validation of ours, no revocation (not even of commitment 0), no
+    /// commitment of ours for broadcast and no close. It reports the
+    /// channel. A channel set up afterwards is validated as any other.
+    #[test]
+    fn v1_store_channels_predate_validation() {
+        let mut s = signer(Policy::Enforce);
+        track(&mut s, false, &peer_script());
+        for n in 0..3 {
+            assert!(matches!(validate(&mut s, n, 300_000, 699_000, 1_000), Outcome::Reply(_)));
+        }
+        assert!(matches!(revoke(&mut s, 0), Outcome::Reply(_)));
+        let blob = as_v1_blob(&s);
+
+        let mut d = signer(Policy::Enforce);
+        assert_eq!(d.import_channels(&blob), Ok(1));
+        assert!(st(&d).predates_validation);
+        let listed = d.predating_channels();
+        assert_eq!(listed, vec![(PEER, DBID, FUNDING_TXID, 0, FUNDING)]);
+        // channeld sends setup_channel again at every start: still marked.
+        track(&mut d, false, &peer_script());
+        assert!(st(&d).predates_validation);
+
+        let why = |o: Outcome| match o {
+            Outcome::Reject(r) => r,
+            o => panic!("signed: {}", verdict(&o)),
+        };
+        let r = why(validate(&mut d, 3, 300_000, 699_000, 1_000));
+        println!("VALIDATE on a v1-store channel: {r}");
+        assert!(r.starts_with("VALIDATE_COMMITMENT_TX refused: channel 3 of peer 02020202 predates validation"), "{r}");
+        let r = why(sign_remote(&mut d, 2, 699_000, 300_000, 1_000));
+        assert!(r.starts_with("SIGN_REMOTE_COMMITMENT_TX refused: channel 3"), "{r}");
+        for n in [0, 1] {
+            let r = why(revoke(&mut d, n));
+            assert!(r.starts_with("REVOKE_COMMITMENT_TX refused: channel 3"), "{r}");
+        }
+        let ours = d.wallet_sweep_script(4, false);
+        let honest = close(FUNDING_TXID, &[(ours, 300_500), (peer_script(), 699_000), (Vec::new(), 500)]);
+        let r = why(d.handle(&req(mutual_close_msg(&d, &honest))));
+        assert!(r.starts_with("SIGN_MUTUAL_CLOSE_TX refused: channel 3"), "{r}");
+        let r = why(d.handle(&req(sign_commitment_msg(&d, &honest, 2))));
+        assert!(r.starts_with("SIGN_COMMITMENT_TX refused: channel 3"), "{r}");
+        let commitment = local_commitment(&d, 2, 300_000, 699_000, 1_000);
+        let r = why(d.handle(&req(sign_commitment_msg(&d, &commitment, 2))));
+        assert!(r.starts_with("SIGN_COMMITMENT_TX refused: channel 3"), "{r}");
+
+        // Nothing it refused moved its record.
+        assert_eq!((st(&d).revoked_through, st(&d).validated_through), (None, None));
+        // The mark survives the store's round trip, and a later import of
+        // the same old store over a live record.
+        let back = d.export_channels();
+        let mut e = signer(Policy::Enforce);
+        track(&mut e, false, &peer_script());
+        assert!(!st(&e).predates_validation);
+        assert_eq!(e.import_channels(&back), Ok(0));
+        assert!(st(&e).predates_validation);
+        // Permissive signs as libhsmd does.
+        let mut p = signer(Policy::Permissive);
+        p.import_channels(&blob).unwrap();
+        assert!(matches!(validate(&mut p, 3, 300_000, 699_000, 1_000), Outcome::Reply(_)));
+    }
+
+    /// A version-6 store came from a validating device: its channels go on.
+    #[test]
+    fn v6_store_channels_are_carried_over() {
+        let mut s = signer(Policy::Enforce);
+        track(&mut s, false, &peer_script());
+        for n in 0..2 {
+            assert!(matches!(validate(&mut s, n, 300_000, 699_000, 1_000), Outcome::Reply(_)));
+        }
+        let full = policy::encode_channel_store(&s.store);
+        // Version 8 less the entry's flag and the close record: version 6.
+        let mut payload = [&full[..full.len() - 2 - 4 - 1], &full[full.len() - 2 - 4..full.len() - 2]].concat();
+        payload[4] = 6;
+        let mac = s.chstore_mac(&payload);
+        payload.extend_from_slice(&mac);
+        let mut d = signer(Policy::Enforce);
+        assert_eq!(d.import_channels(&payload), Ok(1));
+        assert!(!st(&d).predates_validation);
+        assert!(d.predating_channels().is_empty());
+        assert!(matches!(validate(&mut d, 2, 300_000, 699_000, 1_000), Outcome::Reply(_)));
+        assert!(matches!(revoke(&mut d, 0), Outcome::Reply(_)));
     }
 }
 
@@ -4896,6 +5079,7 @@ mod close_output_spend_tests {
             remote_split: None,
             validated: Vec::new(),
             pay: crate::payments::PayTrack { asset: Some(asset), ..Default::default() },
+            predates_validation: false,
         }
     }
 }

@@ -83,6 +83,9 @@ if (existsSync(STORE)) {
   try {
     const n = signer.importChannels(readFileSync(STORE));
     log(`seqln-signer: restored ${n} channel(s) from ${STORE}`);
+    for (const c of JSON.parse(signer.predatingChannels())) {
+      say(`seqln-signer: channel ${c.dbid} of peer ${c.peerId} (funding ${c.fundingTxid}:${c.fundingOutnum}, ${c.fundingSats}) predates validation: no commitment step is signed for it; its peer closes it`);
+    }
   } catch (e) {
     say(`seqln-signer: channel store ${STORE} NOT restored: ${e.message || e}`);
   }
