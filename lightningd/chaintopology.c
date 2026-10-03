@@ -612,7 +612,6 @@ static void update_feeexchangerates(struct lightningd *ld,
 	struct chain_topology *topo = ld->topology;
 	bool changed;
 
-	topo->asset_fee_rates_gen++;
 	changed = tal_count(rates) != tal_count(topo->asset_fee_rates)
 		|| (tal_count(rates)
 		    && memcmp(rates, topo->asset_fee_rates,
@@ -636,7 +635,6 @@ static void get_feeexchangerates_once(struct lightningd *ld,
 	tal_free(topo->asset_fee_rates);
 	topo->asset_fee_rates = tal_dup_talarr(topo, struct asset_fee_rate,
 					       rates);
-	topo->asset_fee_rates_gen++;
 	io_break(topo);
 }
 
@@ -1431,7 +1429,6 @@ struct chain_topology *new_topology(struct lightningd *ld, struct logger *log)
 	memset(topo->feerates, 0, sizeof(topo->feerates));
 	topo->smoothed_feerates = NULL;
 	topo->asset_fee_rates = NULL;
-	topo->asset_fee_rates_gen = 0;
 	topo->root = NULL;
 	topo->sync_waiters = tal(topo, struct list_head);
 	topo->extend_timer = NULL;

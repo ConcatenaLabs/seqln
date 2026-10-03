@@ -150,12 +150,14 @@ privileged fee asset), so a node returns no `estimatesmartfee`-style feerate:
   - the receiver's limits are its relay floor and `feerate_max()` (ten times its highest
     estimate), each converted at its own rate (`peer_commitment_feerate_min()`; `openingd_init`
     carries the node's rates for an open). An `update_fee` outside them is refused with a warning,
-    and lightningd refreshes its rates at once (each node polls its own, so the receiver may have
-    judged by a rate older than the opener's). Refused again within ten minutes by the refreshed
-    rates, it fails the channel, saying why, instead of disconnecting at every reconnect;
+    and lightningd refreshes its rates at once: each node takes rates from its own feed, so the
+    receiver may be judging by a rate older than the opener's. It keeps refusing (and
+    disconnecting) while its rate for the channel asset is unchanged, and fails the channel,
+    saying why, only when a refusal persists after that rate has changed, or for more than five
+    minutes, longer than a lagging feed takes to catch up (`channel_update_fee_refused()`);
   - a fundee with no rate for the channel asset refuses a channel in it, and in an open channel
     holds the opener to the last limits its rate gave, or, with none since it started, to the
-    current feerate.
+    current feerate; with no rate to judge by, it never fails the channel over a feerate.
 - The cap on HTLCs trimmed to dust in flight (`--max-dust-htlc-exposure-msat`) is a reference
   amount like the fee settings, so lightningd values it at the node's rate for the channel asset
   (`channel_dust_cap()` in `lightningd/channel_control.c`) and channeld receives it at start and

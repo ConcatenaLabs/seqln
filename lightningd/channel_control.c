@@ -60,20 +60,32 @@ static u32 chan_feerate(struct lightningd *ld, const struct channel *channel,
 				     feerate);
 }
 
+/* How long a refusal of the peer's update_fee may persist, with this node's
+ * rate for the channel asset unchanged, before it is taken as a real
+ * disagreement: several times what a price feed lagging the peer's should take
+ * to catch up (the price server polls every minute by default, and lightningd
+ * reads the node's rates every 30 seconds). */
+#define UPDATE_FEE_RATE_LAG_GRACE_SECS 300
+/* A refusal this long after the last one starts a new episode. */
+#define UPDATE_FEE_REFUSAL_EPISODE_SECS 600
+
 /* channeld refused the peer's update_fee as outside this node's range, on a
- * Sequentia network, and is about to warn and disconnect.  The first time,
- * the range may come from a rate older than the peer's (both nodes poll their
- * own rates): refresh them now, so the reconnected channeld judges the
- * update_fee the peer sends again by the current rate.  If that one is
- * refused too, within ten minutes, the two nodes value the channel asset too
- * differently to agree a feerate: fail the channel once, rather than
- * disconnect at every reconnect. */
+ * Sequentia network, and is about to warn and disconnect.  The range may come
+ * from a rate older than the peer's (each node takes rates from its own feed),
+ * so the refusal alone proves nothing: refresh the rates and keep refusing.
+ * Fail the channel, once, rather than disconnect at every reconnect, only when
+ * the refusal persists after this node's rate for the channel asset has
+ * changed (it is then judged by a fresh rate), or for longer than a lagging
+ * feed takes to catch up.  With no rate for the asset, the node has nothing
+ * to judge by: it holds the feerate and never fails the channel for it. */
 static void channel_update_fee_refused(struct lightningd *ld,
 				       struct channel *channel,
 				       const u8 *msg)
 {
 	u32 feerate, min, max;
 	struct chain_topology *topo = ld->topology;
+	u64 rate = topo_asset_fee_rate(topo, channel->channel_asset);
+	struct timerel since;
 
 	if (!fromwire_channeld_update_fee_refused(msg, &feerate, &min, &max)) {
 		channel_internal_error(channel,
@@ -82,29 +94,56 @@ static void channel_update_fee_refused(struct lightningd *ld,
 		return;
 	}
 
-	if (channel->update_fee_refused
-	    && channel->update_fee_refused_rates != topo->asset_fee_rates_gen
-	    && time_less(timemono_since(channel->update_fee_refused_time),
-			 time_from_sec(600))) {
-		channel_fail_permanent(channel, REASON_LOCAL,
-				       "update_fee %u outside range %u-%u"
-				       " again, judged by this node's fee"
-				       " exchange rates refreshed since the"
-				       " first refusal: the peers value the"
-				       " channel asset too differently to"
-				       " agree a feerate",
-				       feerate, min, max);
+	if (!channel->update_fee_refused
+	    || !time_less(timemono_since(channel->update_fee_refused_last),
+			  time_from_sec(UPDATE_FEE_REFUSAL_EPISODE_SECS))) {
+		channel->update_fee_refused = true;
+		channel->update_fee_refused_time = time_mono();
+		channel->update_fee_refused_rate = rate;
+		channel->update_fee_refused_last = time_mono();
+		log_unusual(channel->log,
+			    "Refused the peer's update_fee %u, outside range"
+			    " %u-%u in the channel asset at this node's rate:"
+			    " refreshing the fee exchange rates before it"
+			    " reconnects",
+			    feerate, min, max);
+		topo_refresh_feeexchangerates(topo);
 		return;
 	}
 
-	channel->update_fee_refused = true;
-	channel->update_fee_refused_time = time_mono();
-	channel->update_fee_refused_rates = topo->asset_fee_rates_gen;
+	channel->update_fee_refused_last = time_mono();
+	since = timemono_since(channel->update_fee_refused_time);
+	if (rate && rate != channel->update_fee_refused_rate) {
+		channel_fail_permanent(channel, REASON_LOCAL,
+				       "update_fee %u outside range %u-%u"
+				       " again, judged by this node's fee"
+				       " exchange rate for the channel asset,"
+				       " which changed since the first refusal:"
+				       " the peers value the channel asset too"
+				       " differently to agree a feerate",
+				       feerate, min, max);
+		return;
+	}
+	if (rate && !time_less(since, time_from_sec(UPDATE_FEE_RATE_LAG_GRACE_SECS))) {
+		channel_fail_permanent(channel, REASON_LOCAL,
+				       "update_fee %u outside range %u-%u"
+				       " again, after %"PRIu64" seconds of"
+				       " refusals, longer than a lagging rate"
+				       " feed takes to catch up: the peers"
+				       " value the channel asset too differently"
+				       " to agree a feerate",
+				       feerate, min, max,
+				       (u64)time_to_sec(since));
+		return;
+	}
 	log_unusual(channel->log,
-		    "Refused the peer's update_fee %u, outside range %u-%u in"
-		    " the channel asset at this node's rate: refreshing the"
-		    " fee exchange rates before it reconnects",
-		    feerate, min, max);
+		    "Refused the peer's update_fee %u, outside range %u-%u,"
+		    " again after %"PRIu64" seconds: %s",
+		    feerate, min, max, (u64)time_to_sec(since),
+		    rate ? "this node's rate for the channel asset has not"
+		    " changed yet, so still waiting for its feed"
+		    : "no fee exchange rate for the channel asset, so holding"
+		    " the feerate rather than failing the channel");
 	topo_refresh_feeexchangerates(topo);
 }
 
