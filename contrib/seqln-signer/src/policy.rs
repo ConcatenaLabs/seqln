@@ -151,6 +151,11 @@ pub struct ChannelState {
     /// one was given.
     pub local_shutdown_script: Vec<u8>,
     pub remote_shutdown_script: Vec<u8>,
+    /// The wallet key index `setup_channel` gave for the local upfront
+    /// shutdown script (lightningd names one when the script is one of its
+    /// wallet's addresses). The script counts as this wallet's in a close
+    /// only when it derives from this device's keys at that index.
+    pub local_shutdown_wallet_index: Option<u32>,
     /// The highest of OUR commitment numbers whose per-commitment secret this
     /// device has revealed (REVOKE_COMMITMENT_TX). Every commitment numbered
     /// at or below it is revoked: signing one would hand the peer the channel.
@@ -239,6 +244,7 @@ impl ChannelState {
         }
         if !old.local_shutdown_script.is_empty() {
             self.local_shutdown_script = old.local_shutdown_script.clone();
+            self.local_shutdown_wallet_index = old.local_shutdown_wallet_index;
         }
         if !old.remote_shutdown_script.is_empty() {
             self.remote_shutdown_script = old.remote_shutdown_script.clone();
@@ -375,9 +381,10 @@ pub const CHSTORE_MAGIC: [u8; 4] = *b"SQCH";
 /// adds, after those, the unrevoked validated commitments (count(1), then
 /// number(8) and txid(32) each). Version 5 adds, after those, the channel's
 /// payment tracking ([`PayTrack`]), and after the last entry the payment
-/// ledger ([`Ledger`]). Versions 1 to 4 still import (the fields they lack
-/// unknown).
-pub const CHSTORE_VERSION: u8 = 5;
+/// ledger ([`Ledger`]). Version 6 adds, after the payment tracking, the
+/// local shutdown script's wallet index (flag(1), then index(4)). Versions 1
+/// to 5 still import (the fields they lack unknown).
+pub const CHSTORE_VERSION: u8 = 6;
 /// The fixed part of an entry, which is the whole of a version-1 entry:
 /// node_id(33) dbid(8) sats(8) txid(32) txout(2) local_delay(2) remote_delay(2)
 /// 5 pubkeys(165) static_remotekey(1) anchors(1)
@@ -502,6 +509,13 @@ pub fn encode_channel_store(store: &ChannelStore) -> Vec<u8> {
             out.extend_from_slice(txid);
         }
         push_pay(&mut out, &st.pay);
+        match st.local_shutdown_wallet_index {
+            None => out.push(0),
+            Some(i) => {
+                out.push(1);
+                out.extend_from_slice(&i.to_le_bytes());
+            }
+        }
     }
     push_ledger(&mut out, &store.ledger);
     out
@@ -621,13 +635,13 @@ impl<'a> StoreReader<'a> {
 pub type DecodedStore = (Vec<(([u8; 33], u64), ChannelState)>, Ledger);
 
 /// Decode a channel-store payload (the MAC must already have been verified
-/// and stripped by the caller). Takes versions 1 to 5.
+/// and stripped by the caller). Takes versions 1 to 6.
 pub fn decode_channel_store(bytes: &[u8]) -> Result<DecodedStore, String> {
     if bytes.len() < 9 || bytes[..4] != CHSTORE_MAGIC {
         return Err("not a channel-store blob (bad magic)".to_string());
     }
     let version = bytes[4];
-    if !(1..=5).contains(&version) {
+    if !(1..=6).contains(&version) {
         return Err(format!("unsupported channel-store version {version}"));
     }
     let count = u32::from_le_bytes(bytes[5..9].try_into().unwrap()) as usize;
@@ -657,6 +671,7 @@ pub fn decode_channel_store(bytes: &[u8]) -> Result<DecodedStore, String> {
             is_outbound: None,
             local_shutdown_script: Vec::new(),
             remote_shutdown_script: Vec::new(),
+            local_shutdown_wallet_index: None,
             revoked_through: None,
             validated_through: None,
             local_split: None,
@@ -689,6 +704,13 @@ pub fn decode_channel_store(bytes: &[u8]) -> Result<DecodedStore, String> {
         }
         if version >= 5 {
             st.pay = r.pay()?;
+        }
+        if version >= 6 {
+            st.local_shutdown_wallet_index = match r.u8()? {
+                0 => None,
+                1 => Some(u32::from_le_bytes(r.take(4)?.try_into().unwrap())),
+                v => return Err(format!("bad wallet-index flag {v} in channel-store blob")),
+            };
         }
         out.push(((node_id, dbid), st));
     }
@@ -1237,14 +1259,20 @@ pub const CLOSE_FEE_CEILING_FACTOR: u64 = 4;
 ///
 ///  * the single input spends the tracked funding outpoint;
 ///  * every value is explicit and the outputs do not exceed the funding;
-///  * besides the fee, at most two outputs: at most one paying one of this
-///    device's own wallet scripts (`own`, our share), and at most one paying
-///    the peer: its recorded upfront shutdown script when `setup_channel`
-///    named one, else any one script;
+///  * besides the fee, at most two outputs: at most one paying this device's
+///    wallet (one of its own wallet scripts, `own`, or `own_close`: the local
+///    upfront shutdown script, when it derives from this device's keys), our
+///    share; and at most one paying the peer: its recorded upfront shutdown
+///    script when `setup_channel` named one, else any one script;
 ///  * the split: see [`check_close_balance`].
+///
+/// The local upfront shutdown script alone does not make an output ours:
+/// `setup_channel` comes from the host, so a script the device cannot derive
+/// could be the host's.
 pub fn validate_mutual_close(
     st: &ChannelState,
     own: &std::collections::HashSet<Vec<u8>>,
+    own_close: Option<&[u8]>,
     tx: &ElementsTx,
 ) -> Result<(), String> {
     if tx.inputs.len() != 1 {
@@ -1263,7 +1291,7 @@ pub fn validate_mutual_close(
         if o.script.is_empty() {
             continue; // fee
         }
-        if own.contains(&o.script) {
+        if own.contains(&o.script) || own_close == Some(o.script.as_slice()) {
             ours += 1;
             ours_value = v;
         } else if st.remote_shutdown_script.is_empty()

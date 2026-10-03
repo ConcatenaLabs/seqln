@@ -75,13 +75,19 @@ What enforce mode checks:
   the commitment message when a close completes and whenever it starts with a channel closing):
   one input, the funding output; at most one output to this device's own wallet and at most one
   to the peer, which must be the peer's upfront shutdown script when the channel named one; no
-  value created. A close paying our share anywhere but our own wallet is refused, whatever local
-  shutdown script the host supplied. The output to our wallet must be at least the recorded
-  balance (the larger of the two commitments' figures), less the close fee when this side
-  opened the channel, and that fee is counted only up to four times the commitment's fee and
-  anchors. It may be left out only when what is due is under the 546-atom dust limit, and the
-  peer's output may not exceed the funding less our balance. While no balance is recorded, a
-  close that pays this wallet nothing is refused.
+  value created. A close paying our share anywhere but our own wallet is refused. The local
+  upfront shutdown script (`fundchannel close_to=`) counts as our wallet only when it is one of
+  this device's wallet addresses at the key index `setup_channel` gives for it, because the host
+  supplies that script: a channel opened with `close_to` an address outside this wallet cannot be
+  closed mutually, and closes unilaterally instead (the device sweeps its delayed output to its
+  own wallet). The output to our wallet must be at least the recorded balance (the larger of the
+  two commitments' figures), less the close fee when this side opened the channel. That fee is
+  counted only up to four times the commitment's fee and anchors: a close paying more (`close`
+  with a `feerange` far above the channel's feerate, say) is refused, lightningd keeps running,
+  and `close` falls back to a unilateral close after its `unilateraltimeout`. Our output may be
+  left out only when what is due is under the 546-atom dust limit, and the peer's output may not
+  exceed the funding less our balance. While no balance is recorded, a close that pays this
+  wallet nothing is refused.
 - **Revocations**: the device reveals the secret of our commitment n only when n is the next to
   revoke (or already revealed: channeld re-sends a revocation after a reconnect) and commitment
   n + 1 has been validated; and it never signs a commitment of ours numbered at or below the
@@ -127,8 +133,9 @@ unrevoked commitments it validated and its payment tracking, and the approvals a
 the payment limits) carries no secret and is authenticated by a MAC keyed from the seed. The native signer keeps it in
 `seqln-signer-channels` in its working directory (or the path in `SEQLN_SIGNER_STORE`): it
 loads the file at start and rewrites it durably (temporary file, sync, rename) after every
-request that changed it, before the reply leaves, refusing the request if the file cannot be
-written. The WASM build hands the same blob to the wallet's `channelStore` to keep.
+request that changed it, before the reply leaves. If the file cannot be written it refuses the
+request, and every request after it until a write succeeds, so channeld asking again for what
+was refused gets no answer the store does not record. The WASM build hands the same blob to the wallet's `channelStore` to keep.
 
 ## Layout
 
@@ -148,8 +155,8 @@ written. The WASM build hands the same blob to the wallet's `channelStore` to ke
 | `src/bin/ecdh_latency.rs` | ECDH hot-path latency probe (in-process vs transport round-trip). |
 | `src/bin/emit_elements_vector.rs` | Emits an Elements v2 PSET `sign_withdrawal` vector for the conformance harness's `SEQLN_WITHDRAWAL_VECTOR` mode. |
 | `tests/tamper.rs` | Enforce-mode theft-rejection test (skips without a captured corpus). |
-| `tests/chstore.rs` | Channel-store persistence contract (`export_channels`/`import_channels` round-trip, MAC refusal, merge semantics). The store carries each channel's opener, upfront shutdown scripts, revocation counters, recorded balance and unrevoked validated commitments, and imports an older store without them. |
-| `tests/native_store.rs` | The native binary keeps its store across a restart: a new process refuses a revoked commitment and a close below the recorded balance, which a signer with an empty store signs (the commitment once it has validated it itself). |
+| `tests/chstore.rs` | Channel-store persistence contract (`export_channels`/`import_channels` round-trip, MAC refusal, merge semantics). The store carries each channel's opener, upfront shutdown scripts (and the local one's wallet index), revocation counters, recorded balance and unrevoked validated commitments, and imports an older store without them. |
+| `tests/native_store.rs` | The native binary keeps its store across a restart: a new process refuses a revoked commitment and a close below the recorded balance, which a signer with an empty store signs (the commitment once it has validated it itself). With the store unwritable it refuses every request, a re-sent revocation included, until a write succeeds. |
 | `wasm/` | `wasm-bindgen` build of the same library for browsers/Node, plus SDK, relay, tests, demo page. |
 | `wasm/test/enforce.mjs` | WASM enforce-mode proof: corpus replay byte-exact, tampered commitment refused. |
 | `wasm/test/ws_device.mjs` | The browser-shaped device path over a real WebSocket, driven by the wallet SDK. |
