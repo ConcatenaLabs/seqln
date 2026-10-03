@@ -92,6 +92,12 @@ pub struct Signer {
     /// The current time (Unix seconds), set by the host before each request:
     /// approvals and charges expire against it. Left at 0, nothing expires.
     now: u64,
+    /// Why the device would not sign what the current request asked for,
+    /// when the reply still goes out (a withdrawal returned unsigned) or the
+    /// handler can only answer the sentinel. `handle` turns a sentinel with a
+    /// reason into `Outcome::Reject`; the host takes the rest
+    /// (`take_refusal`) to log it.
+    refusal: std::cell::RefCell<Option<String>>,
 }
 
 impl Signer {
@@ -115,7 +121,19 @@ impl Signer {
             last_untracked: std::cell::Cell::new(None),
             limits: Limits::default(),
             now: 0,
+            refusal: std::cell::RefCell::new(None),
         }
+    }
+
+    /// The reason the last request was refused, when its reply was not the
+    /// refusal sentinel: a withdrawal the device returned without signing it
+    /// (take-and-clear). The host logs it.
+    pub fn take_refusal(&mut self) -> Option<String> {
+        self.refusal.borrow_mut().take()
+    }
+
+    fn refuse(&self, reason: String) {
+        *self.refusal.borrow_mut() = Some(reason);
     }
 
     /// Set the payment limits (the native binary reads them from the
@@ -140,6 +158,18 @@ impl Signer {
     }
 
     pub fn handle(&mut self, req: &Request) -> Outcome {
+        *self.refusal.borrow_mut() = None;
+        match self.dispatch(req) {
+            // A handler that refused on policy grounds left its reason.
+            Outcome::Sentinel => match self.refusal.borrow_mut().take() {
+                Some(reason) => Outcome::Reject(reason),
+                None => Outcome::Sentinel,
+            },
+            other => other,
+        }
+    }
+
+    fn dispatch(&mut self, req: &Request) -> Outcome {
         let t = match wire::peektype(&req.hsmd_msg) {
             Some(t) => t,
             None => return Outcome::Sentinel,
@@ -174,8 +204,9 @@ impl Signer {
             msg::HSMD_SIGN_COMMITMENT_TX => self.sign_commitment_tx_checked(req),
             msg::HSMD_SIGN_REMOTE_COMMITMENT_TX => self.sign_remote_commitment_tx_checked(req),
             // SIGN_WITHDRAWAL (7): the node signs its OWN wallet inputs of a
-            // withdrawal / channel-funding tx (the funder role). Not a theft
-            // vector for the fundee split, so no policy gate.
+            // withdrawal / channel-funding tx (the funder role). A close
+            // output among them is held to the close-output rule
+            // (`sign_wallet_inputs_into_psbt`).
             msg::HSMD_SIGN_WITHDRAWAL => opt(self.h_sign_withdrawal(&req.hsmd_msg)),
             // SIGN_ANCHORSPEND (147): CPFP-bump a commitment by spending its
             // anchor output (funding-key partial sig) plus the node's own wallet
@@ -487,7 +518,7 @@ impl Signer {
             m.verify_slice(mac)
                 .map_err(|_| "channel-store MAC mismatch (foreign or tampered blob)".to_string())?;
         }
-        let (entries, ledger) = policy::decode_channel_store(payload)?;
+        let (entries, ledger, closes) = policy::decode_channel_store(payload)?;
         let mut added = 0u32;
         for ((node_id, dbid), st) in entries {
             if self.store.insert_if_absent(node_id, dbid, st) {
@@ -496,7 +527,8 @@ impl Signer {
         }
         let before = self.store.ledger.clone();
         self.store.ledger.merge_from(&ledger);
-        if added > 0 || self.store.ledger != before {
+        let closes_changed = self.store.merge_closes(&closes);
+        if added > 0 || self.store.ledger != before || closes_changed {
             self.store_dirty = true;
         }
         Ok(added)
@@ -557,7 +589,17 @@ impl Signer {
                 return Outcome::Reject(format!("SIGN_COMMITMENT_TX refused: {reason}"));
             }
         }
-        opt(self.h_sign_commitment_tx(&req.hsmd_msg))
+        let reply = self.h_sign_commitment_tx(&req.hsmd_msg);
+        if reply.is_some() {
+            // lightningd signs a completed mutual close with this message
+            // too: what it pays this wallet is a close output.
+            if let Some((_, _, bt, _, _)) = parse_own_commitment(&req.hsmd_msg) {
+                if !policy::is_commitment_shaped(&bt.tx) && self.store.record_close(bt.txid) {
+                    self.store_dirty = true;
+                }
+            }
+        }
+        opt(reply)
     }
 
     /// SIGN_MUTUAL_CLOSE_TX (21): closingd's signature on a closing proposal.
@@ -578,7 +620,18 @@ impl Signer {
                 return Outcome::Reject(format!("SIGN_MUTUAL_CLOSE_TX refused: {reason}"));
             }
         }
-        opt(self.h_sign_mutual_close_tx(req))
+        let reply = self.h_sign_mutual_close_tx(req);
+        if reply.is_some() {
+            // Remember the close: what it pays this wallet is a close output,
+            // whose spend the device signs only to its own scripts.
+            let mut r = wire::Reader::new(&req.hsmd_msg);
+            if let (Some(_), Some(bt)) = (r.u16(), wire::read_bitcoin_tx(&mut r)) {
+                if self.store.record_close(bt.txid) {
+                    self.store_dirty = true;
+                }
+            }
+        }
+        opt(reply)
     }
 
     /// REVOKE_COMMITMENT_TX (40): reveal the secret of OUR commitment n. Once
@@ -1132,23 +1185,123 @@ impl Signer {
     }
 
     /// The enforce gate for a DIRECT-TO-WALLET sweep (Class A: delayed/penalty/
-    /// htlc-to-us). Returns Err if enforce is on and a committed output is not the
-    /// node's own. `label` names the handler for the log line.
+    /// htlc-to-us), which spends an output of channel (`peer_id`, `dbid`)'s
+    /// commitment: every output the signature commits to pays one of the
+    /// node's own scripts, in the channel's asset ([`Self::sweep_loss`]).
+    /// With `bounded` (the sweep of our own commitment's to_local after its
+    /// delay, a close output, which nothing hurries), what the signature lets
+    /// leave those scripts is also within the payment limit of that asset. A
+    /// penalty or an HTLC claim races the peer: it is never refused over its
+    /// fee. Returns Err, with the reason left for `handle`, when enforce is
+    /// on and a check fails. `label` names the handler.
+    #[allow(clippy::too_many_arguments)]
     fn enforce_wallet_sweep(
         &self,
         label: &str,
+        peer_id: &[u8; 33],
+        dbid: u64,
         bt: &BitcoinTx,
         sign_index: usize,
         sighash: u32,
+        bounded: bool,
     ) -> Result<(), ()> {
         if !self.policy.is_enforce() {
             return Ok(());
         }
-        match self.check_sweep_outputs(bt, sign_index, sighash, self.own_sweep_script_set()) {
+        let check = self
+            .check_sweep_outputs(bt, sign_index, sighash, self.own_sweep_script_set())
+            .and_then(|()| self.sweep_loss(peer_id, dbid, bt, sign_index, sighash))
+            .and_then(|(asset, loss)| {
+                if bounded {
+                    self.within_limit(&asset, loss, "what it lets leave this device")
+                } else {
+                    Ok(())
+                }
+            });
+        match check {
             Ok(()) => Ok(()),
             Err(reason) => {
-                eprintln!("{label} refused (enforce): {reason}");
+                self.refuse(format!("{label} refused: {reason}"));
                 Err(())
+            }
+        }
+    }
+
+    /// What a Class A sweep signature lets leave this device's scripts, and in
+    /// which asset. The input it signs is a close output of the channel, so
+    /// its asset is the channel's: the one this device recorded from the
+    /// channel's commitments, whatever the request names for the input (a
+    /// segwit-v0 signature does not commit to the asset of the input it
+    /// spends). For a channel it never validated a commitment of, it has
+    /// only the request's word: that half of the bound rests on the request.
+    ///  * SIGHASH_SINGLE|ANYONECANPAY commits to this input and output
+    ///    `sign_index` only: the host may add inputs and outputs, so all the
+    ///    input carries beyond that output, in the channel's asset, can leave.
+    ///    The output must be in that asset.
+    ///  * SIGHASH_ALL commits to every output: on Sequentia what leaves is
+    ///    the fee outputs, on Bitcoin the input less every output.
+    fn sweep_loss(
+        &self,
+        peer_id: &[u8; 33],
+        dbid: u64,
+        bt: &BitcoinTx,
+        sign_index: usize,
+        sighash: u32,
+    ) -> Result<(AssetKey, u64), String> {
+        let single = sighash & 0x1f == 0x03;
+        let outs = &bt.tx.outputs;
+        match bt.tx.network {
+            kernel::Network::Bitcoin => {
+                let v = u64::from_le_bytes(
+                    wire::psbt_input_value_sats_le(&bt.psbt, sign_index)
+                        .ok_or("the request gives no amount for the input")?,
+                );
+                let amount = |o: &kernel::TxOutput| -> u64 {
+                    o.value.get(0..8).and_then(|b| b.try_into().ok()).map_or(0, u64::from_le_bytes)
+                };
+                let kept = if single {
+                    outs.get(sign_index).map_or(0, amount)
+                } else {
+                    outs.iter().fold(0u64, |t, o| t.saturating_add(amount(o)))
+                };
+                Ok((AssetKey::Btc, v.saturating_sub(kept)))
+            }
+            kernel::Network::Elements => {
+                let v = wire::psbt_input_value9(&bt.psbt, sign_index)
+                    .and_then(|v| explicit_amount(&v))
+                    .ok_or("the input's value is not explicit")?;
+                let asset = match self.store.get(peer_id, dbid).and_then(|st| st.pay.asset) {
+                    Some(a) => a,
+                    None => wire::psbt_input_asset(&bt.psbt, sign_index)
+                        .and_then(|a| explicit_asset(&a))
+                        .ok_or("the input's asset is not explicit")?,
+                };
+                if single {
+                    let o = outs
+                        .get(sign_index)
+                        .ok_or_else(|| format!("no output at sign index {sign_index}"))?;
+                    if explicit_asset(&o.asset) != Some(asset) {
+                        return Err(format!(
+                            "output {sign_index} is not in the channel's asset {}",
+                            asset.display()
+                        ));
+                    }
+                    let kept = explicit_amount(&o.value)
+                        .ok_or_else(|| format!("output {sign_index} has a blinded value"))?;
+                    Ok((asset, v.saturating_sub(kept)))
+                } else {
+                    let mut fee = 0u64;
+                    for (i, o) in outs.iter().enumerate().filter(|(_, o)| o.script.is_empty()) {
+                        if explicit_asset(&o.asset) != Some(asset) {
+                            return Err(format!("fee output {i} is not in the channel's asset"));
+                        }
+                        fee = fee.saturating_add(
+                            explicit_amount(&o.value)
+                                .ok_or_else(|| format!("fee output {i} has a blinded value"))?,
+                        );
+                    }
+                    Ok((asset, fee))
+                }
             }
         }
     }
@@ -1181,7 +1334,7 @@ impl Signer {
         let spk = match expected {
             Ok(spk) => spk,
             Err(reason) => {
-                eprintln!("{label} refused (enforce): {reason}");
+                self.refuse(format!("{label} refused: {reason}"));
                 return Err(());
             }
         };
@@ -1190,7 +1343,7 @@ impl Signer {
         match self.check_sweep_outputs(bt, sign_index, sighash, &set) {
             Ok(()) => Ok(()),
             Err(reason) => {
-                eprintln!("{label} refused (enforce): {reason}");
+                self.refuse(format!("{label} refused: {reason}"));
                 Err(())
             }
         }
@@ -1340,7 +1493,7 @@ impl Signer {
         let s = self.kernel().channel_secrets(&req.node_id, req.dbid);
         let privkey = self.kernel().derive_simple_privkey(&s.htlc, &remote_per_commit);
         let sighash = if anchor { SIGHASH_SINGLE_ACP } else { SIGHASH_ALL };
-        self.enforce_wallet_sweep("SIGN_REMOTE_HTLC_TO_US", &bt, 0, sighash).ok()?;
+        self.enforce_wallet_sweep("SIGN_REMOTE_HTLC_TO_US", &req.node_id, req.dbid, &bt, 0, sighash, false).ok()?;
         self.sig_reply(&bt, 0, &wscript, &privkey, sighash, msg::HSMD_SIGN_TX_REPLY)
     }
 
@@ -1358,7 +1511,7 @@ impl Signer {
         let s = self.kernel().channel_secrets(&peer_id, dbid);
         let privkey = self.kernel().derive_simple_privkey(&s.htlc, &remote_per_commit);
         let sighash = if anchor { SIGHASH_SINGLE_ACP } else { SIGHASH_ALL };
-        self.enforce_wallet_sweep("SIGN_ANY_REMOTE_HTLC_TO_US", &bt, 0, sighash).ok()?;
+        self.enforce_wallet_sweep("SIGN_ANY_REMOTE_HTLC_TO_US", &peer_id, dbid, &bt, 0, sighash, false).ok()?;
         self.sig_reply(&bt, 0, &wscript, &privkey, sighash, msg::HSMD_SIGN_TX_REPLY)
     }
 
@@ -1374,7 +1527,7 @@ impl Signer {
         let privkey = self.kernel().derive_simple_privkey(&s.delayed, &point);
         // SINGLE|ACP (watchtower): pins the user's recovery output 0 while
         // speculad appends its own fee inputs at index >= 1 and RBFs autonomously.
-        self.enforce_wallet_sweep("SIGN_DELAYED_PAYMENT_TO_US", &bt, 0, SIGHASH_SINGLE_ACP).ok()?;
+        self.enforce_wallet_sweep("SIGN_DELAYED_PAYMENT_TO_US", &req.node_id, req.dbid, &bt, 0, SIGHASH_SINGLE_ACP, true).ok()?;
         self.sig_reply(&bt, 0, &wscript, &privkey, SIGHASH_SINGLE_ACP, msg::HSMD_SIGN_TX_REPLY)
     }
 
@@ -1392,7 +1545,7 @@ impl Signer {
         let point = self.kernel().per_commit_point_at(&s.shaseed, commit_num);
         let privkey = self.kernel().derive_simple_privkey(&s.delayed, &point);
         // SINGLE|ACP (watchtower), see SIGN_DELAYED_PAYMENT_TO_US.
-        self.enforce_wallet_sweep("SIGN_ANY_DELAYED_PAYMENT_TO_US", &bt, 0, SIGHASH_SINGLE_ACP).ok()?;
+        self.enforce_wallet_sweep("SIGN_ANY_DELAYED_PAYMENT_TO_US", &peer_id, dbid, &bt, 0, SIGHASH_SINGLE_ACP, true).ok()?;
         self.sig_reply(&bt, 0, &wscript, &privkey, SIGHASH_SINGLE_ACP, msg::HSMD_SIGN_TX_REPLY)
     }
 
@@ -1435,7 +1588,7 @@ impl Signer {
             .derive_revocation_privkey(&s.revocation, &rev_sk, &point);
         // SINGLE|ACP (watchtower): pins the recovery output 0 while speculad
         // appends its own fee inputs and RBFs the justice tx autonomously.
-        self.enforce_wallet_sweep("SIGN_PENALTY_TO_US", bt, 0, SIGHASH_SINGLE_ACP).ok()?;
+        self.enforce_wallet_sweep("SIGN_PENALTY_TO_US", peer_id, dbid, bt, 0, SIGHASH_SINGLE_ACP, false).ok()?;
         self.sig_reply(bt, 0, wscript, &privkey, SIGHASH_SINGLE_ACP, msg::HSMD_SIGN_TX_REPLY)
     }
 
@@ -1454,20 +1607,31 @@ impl Signer {
     /// key, which also covers native-P2WPKH and P2SH-P2WPKH transparently.
     fn h_sign_withdrawal(&self, m: &[u8]) -> Option<Vec<u8>> {
         let (utxos, psbt) = wire::parse_sign_withdrawal(m)?;
-        let out = self.sign_wallet_inputs_into_psbt(&utxos, psbt)?;
+        let out = self.sign_wallet_inputs_into_psbt("SIGN_WITHDRAWAL", &utxos, psbt)?;
         let mut w = Writer::new(msg::HSMD_SIGN_WITHDRAWAL_REPLY);
         w.u32(out.len() as u32);
         w.bytes(&out);
         Some(w.into_vec())
     }
 
-    /// Sign every HD-wallet input listed in `utxos` of `psbt`, splicing a
+    /// Sign every wallet input listed in `utxos` of `psbt`, splicing a
     /// PSBT_IN_PARTIAL_SIG (or PSBT_IN_TAP_KEY_SIG for a taproot input) per input,
     /// and return the mutated PSBT bytes. Shared by SIGN_WITHDRAWAL and
     /// SIGN_ANCHORSPEND (which additionally signs the anchor input with the
-    /// funding key). Byte-identical to the previous inline withdrawal loop.
+    /// funding key).
+    ///
+    /// A close output among the inputs (what a peer's commitment paid this
+    /// side, which `hsm_utxo` marks with its channel, or what a mutual close
+    /// this device signed paid it) is the user's coin coming off a channel.
+    /// In enforce mode the device signs a transaction spending one only when
+    /// every output but the fee pays one of its own wallet scripts and the
+    /// fee is within the payment limit of its asset ([`Self::check_close_spend`]).
+    /// Otherwise it signs nothing and returns the PSBT as it came, so the
+    /// node, which cannot finalize it, sends nothing and keeps running; the
+    /// reason goes to the host (`take_refusal`).
     fn sign_wallet_inputs_into_psbt(
         &self,
+        label: &str,
         utxos: &[wire::HsmUtxo],
         psbt: Vec<u8>,
     ) -> Option<Vec<u8>> {
@@ -1501,12 +1665,20 @@ impl Signer {
             .map(|i| wire::psbt_input_btc_prevout(&out, i))
             .collect::<Option<Vec<_>>>()
             .unwrap_or_default();
-        for utxo in utxos {
-            // The HD wallet path only; a their-close sweep needs channel keys and
-            // is never part of a channel-funding withdrawal.
-            if utxo.is_unilateral_close {
-                continue;
+        let spends = |u: &wire::HsmUtxo| {
+            tx.inputs.iter().any(|i| i.txhash == u.txid && i.index == u.vout)
+        };
+        if self.policy.is_enforce()
+            && utxos
+                .iter()
+                .any(|u| spends(u) && (u.close.is_some() || self.store.is_close(&u.txid)))
+        {
+            if let Err(reason) = self.check_close_spend(&tx, network, utxos) {
+                self.refuse(format!("{label} refused: {reason}"));
+                return Some(out);
             }
+        }
+        for utxo in utxos {
             // Match the utxo to its PSBT/tx input by outpoint (`wally_psbt_input_spends`).
             let Some(j) = tx
                 .inputs
@@ -1515,6 +1687,17 @@ impl Signer {
             else {
                 continue;
             };
+            // What a peer's commitment paid this side: the channel's payment
+            // key signs it (`hsm_unilateral_close_privkey`).
+            if let Some(ci) = &utxo.close {
+                if let Some(next) = self.sign_close_input(&tx, network, j, utxo, ci, &out) {
+                    out = next;
+                }
+                continue;
+            }
+            if utxo.is_unilateral_close {
+                continue;
+            }
             // Taproot (BIP-86 KEY PATH) wallet input `OP_1 <32-byte x-only>`: the
             // real form a modern mnemonic node's funds sit on. Schnorr-sign the
             // BIP-341 key-spend sighash and splice a PSBT_IN_TAP_KEY_SIG record;
@@ -1585,6 +1768,144 @@ impl Signer {
         Some(out)
     }
 
+    /// Sign input `j`, a their-unilateral-close output (`ci`), with the
+    /// channel's payment key, as `hsm_key_for_utxo` derives it: the payment
+    /// basepoint secret, tweaked by the commitment point when the output
+    /// carries one. The key must reproduce the output's script (P2WPKH, or the
+    /// anchor channel's CSV-1 P2WSH, whose witness script is added to the
+    /// input for the node's finalizer); otherwise nothing is signed.
+    fn sign_close_input(
+        &self,
+        tx: &kernel::ElementsTx,
+        network: kernel::Network,
+        j: usize,
+        utxo: &wire::HsmUtxo,
+        ci: &wire::CloseInfo,
+        psbt: &[u8],
+    ) -> Option<Vec<u8>> {
+        let s = self.kernel().channel_secrets(&ci.peer_id, ci.channel_id);
+        let sk = match &ci.commitment_point {
+            None => s.payment,
+            Some(cp) => self.kernel().derive_simple_privkey(&s.payment, cp),
+        };
+        let pubkey = self.kernel().pubkey_of(&sk);
+        let keyhash = kernel::hash160(&pubkey);
+        let (spk, scriptcode, wscript) = if ci.option_anchors {
+            let ws = policy::to_remote_anchored_wscript(&pubkey, ci.csv);
+            (policy::p2wsh_spk(&ws), ws.clone(), Some(ws))
+        } else {
+            (self.kernel().p2wpkh_scriptpubkey(&pubkey), p2pkh_scriptcode(&keyhash), None)
+        };
+        if spk != utxo.script_pubkey {
+            return None;
+        }
+        let hash = match network {
+            kernel::Network::Bitcoin => {
+                kernel::bitcoin_sighash_sw_v0(tx, j, &scriptcode, &utxo.amount.to_le_bytes(), SIGHASH_ALL)
+            }
+            kernel::Network::Elements => {
+                let mut v9 = [0u8; 9];
+                v9[0] = 0x01;
+                v9[1..].copy_from_slice(&utxo.amount.to_be_bytes());
+                kernel::elements_sighash_sw_v0(tx, j, &scriptcode, &v9, SIGHASH_ALL)
+            }
+        };
+        let der = self.kernel().sign_low_r_der_libwally_checked(&hash, &sk, &pubkey)?;
+        let mut rec = partial_sig_record(&pubkey, &der, SIGHASH_ALL as u8);
+        if let Some(ws) = wscript {
+            if !wire::psbt_input_has_key(psbt, j, &[0x05])? {
+                // PSBT_IN_WITNESS_SCRIPT: the node's `psbt_finalize` builds
+                // the anchor to_remote witness from it.
+                rec.extend_from_slice(&compact_size(1));
+                rec.push(0x05);
+                rec.extend_from_slice(&compact_size(ws.len()));
+                rec.extend_from_slice(&ws);
+            }
+        }
+        let term = wire::psbt_input_map_terminator(psbt, j)?;
+        let mut next = Vec::with_capacity(psbt.len() + rec.len());
+        next.extend_from_slice(&psbt[..term]);
+        next.extend_from_slice(&rec);
+        next.extend_from_slice(&psbt[term..]);
+        Some(next)
+    }
+
+    /// The close-output rule, for a transaction that spends one (enforce
+    /// mode): every output but the fee pays one of this device's own wallet
+    /// scripts ([`Self::own_sweep_script_set`]), unblinded, and what leaves
+    /// those scripts, the fee, is at most the payment limit of its asset.
+    /// On Sequentia the fee is the explicit fee output, which the signature
+    /// commits to with every other output; on Bitcoin it is what the inputs
+    /// this device signs carry beyond the outputs (each signature commits to
+    /// its own input's amount, and inputs it does not sign only add value).
+    fn check_close_spend(
+        &self,
+        tx: &kernel::ElementsTx,
+        network: kernel::Network,
+        utxos: &[wire::HsmUtxo],
+    ) -> Result<(), String> {
+        let own = self.own_sweep_script_set();
+        let mut fees: std::collections::BTreeMap<AssetKey, u64> = Default::default();
+        let mut paid: u64 = 0;
+        for (i, o) in tx.outputs.iter().enumerate() {
+            if network == kernel::Network::Elements && o.script.is_empty() {
+                let asset = explicit_asset(&o.asset)
+                    .ok_or_else(|| format!("fee output {i} has a blinded asset"))?;
+                let v = explicit_amount(&o.value)
+                    .ok_or_else(|| format!("fee output {i} has a blinded value"))?;
+                let f = fees.entry(asset).or_insert(0);
+                *f = f.saturating_add(v);
+                continue;
+            }
+            if !own.contains(&o.script) {
+                return Err(format!(
+                    "output {i} pays {}, which is not one of this device's own scripts: \
+                     what a channel close paid it goes only to its own addresses",
+                    hexbytes(&o.script)
+                ));
+            }
+            match network {
+                kernel::Network::Elements => {
+                    if explicit_asset(&o.asset).is_none()
+                        || explicit_amount(&o.value).is_none()
+                        || o.nonce != [0x00]
+                    {
+                        return Err(format!("output {i} is blinded"));
+                    }
+                }
+                kernel::Network::Bitcoin => {
+                    let v = u64::from_le_bytes(o.value.get(0..8).and_then(|b| b.try_into().ok())
+                        .ok_or_else(|| format!("output {i} has no amount"))?);
+                    paid = paid.saturating_add(v);
+                }
+            }
+        }
+        if network == kernel::Network::Bitcoin {
+            let signed = utxos
+                .iter()
+                .filter(|u| tx.inputs.iter().any(|i| i.txhash == u.txid && i.index == u.vout))
+                .fold(0u64, |t, u| t.saturating_add(u.amount));
+            fees.insert(AssetKey::Btc, signed.saturating_sub(paid));
+        }
+        for (asset, fee) in fees {
+            self.within_limit(&asset, fee, "its fee")?;
+        }
+        Ok(())
+    }
+
+    /// `what` (`amount` atoms of `asset` leaving this device's scripts) is at
+    /// most the payment limit for `asset`.
+    fn within_limit(&self, asset: &AssetKey, amount: u64, what: &str) -> Result<(), String> {
+        match self.limits.limit_msat(asset).map(|l| l / 1000) {
+            Some(limit) if amount > limit => Err(format!(
+                "{what}, {amount} atoms of {}, is over this device's payment limit for that \
+                 asset ({limit} atoms)",
+                asset.display()
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// SIGN_ANCHORSPEND (147): CPFP a commitment by spending its anchor output.
     /// Mirrors libhsmd `handle_sign_anchorspend`: sign the node's own wallet fee
     /// inputs (like a withdrawal), THEN sign the anchor input with the channel
@@ -1595,7 +1916,7 @@ impl Signer {
     fn h_sign_anchorspend(&self, m: &[u8]) -> Option<Vec<u8>> {
         let (peer_id, dbid, utxos, psbt) = wire::parse_sign_anchorspend(m)?;
         // (a) sign the appended wallet fee inputs, exactly as a withdrawal.
-        let out = self.sign_wallet_inputs_into_psbt(&utxos, psbt)?;
+        let out = self.sign_wallet_inputs_into_psbt("SIGN_ANCHORSPEND", &utxos, psbt)?;
         // (b) sign the anchor input with the funding key.
         let out = self.sign_anchor_input(&peer_id, dbid, out)?;
         let mut w = Writer::new(msg::HSMD_SIGN_ANCHORSPEND_REPLY);
@@ -1812,6 +2133,39 @@ impl Signer {
         w.u16(out.len() as u16);
         w.bytes(&out);
         Some(w.into_vec())
+    }
+}
+
+/// An explicit asset as it serializes (`0x01 || id`), as an [`AssetKey`].
+fn explicit_asset(a: &[u8]) -> Option<AssetKey> {
+    match a {
+        [0x01, id @ ..] if id.len() == 32 => Some(AssetKey::Asset(id.try_into().ok()?)),
+        _ => None,
+    }
+}
+
+/// An explicit value as it serializes (`0x01 || u64 big-endian`).
+fn explicit_amount(v: &[u8]) -> Option<u64> {
+    match v {
+        [0x01, b @ ..] if b.len() == 8 => Some(u64::from_be_bytes(b.try_into().ok()?)),
+        _ => None,
+    }
+}
+
+/// A Bitcoin compact size.
+fn compact_size(n: usize) -> Vec<u8> {
+    match n {
+        0..=0xfc => vec![n as u8],
+        0xfd..=0xffff => {
+            let mut v = vec![0xfd];
+            v.extend_from_slice(&(n as u16).to_le_bytes());
+            v
+        }
+        _ => {
+            let mut v = vec![0xfe];
+            v.extend_from_slice(&(n as u32).to_le_bytes());
+            v
+        }
     }
 }
 
@@ -2997,9 +3351,19 @@ mod close_and_revocation_tests {
         }
         assert!(matches!(sign_remote(&mut s, 0, 699_000, 300_000, 1_000), Outcome::Reply(_)));
         assert!(matches!(revoke(&mut s, 0), Outcome::Reply(_)));
-        let v6 = policy::encode_channel_store(&s.store);
-        assert_eq!(v6[4], 6);
-        let (back, ledger) = policy::decode_channel_store(&v6).unwrap();
+        assert!(s.store.record_close([0x99; 32]));
+        assert!(!s.store.record_close([0x99; 32]));
+        let v7 = policy::encode_channel_store(&s.store);
+        assert_eq!(v7[4], 7);
+        let (back, ledger, closes) = policy::decode_channel_store(&v7).unwrap();
+        assert_eq!(closes, vec![[0x99; 32]]);
+        assert_eq!(back[0].1.validated, st(&s).validated);
+        // A version-6 payload: the same, without the close record.
+        let mut v6 = v7[..v7.len() - (2 + 32)].to_vec();
+        v6[4] = 6;
+        let (back, l6, closes) = policy::decode_channel_store(&v6).unwrap();
+        assert!(closes.is_empty());
+        assert_eq!(l6, ledger);
         let (_, b) = &back[0];
         assert_eq!(b.revoked_through, Some(0));
         assert_eq!(b.is_outbound, Some(false));
@@ -3019,7 +3383,7 @@ mod close_and_revocation_tests {
         let at = v6.len() - ledger_len - 1;
         let mut v5 = [&v6[..at], &v6[at + 1..]].concat();
         v5[4] = 5;
-        let (back, l5) = policy::decode_channel_store(&v5).unwrap();
+        let (back, l5, _) = policy::decode_channel_store(&v5).unwrap();
         assert_eq!((&back[0].1.pay, &l5), (&b.pay, &ledger));
         // A version-4 payload: the same entry without the payment tracking,
         // and no ledger.
@@ -3029,14 +3393,14 @@ mod close_and_revocation_tests {
         let pay_len = 34 + side_len(&b.pay.local) + side_len(&b.pay.remote) + 8;
         let mut v4 = v5[..v5.len() - ledger_len - pay_len].to_vec();
         v4[4] = 4;
-        let (back, l4) = policy::decode_channel_store(&v4).unwrap();
+        let (back, l4, _) = policy::decode_channel_store(&v4).unwrap();
         let (_, b) = &back[0];
         assert_eq!(b.validated.len(), 1);
         assert_eq!((b.pay.clone(), l4), Default::default());
         // A version-3 payload: the same entry without the validated record.
         let mut v3 = v4[..v4.len() - (1 + 40)].to_vec();
         v3[4] = 3;
-        let (back, _) = policy::decode_channel_store(&v3).unwrap();
+        let (back, _, _) = policy::decode_channel_store(&v3).unwrap();
         let (_, b) = &back[0];
         assert_eq!(b.local_split, Some((1, Split { ours: 300_000, fee: 1_000, anchors: 0 })));
         assert!(b.validated.is_empty());
@@ -3044,7 +3408,7 @@ mod close_and_revocation_tests {
         let split_len = 2 * (1 + 4 * 8);
         let mut v2 = v3[..v3.len() - split_len].to_vec();
         v2[4] = 2;
-        let (back, _) = policy::decode_channel_store(&v2).unwrap();
+        let (back, _, _) = policy::decode_channel_store(&v2).unwrap();
         let (_, b) = &back[0];
         assert_eq!((b.revoked_through, b.is_outbound), (Some(0), Some(false)));
         assert_eq!((b.local_split, b.remote_split), (None, None));
@@ -3052,19 +3416,20 @@ mod close_and_revocation_tests {
         let mut v1 = v3[..9].to_vec();
         v1[4] = 1;
         v1.extend_from_slice(&v3[9..9 + policy::CHSTORE_ENTRY_LEN]);
-        let (back, _) = policy::decode_channel_store(&v1).unwrap();
+        let (back, _, _) = policy::decode_channel_store(&v1).unwrap();
         let (_, b) = &back[0];
         assert_eq!(b.funding_sats, FUNDING);
         assert_eq!((b.is_outbound, b.revoked_through), (None, None));
         assert!(b.remote_shutdown_script.is_empty());
-        // Truncated or padded payloads are refused, as is a version 7.
+        // Truncated or padded payloads are refused, as is a version 8.
+        assert!(policy::decode_channel_store(&v7[..v7.len() - 1]).is_err());
         assert!(policy::decode_channel_store(&v6[..v6.len() - 1]).is_err());
         let mut padded = v6.clone();
         padded.push(0);
         assert!(policy::decode_channel_store(&padded).is_err());
-        let mut v7 = v6.clone();
-        v7[4] = 7;
-        assert!(policy::decode_channel_store(&v7).is_err());
+        let mut v8 = v7.clone();
+        v8[4] = 8;
+        assert!(policy::decode_channel_store(&v8).is_err());
     }
 
     // ---- Balance-held closes and store-miss revocations ----
@@ -3265,8 +3630,13 @@ mod close_and_revocation_tests {
         let peer = peer_script();
         let c = |o: u64, p: u64, f: u64| close(FUNDING_TXID, &[(ours.clone(), o), (peer.clone(), p), (Vec::new(), f)]);
         // The honest close: our share less a 500 fee.
+        assert!(s.store.close_txids.is_empty());
         assert_eq!(sign_close(&mut s, &c(600_500, 399_000, 500)), Ok(()));
         println!("honest close paying us 600500 of a 601000 share (fee 500): SIGNED");
+        // Signed (by closingd's message and by lightningd's): remembered as
+        // a close, once.
+        let txid = wire::parse_elements_tx_span_txid(&c(600_500, 399_000, 500));
+        assert_eq!(s.store.close_txids, vec![txid]);
         // The fee at its ceiling, 4 × 1,000.
         assert_eq!(sign_close(&mut s, &c(597_000, 399_000, 4_000)), Ok(()));
         // One atom past it.
@@ -3280,6 +3650,8 @@ mod close_and_revocation_tests {
         // Our output trimmed: only when what is due is under the dust limit.
         let err = sign_close(&mut s, &close(FUNDING_TXID, &[(peer.clone(), 399_000), (Vec::new(), 601_000)])).unwrap_err();
         assert!(err.contains("pays this wallet nothing"), "{err}");
+        // Three closes signed; the refused ones are not remembered.
+        assert_eq!(s.store.close_txids.len(), 3);
     }
 
     /// The peer opened: it pays every fee, so a close owes us all of our
@@ -3943,7 +4315,7 @@ mod close_and_revocation_tests {
     /// channels: each entry's fixed part and version-2 fields, no ledger.
     fn as_v2(s: &Signer) -> Vec<u8> {
         let v6 = policy::encode_channel_store(&s.store);
-        let (entries, _) = policy::decode_channel_store(&v6).unwrap();
+        let (entries, _, _) = policy::decode_channel_store(&v6).unwrap();
         let mut out = v6[..9].to_vec();
         out[4] = 2;
         let mut at = 9;
@@ -3953,10 +4325,11 @@ mod close_and_revocation_tests {
                 + 2 + st.local_shutdown_script.len() + 2 + st.remote_shutdown_script.len();
             out.extend_from_slice(&v6[at..at + len]);
             at += len;
-            // Skip the later versions' fields of this entry by re-encoding.
+            // Skip the later versions' fields of this entry by re-encoding
+            // (less the empty ledger and close record that close the store).
             let mut one = ChannelStore::new();
             one.insert(PEER, DBID, st.clone());
-            at += policy::encode_channel_store(&one).len() - 9 - len - 4;
+            at += policy::encode_channel_store(&one).len() - 9 - len - 4 - 2;
         }
         out
     }
@@ -3975,7 +4348,7 @@ mod close_and_revocation_tests {
         assert!(matches!(revoke(&mut s, 0), Outcome::Reply(_)));
         let v2 = as_v2(&s);
         let mut s2 = signer(Policy::Enforce);
-        let (entries, ledger) = policy::decode_channel_store(&v2).unwrap();
+        let (entries, ledger, _) = policy::decode_channel_store(&v2).unwrap();
         assert_eq!(ledger, payments::Ledger::default());
         for ((node, dbid), stv) in entries {
             assert_eq!((stv.local_split, stv.remote_split), (None, None));
@@ -3998,5 +4371,531 @@ mod close_and_revocation_tests {
         assert!(matches!(validate(&mut s2, 2, 600_000, 399_000, 1_000), Outcome::Reply(_)));
         assert!(matches!(s2.handle(&req(mutual_close_msg(&s2, &honest))), Outcome::Reply(_)));
         assert!(matches!(s2.handle(&req(mutual_close_msg(&s2, &theft))), Outcome::Reject(_)));
+    }
+}
+
+/// What a channel close paid this device (a peer's commitment's to_remote,
+/// a mutual close output, a delayed sweep of our own commitment) is spent
+/// only to the device's own scripts, with a fee within the payment limit.
+#[cfg(test)]
+mod close_output_spend_tests {
+    use super::*;
+    use crate::hsm_secret::HsmSecret;
+    use crate::kernel::{Kernel, BIP32_VER_TEST_PRIVATE, BIP32_VER_TEST_PUBLIC};
+    use crate::policy::Policy;
+
+    const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    const PEER: [u8; 33] = [0x02; 33];
+    const DBID: u64 = 7;
+    const GOLD: [u8; 32] = [0x47; 32];
+    const CLOSE_TXID: [u8; 32] = [0x5c; 32];
+
+    fn signer(policy: Policy) -> Signer {
+        let seed = crate::kernel::bip39_seed(MNEMONIC, "");
+        let kernel = Kernel::new(seed.to_vec(), BIP32_VER_TEST_PUBLIC, BIP32_VER_TEST_PRIVATE);
+        let secret = HsmSecret { seed, secret_type: 2, mnemonic: String::new() };
+        let mut s = Signer::with_policy(secret, policy);
+        s.kernel = Some(kernel);
+        s.hsm_version = 6;
+        s
+    }
+
+    fn compact(n: usize) -> Vec<u8> {
+        compact_size(n)
+    }
+
+    fn rec(key: &[u8], val: &[u8]) -> Vec<u8> {
+        let mut r = compact(key.len());
+        r.extend_from_slice(key);
+        r.extend_from_slice(&compact(val.len()));
+        r.extend_from_slice(val);
+        r
+    }
+
+    fn pset_key(t: u8) -> Vec<u8> {
+        vec![0xfc, 0x04, 0x70, 0x73, 0x65, 0x74, t]
+    }
+
+    /// The key of a peer's-commitment output of channel (PEER, DBID): the
+    /// static payment basepoint (no commitment point), as the C wallet
+    /// records it for `option_static_remotekey` and `option_anchors`.
+    fn payment_key(s: &Signer) -> (SecretKey, [u8; 33]) {
+        let sk = s.kernel().channel_secrets(&PEER, DBID).payment;
+        let pk = s.kernel().pubkey_of(&sk);
+        (sk, pk)
+    }
+
+    fn to_remote_spk(s: &Signer, anchors: bool) -> Vec<u8> {
+        let (_, pk) = payment_key(s);
+        if anchors {
+            policy::p2wsh_spk(&policy::to_remote_anchored_wscript(&pk, 1))
+        } else {
+            s.kernel().p2wpkh_scriptpubkey(&pk)
+        }
+    }
+
+    fn foreign_spk() -> Vec<u8> {
+        [0x00u8, 0x14].iter().copied().chain([0xeeu8; 20]).collect()
+    }
+
+    struct In {
+        txid: [u8; 32],
+        amount: u64,
+        spk: Vec<u8>,
+        keyindex: u32,
+        close: Option<bool>, // Some(anchors) for a peer's-commitment output
+    }
+
+    /// An Elements v2 PSET spending `ins` (all GOLD) to `outs` (asset,
+    /// amount, script; an empty script is the fee output). `blind` gives
+    /// output 0 an ECDH pubkey, as a blinded output carries.
+    fn pset(ins: &[In], outs: &[([u8; 32], u64, Vec<u8>)], blind: bool) -> Vec<u8> {
+        let mut p = b"pset\xff".to_vec();
+        p.extend(rec(&[0x02], &2u32.to_le_bytes()));
+        p.extend(rec(&[0x03], &0u32.to_le_bytes()));
+        p.extend(rec(&[0x04], &[ins.len() as u8]));
+        p.extend(rec(&[0x05], &[outs.len() as u8]));
+        p.push(0x00);
+        for i in ins {
+            let mut wu = vec![0x01u8];
+            wu.extend_from_slice(&GOLD);
+            wu.push(0x01);
+            wu.extend_from_slice(&i.amount.to_be_bytes());
+            wu.push(0x00);
+            wu.extend(compact(i.spk.len()));
+            wu.extend_from_slice(&i.spk);
+            p.extend(rec(&[0x01], &wu));
+            p.extend(rec(&[0x0e], &i.txid));
+            p.extend(rec(&[0x0f], &0u32.to_le_bytes()));
+            let seq: u32 = if i.close == Some(true) { 1 } else { 0xffff_fffd };
+            p.extend(rec(&[0x10], &seq.to_le_bytes()));
+            p.push(0x00);
+        }
+        for (n, (asset, amount, spk)) in outs.iter().enumerate() {
+            p.extend(rec(&pset_key(0x02), asset));
+            p.extend(rec(&[0x03], &amount.to_le_bytes()));
+            p.extend(rec(&[0x04], spk));
+            if blind && n == 0 {
+                p.extend(rec(&pset_key(0x07), &[0x02; 33]));
+            }
+            p.push(0x00);
+        }
+        p
+    }
+
+    /// A Bitcoin v0 PSBT spending `ins` to `outs` (amount, script).
+    fn psbt_v0(ins: &[In], outs: &[(u64, Vec<u8>)]) -> Vec<u8> {
+        let mut t = 2u32.to_le_bytes().to_vec();
+        t.push(ins.len() as u8);
+        for i in ins {
+            t.extend_from_slice(&i.txid);
+            t.extend_from_slice(&0u32.to_le_bytes());
+            t.push(0x00);
+            let seq: u32 = if i.close == Some(true) { 1 } else { 0xffff_fffd };
+            t.extend_from_slice(&seq.to_le_bytes());
+        }
+        t.push(outs.len() as u8);
+        for (amount, spk) in outs {
+            t.extend_from_slice(&amount.to_le_bytes());
+            t.extend(compact(spk.len()));
+            t.extend_from_slice(spk);
+        }
+        t.extend_from_slice(&0u32.to_le_bytes());
+        let mut p = b"psbt\xff".to_vec();
+        p.extend(rec(&[0x00], &t));
+        p.push(0x00);
+        for i in ins {
+            let mut wu = i.amount.to_le_bytes().to_vec();
+            wu.extend(compact(i.spk.len()));
+            wu.extend_from_slice(&i.spk);
+            p.extend(rec(&[0x01], &wu));
+            p.push(0x00);
+        }
+        for _ in outs {
+            p.push(0x00);
+        }
+        p
+    }
+
+    fn withdrawal(ins: &[In], psbt: &[u8]) -> Vec<u8> {
+        let mut w = Writer::new(msg::HSMD_SIGN_WITHDRAWAL);
+        w.u16(ins.len() as u16);
+        for i in ins {
+            w.bytes(&i.txid);
+            w.u32(0);
+            w.u64(i.amount);
+            w.u32(i.keyindex);
+            w.bool(false);
+            w.u16(i.spk.len() as u16);
+            w.bytes(&i.spk);
+            match i.close {
+                None => w.bool(false),
+                Some(anchors) => {
+                    w.bool(true);
+                    w.u64(DBID);
+                    w.bytes(&PEER);
+                    w.bool(false); // no commitment point: static payment key
+                    w.bool(anchors);
+                    w.u32(if anchors { 1 } else { 0 });
+                }
+            }
+            w.bool(false);
+        }
+        w.u32(psbt.len() as u32);
+        w.bytes(psbt);
+        w.into_vec()
+    }
+
+    fn req(msg: Vec<u8>) -> Request {
+        Request { is_main: true, node_id: [0u8; 33], dbid: 0, capabilities: 0, hsmd_msg: msg }
+    }
+
+    /// The PSBT a withdrawal reply carries.
+    fn reply_psbt(o: Outcome) -> Vec<u8> {
+        match o {
+            Outcome::Reply(r) => {
+                assert_eq!(u16::from_be_bytes([r[0], r[1]]), msg::HSMD_SIGN_WITHDRAWAL_REPLY);
+                let n = u32::from_be_bytes([r[2], r[3], r[4], r[5]]) as usize;
+                r[6..6 + n].to_vec()
+            }
+            _ => panic!("a withdrawal is always answered"),
+        }
+    }
+
+    /// The partial signature for `pubkey` in `psbt`, if there is one.
+    fn partial_sig(psbt: &[u8], pubkey: &[u8; 33]) -> Option<Vec<u8>> {
+        let mut key = vec![34u8, 0x02];
+        key.extend_from_slice(pubkey);
+        let pos = psbt.windows(key.len()).position(|w| w == key.as_slice())?;
+        let vp = pos + key.len();
+        let n = psbt[vp] as usize;
+        Some(psbt[vp + 1..vp + 1 + n].to_vec())
+    }
+
+    fn close_in(s: &Signer, anchors: bool, amount: u64) -> In {
+        In { txid: [0x11; 32], amount, spk: to_remote_spk(s, anchors), keyindex: 0, close: Some(anchors) }
+    }
+
+    #[test]
+    fn peers_commitment_output_spent_to_own_address_elements() {
+        let mut s = signer(Policy::Enforce);
+        let own = s.wallet_sweep_script(3, false);
+        for anchors in [false, true] {
+            let ins = [close_in(&s, anchors, 500_000)];
+            let psbt = pset(&ins, &[(GOLD, 499_000, own.clone()), (GOLD, 1_000, vec![])], false);
+            let out = reply_psbt(s.handle(&req(withdrawal(&ins, &psbt))));
+            assert_eq!(s.take_refusal(), None);
+            let (sk, pk) = payment_key(&s);
+            let sig = partial_sig(&out, &pk).expect("the close output is signed");
+            // Over the Elements sighash of the transaction, with the channel's
+            // payment key, the scriptCode the output's script needs.
+            let tx = wire::reconstruct_elements_tx_from_pset(&psbt).unwrap();
+            let code = if anchors {
+                policy::to_remote_anchored_wscript(&pk, 1)
+            } else {
+                p2pkh_scriptcode(&kernel::hash160(&pk))
+            };
+            let mut v9 = [0u8; 9];
+            v9[0] = 0x01;
+            v9[1..].copy_from_slice(&500_000u64.to_be_bytes());
+            let h = kernel::elements_sighash_sw_v0(&tx, 0, &code, &v9, SIGHASH_ALL);
+            let der = s.kernel().sign_low_r_der_libwally_checked(&h, &sk, &pk).unwrap();
+            assert_eq!(sig[..sig.len() - 1], der[..]);
+            // The anchor channel's P2WSH: the witness script travels with it.
+            assert_eq!(wire::psbt_input_has_key(&out, 0, &[0x05]), Some(anchors));
+        }
+    }
+
+    #[test]
+    fn peers_commitment_output_to_another_script_is_refused() {
+        let mut s = signer(Policy::Enforce);
+        let own = s.wallet_sweep_script(3, false);
+        let ins = [close_in(&s, false, 500_000)];
+        // All of it elsewhere; and only part of it elsewhere, beside our own.
+        for outs in [
+            vec![(GOLD, 499_000, foreign_spk()), (GOLD, 1_000, vec![])],
+            vec![(GOLD, 400_000, own.clone()), (GOLD, 99_000, foreign_spk()), (GOLD, 1_000, vec![])],
+        ] {
+            let psbt = pset(&ins, &outs, false);
+            let out = reply_psbt(s.handle(&req(withdrawal(&ins, &psbt))));
+            assert_eq!(out, psbt, "nothing is signed");
+            let why = s.take_refusal().expect("a reason");
+            assert!(why.starts_with("SIGN_WITHDRAWAL refused: output "), "{why}");
+            assert!(why.contains("not one of this device's own scripts"), "{why}");
+        }
+        // A blinded output to our own script is refused too: its value could
+        // be unblindable for us.
+        let psbt = pset(&ins, &[(GOLD, 499_000, own.clone()), (GOLD, 1_000, vec![])], true);
+        let out = reply_psbt(s.handle(&req(withdrawal(&ins, &psbt))));
+        assert_eq!(out, psbt);
+        assert_eq!(s.take_refusal().unwrap(), "SIGN_WITHDRAWAL refused: output 0 is blinded");
+        // Permissive signs it, as libhsmd does.
+        let mut p = signer(Policy::Permissive);
+        let psbt = pset(&ins, &[(GOLD, 499_000, foreign_spk()), (GOLD, 1_000, vec![])], false);
+        let out = reply_psbt(p.handle(&req(withdrawal(&ins, &psbt))));
+        assert!(partial_sig(&out, &payment_key(&p).1).is_some());
+    }
+
+    #[test]
+    fn close_spend_fee_over_the_limit_is_refused() {
+        let mut s = signer(Policy::Enforce);
+        let own = s.wallet_sweep_script(3, false);
+        let mut limits = Limits::default();
+        limits.per_asset.insert(AssetKey::Asset(GOLD), Some(5_000));
+        s.set_limits(limits);
+        let ins = [close_in(&s, false, 500_000)];
+        let psbt = pset(&ins, &[(GOLD, 494_000, own.clone()), (GOLD, 6_000, vec![])], false);
+        let out = reply_psbt(s.handle(&req(withdrawal(&ins, &psbt))));
+        assert_eq!(out, psbt);
+        assert_eq!(
+            s.take_refusal().unwrap(),
+            format!(
+                "SIGN_WITHDRAWAL refused: its fee, 6000 atoms of {}, is over this device's \
+                 payment limit for that asset (5000 atoms)",
+                AssetKey::Asset(GOLD).display()
+            )
+        );
+        // At the limit it is signed.
+        let psbt = pset(&ins, &[(GOLD, 495_000, own), (GOLD, 5_000, vec![])], false);
+        let out = reply_psbt(s.handle(&req(withdrawal(&ins, &psbt))));
+        assert!(partial_sig(&out, &payment_key(&s).1).is_some());
+        assert_eq!(s.take_refusal(), None);
+    }
+
+    #[test]
+    fn mutual_close_output_is_a_close_output() {
+        let mut s = signer(Policy::Enforce);
+        let own = s.wallet_sweep_script(3, false);
+        let pk = s.kernel().bip86_child_pubkey(4);
+        let wallet_in = |txid| In {
+            txid,
+            amount: 300_000,
+            spk: s.kernel().p2wpkh_scriptpubkey(&pk),
+            keyindex: 4,
+            close: None,
+        };
+        let away = [(GOLD, 299_000, foreign_spk()), (GOLD, 1_000, vec![])];
+        // An output of a transaction the device never signed as a close: a
+        // wallet coin like any other, signed wherever it goes.
+        let ins = [wallet_in(CLOSE_TXID)];
+        let out = reply_psbt(s.handle(&req(withdrawal(&ins, &pset(&ins, &away, false)))));
+        assert!(partial_sig(&out, &pk).is_some());
+        // Once the device signed that transaction as a mutual close, what it
+        // pays the wallet goes only to the device's own scripts.
+        assert!(s.store.record_close(CLOSE_TXID));
+        let psbt = pset(&ins, &away, false);
+        let out = reply_psbt(s.handle(&req(withdrawal(&ins, &psbt))));
+        assert_eq!(out, psbt);
+        assert!(s.take_refusal().unwrap().contains("not one of this device's own scripts"));
+        let out = reply_psbt(s.handle(&req(withdrawal(
+            &ins,
+            &pset(&ins, &[(GOLD, 299_000, own), (GOLD, 1_000, vec![])], false),
+        ))));
+        assert!(partial_sig(&out, &pk).is_some());
+        // And the record survives the store's round trip.
+        let blob = s.export_channels();
+        let mut t = signer(Policy::Enforce);
+        t.import_channels(&blob).unwrap();
+        assert!(t.store.is_close(&CLOSE_TXID));
+    }
+
+    #[test]
+    fn peers_commitment_output_bitcoin() {
+        let mut s = signer(Policy::Enforce);
+        let own = s.kernel().bip86_p2tr_scriptpubkey(2);
+        let ins = [close_in(&s, true, 100_000)];
+        let psbt = psbt_v0(&ins, &[(99_000, own.clone())]);
+        let out = reply_psbt(s.handle(&req(withdrawal(&ins, &psbt))));
+        assert_eq!(s.take_refusal(), None);
+        let (sk, pk) = payment_key(&s);
+        let sig = partial_sig(&out, &pk).expect("signed");
+        let tx = wire::parse_bitcoin_tx(wire::psbt_global_unsigned_tx(&psbt).unwrap()).unwrap();
+        let h = kernel::bitcoin_sighash_sw_v0(
+            &tx, 0, &policy::to_remote_anchored_wscript(&pk, 1), &100_000u64.to_le_bytes(), SIGHASH_ALL);
+        let der = s.kernel().sign_low_r_der_libwally_checked(&h, &sk, &pk).unwrap();
+        assert_eq!(sig[..sig.len() - 1], der[..]);
+        // To another script: refused.
+        let psbt = psbt_v0(&ins, &[(60_000, own.clone()), (39_000, foreign_spk())]);
+        assert_eq!(reply_psbt(s.handle(&req(withdrawal(&ins, &psbt)))), psbt);
+        assert!(s.take_refusal().unwrap().contains("output 1 pays"));
+        // A fee over the limit: refused.
+        let mut limits = Limits::default();
+        limits.per_asset.insert(AssetKey::Btc, Some(800));
+        s.set_limits(limits);
+        let psbt = psbt_v0(&ins, &[(99_000, own)]);
+        assert_eq!(reply_psbt(s.handle(&req(withdrawal(&ins, &psbt)))), psbt);
+        assert_eq!(
+            s.take_refusal().unwrap(),
+            "SIGN_WITHDRAWAL refused: its fee, 1000 atoms of btc, is over this device's payment \
+             limit for that asset (800 atoms)"
+        );
+    }
+
+    #[test]
+    fn a_close_output_of_another_channel_key_is_not_signed() {
+        // The host names a channel whose key does not give the output's
+        // script: nothing is signed for it.
+        let mut s = signer(Policy::Enforce);
+        let own = s.wallet_sweep_script(3, false);
+        let mut i = close_in(&s, false, 500_000);
+        i.spk = foreign_spk();
+        let ins = [i];
+        let psbt = pset(&ins, &[(GOLD, 499_000, own), (GOLD, 1_000, vec![])], false);
+        let out = reply_psbt(s.handle(&req(withdrawal(&ins, &psbt))));
+        assert_eq!(out, psbt);
+    }
+
+    /// A Class A sweep: SIGN_DELAYED_PAYMENT_TO_US of an Elements output.
+    fn delayed_sweep(s: &Signer, in_amount: u64, out_asset: [u8; 32], out_amount: u64,
+                     out_spk: &[u8]) -> Request {
+        sweep_req(s, msg::HSMD_SIGN_DELAYED_PAYMENT_TO_US, in_amount, out_asset, out_amount, out_spk)
+    }
+
+    /// The same sweep as a penalty, SIGN_PENALTY_TO_US.
+    fn penalty_sweep(s: &Signer, in_amount: u64, out_asset: [u8; 32], out_amount: u64,
+                     out_spk: &[u8]) -> Request {
+        sweep_req(s, msg::HSMD_SIGN_PENALTY_TO_US, in_amount, out_asset, out_amount, out_spk)
+    }
+
+    fn sweep_req(s: &Signer, t_msg: u16, in_amount: u64, out_asset: [u8; 32], out_amount: u64,
+                 out_spk: &[u8]) -> Request {
+        let mut t = 2u32.to_le_bytes().to_vec();
+        t.push(0x00);
+        t.push(0x01);
+        t.extend_from_slice(&[0x33; 32]);
+        t.extend_from_slice(&0u32.to_le_bytes());
+        t.push(0x00);
+        t.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+        t.push(0x02);
+        for (asset, amount, spk) in [(out_asset, out_amount, out_spk.to_vec()),
+                                     (GOLD, in_amount.saturating_sub(out_amount), vec![])] {
+            t.push(0x01);
+            t.extend_from_slice(&asset);
+            t.push(0x01);
+            t.extend_from_slice(&amount.to_be_bytes());
+            t.push(0x00);
+            t.extend(compact(spk.len()));
+            t.extend_from_slice(&spk);
+        }
+        t.extend_from_slice(&0u32.to_le_bytes());
+        let mut wu = vec![0x01u8];
+        wu.extend_from_slice(&GOLD);
+        wu.push(0x01);
+        wu.extend_from_slice(&in_amount.to_be_bytes());
+        wu.push(0x00);
+        let in_spk = [0x00u8, 0x20].iter().copied().chain([0xab; 32]).collect::<Vec<u8>>();
+        wu.extend(compact(in_spk.len()));
+        wu.extend_from_slice(&in_spk);
+        let mut p = b"pset\xff".to_vec();
+        p.push(0x00);
+        p.extend(rec(&[0x01], &wu));
+        p.push(0x00);
+        let _ = s;
+        let mut w = Writer::new(t_msg);
+        if t_msg == msg::HSMD_SIGN_PENALTY_TO_US {
+            w.bytes(&[0x11; 32]); // the revocation secret
+        } else {
+            w.u64(0); // the commitment number
+        }
+        w.u32(t.len() as u32);
+        w.bytes(&t);
+        w.u32(p.len() as u32);
+        w.bytes(&p);
+        w.u16(1);
+        w.bytes(&[0x51]);
+        Request { is_main: false, node_id: PEER, dbid: DBID, capabilities: 0, hsmd_msg: w.into_vec() }
+    }
+
+    fn verdict(o: Outcome) -> Result<(), String> {
+        match o {
+            Outcome::Reply(_) => Ok(()),
+            Outcome::Reject(r) => Err(r),
+            Outcome::Sentinel => Err("sentinel".into()),
+            Outcome::Fatal(m) => Err(m),
+        }
+    }
+
+    #[test]
+    fn delayed_sweep_lets_leave_at_most_the_limit() {
+        let mut s = signer(Policy::Enforce);
+        let own = s.wallet_sweep_script(3, false);
+        let mut limits = Limits::default();
+        limits.per_asset.insert(AssetKey::Asset(GOLD), Some(5_000));
+        s.set_limits(limits);
+        // Output 0 keeps all but 5,000: signed.
+        assert_eq!(verdict(s.handle(&delayed_sweep(&s, 400_000, GOLD, 395_000, &own))), Ok(()));
+        // Output 0 keeps one atom: under SIGHASH_SINGLE|ANYONECANPAY the host
+        // could add an output taking the rest. Refused.
+        assert_eq!(
+            verdict(s.handle(&delayed_sweep(&s, 400_000, GOLD, 1, &own))),
+            Err(format!(
+                "SIGN_DELAYED_PAYMENT_TO_US refused: what it lets leave this device, 399999 \
+                 atoms of {}, is over this device's payment limit for that asset (5000 atoms)",
+                AssetKey::Asset(GOLD).display()
+            ))
+        );
+        // Output 0 in another asset: the host could balance it with a
+        // worthless one and take the input. Refused.
+        let other = [0x99; 32];
+        let r = verdict(s.handle(&delayed_sweep(&s, 400_000, other, 400_000, &own))).unwrap_err();
+        assert!(r.contains("output 0 is not in the channel's asset"), "{r}");
+        // To another script: refused, as before.
+        let r = verdict(s.handle(&delayed_sweep(&s, 400_000, GOLD, 395_000, &foreign_spk()))).unwrap_err();
+        assert!(r.contains("pays a non-owned script"), "{r}");
+        // Once the device knows the channel's asset (here `other`), that is
+        // the asset held to, whatever the request names for the input (its
+        // witness UTXO says GOLD; the signature does not commit to it).
+        s.store.insert(PEER, DBID, channel_in(AssetKey::Asset(other)));
+        let r = verdict(s.handle(&delayed_sweep(&s, 400_000, GOLD, 395_000, &own))).unwrap_err();
+        assert!(r.contains(&format!("output 0 is not in the channel's asset {}",
+                                    AssetKey::Asset(other).display())), "{r}");
+        let mut limits = Limits::default();
+        limits.per_asset.insert(AssetKey::Asset(other), Some(5_000));
+        s.set_limits(limits);
+        assert_eq!(verdict(s.handle(&delayed_sweep(&s, 400_000, other, 395_000, &own))), Ok(()));
+    }
+
+    #[test]
+    fn penalty_is_held_to_the_asset_not_the_limit() {
+        // A penalty races the cheating peer: never refused over its fee.
+        let mut s = signer(Policy::Enforce);
+        let own = s.wallet_sweep_script(3, false);
+        let mut limits = Limits::default();
+        limits.per_asset.insert(AssetKey::Asset(GOLD), Some(5_000));
+        s.set_limits(limits);
+        assert_eq!(verdict(s.handle(&penalty_sweep(&s, 400_000, GOLD, 300_000, &own))), Ok(()));
+        // But it pays our own script, in the channel's asset.
+        let r = verdict(s.handle(&penalty_sweep(&s, 400_000, [0x99; 32], 400_000, &own))).unwrap_err();
+        assert!(r.starts_with("SIGN_PENALTY_TO_US refused: output 0 is not in the channel's asset"), "{r}");
+        let r = verdict(s.handle(&penalty_sweep(&s, 400_000, GOLD, 395_000, &foreign_spk()))).unwrap_err();
+        assert!(r.contains("pays a non-owned script"), "{r}");
+    }
+
+    /// A channel record whose payment tracking names `asset`.
+    fn channel_in(asset: AssetKey) -> ChannelState {
+        ChannelState {
+            funding_sats: 1_000_000,
+            funding_txid: [0x44; 32],
+            funding_txout: 0,
+            local_to_self_delay: 144,
+            remote_to_self_delay: 144,
+            remote_revocation: [0x02; 33],
+            remote_payment: [0x02; 33],
+            remote_htlc: [0x02; 33],
+            remote_delayed: [0x02; 33],
+            remote_funding: [0x02; 33],
+            option_static_remotekey: true,
+            option_anchors: true,
+            is_outbound: Some(false),
+            local_shutdown_script: Vec::new(),
+            remote_shutdown_script: Vec::new(),
+            local_shutdown_wallet_index: None,
+            revoked_through: None,
+            validated_through: None,
+            local_split: None,
+            remote_split: None,
+            validated: Vec::new(),
+            pay: crate::payments::PayTrack { asset: Some(asset), ..Default::default() },
+        }
     }
 }

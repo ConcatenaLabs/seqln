@@ -29,6 +29,13 @@ PROXY = os.path.abspath(os.path.join(REPO, 'lightningd', 'lightning_hsmd_proxy')
 CLI = os.path.abspath(os.path.join(REPO, 'cli', 'lightning-cli'))
 SIGNER = os.environ.get('SEQLN_SIGNER', os.path.abspath(os.path.join(
     REPO, 'contrib', 'seqln-signer', 'target', 'release', 'seqln-signer')))
+# SEQLN_DEVICE=wasm serves the keyless node from the browser build instead
+# (the `wasm-pack --target nodejs` package in contrib/seqln-signer/wasm/pkg,
+# run under Node by wasm/test/device_serve.mjs, which reads the same files and
+# environment as the native binary).
+WASM_DEVICE = os.path.abspath(os.path.join(
+    REPO, 'contrib', 'seqln-signer', 'wasm', 'test', 'device_serve.mjs'))
+DEVICE = os.environ.get('SEQLN_DEVICE', 'native')
 MNEMONIC = ' '.join(['abandon'] * 11 + ['about'])
 PAR = 10**8
 # The device's payment limit (atoms of each asset a day) in these tests: their
@@ -37,6 +44,8 @@ TEST_PAY_LIMIT = '1000000000'
 
 
 def genkey():
+    """A Noise static keypair (the native binary makes it, whichever device
+    serves the node)."""
     out = subprocess.check_output([SIGNER, '--genkey']).decode().split()
     return out[1], out[3]
 
@@ -64,7 +73,10 @@ class Device(object):
                         SEQLN_SIGNER_PAY_LIMIT=pay_limit)
         if trace:
             self.env['SEQLN_SIGNER_TRACE'] = '1'
-        self.cmd = [SIGNER, '--connect', '127.0.0.1:{}'.format(port)]
+        if DEVICE == 'wasm':
+            self.cmd = ['node', WASM_DEVICE, '--connect', '127.0.0.1:{}'.format(port)]
+        else:
+            self.cmd = [SIGNER, '--connect', '127.0.0.1:{}'.format(port)]
         self.stopping = False
         self.proc = None
         self.thread = threading.Thread(target=self.run, daemon=True)
@@ -108,7 +120,10 @@ def keyless_node(node_factory, directory, trace=False, pay_limit=TEST_PAY_LIMIT,
     node.daemon.env.update({'SEQLN_SIGNER_LISTEN': '127.0.0.1:{}'.format(port),
                             'SEQLN_HOST_PRIVKEY': host_priv,
                             'SEQLN_SIGNER_PEER_PUBKEY': dev_pub,
-                            'SEQLN_SIGNER_OP_TIMEOUT_MS': '5000'})
+                            # The WASM device takes seconds over its first
+                            # sweep (it derives its wallet scripts once):
+                            # the proxy's default timeout, not a short one.
+                            'SEQLN_SIGNER_OP_TIMEOUT_MS': '120000' if DEVICE == 'wasm' else '5000'})
     node.start()
     return device, node
 

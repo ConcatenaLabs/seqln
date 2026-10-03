@@ -96,7 +96,29 @@ What enforce mode checks:
   not taken from the request. A device with no record of the channel's commitments (a store from
   before they were recorded, or a channel armed from the node's own data) reveals only
   commitment 0 until it has validated a later commitment.
-- **Sweeps, penalties and HTLC transactions**: they pay only the node's own outputs.
+- **Sweeps, penalties and HTLC transactions**: they pay only the node's own outputs, and a sweep
+  of a channel's commitment output pays it in the channel's asset (the one the device recorded
+  from the channel's commitments; for a channel it never validated a commitment of, the one the
+  request names). These are signed `SIGHASH_SINGLE|ANYONECANPAY` (a watchtower attaches its own
+  fee input), which commits to the swept input and output 0 only: whatever the input carries
+  beyond output 0, a host could take with an output it adds. So the sweep of our own commitment's
+  `to_local` once its delay is over, a close output, is signed only when that difference is within
+  the payment limit of the channel's asset. A penalty or an HTLC claim races the peer, and is never
+  refused over its fee. lightningd has the `to_local` sweep signed as soon as the commitment
+  confirms and cannot start without it, so a device whose limit is below that sweep's fee stops the
+  node until the limit is raised; the default limit is thousands of times any sweep's fee.
+- **Close outputs**: what a channel close paid this node goes only to the device's own wallet
+  scripts (P2WPKH or BIP-86 P2TR of its wallet keys at indices below 5,000), unblinded, with a fee
+  within the payment limit of its asset. A close output is the output a peer's commitment pays
+  this node, which the wallet holds with its channel noted and the device signs with that channel's
+  payment key, or what a mutual close this device signed pays it (the device keeps the txids of the
+  closes it signs). On Sequentia the fee is the explicit fee output, which the signature commits
+  to with every other output; on Bitcoin it is what the inputs the device signs carry beyond the
+  outputs. A withdrawal that breaks the rule is returned unsigned: the node cannot finalize it
+  (`withdraw` and `sendpsbt` fail with "not finalizeable"), sends nothing and keeps running, and
+  the device logs why (native: its log; WASM: `lastReject` and the SDK's `onReject`). Any other
+  wallet output (a deposit, change, what the device swept to its own wallet) is signed to any
+  destination: channel funding spends those.
 - **Payments** (`src/payments.rs`): `pay` and `keysend` ask the device to approve each payment
   (`PREAPPROVE_INVOICE`, `PREAPPROVE_KEYSEND`) before offering an HTLC. The device approves the
   payment hash when the amount, with a routing-fee allowance (half a percent, at least 5,000
@@ -130,8 +152,8 @@ peer can sign commitments that move the balance without any HTLC, which the devi
 limit but cannot tell from a payment.
 
 The channel store (each channel's parameters, revocation counters, recorded balance, the
-unrevoked commitments it validated and its payment tracking, and the approvals and charges against
-the payment limits) carries no secret and is authenticated by a MAC keyed from the seed. The native signer keeps it in
+unrevoked commitments it validated and its payment tracking, the approvals and charges against
+the payment limits, and the txids of the mutual closes the device signed) carries no secret and is authenticated by a MAC keyed from the seed. The native signer keeps it in
 `seqln-signer-channels` in its working directory (or the path in `SEQLN_SIGNER_STORE`): it
 loads the file at start and rewrites it durably (temporary file, sync, rename) after every
 request that changed it, before the reply leaves. If the file cannot be written it refuses the
@@ -172,6 +194,7 @@ confirms, and onchaind resolves it from the chain as it does any channel.
 | `wasm/` | `wasm-bindgen` build of the same library for browsers/Node, plus SDK, relay, tests, demo page. |
 | `wasm/test/enforce.mjs` | WASM enforce-mode proof: corpus replay byte-exact, tampered commitment refused. |
 | `wasm/test/ws_device.mjs` | The browser-shaped device path over a real WebSocket, driven by the wallet SDK. |
+| `wasm/test/device_serve.mjs` | The WASM build as a drop-in for `seqln-signer --connect` (same files and environment), so the node's keyless tests run on it with `SEQLN_DEVICE=wasm`. |
 | `wasm/test/reconnect_stress.sh` | Isolated regtest harness: N device disconnect/reconnect cycles and a relay restart without wedging the hosted node. |
 
 ## Build and test

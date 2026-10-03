@@ -491,7 +491,15 @@ fn serve<S: Read + Write>(
                 .map_or(0, |d| d.as_secs()),
         );
         let reply: Vec<u8> = match signer.handle(&req) {
-            Outcome::Reply(bytes) => bytes,
+            Outcome::Reply(bytes) => {
+                // Answered, but not with what was asked for: a withdrawal the
+                // device returns unsigned.
+                if let Some(reason) = signer.take_refusal() {
+                    logline(log, &format!("seqln-signer: POLICY REJECT: {reason}"));
+                    eprintln!("seqln-signer: POLICY REJECT: {reason}");
+                }
+                bytes
+            }
             Outcome::Sentinel => Vec::new(), // zero-length error sentinel
             Outcome::Reject(reason) => {
                 logline(log, &format!("seqln-signer: POLICY REJECT: {reason}"));

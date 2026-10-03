@@ -295,13 +295,14 @@ a user device while a host runs the node:
   `hsmd_sign_commitment_tx_refused` (`hsmd/hsmd_wire.csv`, `hsmd/hsmd_proxy.c`), and lightningd
   (`lightningd/peer_control.c`) logs the refusal with the channel and the transaction, sends
   nothing, and goes on starting. The channel stays in its state; once its funding is spent,
-  onchaind resolves it from the chain. What a mutual close or an HTLC sweep pays the node is a
-  wallet output the device signs a spend of like any other; the output the peer's commitment
-  pays the node (to the channel's payment key) is held in the wallet, but the device signs
-  withdrawals only from the wallet's own keys and leaves it unsigned. A `close` waiting on that
-  transaction fails with the refusal
-  (`lightningd/closing_control.c`). A node with its own keys is never refused, and signs and
-  sends the transaction as before.
+  onchaind resolves it from the chain. A `close` waiting on that transaction fails with the
+  refusal (`lightningd/closing_control.c`). A node with its own keys is never refused, and signs
+  and sends the transaction as before.
+- What a channel close pays a keyless node (the output the peer's commitment pays it, to the
+  channel's payment key; what a mutual close pays it; its own commitment's `to_local` once its
+  delay is over) the device signs a spend of only to its own wallet scripts, with a fee within
+  its payment limit for the asset (the signer README, "Close outputs"). A withdrawal it declines
+  comes back unsigned, so the node cannot finalize it and sends nothing.
 
 ## 7b. Specula keyless watchtower
 
@@ -315,6 +316,9 @@ host can defend the channel while the device is offline, without ever holding a 
   `to_local` (a peer with no balance of its own) gets a justice set too. The templates are
   `SIGHASH_SINGLE|ANYONECANPAY`, so output 0 carries the swept value and a fee input can be
   attached later without the device.
+- The penalty transaction channeld builds for each revoked commitment and hands to lightningd
+  for the `commitment_revocation` hook (`penalty_tx_create`, upstream) is in the channel asset
+  too.
 - `lightningd/onchain_presign.{c,h}`: the same for the honest force-close sweeps (delayed
   `to_local`, offered-HTLC timeout) at every advance, the HTLC-success sweep at fulfil, and the
   sweeps of our HTLC outputs on the peer's commitment.
@@ -384,7 +388,10 @@ opened the escaping stall. Lightning nodes run the network's own timelock and `r
 The tests cover an asset channel opened, paid over and mutually closed, the anchor-burial gate,
 the certified-frontier clamp, a Bitcoin reorg unwinding Sequentia blocks under a running node,
 the network defaults, the output a peer's commitment pays this node listed and spent in the
-channel's asset (`test_close_output_asset.py`), a breach of an asset channel with a pending HTLC
+channel's asset (`test_close_output_asset.py`), a keyless node spending each kind of close
+output only to its own address and within its device's payment limit
+(`test_close_output_spend.py`, on Bitcoin regtest too, with the redirected spend forced into a
+block there; `SEQLN_DEVICE=wasm` runs the keyless tests on the browser build), a breach of an asset channel with a pending HTLC
 answered by `speculad` while the victim is offline (`test_watchtower.py`), a keyless node, as
 either side of a channel, closing it and restarting with it closing (`test_keyless_close.py`), a
 keyless node whose device, moved onto an older store, refuses its closing transaction, at start

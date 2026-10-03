@@ -76,6 +76,12 @@ penalty_tx_create(const tal_t *ctx,
 					   &keyset.self_delayed_payment_key);
 
 	tx = bitcoin_tx(ctx, chainparams, 1, 1, locktime);
+	/* Asset-aware channels: the revoked output is in the channel's asset,
+	 * so the penalty's input and output (and Elements fee) are too.
+	 * Left in the policy asset, the transaction could never confirm, and
+	 * its SIGHASH_SINGLE|ANYONECANPAY signature would let anyone pair the
+	 * input with an output in another asset.  No-op off elements. */
+	bitcoin_tx_set_output_asset(tx, channel->channel_asset);
 	bitcoin_tx_add_input(tx, &outpoint, 0xFFFFFFFF,
 			     NULL, to_them_sats, NULL, wscript);
 
