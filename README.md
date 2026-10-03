@@ -71,7 +71,9 @@ testnet unless noted. The precise file-level change list, with known hazards, is
   `invoice ... asset=<id>` makes the payee refuse an HTLC in any other asset.
 - **Pure-Lightning swap primitive.** `contrib/holdinvoice-seq/` is a hold-invoice plugin (hold an
   externally-supplied payment hash until settle/cancel), the safety primitive for pure-Lightning
-  asset↔BTC swaps. The swap orchestration itself lives in
+  asset↔BTC swaps. A hold is in one asset and refuses HTLCs in any other, and it survives a
+  restart. The `htlc_accepted` hook and the forward and payment notifications name the asset an
+  HTLC arrived in. The swap orchestration itself lives in
   [seqdex](https://github.com/ConcatenaLabs/seqdex).
 - **Signer split (non-custodial hosted nodes).** `hsmd/hsmd_proxy.c` + `hsmd/signerd.c` split the
   key-holding signer out of the node process, and `contrib/seqln-signer/` is a Rust device signer

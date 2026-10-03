@@ -1,4 +1,5 @@
 #include "config.h"
+#include <ccan/mem/mem.h>
 #include <common/timeout.h>
 #include <lightningd/chaintopology.h>
 #include <lightningd/channel.h>
@@ -108,7 +109,8 @@ void htlc_set_fulfill(struct htlc_set *set, const struct preimage *preimage)
 static struct htlc_set *new_htlc_set(struct lightningd *ld,
 				     struct incoming_payment *inpay,
 				     const struct sha256 *payment_hash,
-				     struct amount_msat total_msat)
+				     struct amount_msat total_msat,
+				     const u8 *asset)
 {
 	struct htlc_set *set;
 
@@ -116,6 +118,7 @@ static struct htlc_set *new_htlc_set(struct lightningd *ld,
 	set->ld = ld;
 	set->total_msat = total_msat;
 	set->payment_hash = *payment_hash;
+	set->asset = asset ? tal_dup_arr(set, u8, asset, 33, 0) : NULL;
 	set->so_far = AMOUNT_MSAT(0);
 	set->inpays = tal_arr(set, struct incoming_payment *, 1);
 	set->inpays[0] = inpay;
@@ -179,10 +182,25 @@ void htlc_set_add_(struct lightningd *ld,
 	 *  - otherwise, if it supports `basic_mpp`:
 	 *    - MUST add it to the HTLC set corresponding to that `payment_hash`.
 	 */
-	inpay = new_inpay(arg, log, msat, fail, succeeded, arg);
 	set = htlc_set_map_get(ld->htlc_sets, payment_hash);
+	/* An HTLC's amount is in the asset of its channel: the parts of one
+	 * payment must all be in one asset, or this would add one asset's
+	 * atoms to another's at par.  (An invoice that names its asset has
+	 * refused any other already; one that names none takes the asset of
+	 * its first part.) */
+	if (set && asset && set->asset && !memeq(asset, 33, set->asset, 33)) {
+		log_unusual(log, "Failing HTLC for payment %s in asset %s,"
+			    " the payment set is in asset %s",
+			    fmt_sha256(tmpctx, payment_hash),
+			    fmt_asset_id(tmpctx, asset),
+			    fmt_asset_id(tmpctx, set->asset));
+		fail(arg, take(failmsg_incorrect_or_unknown(NULL, ld, msat)));
+		return;
+	}
+
+	inpay = new_inpay(arg, log, msat, fail, succeeded, arg);
 	if (!set)
-		set = new_htlc_set(ld, inpay, payment_hash, total_msat);
+		set = new_htlc_set(ld, inpay, payment_hash, total_msat, asset);
 	else {
 		/* BOLT #4:
 		 *

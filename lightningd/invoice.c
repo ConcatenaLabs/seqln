@@ -191,6 +191,8 @@ struct invoice_payment_hook_payload {
 	struct amount_msat msat;
 	/* Preimage we'll give it if succeeds. */
 	struct preimage preimage;
+	/* The asset it is paid in (33-byte tag), or NULL if not known. */
+	const u8 *asset;
 	/* FIXME: Include raw payload! */
 };
 
@@ -235,6 +237,10 @@ invoice_payment_serialize(struct invoice_payment_hook_payload *payload,
 	json_add_escaped_string(stream, "label", payload->label);
 	json_add_preimage(stream, "preimage", &payload->preimage);
 	json_add_amount_msat(stream, "msat", payload->msat);
+	/* On a Sequentia network, the asset the payment arrived in. */
+	if (payload->asset && chainparams->has_anchor_header)
+		json_add_string(stream, "asset",
+				fmt_asset_id(tmpctx, payload->asset));
 
 	if (payload->ld->developer && payload->set)
 		invoice_payment_add_tlvs(stream, payload->set);
@@ -323,7 +329,8 @@ invoice_payment_hooks_done(struct invoice_payment_hook_payload *payload STEALS)
 		htlc_set_fulfill(payload->set, &payload->preimage);
 
 	notify_invoice_payment(ld, payload->msat, &payload->preimage,
-			       payload->label, payload->outpoint);
+			       payload->label, payload->outpoint,
+			       payload->asset);
 }
 
 static bool
@@ -500,6 +507,13 @@ void invoice_try_pay(struct lightningd *ld,
 	payload->msat = msat;
 	payload->set = set;
 	payload->outpoint = tal_dup_or_null(payload, struct bitcoin_outpoint, outpoint);
+	/* The HTLCs' asset (a set holds one), else the invoice's. */
+	if (set && set->asset)
+		payload->asset = tal_dup_talarr(payload, u8, set->asset);
+	else if (details->asset)
+		payload->asset = tal_dup_talarr(payload, u8, details->asset);
+	else
+		payload->asset = NULL;
 
 	// set is NULL if invoice is being paid on-chain
 	if (payload->set)

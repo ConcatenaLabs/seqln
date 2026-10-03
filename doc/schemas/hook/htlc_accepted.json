@@ -179,6 +179,13 @@
             "description": [
               "Optional TLV stream attached to the HTLC."
             ]
+          },
+          "asset": {
+            "type": "hex",
+            "description": [
+              "On a Sequentia network, the 32-byte display id of the asset of the channel the HTLC arrived on (the Sequence token's included): `amount_msat` is in thousandths of that asset's atoms.",
+              "Absent on other networks."
+            ]
           }
         }
       },

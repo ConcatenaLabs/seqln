@@ -37,11 +37,14 @@ void notify_custommsg(struct lightningd *ld,
 		      const struct node_id *peer_id,
 		      const u8 *msg);
 
+/* @asset: on a Sequentia network, the asset the payment arrived in (33-byte
+ * tag), or NULL when not known. */
 void notify_invoice_payment(struct lightningd *ld,
 			    struct amount_msat amount,
 			    const struct preimage *preimage,
 			    const struct json_escape *label,
-			    const struct bitcoin_outpoint *outpoint);
+			    const struct bitcoin_outpoint *outpoint,
+			    const u8 *asset);
 
 void notify_invoice_creation(struct lightningd *ld,
 			     const struct amount_msat *amount,
