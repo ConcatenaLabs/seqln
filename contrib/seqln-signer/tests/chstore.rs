@@ -52,6 +52,7 @@ fn chan(seed: u8) -> ChannelState {
             None
         },
         remote_split: Some((seed as u64 * 7, Split { ours: 400_000, fee: 800 + seed as u64, anchors: 660 })),
+        validated: vec![(seed as u64 * 7 + 1, [seed.wrapping_add(9); 32])],
     }
 }
 

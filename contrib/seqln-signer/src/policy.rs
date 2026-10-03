@@ -37,9 +37,13 @@
 //! A validated commitment also yields what it pays this side ([`Split`]),
 //! which the dispatcher records and [`validate_mutual_close`] holds a close to.
 //!
-//! For `WIRE_HSMD_SIGN_COMMITMENT_TX` (our own commitment, msg 5) the request
-//! carries NO HTLC data, so HTLC outputs cannot be reconstructed; see
-//! [`validate_local_commitment_no_htlcs`] for the strongest correct subset there.
+//! For `WIRE_HSMD_SIGN_COMMITMENT_TX` (our own commitment, msg 5: the
+//! signature that lets the host broadcast it) the request carries no HTLC
+//! data, so its outputs cannot be rebuilt. The device signs instead only a
+//! transaction it has already validated in full: one whose txid is among the
+//! commitments of ours it validated and has not revoked
+//! ([`ChannelState::validated`]). lightningd asks for nothing else: it signs
+//! its `last_tx`, which is the commitment channeld last had validated.
 //! lightningd also signs a completed mutual close with msg 5; a transaction
 //! without a commitment's shape ([`is_commitment_shaped`]) is held to
 //! [`validate_mutual_close`] instead, as `WIRE_HSMD_SIGN_MUTUAL_CLOSE_TX` is.
@@ -160,7 +164,17 @@ pub struct ChannelState {
     /// (SIGN_REMOTE_COMMITMENT_TX). A mutual close is held to the balance
     /// these two give this side ([`validate_mutual_close`]).
     pub remote_split: Option<(u64, Split)>,
+    /// Our commitments this device validated in full and has not revoked:
+    /// (commitment number, txid). SIGN_COMMITMENT_TX signs a commitment for
+    /// broadcast only when its txid is one of these. A revocation drops every
+    /// entry at or below the revoked number; at most [`MAX_VALIDATED`] are
+    /// kept (an honest channel holds two at most: the current commitment and
+    /// its replacement, between validating one and revoking the other).
+    pub validated: Vec<(u64, [u8; 32])>,
 }
+
+/// How many unrevoked validated commitments a channel record keeps.
+pub const MAX_VALIDATED: usize = 8;
 
 /// What one commitment pays this side, in the channel asset's atoms, read off
 /// a commitment whose every output the device has matched to the channel's
@@ -210,6 +224,10 @@ impl ChannelState {
         self.validated_through = max_opt(self.validated_through, old.validated_through);
         self.local_split = newer(self.local_split, old.local_split);
         self.remote_split = newer(self.remote_split, old.remote_split);
+        for &(n, txid) in &old.validated {
+            self.record_validated(n, txid);
+        }
+        self.drop_revoked();
         if !old.local_shutdown_script.is_empty() {
             self.local_shutdown_script = old.local_shutdown_script.clone();
         }
@@ -219,6 +237,38 @@ impl ChannelState {
         if self.is_outbound.is_none() {
             self.is_outbound = old.is_outbound;
         }
+    }
+}
+
+impl ChannelState {
+    /// Record a commitment of ours this device validated in full. Returns
+    /// whether the record changed. A revoked number is never recorded.
+    pub fn record_validated(&mut self, n: u64, txid: [u8; 32]) -> bool {
+        if self.revoked_through.is_some_and(|r| n <= r)
+            || self.validated.iter().any(|&(_, t)| t == txid)
+        {
+            return false;
+        }
+        self.validated.push((n, txid));
+        self.validated.sort();
+        while self.validated.len() > MAX_VALIDATED {
+            self.validated.remove(0);
+        }
+        true
+    }
+
+    /// Forget the validated commitments at or below `revoked_through`: their
+    /// secrets are out, and signing one would hand the peer the channel.
+    pub fn drop_revoked(&mut self) {
+        if let Some(r) = self.revoked_through {
+            self.validated.retain(|&(n, _)| n > r);
+        }
+    }
+
+    /// Whether `txid` is a commitment of ours this device validated and has
+    /// not revoked.
+    pub fn is_validated(&self, txid: &[u8; 32]) -> bool {
+        self.validated.iter().any(|(_, t)| t == txid)
     }
 }
 
@@ -302,9 +352,11 @@ impl ChannelStore {
 pub const CHSTORE_MAGIC: [u8; 4] = *b"SQCH";
 /// Version 2 adds, after each entry's version-1 fields: the opener flag, both
 /// revocation counters and both upfront shutdown scripts. Version 3 adds,
-/// after those, the latest local and remote commitment splits. Versions 1
-/// and 2 still import (the fields they lack unknown).
-pub const CHSTORE_VERSION: u8 = 3;
+/// after those, the latest local and remote commitment splits. Version 4
+/// adds, after those, the unrevoked validated commitments (count(1), then
+/// number(8) and txid(32) each). Versions 1 to 3 still import (the fields
+/// they lack unknown).
+pub const CHSTORE_VERSION: u8 = 4;
 /// The fixed part of an entry, which is the whole of a version-1 entry:
 /// node_id(33) dbid(8) sats(8) txid(32) txout(2) local_delay(2) remote_delay(2)
 /// 5 pubkeys(165) static_remotekey(1) anchors(1)
@@ -375,6 +427,11 @@ pub fn encode_channel_store(store: &ChannelStore) -> Vec<u8> {
         push_script(&mut out, &st.remote_shutdown_script);
         push_opt_split(&mut out, st.local_split);
         push_opt_split(&mut out, st.remote_split);
+        out.push(st.validated.len() as u8);
+        for (n, txid) in &st.validated {
+            out.extend_from_slice(&n.to_le_bytes());
+            out.extend_from_slice(txid);
+        }
     }
     out
 }
@@ -432,7 +489,7 @@ impl<'a> StoreReader<'a> {
 }
 
 /// Decode a channel-store payload (the MAC must already have been verified
-/// and stripped by the caller). Takes versions 1, 2 and 3.
+/// and stripped by the caller). Takes versions 1 to 4.
 pub fn decode_channel_store(
     bytes: &[u8],
 ) -> Result<Vec<(([u8; 33], u64), ChannelState)>, String> {
@@ -440,7 +497,7 @@ pub fn decode_channel_store(
         return Err("not a channel-store blob (bad magic)".to_string());
     }
     let version = bytes[4];
-    if !(1..=3).contains(&version) {
+    if !(1..=4).contains(&version) {
         return Err(format!("unsupported channel-store version {version}"));
     }
     let count = u32::from_le_bytes(bytes[5..9].try_into().unwrap()) as usize;
@@ -474,6 +531,7 @@ pub fn decode_channel_store(
             validated_through: None,
             local_split: None,
             remote_split: None,
+            validated: Vec::new(),
         };
         if version >= 2 {
             st.is_outbound = r.opt_bool()?;
@@ -485,6 +543,18 @@ pub fn decode_channel_store(
         if version >= 3 {
             st.local_split = r.opt_split()?;
             st.remote_split = r.opt_split()?;
+        }
+        if version >= 4 {
+            let n = r.u8()? as usize;
+            if n > MAX_VALIDATED {
+                return Err(format!("{n} validated commitments in a channel-store entry"));
+            }
+            for _ in 0..n {
+                let num = r.u64()?;
+                let txid: [u8; 32] = r.take(32)?.try_into().unwrap();
+                st.validated.push((num, txid));
+            }
+            st.drop_revoked();
         }
         out.push(((node_id, dbid), st));
     }
@@ -968,62 +1038,6 @@ pub fn validate_commitment(
     }
     split.fee = (st.funding_sats as u128 - not_fee) as u64;
     Ok(split)
-}
-
-/// Strongest CORRECT subset for `WIRE_HSMD_SIGN_COMMITMENT_TX` (msg 5, OUR own
-/// commitment): the request carries no HTLC list, so HTLC output scripts cannot
-/// be reconstructed. We therefore enforce only what stays sound without them:
-///  * one input, spending the funding outpoint;
-///  * value conservation (no value created);
-///  * every NON-P2WSH output must be a recognised `to_local`/`to_remote` script
-///    (an attacker's P2WPKH/P2TR/OP_RETURN payout is rejected);
-///  * P2WSH outputs are ACCEPTED unverified (they may be HTLCs we can't rebuild).
-/// This still catches the blatant theft shapes on msg 5 while never falsely
-/// rejecting a legitimate HTLC-bearing own-commitment. Msg 5 is not exercised by
-/// the pure-LN fundee path (it appears only on a unilateral close), so this gap
-/// is not on the hot path; full msg-5 HTLC validation is a follow-up.
-pub fn validate_local_commitment_no_htlcs(
-    kernel: &Kernel,
-    node_id: &[u8; 33],
-    dbid: u64,
-    st: &ChannelState,
-    point: &[u8; 33],
-    tx: &ElementsTx,
-) -> Result<(), String> {
-    let static_remotekey = st.option_static_remotekey || st.option_anchors;
-    let our_bp = kernel.channel_basepoints(node_id, dbid);
-    let ks = build_keyset(kernel, st, &our_bp, Side::Local, point, static_remotekey)?;
-    // Only the HTLC-free scripts (to_local / to_remote / anchors).
-    let whitelist = expected_scripts(&ks, st, Side::Local, &[]);
-
-    if tx.inputs.len() != 1 {
-        return Err(format!("commitment has {} inputs", tx.inputs.len()));
-    }
-    let inp = &tx.inputs[0];
-    if inp.txhash != st.funding_txid || inp.index as u16 != st.funding_txout {
-        return Err("commitment input is not the tracked funding outpoint".to_string());
-    }
-    let mut total: u128 = 0;
-    for (i, o) in tx.outputs.iter().enumerate() {
-        let v = output_value(o, tx.network)
-            .ok_or_else(|| format!("output {i} has a non-explicit value"))?;
-        total += v as u128;
-        if o.script.is_empty() {
-            continue; // fee
-        }
-        let is_p2wsh = o.script.len() == 34 && o.script[0] == 0x00 && o.script[1] == 0x20;
-        let known = whitelist.iter().any(|s| s.as_slice() == o.script.as_slice());
-        if !known && !is_p2wsh {
-            return Err(format!(
-                "output {i} pays to a non-channel script (value {v}, script {})",
-                hexstr(&o.script)
-            ));
-        }
-    }
-    if total > st.funding_sats as u128 {
-        return Err(format!("value created: outputs {total} > funding {}", st.funding_sats));
-    }
-    Ok(())
 }
 
 /// Whether a transaction spending the funding output has the shape BOLT 3

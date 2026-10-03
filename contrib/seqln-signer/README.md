@@ -64,6 +64,13 @@ What enforce mode checks:
   the channel's remote funding key. From the latest of our commitments it validated, and the
   latest of the peer's it signed, the device records this side's balance: its own output, plus
   the fee and anchors when this side opened the channel.
+- **Broadcasting a commitment of ours** (`SIGN_COMMITMENT_TX`, the signature that lets the host
+  put it on chain): the device signs only a transaction whose txid is one of our commitments it
+  validated and has not revoked. That request carries no HTLC list, so the device could not
+  rebuild a commitment it had not already validated; lightningd never needs one, because what it
+  signs is the commitment channeld last had validated. A device with no such record (a store
+  from before commitments were recorded, or a lost store) signs none of our commitments for
+  broadcast until the channel's next commitment step.
 - **Mutual closes** (closingd's request, and the closing transaction lightningd signs again with
   the commitment message when a close completes and whenever it starts with a channel closing):
   one input, the funding output; at most one output to this device's own wallet and at most one
@@ -90,8 +97,8 @@ device does not protect a user from a host that also runs the channel's peer. Su
 pay the peer, or broadcast a commitment the device signed for the watchtower's preempt slot
 before the device revoked it, which the peer then takes whole with the revocation secret.
 
-The channel store (each channel's parameters, revocation counters and recorded balance) carries
-no secret and is authenticated by a MAC keyed from the seed. The native signer keeps it in
+The channel store (each channel's parameters, revocation counters, recorded balance and the
+unrevoked commitments it validated) carries no secret and is authenticated by a MAC keyed from the seed. The native signer keeps it in
 `seqln-signer-channels` in its working directory (or the path in `SEQLN_SIGNER_STORE`): it
 loads the file at start and rewrites it durably (temporary file, sync, rename) after every
 request that changed it, before the reply leaves, refusing the request if the file cannot be
@@ -114,8 +121,8 @@ written. The WASM build hands the same blob to the wallet's `channelStore` to ke
 | `src/bin/ecdh_latency.rs` | ECDH hot-path latency probe (in-process vs transport round-trip). |
 | `src/bin/emit_elements_vector.rs` | Emits an Elements v2 PSET `sign_withdrawal` vector for the conformance harness's `SEQLN_WITHDRAWAL_VECTOR` mode. |
 | `tests/tamper.rs` | Enforce-mode theft-rejection test (skips without a captured corpus). |
-| `tests/chstore.rs` | Channel-store persistence contract (`export_channels`/`import_channels` round-trip, MAC refusal, merge semantics). The store carries each channel's opener, upfront shutdown scripts, revocation counters and recorded balance, and imports an older store without them. |
-| `tests/native_store.rs` | The native binary keeps its store across a restart: a new process refuses a revoked commitment and a close below the recorded balance, which a signer with an empty store signs. |
+| `tests/chstore.rs` | Channel-store persistence contract (`export_channels`/`import_channels` round-trip, MAC refusal, merge semantics). The store carries each channel's opener, upfront shutdown scripts, revocation counters, recorded balance and unrevoked validated commitments, and imports an older store without them. |
+| `tests/native_store.rs` | The native binary keeps its store across a restart: a new process refuses a revoked commitment and a close below the recorded balance, which a signer with an empty store signs (the commitment once it has validated it itself). |
 | `wasm/` | `wasm-bindgen` build of the same library for browsers/Node, plus SDK, relay, tests, demo page. |
 | `wasm/test/enforce.mjs` | WASM enforce-mode proof: corpus replay byte-exact, tampered commitment refused. |
 | `wasm/test/ws_device.mjs` | The browser-shaped device path over a real WebSocket, driven by the wallet SDK. |
