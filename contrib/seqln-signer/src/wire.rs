@@ -455,6 +455,12 @@ fn parse_elements_tx_span(d: &[u8]) -> Option<(ElementsTx, usize)> {
     ))
 }
 
+/// The txid of a linearized Elements transaction (test harnesses).
+#[cfg(test)]
+pub fn parse_elements_tx_span_txid(d: &[u8]) -> [u8; 32] {
+    parse_tx_with_txid(d, Network::Elements).expect("an Elements transaction").1
+}
+
 /// Parse a linearized Bitcoin (non-Elements) transaction far enough for the
 /// BIP-143 sighash. Mirrors `tx_from_bytes` (`external/libwally-core`) for the
 /// `is_elements == false` path.
@@ -807,10 +813,10 @@ fn find_witness_utxo_value(d: &[u8], p: &mut usize) -> Option<[u8; 9]> {
 // BIP-143 sighash and add a PSBT_IN_PARTIAL_SIG per input we control.
 // =====================================================================
 
-/// A parsed `hsm_utxo` (`fromwire_hsm_utxo`, `hsmd/hsm_utxo.c`). We keep the
-/// fields needed to locate + sign a wallet input; `close_info` (a
-/// their-unilateral-close to-us output being swept) is decoded to keep the byte
-/// layout exact but is not part of the funding-open path.
+/// A parsed `hsm_utxo` (`fromwire_hsm_utxo`, `hsmd/hsm_utxo.c`): the fields
+/// needed to locate and sign a wallet input, and, for the output a peer's
+/// commitment paid us, the channel it came from (`close_info`), whose payment
+/// key signs it.
 pub struct HsmUtxo {
     /// Outpoint txid, raw 32 bytes (internal order, matches the tx's txhash).
     pub txid: [u8; 32],
@@ -823,6 +829,23 @@ pub struct HsmUtxo {
     /// True for a their-unilateral-close to-us input (needs channel-key derivation,
     /// not the HD wallet path); never present in a channel-funding withdrawal.
     pub is_unilateral_close: bool,
+    /// The channel a their-unilateral-close output came from, when
+    /// `is_unilateral_close` (`struct unilateral_close_info`).
+    pub close: Option<CloseInfo>,
+}
+
+/// What `hsm_utxo` carries about the channel a peer's commitment paid us
+/// from (`struct unilateral_close_info`): enough to derive the key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CloseInfo {
+    /// The channel's dbid.
+    pub channel_id: u64,
+    pub peer_id: [u8; 33],
+    /// Absent when the output pays the static payment basepoint
+    /// (`option_static_remotekey` or `option_anchors`).
+    pub commitment_point: Option<[u8; 33]>,
+    pub option_anchors: bool,
+    pub csv: u32,
 }
 
 /// Read one `hsm_utxo` subtype (see `fromwire_hsm_utxo`):
@@ -838,15 +861,16 @@ pub fn read_hsm_utxo(r: &mut Reader) -> Option<HsmUtxo> {
     let _is_p2sh_legacy = r.bool()?; // always emitted false; type comes from scriptPubkey
     let script_pubkey = r.u16_prefixed()?;
     let is_unilateral_close = r.bool()?;
-    if is_unilateral_close {
-        r.u64()?; // channel_id
-        r.arr33()?; // peer node_id
-        if r.bool()? {
-            r.arr33()?; // commitment_point (?)
-        }
-        r.bool()?; // option_anchors
-        r.u32()?; // csv
-    }
+    let close = if is_unilateral_close {
+        let channel_id = r.u64()?;
+        let peer_id = r.arr33()?;
+        let commitment_point = if r.bool()? { Some(r.arr33()?) } else { None };
+        let option_anchors = r.bool()?;
+        let csv = r.u32()?;
+        Some(CloseInfo { channel_id, peer_id, commitment_point, option_anchors, csv })
+    } else {
+        None
+    };
     let _is_in_coinbase = r.bool()?;
     Some(HsmUtxo {
         txid,
@@ -855,6 +879,7 @@ pub fn read_hsm_utxo(r: &mut Reader) -> Option<HsmUtxo> {
         keyindex,
         script_pubkey,
         is_unilateral_close,
+        close,
     })
 }
 
@@ -917,6 +942,30 @@ pub fn psbt_input_witness_spk(psbt: &[u8], input_index: usize, network: Network)
     }
     let slen = read_compact(val, &mut p)? as usize;
     Some(val.get(p..p + slen)?.to_vec())
+}
+
+/// Whether input `idx`'s map holds a record whose key is `key` (None if the
+/// PSBT is malformed).
+pub fn psbt_input_has_key(psbt: &[u8], idx: usize, key: &[u8]) -> Option<bool> {
+    if psbt.len() < 5 {
+        return None;
+    }
+    let mut p = 5usize;
+    skip_psbt_map(psbt, &mut p)?; // global map
+    for _ in 0..idx {
+        skip_psbt_map(psbt, &mut p)?;
+    }
+    let recs = parse_psbt_map(psbt, &mut p)?;
+    Some(recs.iter().any(|(k, _)| *k == key))
+}
+
+/// The asset field (as serialized: `0x01 || id` when explicit) of input
+/// `input_index`'s Elements `PSBT_IN_WITNESS_UTXO`. This is what the request
+/// says the input holds: a segwit-v0 signature does not commit to it.
+pub fn psbt_input_asset(psbt: &[u8], input_index: usize) -> Option<Vec<u8>> {
+    let val = psbt_witness_utxo_raw(psbt, input_index)?;
+    let mut p = 0usize;
+    Some(commit_field(val, &mut p, false)?.to_vec())
 }
 
 /// Return the raw value of the v0 `PSBT_GLOBAL_UNSIGNED_TX` (global map key 0x00)

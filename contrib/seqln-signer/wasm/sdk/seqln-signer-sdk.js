@@ -361,18 +361,19 @@ export class SeqlnSigner {
           // which every payment on that channel fails with a message that
           // names neither the channel nor the reason. The wasm signer records
           // the reason; surface it here (onReject + a console warning) so the
-          // host can say WHY it refused instead of leaving a dead channel.
-          if (reply.length === 4) {
-            let why = null;
-            try { why = this._inner.lastReject; } catch {}
-            if (why) {
-              console.warn(`seqln-signer: REFUSED ${hsmdName(type)} — ${why}`);
-              if (this.onReject) { try { this.onReject({ type, name: hsmdName(type), reason: why }); } catch {} }
-            }
+          // host can say WHY it refused instead of leaving a dead channel. A
+          // withdrawal the device declines is answered with the transaction
+          // unsigned, not the sentinel, and carries a reason too.
+          let why = null;
+          try { why = this._inner.lastReject; } catch {}
+          const refused = reply.length === 4 || !!why;
+          if (refused && why) {
+            console.warn(`seqln-signer: REFUSED ${hsmdName(type)} — ${why}`);
+            if (this.onReject) { try { this.onReject({ type, name: hsmdName(type), reason: why }); } catch {} }
           }
           if (this.onRequest) {
             try {
-              this.onRequest({ seq, type, name: hsmdName(type), replyBytes: reply.length - 4, rejected: reply.length === 4 });
+              this.onRequest({ seq, type, name: hsmdName(type), replyBytes: reply.length - 4, rejected: refused });
             } catch {}
           }
           // Persist the channel store if this frame changed it (setup/forget),

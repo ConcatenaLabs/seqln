@@ -126,8 +126,8 @@ def restart_device(device):
 
 # The device's channel store (contrib/seqln-signer/src/policy.rs): magic,
 # version, count, then each entry's fixed part and the fields later versions
-# add, then (from version 5) the payment ledger; a MAC keyed from the seed
-# closes it.
+# add, then (from version 5) the payment ledger and (from version 7) the
+# closes the device signed; a MAC keyed from the seed closes it.
 ENTRY = 33 + 8 + 8 + 32 + 2 + 2 + 2 + 33 * 5 + 1 + 1
 
 
@@ -149,7 +149,7 @@ def store_as_version(device, version):
     blob = open(path, 'rb').read()
     payload, mac = blob[:-32], blob[-32:]
     assert hmac.compare_digest(store_mac(payload), mac)
-    assert payload[:4] == b'SQCH' and payload[4] == 6, payload[:5]
+    assert payload[:4] == b'SQCH' and payload[4] in (6, 7), payload[:5]
     count = struct.unpack('<I', payload[5:9])[0]
     o, entries = 9, []
 

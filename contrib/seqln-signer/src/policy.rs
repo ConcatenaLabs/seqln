@@ -297,19 +297,55 @@ fn max_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
 
 /// The in-memory store of channel states. A device tracks few channels, so a
 /// flat map is ample; lookups are by (node_id, dbid). The payment ledger
-/// (approvals and charges across every channel) is kept and persisted with it.
+/// (approvals and charges across every channel) and the closing transactions
+/// the device signed are kept and persisted with it.
 #[derive(Default)]
 pub struct ChannelStore {
     map: std::collections::HashMap<([u8; 33], u64), ChannelState>,
     pub ledger: Ledger,
+    /// The txids of the mutual closes this device signed, oldest first, at
+    /// most [`MAX_CLOSE_TXIDS`]. What such a close pays this wallet is a
+    /// close output: the device signs its spend only to its own scripts
+    /// (`dispatch.rs`, `check_close_spend`). Kept apart from the channel
+    /// records, which `FORGET_CHANNEL` drops long before the output is spent.
+    pub close_txids: Vec<[u8; 32]>,
 }
+
+/// How many mutual-close txids the store keeps. A node closes few channels
+/// and a close negotiation signs a handful of proposals; the oldest go first.
+pub const MAX_CLOSE_TXIDS: usize = 256;
 
 impl ChannelStore {
     pub fn new() -> Self {
         ChannelStore {
             map: std::collections::HashMap::new(),
             ledger: Ledger::default(),
+            close_txids: Vec::new(),
         }
+    }
+    /// Record the txid of a mutual close this device signed. Returns whether
+    /// the record changed.
+    pub fn record_close(&mut self, txid: [u8; 32]) -> bool {
+        if self.close_txids.contains(&txid) {
+            return false;
+        }
+        self.close_txids.push(txid);
+        while self.close_txids.len() > MAX_CLOSE_TXIDS {
+            self.close_txids.remove(0);
+        }
+        true
+    }
+    /// Whether `txid` is a mutual close this device signed.
+    pub fn is_close(&self, txid: &[u8; 32]) -> bool {
+        self.close_txids.contains(txid)
+    }
+    /// Fold in the close record of a persisted store (a blob import).
+    pub fn merge_closes(&mut self, txids: &[[u8; 32]]) -> bool {
+        let mut changed = false;
+        for t in txids {
+            changed |= self.record_close(*t);
+        }
+        changed
     }
     /// The assets of every channel whose asset is known.
     pub fn assets(&self) -> Vec<AssetKey> {
@@ -382,9 +418,11 @@ pub const CHSTORE_MAGIC: [u8; 4] = *b"SQCH";
 /// number(8) and txid(32) each). Version 5 adds, after those, the channel's
 /// payment tracking ([`PayTrack`]), and after the last entry the payment
 /// ledger ([`Ledger`]). Version 6 adds, after the payment tracking, the
-/// local shutdown script's wallet index (flag(1), then index(4)). Versions 1
-/// to 5 still import (the fields they lack unknown).
-pub const CHSTORE_VERSION: u8 = 6;
+/// local shutdown script's wallet index (flag(1), then index(4)). Version 7
+/// adds, after the ledger, the txids of the mutual closes the device signed
+/// (count(2), then txid(32) each). Versions 1 to 6 still import (the fields
+/// they lack unknown).
+pub const CHSTORE_VERSION: u8 = 7;
 /// The fixed part of an entry, which is the whole of a version-1 entry:
 /// node_id(33) dbid(8) sats(8) txid(32) txout(2) local_delay(2) remote_delay(2)
 /// 5 pubkeys(165) static_remotekey(1) anchors(1)
@@ -518,6 +556,10 @@ pub fn encode_channel_store(store: &ChannelStore) -> Vec<u8> {
         }
     }
     push_ledger(&mut out, &store.ledger);
+    out.extend_from_slice(&(store.close_txids.len() as u16).to_le_bytes());
+    for t in &store.close_txids {
+        out.extend_from_slice(t);
+    }
     out
 }
 
@@ -630,18 +672,19 @@ impl<'a> StoreReader<'a> {
     }
 }
 
-/// A decoded channel-store payload: its entries and its payment ledger
-/// (empty before version 5).
-pub type DecodedStore = (Vec<(([u8; 33], u64), ChannelState)>, Ledger);
+/// A decoded channel-store payload: its entries, its payment ledger (empty
+/// before version 5) and the mutual closes the device signed (empty before
+/// version 7).
+pub type DecodedStore = (Vec<(([u8; 33], u64), ChannelState)>, Ledger, Vec<[u8; 32]>);
 
 /// Decode a channel-store payload (the MAC must already have been verified
-/// and stripped by the caller). Takes versions 1 to 6.
+/// and stripped by the caller). Takes versions 1 to 7.
 pub fn decode_channel_store(bytes: &[u8]) -> Result<DecodedStore, String> {
     if bytes.len() < 9 || bytes[..4] != CHSTORE_MAGIC {
         return Err("not a channel-store blob (bad magic)".to_string());
     }
     let version = bytes[4];
-    if !(1..=6).contains(&version) {
+    if !(1..=CHSTORE_VERSION).contains(&version) {
         return Err(format!("unsupported channel-store version {version}"));
     }
     let count = u32::from_le_bytes(bytes[5..9].try_into().unwrap()) as usize;
@@ -715,10 +758,20 @@ pub fn decode_channel_store(bytes: &[u8]) -> Result<DecodedStore, String> {
         out.push(((node_id, dbid), st));
     }
     let ledger = if version >= 5 { r.ledger()? } else { Ledger::default() };
+    let mut closes = Vec::new();
+    if version >= 7 {
+        let n = r.u16()? as usize;
+        if n > MAX_CLOSE_TXIDS {
+            return Err(format!("{n} close txids in a channel-store blob"));
+        }
+        for _ in 0..n {
+            closes.push(r.take(32)?.try_into().unwrap());
+        }
+    }
     if r.o != bytes.len() {
         return Err("channel-store blob has trailing bytes".to_string());
     }
-    Ok((out, ledger))
+    Ok((out, ledger, closes))
 }
 
 /// Decode a BOLT/BOLT channel_type feature bitfield (BOLT-1 big-endian: the
@@ -827,6 +880,12 @@ fn wscript_to_local(to_self_delay: u16, csv: u32, revocation: &[u8; 33], delayed
     s.push(OP_ENDIF);
     s.push(OP_CHECKSIG);
     s
+}
+
+/// The anchor-channel to_remote witness script for `remote_key` (what a
+/// peer's commitment pays this side on an `option_anchors` channel).
+pub fn to_remote_anchored_wscript(remote_key: &[u8; 33], csv: u32) -> Vec<u8> {
+    wscript_to_remote_anchored(remote_key, csv)
 }
 
 /// `bitcoin_wscript_to_remote_anchored`: the anchor-channel to_remote script.

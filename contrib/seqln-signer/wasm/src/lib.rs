@@ -112,7 +112,8 @@ impl Signer {
     /// (`u32 len | hsmd_reply`, a zero-length body being the error sentinel) —
     /// byte-for-byte what the native serve loop writes back. Throws only on a
     /// libhsmd-fatal condition (which closes the transport natively).
-    /// The reason the last request was refused (cleared by the next successful one).
+    /// The reason the last request was refused, or answered without the
+    /// signature it asked for (cleared by the next request).
     #[wasm_bindgen(js_name = lastReject, getter)]
     pub fn last_reject(&self) -> Option<String> {
         self.last_reject.clone()
@@ -164,7 +165,12 @@ impl Signer {
         };
         self.last_reject = None;
         let reply: Vec<u8> = match self.inner.handle(&req) {
-            Outcome::Reply(bytes) => bytes,
+            // Answered, but not with what was asked for (a withdrawal the
+            // device returns unsigned): keep the reason as for a refusal.
+            Outcome::Reply(bytes) => {
+                self.last_reject = self.inner.take_refusal();
+                bytes
+            }
             // Sentinel and (policy) Reject are both the zero-length wire sentinel.
             //
             // But the REASON must not die here. Outcome::Reject documents itself as
