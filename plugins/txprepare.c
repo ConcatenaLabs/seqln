@@ -31,6 +31,12 @@ struct txprepare {
 
 	/* Keep track if upgrade, so we can report on finish */
 	bool is_upgrade;
+
+	/* The asset named (display id), or NULL: then the asset of the
+	 * inputs fundpsbt/utxopsbt chose, which is the asset being moved. */
+	const char *asset;
+	/* On an asset-aware chain, the asset of every output (33-byte tag). */
+	u8 out_asset[33];
 };
 
 struct unreleased_tx {
@@ -235,8 +241,12 @@ static struct command_result *finish_txprepare(struct command *cmd,
 	for (size_t i = 0; i < tal_count(txp->outputs); i++) {
 		struct wally_tx_output *out;
 
-		out = wally_tx_output(NULL, txp->outputs[i].script,
-				      txp->outputs[i].amount);
+		out = chainparams->is_elements
+			? wally_tx_output_asset(NULL, txp->outputs[i].script,
+						txp->outputs[i].amount,
+						txp->out_asset)
+			: wally_tx_output(NULL, txp->outputs[i].script,
+					  txp->outputs[i].amount);
 		if (!out)
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 					    "Invalid output %zi (%s:%s)", i,
@@ -307,6 +317,18 @@ static struct command_result *psbt_created(struct command *cmd,
 	if (!psbt_set_version(txp->psbt, 2)) {
 		return command_fail(cmd, LIGHTNINGD,
 					"Unable to convert PSBT to version 2.");
+	}
+
+	/* Every output is in the asset being moved: the one the inputs hold
+	 * (fundpsbt and utxopsbt pick inputs of one asset, the named one when
+	 * an asset was named), which pays the fee too. */
+	if (chainparams->is_elements) {
+		if (txp->psbt->num_inputs == 0 || !txp->psbt->inputs[0].witness_utxo)
+			return command_fail(cmd, LIGHTNINGD,
+					    "PSBT input has no asset");
+		struct amount_asset ia =
+			wally_tx_output_get_amount(txp->psbt->inputs[0].witness_utxo);
+		memcpy(txp->out_asset, ia.asset, sizeof(txp->out_asset));
 	}
 
 	if (!json_to_number(buf, json_get_member(buf, result, "feerate_per_kw"),
@@ -395,6 +417,8 @@ static struct command_result *txprepare_continue(struct command *cmd,
 		json_add_sats(req->js, "satoshi", txp->output_total);
 	else
 		json_add_string(req->js, "satoshi", "all");
+	if (txp->asset)
+		json_add_string(req->js, "asset", txp->asset);
 
 	json_add_u32(req->js, "startweight", txp->weight);
 	json_add_bool(req->js, "excess_as_change", true);
@@ -417,6 +441,7 @@ static struct command_result *json_txprepare(struct command *cmd,
 		   p_opt("feerate", param_string, &feerate),
 		   p_opt_def("minconf", param_number, &minconf, 1),
 		   p_opt("utxos", param_outpoint_arr, &utxos),
+		   p_opt("asset", param_string, &txp->asset),
 		   NULL))
 		return command_param_failed();
 
@@ -530,6 +555,7 @@ static struct command_result *json_withdraw(struct command *cmd,
 		   p_opt("feerate", param_string, &feerate),
 		   p_opt_def("minconf", param_number, &minconf, 1),
 		   p_opt("utxos", param_outpoint_arr, &utxos),
+		   p_opt("asset", param_string, &txp->asset),
 		   NULL))
 		return command_param_failed();
 
@@ -646,6 +672,7 @@ static struct command_result *newaddr_sweep_done(struct command *cmd,
 
 	info->txp = tal(info, struct txprepare);
 	info->txp->is_upgrade = true;
+	info->txp->asset = NULL;
 
 	/* Add output for 'all' to txp */
 	info->txp->outputs = tal_arr(info->txp, struct tx_output, 1);

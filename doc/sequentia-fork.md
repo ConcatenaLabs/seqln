@@ -200,6 +200,12 @@ policy asset by default). File-level map of the threading:
   shows an `asset` field on issued-asset UTXOs (amounts are that asset's atoms). The per-asset
   selection, including the fee-bump coins of anchor spends and HTLC transactions, applies on
   Sequentia networks only; a Bitcoin node selects from all its UTXOs, as upstream does.
+- `fundpsbt`, `utxopsbt`, `addpsbtoutput`, `txprepare` and `withdraw` (`wallet/reservation.c`,
+  `plugins/txprepare.c`) take the `asset` being moved (32-byte display-hex id) and pay the fee in
+  it, at the node's rate for it. Without it they move the asset of their inputs: `utxopsbt`
+  the one asset its `utxos` hold (coins of two assets are refused), `fundpsbt` and the commands
+  built on it the policy asset. `migrate_fill_close_output_asset` (`wallet/db.c`) gives a close
+  output recorded without an asset its channel's.
 - `plugins/spender/fundchannel.c`, `plugins/spender/multifundchannel.{c,h}`: the `asset` parameter
   (32-byte display-hex id); all channels in one funding tx must share one asset.
 - `onchaind/onchaind.c` + `onchaind/onchaind_wire.csv`, `lightningd/onchain_control.c`,
@@ -388,7 +394,9 @@ opened the escaping stall. Lightning nodes run the network's own timelock and `r
 The tests cover an asset channel opened, paid over and mutually closed, the anchor-burial gate,
 the certified-frontier clamp, a Bitcoin reorg unwinding Sequentia blocks under a running node,
 the network defaults, the output a peer's commitment pays this node listed and spent in the
-channel's asset (`test_close_output_asset.py`), a keyless node spending each kind of close
+channel's asset (`test_close_output_asset.py`), and moved by `withdraw`, `txprepare` and
+`utxopsbt` in that asset at a rate other than par, and given its asset by the upgrade of a
+database that recorded it without one (`test_asset_withdraw.py`), a keyless node spending each kind of close
 output only to its own address and within its device's payment limit
 (`test_close_output_spend.py`, on Bitcoin regtest too, with the redirected spend forced into a
 block there; `SEQLN_DEVICE=wasm` runs the keyless tests on the browser build), a breach of an asset channel with a pending HTLC
