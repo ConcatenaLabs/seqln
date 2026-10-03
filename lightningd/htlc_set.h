@@ -29,6 +29,9 @@ struct htlc_set {
 	struct lightningd *ld;
 	struct amount_msat total_msat, so_far;
 	struct sha256 payment_hash;
+	/* The asset of the first HTLC's channel (33-byte tag), which every
+	 * other part must arrive in; NULL on a chain without assets. */
+	u8 *asset;
 	struct incoming_payment **inpays;
 	struct oneshot *timeout;
 };

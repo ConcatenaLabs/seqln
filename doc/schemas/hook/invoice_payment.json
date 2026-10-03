@@ -52,6 +52,12 @@
             "description": [
               "Amount paid in millisatoshis."
             ]
+          },
+          "asset": {
+            "type": "hex",
+            "description": [
+              "On a Sequentia network, the 32-byte display id of the asset the payment arrived in (every part of a payment arrives in one asset), or the asset the invoice names when it was paid otherwise."
+            ]
           }
         },
         "description": [

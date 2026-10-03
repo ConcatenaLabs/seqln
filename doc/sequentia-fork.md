@@ -225,6 +225,18 @@ policy asset by default). File-level map of the threading:
   "paid in asset X, invoice wants Y"). Without `asset=`, the invoice records the asset of this
   node's channels when they all hold one; on a node with channels in several assets, or none, it
   names no asset and accepts any. `listinvoices` and the `wait*invoice` results show it.
+- `lightningd/htlc_set.c`: the parts of one payment must arrive in one asset; a part in another
+  asset than the first is refused (`incorrect_or_unknown_payment_details`, logged as "in asset X,
+  the payment set is in asset Y"), so an invoice that names no asset never adds one asset's atoms
+  to another's.
+- `lightningd/peer_htlcs.c`, `lightningd/invoice.c`, `lightningd/notification.c`: the
+  `htlc_accepted` hook (`htlc.asset`), the `invoice_payment` hook (`payment.asset`), and the
+  `forward_event` and `invoice_payment` notifications (`asset`) name the asset of the channel the
+  HTLC arrived on, as a 32-byte display id, the Sequence token's included; the amounts are in
+  thousandths of that asset's atoms. The fields appear on Sequentia networks only. The schemas in
+  `doc/schemas/hook/` and `doc/schemas/notification/` describe them; the generated typed bindings
+  (`.msggen.json`, `cln-rpc`, `cln-grpc`) are not regenerated from them, so a typed client does
+  not see the fields.
 
 Invoices: standard BOLT11 with the `tsqt` HRP, and no asset field: the asset an invoice wants is
 known to the payee, which enforces it, and is told to the payer out of band (`pay ... asset=`).
@@ -340,8 +352,11 @@ opened the escaping stall. Lightning nodes run the network's own timelock and `r
 The tests cover an asset channel opened, paid over and mutually closed, the anchor-burial gate,
 the certified-frontier clamp, a Bitcoin reorg unwinding Sequentia blocks under a running node,
 the network defaults, a breach of an asset channel with a pending HTLC answered by `speculad`
-while the victim is offline (`test_watchtower.py`), and a keyless node, as either side of a
-channel, closing it and restarting with it closing (`test_keyless_close.py`). They need `sequentiad`, `sequentia-cli`
+while the victim is offline (`test_watchtower.py`), a keyless node, as either side of a channel,
+closing it and restarting with it closing (`test_keyless_close.py`), the fees of channels in
+assets of any value and between peers that value an asset differently (`test_fee_market.py`),
+and the asset plugins see on an HTLC, with `holdinvoice-seq` holding only the asset it was
+registered in, across a restart (`test_hold_asset.py`). They need `sequentiad`, `sequentia-cli`
 and a Bitcoin Core `bitcoind` on `PATH`, and the keyless test needs the device signer built
 (`cargo build --release` in `contrib/seqln-signer`, or `SEQLN_SIGNER=/path/to/seqln-signer`):
 
@@ -379,9 +394,9 @@ Each verified present in the code as of 2026-07-08:
    PSBT outputs (`common/interactivetx.c`, `openingd/dualopend.c`), so a non-policy output there
    aborts the daemon. Asset channels must use the ordinary single-funder `fundchannel`.
 2. **Payment paths other than `pay` are asset-blind.** xpay, askrene, renepay and keysend know
-   no asset, and the `htlc_accepted` hook payload carries none, so a plugin that settles HTLCs
-   itself (`contrib/holdinvoice-seq`) cannot check the asset an HTLC arrived in. Use `pay` with
-   `asset=` and invoices that name their asset.
+   no asset. Use `pay` with `asset=` and invoices that name their asset. A plugin that settles
+   HTLCs itself must check the `asset` the `htlc_accepted` hook names, as
+   `contrib/holdinvoice-seq` does.
 3. **Local/private channels have no asset record in pathfinding.** The gossmap local
    modifications (`common/gossmods_listpeerchannels.c`) carry no asset, so unannounced channels
    are treated as policy-asset channels by the `pay`/`getroute` asset filter.
@@ -389,16 +404,14 @@ Each verified present in the code as of 2026-07-08:
    BOLT11 string does not carry it: the payer learns it out of band and passes `pay ... asset=`.
 5. **Mainnet chainparams are placeholders.** All-zero genesis, NULL fee asset; the `sequentia`
    network entry must not be used.
-6. **`holdinvoice-seq` state is in-memory only** (no persistence across plugin restart); see its
-   [README](../contrib/holdinvoice-seq/README.md).
-7. **Committee-stall fail-open.** If the certified frontier is more than 144 blocks behind the tip
+6. **Committee-stall fail-open.** If the certified frontier is more than 144 blocks behind the tip
    (a stalled committee), the bcli clamp fails open with a warning rather than halting; operators
    should monitor for that log message.
-8. **Penalty across an induced anchor reorg is untested.** Open, payment and mutual close of an
+7. **Penalty across an induced anchor reorg is untested.** Open, payment and mutual close of an
    issued-asset channel, and a breach of one answered by `speculad`, run in `tests/sequentia/`,
    and force-close resolution has been exercised on the testnet, but no test covers a penalty
    across a Bitcoin-anchor tail truncation.
-9. **`speculad` pays a justice transaction's fee only in the channel asset.** If the node stops
+8. **`speculad` pays a justice transaction's fee only in the channel asset.** If the node stops
    accepting that asset for fees, the tower cannot fund the justice transaction (it logs the
    asset and broadcasts it unfunded, which the network refuses). Its fee wallet must also hold a
    UTXO in each channel asset it defends.

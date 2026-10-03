@@ -202,13 +202,18 @@ static void invoice_payment_notification_serialize(struct json_stream *stream,
 						   struct amount_msat amount,
 						   const struct preimage *preimage,
 						   const struct json_escape *label,
-						   const struct bitcoin_outpoint *outpoint)
+						   const struct bitcoin_outpoint *outpoint,
+						   const u8 *asset)
 {
 	json_add_amount_msat(stream, "msat", amount);
 	json_add_preimage(stream, "preimage", preimage);
 	if (outpoint)
 		json_add_outpoint(stream, "outpoint", outpoint);
 	json_add_escaped_string(stream, "label", label);
+	/* On a Sequentia network `msat` is in thousandths of this asset's
+	 * atoms. */
+	if (asset && chainparams->has_anchor_header)
+		json_add_string(stream, "asset", fmt_asset_id(tmpctx, asset));
 }
 
 REGISTER_NOTIFICATION(invoice_payment)
@@ -217,12 +222,13 @@ void notify_invoice_payment(struct lightningd *ld,
 			    struct amount_msat amount,
 			    const struct preimage *preimage,
 			    const struct json_escape *label,
-			    const struct bitcoin_outpoint *outpoint)
+			    const struct bitcoin_outpoint *outpoint,
+			    const u8 *asset)
 {
 	struct jsonrpc_notification *n = notify_start(ld, "invoice_payment");
 	if (!n)
 		return;
-	invoice_payment_notification_serialize(n->stream, amount, preimage, label, outpoint);
+	invoice_payment_notification_serialize(n->stream, amount, preimage, label, outpoint, asset);
 	notify_send(ld, n);
 }
 
@@ -393,6 +399,11 @@ static void forward_event_notification_serialize(struct json_stream *stream,
 	cur->created_index = created_index;
 	cur->updated_index = updated_index;
 	json_add_forwarding_fields(stream, cur, &in->payment_hash, in->preimage);
+	/* On a Sequentia network, the asset the HTLC arrived in: the amounts
+	 * are in thousandths of its atoms, and a forward never leaves it. */
+	if (chainparams->has_anchor_header)
+		json_add_string(stream, "asset",
+				fmt_asset_id(tmpctx, in->key.channel->channel_asset));
 }
 
 REGISTER_NOTIFICATION(forward_event);

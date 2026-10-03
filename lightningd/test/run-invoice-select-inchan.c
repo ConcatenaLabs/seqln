@@ -538,7 +538,8 @@ void notify_invoice_payment(struct lightningd *ld UNNEEDED,
 			    struct amount_msat amount UNNEEDED,
 			    const struct preimage *preimage UNNEEDED,
 			    const struct json_escape *label UNNEEDED,
-			    const struct bitcoin_outpoint *outpoint UNNEEDED)
+			    const struct bitcoin_outpoint *outpoint UNNEEDED,
+			    const u8 *asset UNNEEDED)
 { fprintf(stderr, "notify_invoice_payment called!\n"); abort(); }
 /* Generated stub for onchaind_funding_spent */
 enum watch_result onchaind_funding_spent(struct channel *channel UNNEEDED,

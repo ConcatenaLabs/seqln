@@ -1303,6 +1303,11 @@ static void htlc_accepted_hook_serialize(struct htlc_accepted_hook_payload *p,
 	if (p->extra_tlvs_raw) {
 		json_add_hex_talarr(s, "extra_tlvs", p->extra_tlvs_raw);
 	}
+	/* On a Sequentia network, the asset of the channel the HTLC arrived
+	 * on: its amount is in thousandths of that asset's atoms. */
+	if (chainparams->has_anchor_header)
+		json_add_string(s, "asset",
+				fmt_asset_id(tmpctx, hin->key.channel->channel_asset));
 	json_object_end(s);
 }
 
