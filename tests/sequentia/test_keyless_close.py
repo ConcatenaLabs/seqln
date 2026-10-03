@@ -49,7 +49,7 @@ def free_port():
 class Device(object):
     """The device signer, reconnecting whenever its session ends, as a
     browser does."""
-    def __init__(self, directory, port, priv, host_pub):
+    def __init__(self, directory, port, priv, host_pub, trace=False):
         self.dir = os.path.join(directory, 'device')
         os.makedirs(self.dir, exist_ok=True)
         with open(os.path.join(self.dir, 'hsm_secret'), 'wb') as f:
@@ -58,6 +58,8 @@ class Device(object):
         self.env = dict(os.environ, SEQLN_SIGNER_PRIVKEY=priv,
                         SEQLN_HOST_PEER_PUBKEY=host_pub,
                         SEQLN_SIGNER_POLICY='enforce')
+        if trace:
+            self.env['SEQLN_SIGNER_TRACE'] = '1'
         self.cmd = [SIGNER, '--connect', '127.0.0.1:{}'.format(port)]
         self.stopping = False
         self.proc = None
@@ -84,13 +86,18 @@ class Device(object):
         with open(self.log) as f:
             return f.read()
 
+    def requests(self, msgtype):
+        """How many requests of `msgtype` the device served (trace only)."""
+        with open(os.path.join(self.dir, 'seqln-signer.log')) as f:
+            return f.read().count('TRACE req type=Some({}) '.format(msgtype))
 
-def keyless_node(node_factory, directory):
+
+def keyless_node(node_factory, directory, trace=False):
     """A node whose hsmd is the proxy, served by a device in enforce mode."""
     port = free_port()
     host_priv, host_pub = genkey()
     dev_priv, dev_pub = genkey()
-    device = Device(directory, port, dev_priv, host_pub)
+    device = Device(directory, port, dev_priv, host_pub, trace)
     device.start()
     node = node_factory.get_node(start=False, may_fail=True,
                                  options={'subdaemon': 'hsmd:' + PROXY})
@@ -217,6 +224,81 @@ def test_keyless_node_closes_and_restarts(node_factory, bitcoind, directory, ope
         wait_for(lambda: channel(l1, l2)['state'] == 'ONCHAIN')
         closing = bitcoind.rpc.getrawtransaction(close_txid, True)
         assert {o['asset'] for o in closing['vout']} == {asset}
+    finally:
+        if answers(l1, timeout=2):
+            l1.stop()
+        device.stop()
+
+
+@pytest.mark.skipif(not os.path.exists(SIGNER), reason='needs the seqln-signer binary')
+@pytest.mark.parametrize('opener', ['hub', 'keyless'])
+def test_keyless_node_broadcasts_its_validated_commitment(node_factory, bitcoind, directory,
+                                                          opener):
+    """The device signs a commitment of ours for broadcast only when it is a
+    transaction the device validated and has not revoked.  lightningd asks
+    for nothing else: the preempt slot at every commitment step, a payment
+    each way, `dev-sign-last-tx`, a unilateral close with the hub gone, and
+    the closing node's restart (which signs the commitment again) are all
+    signed, and the commitment confirms."""
+    asset = bitcoind.issue_asset(1000)
+    bitcoind.set_fee_rates({bitcoind.POLICY_ASSET: PAR, asset: PAR})
+    device, l1 = keyless_node(node_factory, directory, trace=True)
+    try:
+        l2 = node_factory.get_node(may_reconnect=True)
+        funder, fundee = (l2, l1) if opener == 'hub' else (l1, l2)
+        addr = funder.rpc.newaddr('bech32')['bech32']
+        txid = bitcoind.send_and_mine_block(addr, 2 * 10**8, asset)
+        wait_for(lambda: any(o['txid'] == txid for o in funder.rpc.listfunds()['outputs']))
+        funder.rpc.connect(fundee.info['id'], 'localhost', fundee.port)
+        res = funder.rpc.call('fundchannel', {'id': fundee.info['id'], 'amount': 10**8,
+                                              'asset': asset, 'announce': True})
+        bitcoind.generate_block(1, wait_for_mempool=res['txid'])
+        for a, b in ((l1, l2), (l2, l1)):
+            wait_for(lambda: channel(a, b)['state'] == 'CHANNELD_NORMAL')
+
+        def settled():
+            return channel(l1, l2)['htlcs'] == [] and channel(l2, l1)['htlcs'] == []
+        inv = fundee.rpc.invoice(3 * 10**7 * 1000, 'out', 'out')['bolt11']
+        funder.rpc.pay(inv)
+        wait_for(settled)
+        inv = funder.rpc.invoice(10**7 * 1000, 'back', 'back')['bolt11']
+        fundee.rpc.pay(inv)
+        wait_for(settled)
+        l1.rpc.dev_sign_last_tx(l2.info['id'])
+        assert 'POLICY REJECT' not in device.output()
+        # VALIDATE_COMMITMENT_TX (35) for commitment 0 and each step after;
+        # SIGN_COMMITMENT_TX (5) for the preempt slot at each step after 0,
+        # and once for dev-sign-last-tx.
+        validated, signed = device.requests(35), device.requests(5)
+        print("validated {}, signed for broadcast {}".format(validated, signed))
+        assert validated >= 5 and signed >= validated
+
+        # The hub goes away; the keyless node closes on its own.
+        l2.stop()
+        res = l1.rpc.close(l2.info['id'], unilateraltimeout=1)
+        assert res['type'] == 'unilateral'
+        commitment = only_one(res['txids'])
+        wait_for(lambda: commitment in bitcoind.rpc.getrawmempool())
+        assert channel(l1, l2)['state'] == 'AWAITING_UNILATERAL'
+
+        # Restarted while the commitment is unconfirmed, lightningd signs it
+        # again: the device, restarted too, still knows it validated it.
+        l1.stop()
+        if device.proc and device.proc.poll() is None:
+            device.proc.kill()
+        l1.start()
+        assert answers(l1)
+        l1.daemon.wait_for_log('sendrawtx exit 0')
+        assert 'POLICY REJECT' not in device.output()
+        assert not l1.daemon.is_in_log('device REJECTED')
+        print("signed for broadcast after the close and the restart: {}"
+              .format(device.requests(5) - signed))
+        assert device.requests(5) >= signed + 2
+
+        bitcoind.generate_block(1, wait_for_mempool=commitment)
+        wait_for(lambda: channel(l1, l2)['state'] in ('FUNDING_SPEND_SEEN', 'ONCHAIN'))
+        spent = bitcoind.rpc.getrawtransaction(commitment, True)
+        assert {o['asset'] for o in spent['vout']} == {asset}
     finally:
         if answers(l1, timeout=2):
             l1.stop()

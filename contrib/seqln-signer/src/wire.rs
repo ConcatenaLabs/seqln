@@ -333,6 +333,10 @@ const WALLY_TX_PEGIN_FLAG: u32 = 0x4000_0000;
 pub struct BitcoinTx {
     pub tx: ElementsTx,
     pub psbt: Vec<u8>,
+    /// The transaction's txid (internal byte order): SHA256d of its
+    /// serialization without witnesses. Two requests with the same txid
+    /// carry the same transaction in every field a signature commits to.
+    pub txid: [u8; 32],
 }
 
 /// Bitcoin/Elements compact-size varint over a byte slice with a cursor.
@@ -378,6 +382,13 @@ fn commit_field<'a>(d: &'a [u8], p: &mut usize, is_value: bool) -> Option<&'a [u
 /// (through locktime; witnesses that follow are ignored). Mirrors
 /// `tx_from_bytes` (`external/libwally-core/src/transaction.c`).
 pub fn parse_elements_tx(d: &[u8]) -> Option<ElementsTx> {
+    parse_elements_tx_span(d).map(|(tx, _)| tx)
+}
+
+/// [`parse_elements_tx`], also returning where the locktime ends: the
+/// serialization up to there, with the flag byte cleared, is what the txid
+/// hashes (witnesses follow the locktime on Elements).
+fn parse_elements_tx_span(d: &[u8]) -> Option<(ElementsTx, usize)> {
     let version = u32::from_le_bytes(d.get(0..4)?.try_into().ok()?);
     let mut p = 4usize;
     // Elements: a single witness-flag byte after version.
@@ -432,13 +443,16 @@ pub fn parse_elements_tx(d: &[u8]) -> Option<ElementsTx> {
     }
 
     let locktime = u32::from_le_bytes(d.get(p..p + 4)?.try_into().ok()?);
-    Some(ElementsTx {
-        version,
-        inputs,
-        outputs,
-        locktime,
-        network: Network::Elements,
-    })
+    Some((
+        ElementsTx {
+            version,
+            inputs,
+            outputs,
+            locktime,
+            network: Network::Elements,
+        },
+        p + 4,
+    ))
 }
 
 /// Parse a linearized Bitcoin (non-Elements) transaction far enough for the
@@ -457,6 +471,19 @@ pub fn parse_elements_tx(d: &[u8]) -> Option<ElementsTx> {
 /// || sequence(4 LE)` (no issuance/pegin on Bitcoin). Outputs:
 /// `value(8 LE) || script(varbuff)`.
 pub fn parse_bitcoin_tx(d: &[u8]) -> Option<ElementsTx> {
+    parse_bitcoin_tx_span(d).map(|(tx, _)| tx)
+}
+
+/// The byte ranges of a Bitcoin serialization that its txid hashes: the
+/// inputs and outputs (between the marker and flag, when present, and the
+/// witnesses) and the locktime. The version is always `d[0..4]`.
+struct BitcoinSpans {
+    body: (usize, usize),
+    locktime: usize,
+}
+
+/// [`parse_bitcoin_tx`], also returning the ranges the txid hashes.
+fn parse_bitcoin_tx_span(d: &[u8]) -> Option<(ElementsTx, BitcoinSpans)> {
     let version = u32::from_le_bytes(d.get(0..4)?.try_into().ok()?);
     let mut p = 4usize;
     // BIP-144 marker/flag: only present when the tx carries witnesses. A real tx
@@ -469,6 +496,7 @@ pub fn parse_bitcoin_tx(d: &[u8]) -> Option<ElementsTx> {
         }
         p += 2;
     }
+    let body_start = p;
 
     let nin = read_compact(d, &mut p)? as usize;
     let mut inputs = Vec::with_capacity(nin);
@@ -505,6 +533,8 @@ pub fn parse_bitcoin_tx(d: &[u8]) -> Option<ElementsTx> {
         });
     }
 
+    let body_end = p;
+
     // Skip the witness stacks (present only when `witnessed`), which sit before
     // the locktime, so we land on the locktime. Each input: num_items(varint)
     // then that many varbuff items.
@@ -519,13 +549,16 @@ pub fn parse_bitcoin_tx(d: &[u8]) -> Option<ElementsTx> {
     }
 
     let locktime = u32::from_le_bytes(d.get(p..p + 4)?.try_into().ok()?);
-    Some(ElementsTx {
-        version,
-        inputs,
-        outputs,
-        locktime,
-        network: Network::Bitcoin,
-    })
+    Some((
+        ElementsTx {
+            version,
+            inputs,
+            outputs,
+            locktime,
+            network: Network::Bitcoin,
+        },
+        BitcoinSpans { body: (body_start, body_end), locktime: p },
+    ))
 }
 
 /// Read a `bitcoin_tx` wire object from the reader (`fromwire_bitcoin_tx`).
@@ -541,11 +574,32 @@ pub fn read_bitcoin_tx(r: &mut Reader) -> Option<BitcoinTx> {
     let plen = r.u32()? as usize; // big-endian psbt byte length
     let psbt = r.take_bytes(plen)?;
     let network = detect_network(&psbt);
+    let (tx, txid) = parse_tx_with_txid(lin, network)?;
+    Some(BitcoinTx { tx, psbt, txid })
+}
+
+/// Parse a linearized transaction with the codec for `network`, and compute
+/// its txid: SHA256d of the serialization without witnesses (Elements:
+/// version, a clear flag byte, inputs, outputs, locktime; Bitcoin: version,
+/// inputs, outputs, locktime).
+fn parse_tx_with_txid(lin: &[u8], network: Network) -> Option<(ElementsTx, [u8; 32])> {
+    let mut ser = Vec::with_capacity(lin.len());
+    ser.extend_from_slice(lin.get(0..4)?);
     let tx = match network {
-        Network::Bitcoin => parse_bitcoin_tx(lin)?,
-        Network::Elements => parse_elements_tx(lin)?,
+        Network::Bitcoin => {
+            let (tx, sp) = parse_bitcoin_tx_span(lin)?;
+            ser.extend_from_slice(lin.get(sp.body.0..sp.body.1)?);
+            ser.extend_from_slice(lin.get(sp.locktime..sp.locktime + 4)?);
+            tx
+        }
+        Network::Elements => {
+            let (tx, end) = parse_elements_tx_span(lin)?;
+            ser.push(0x00);
+            ser.extend_from_slice(lin.get(5..end)?);
+            tx
+        }
     };
-    Some(BitcoinTx { tx, psbt })
+    Some((tx, crate::kernel::double_sha256(&ser)))
 }
 
 /// Decide whether a `bitcoin_tx` wire object is a Bitcoin or an Elements tx.
@@ -1279,5 +1333,53 @@ mod tests {
             // pre-Bitcoin behaviour), never disturbing the Elements path.
             assert_eq!(detect_network(b"psbt\xff\x00\x00"), Network::Elements);
         }
+    }
+
+    /// The txid read off a transaction is the one the chain gives it, with
+    /// or without witnesses. The two transactions were built with
+    /// `sequentia-tx` and `bitcoin-tx` (`-create nversion=2 in=44..44:0:2147483905
+    /// outpubkey=0.006:0279be..1798:W locktime=536870913`), which report
+    /// these txids (display order).
+    #[test]
+    fn txid_is_the_chains() {
+        let display = |t: [u8; 32]| {
+            let mut d = t;
+            d.reverse();
+            d.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        };
+        let el = unhex(
+            "02000000000144444444444444444444444444444444444444444444444444444444444444440000000000\
+             010100800101230f4f5d4b7c6fa845806ee4f67713459e1b69e8e60fcee2e4940c7a0d5de1b201000000\
+             00000927c000160014751e76e8199196d454941c45d1b3a323f1433bd601000020",
+        );
+        let el_txid = "435744750240128675cec4fbeff832fb7566ce0d8b22f7f95937346d5b581d13";
+        let (tx, txid) = parse_tx_with_txid(&el, Network::Elements).unwrap();
+        assert_eq!((tx.locktime, tx.inputs[0].sequence), (0x2000_0001, 0x8000_0101));
+        assert_eq!(display(txid), el_txid);
+        // Witnessed (flag 1, witness data after the locktime): same txid.
+        let mut el_w = el.clone();
+        el_w[4] = 0x01;
+        el_w.extend_from_slice(&[0x00, 0x00, 0x02, 0x01, 0xaa, 0x01, 0xbb, 0x00, 0x00, 0x00]);
+        assert_eq!(display(parse_tx_with_txid(&el_w, Network::Elements).unwrap().1), el_txid);
+        // Another output value: another txid.
+        let mut el_x = el.clone();
+        let at = el_x.len() - 4 - 23 - 1 - 1;
+        el_x[at] ^= 1;
+        assert_ne!(display(parse_tx_with_txid(&el_x, Network::Elements).unwrap().1), el_txid);
+
+        let bt = unhex(
+            "02000000014444444444444444444444444444444444444444444444444444444444444444000000000001\
+             01008001c027090000000000160014751e76e8199196d454941c45d1b3a323f1433bd601000020",
+        );
+        let bt_txid = "befa98b81a89aa0ee6a431868d87d9ffeffd8b7c73b16bf6c90114833256e0c6";
+        assert_eq!(display(parse_tx_with_txid(&bt, Network::Bitcoin).unwrap().1), bt_txid);
+        // Witnessed (marker and flag after the version, a stack before the
+        // locktime): same txid.
+        let mut bt_w = bt[..4].to_vec();
+        bt_w.extend_from_slice(&[0x00, 0x01]);
+        bt_w.extend_from_slice(&bt[4..bt.len() - 4]);
+        bt_w.extend_from_slice(&[0x02, 0x01, 0xaa, 0x02, 0xbb, 0xcc]);
+        bt_w.extend_from_slice(&bt[bt.len() - 4..]);
+        assert_eq!(display(parse_tx_with_txid(&bt_w, Network::Bitcoin).unwrap().1), bt_txid);
     }
 }

@@ -238,6 +238,7 @@ impl Signer {
             validated_through: None,
             local_split: None,
             remote_split: None,
+            validated: Vec::new(),
         };
         self.inner
             .arm_channel(arr33(node_id, "node_id")?, dbid, st)

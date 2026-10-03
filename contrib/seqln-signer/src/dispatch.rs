@@ -593,6 +593,7 @@ impl Signer {
             if let Some(st) = self.store.get_mut(&req.node_id, req.dbid) {
                 if st.revoked_through.map_or(true, |r| n > r) {
                     st.revoked_through = Some(n);
+                    st.drop_revoked();
                     self.store_dirty = true;
                 }
             }
@@ -624,7 +625,8 @@ impl Signer {
 
     /// VALIDATE_COMMITMENT_TX (35): OUR own local commitment (carries the HTLC
     /// set). Full validation, then return the usual next-per-commitment reply,
-    /// and record the commitment's number and what it pays this side.
+    /// and record the commitment's number, its txid (the one transaction
+    /// SIGN_COMMITMENT_TX may sign for it) and what it pays this side.
     fn validate_commitment_tx_checked(&mut self, req: &Request) -> Outcome {
         let split = self.check_local_commitment(req);
         if self.policy.is_enforce() {
@@ -634,7 +636,7 @@ impl Signer {
         }
         let reply = self.h_validate_commitment_tx(req);
         if reply.is_some() {
-            if let (Some((_, _, n)), Some(st)) = (
+            if let (Some((bt, _, n)), Some(st)) = (
                 parse_local_commitment(&req.hsmd_msg),
                 self.store.get_mut(&req.node_id, req.dbid),
             ) {
@@ -645,6 +647,9 @@ impl Signer {
                 if let Ok((_, sp)) = split {
                     if st.local_split.map_or(true, |(m, _)| n >= m) {
                         st.local_split = Some((n, sp));
+                        self.store_dirty = true;
+                    }
+                    if st.record_validated(n, bt.txid) {
                         self.store_dirty = true;
                     }
                 }
@@ -743,20 +748,27 @@ impl Signer {
     }
 
     /// Validation of a msg-5 request (peer_id + dbid come from the MESSAGE).
-    /// A commitment gets the no-HTLC-subset check (msg 5 carries no HTLC
-    /// list) and must not be revoked: its number, read off the transaction,
-    /// must lie above every commitment this device revealed the secret of.
+    /// This is the signature that lets the host broadcast a commitment of
+    /// ours, so a commitment is signed only when it is exactly a transaction
+    /// this device validated in full (VALIDATE_COMMITMENT_TX: every output
+    /// rebuilt from the channel keys, the peer's signature verified) and has
+    /// not revoked: its txid must be in the channel's `validated` record.
+    /// lightningd asks for nothing else; msg 5 carries no HTLC list, so a
+    /// commitment it did not validate could pay anything to a P2WSH.
     /// Anything else spending the funding output is held to the mutual-close
     /// policy: lightningd signs the closing transaction it rebroadcasts with
     /// this message, and refusing it leaves a closing channel's node unable
     /// to start.
     fn check_own_commitment(&self, m: &[u8]) -> Result<(), String> {
-        let (peer_id, dbid, bt, commit_num) =
+        let (peer_id, dbid, bt, remote_funding, commit_num) =
             parse_own_commitment(m).ok_or_else(|| "malformed request".to_string())?;
         let st = self
             .store
             .get(&peer_id, dbid)
             .ok_or_else(|| self.untracked(&peer_id, dbid))?;
+        if remote_funding != st.remote_funding {
+            return Err("remote_funding_key differs from setup_channel".to_string());
+        }
         if !policy::is_commitment_shaped(&bt.tx) {
             return policy::validate_mutual_close(st, self.own_sweep_script_set(), &bt.tx);
         }
@@ -769,9 +781,15 @@ impl Signer {
                 ));
             }
         }
-        let s = self.kernel().channel_secrets(&peer_id, dbid);
-        let point = self.kernel().per_commit_point_at(&s.shaseed, n);
-        policy::validate_local_commitment_no_htlcs(self.kernel(), &peer_id, dbid, st, &point, &bt.tx)
+        if !st.is_validated(&bt.txid) {
+            let known: Vec<u64> = st.validated.iter().map(|&(v, _)| v).collect();
+            return Err(format!(
+                "commitment {n} (txid {}) is not one this device validated \
+                 (unrevoked validated commitments: {known:?})",
+                display_txid(&bt.txid)
+            ));
+        }
+        Ok(())
     }
 
     // =================================================================
@@ -1553,6 +1571,13 @@ fn opt(o: Option<Vec<u8>>) -> Outcome {
     }
 }
 
+/// A txid in the byte order explorers and RPCs display (reversed).
+fn display_txid(txid: &[u8; 32]) -> String {
+    let mut d = *txid;
+    d.reverse();
+    hexbytes(&d)
+}
+
 /// Lowercase hex, for enforce-mode rejection log lines.
 fn hexbytes(b: &[u8]) -> String {
     let mut s = String::with_capacity(b.len() * 2);
@@ -1680,6 +1705,7 @@ fn parse_setup_channel(m: &[u8]) -> Option<ChannelState> {
         validated_through: None,
         local_split: None,
         remote_split: None,
+        validated: Vec::new(),
     })
 }
 
@@ -1743,16 +1769,18 @@ fn parse_local_commitment_sig(m: &[u8]) -> Option<([u8; 64], u8)> {
     Some((sig, sighash))
 }
 
-/// Parse `hsmd_sign_commitment_tx` -> (peer_id, dbid, tx, commit_num).
-fn parse_own_commitment(m: &[u8]) -> Option<([u8; 33], u64, BitcoinTx, u64)> {
+/// Parse `hsmd_sign_commitment_tx` ->
+/// (peer_id, dbid, tx, remote_funding, commit_num).
+#[allow(clippy::type_complexity)]
+fn parse_own_commitment(m: &[u8]) -> Option<([u8; 33], u64, BitcoinTx, [u8; 33], u64)> {
     let mut r = wire::Reader::new(m);
     r.u16()?;
     let peer_id = r.arr33()?;
     let dbid = r.u64()?;
     let bt = wire::read_bitcoin_tx(&mut r)?;
-    let _remote_funding = r.arr33()?;
+    let remote_funding = r.arr33()?;
     let commit_num = r.u64()?;
-    Some((peer_id, dbid, bt, commit_num))
+    Some((peer_id, dbid, bt, remote_funding, commit_num))
 }
 
 fn approve_reply(reply_type: u16) -> Vec<u8> {
@@ -2526,14 +2554,6 @@ mod close_and_revocation_tests {
         (0x2000_0000 | (o & 0xff_ffff) as u32, 0x8000_0000 | ((o >> 24) & 0xff_ffff) as u32)
     }
 
-    fn commitment(s: &Signer, n: u64) -> Vec<u8> {
-        let (locktime, sequence) = obscured(s, n);
-        let to_local: Vec<u8> = [0x00u8, 0x20].iter().copied().chain([0x77; 32]).collect();
-        let to_remote = s.kernel().p2wpkh_scriptpubkey(&point(s, 2));
-        elements_tx(FUNDING_TXID, locktime, sequence,
-                    &[(to_local, 600_000), (to_remote, 399_000), (Vec::new(), 1_000)])
-    }
-
     fn close(input: [u8; 32], outs: &[(Vec<u8>, u64)]) -> Vec<u8> {
         elements_tx(input, 0, 0xffff_ffff, outs)
     }
@@ -2586,24 +2606,28 @@ mod close_and_revocation_tests {
     fn revoked_commitment_is_never_signed() {
         let mut s = signer(Policy::Enforce);
         track(&mut s, true, &[]);
+        let c = |s: &Signer, n: u64| local_commitment(s, n, 600_000, 399_000, 1_000);
+        for n in 0..3 {
+            assert!(matches!(validate(&mut s, n, 600_000, 399_000, 1_000), Outcome::Reply(_)));
+        }
         // The current commitment 2 signs.
-        let m = sign_commitment_msg(&s, &commitment(&s, 2), 2);
+        let m = sign_commitment_msg(&s, &c(&s, 2), 2);
         assert_eq!(s.check_own_commitment(&m), Ok(()));
         assert!(matches!(s.handle(&req(m)), Outcome::Reply(_)));
         // Commitments 0 and 1 are revoked.
         assert!(matches!(revoke(&mut s, 0), Outcome::Reply(_)));
-        s.store.get_mut(&PEER, DBID).unwrap().validated_through = Some(2);
         assert!(matches!(revoke(&mut s, 1), Outcome::Reply(_)));
-        let m = sign_commitment_msg(&s, &commitment(&s, 1), 1);
+        assert_eq!(st(&s).validated.iter().map(|v| v.0).collect::<Vec<_>>(), vec![2]);
+        let m = sign_commitment_msg(&s, &c(&s, 1), 1);
         let err = s.check_own_commitment(&m).unwrap_err();
         assert!(err.contains("commitment 1 is revoked"), "{err}");
         // The number is read off the transaction: claiming the current one
         // for an old transaction changes nothing.
-        let m = sign_commitment_msg(&s, &commitment(&s, 0), 2);
+        let m = sign_commitment_msg(&s, &c(&s, 0), 2);
         let err = s.check_own_commitment(&m).unwrap_err();
         assert!(err.contains("commitment 0 is revoked"), "{err}");
         assert!(matches!(s.handle(&req(m.clone())), Outcome::Reject(_)));
-        let m = sign_commitment_msg(&s, &commitment(&s, 2), 2);
+        let m = sign_commitment_msg(&s, &c(&s, 2), 2);
         assert_eq!(s.check_own_commitment(&m), Ok(()));
     }
 
@@ -2617,18 +2641,14 @@ mod close_and_revocation_tests {
         let m = sign_commitment_msg(&s, &good, 7);
         assert_eq!(s.check_own_commitment(&m), Ok(()));
         assert!(matches!(s.handle(&req(m)), Outcome::Reply(_)));
-        // The commitment policy alone refuses it.
-        let tx = wire::read_bitcoin_tx(&mut wire::Reader::new(&{
-            let mut w = Writer::new(0);
-            w.u32(good.len() as u32);
-            w.bytes(&good);
-            w.u32(0);
-            w.into_vec()[2..].to_vec()
-        }))
-        .unwrap();
-        let st0 = st(&s).clone();
-        let pt = point(&s, 9);
-        assert!(policy::validate_local_commitment_no_htlcs(s.kernel(), &PEER, DBID, &st0, &pt, &tx.tx).is_err());
+        // The same outputs in a commitment's shape are not a close: they are
+        // a commitment this device never validated.
+        let (lt, sq) = obscured(&s, 7);
+        let shaped = elements_tx(FUNDING_TXID, lt, sq,
+                                 &[(ours.clone(), 500_000), (peer_script(), 499_000), (Vec::new(), 1_000)]);
+        let err = s.check_own_commitment(&sign_commitment_msg(&s, &shaped, 7)).unwrap_err();
+        assert!(err.contains("commitment 7"), "{err}");
+        assert!(err.contains("is not one this device validated"), "{err}");
 
         let refuse = |s: &Signer, tx: Vec<u8>, why: &str| {
             let err = s.check_own_commitment(&sign_commitment_msg(s, &tx, 7)).unwrap_err();
@@ -2684,15 +2704,26 @@ mod close_and_revocation_tests {
         }
         assert!(matches!(sign_remote(&mut s, 0, 699_000, 300_000, 1_000), Outcome::Reply(_)));
         assert!(matches!(revoke(&mut s, 0), Outcome::Reply(_)));
-        let v3 = policy::encode_channel_store(&s.store);
-        assert_eq!(v3[4], 3);
-        let back = policy::decode_channel_store(&v3).unwrap();
+        let v4 = policy::encode_channel_store(&s.store);
+        assert_eq!(v4[4], 4);
+        let back = policy::decode_channel_store(&v4).unwrap();
         let (_, b) = &back[0];
         assert_eq!(b.revoked_through, Some(0));
         assert_eq!(b.is_outbound, Some(false));
         assert_eq!(b.remote_shutdown_script, peer_script());
         assert_eq!(b.local_split, Some((1, Split { ours: 300_000, fee: 1_000, anchors: 0 })));
         assert_eq!(b.remote_split, Some((0, Split { ours: 300_000, fee: 1_000, anchors: 0 })));
+        // Commitment 0 was revoked, so only commitment 1 stays signable.
+        assert_eq!(b.validated.len(), 1);
+        assert_eq!(b.validated[0].0, 1);
+        assert_eq!(b.validated, st(&s).validated);
+        // A version-3 payload: the same entry without the validated record.
+        let mut v3 = v4[..v4.len() - (1 + 40)].to_vec();
+        v3[4] = 3;
+        let back = policy::decode_channel_store(&v3).unwrap();
+        let (_, b) = &back[0];
+        assert_eq!(b.local_split, Some((1, Split { ours: 300_000, fee: 1_000, anchors: 0 })));
+        assert!(b.validated.is_empty());
         // A version-2 payload: the same entry without the two splits.
         let split_len = 2 * (1 + 4 * 8);
         let mut v2 = v3[..v3.len() - split_len].to_vec();
@@ -2710,14 +2741,14 @@ mod close_and_revocation_tests {
         assert_eq!(b.funding_sats, FUNDING);
         assert_eq!((b.is_outbound, b.revoked_through), (None, None));
         assert!(b.remote_shutdown_script.is_empty());
-        // Truncated or padded payloads are refused, as is a version 4.
-        assert!(policy::decode_channel_store(&v3[..v3.len() - 1]).is_err());
-        let mut padded = v3.clone();
+        // Truncated or padded payloads are refused, as is a version 5.
+        assert!(policy::decode_channel_store(&v4[..v4.len() - 1]).is_err());
+        let mut padded = v4.clone();
         padded.push(0);
         assert!(policy::decode_channel_store(&padded).is_err());
-        let mut v4 = v3.clone();
-        v4[4] = 4;
-        assert!(policy::decode_channel_store(&v4).is_err());
+        let mut v5 = v4.clone();
+        v5[4] = 5;
+        assert!(policy::decode_channel_store(&v5).is_err());
     }
 
     // ---- Balance-held closes and store-miss revocations ----
@@ -3019,20 +3050,25 @@ mod close_and_revocation_tests {
     fn r2_reveal_after_sign_for_broadcast() {
         let mut s = signer(Policy::Enforce);
         track(&mut s, true, &[]);
+        for n in 0..3 {
+            assert!(matches!(validate(&mut s, n, 600_000, 399_000, 1_000), Outcome::Reply(_)));
+        }
         assert!(matches!(revoke(&mut s, 0), Outcome::Reply(_)));
-        s.store.get_mut(&PEER, DBID).unwrap().validated_through = Some(2);
         assert!(matches!(revoke(&mut s, 1), Outcome::Reply(_)));
         // Commitment 2 is current: the device signs it for broadcast.
-        let m = sign_commitment_msg(&s, &commitment(&s, 2), 2);
-        let signed = s.handle(&req(m));
+        let c2 = local_commitment(&s, 2, 600_000, 399_000, 1_000);
+        let signed = s.handle(&req(sign_commitment_msg(&s, &c2, 2)));
         assert!(matches!(signed, Outcome::Reply(_)));
         // Commitment 3 arrives (validated), then the node asks to revoke 2.
-        s.store.get_mut(&PEER, DBID).unwrap().validated_through = Some(3);
+        assert!(matches!(validate(&mut s, 3, 600_000, 399_000, 1_000), Outcome::Reply(_)));
         let rev = revoke(&mut s, 2);
         println!("R2 REVOKE 2 after SIGN_COMMITMENT_TX 2: {}",
                  match &rev { Outcome::Reply(_) => "REVEALED", Outcome::Reject(r) => r.as_str(), _ => "other" });
         assert!(matches!(rev, Outcome::Reply(_)));
         assert_eq!(st(&s).revoked_through, Some(2));
+        // From then on commitment 2 is never signed again.
+        let err = s.check_own_commitment(&sign_commitment_msg(&s, &c2, 2)).unwrap_err();
+        assert!(err.contains("commitment 2 is revoked"), "{err}");
     }
 
     /// R2 F4: a device with no revocation record must not reveal a commitment
@@ -3059,5 +3095,144 @@ mod close_and_revocation_tests {
             Outcome::Reject(r) => assert!(r.contains("no record"), "{r}"),
             _ => panic!("revoked 41 with nothing validated"),
         }
+    }
+
+    // ---- R2b H1: SIGN_COMMITMENT_TX signs only a validated commitment ----
+
+    fn verdict(o: &Outcome) -> String {
+        match o {
+            Outcome::Reply(_) => "SIGNED".to_string(),
+            Outcome::Reject(r) => format!("REFUSED: {r}"),
+            Outcome::Sentinel => "sentinel".to_string(),
+            Outcome::Fatal(_) => "fatal".to_string(),
+        }
+    }
+
+    /// Our commitment n, commitment-shaped, with arbitrary outputs.
+    fn shaped(s: &Signer, n: u64, outs: &[(Vec<u8>, u64)]) -> Vec<u8> {
+        let (lt, sq) = obscured(s, n);
+        elements_tx(FUNDING_TXID, lt, sq, outs)
+    }
+
+    fn host_p2wsh() -> Vec<u8> {
+        [0x00u8, 0x20].iter().copied().chain([0xAB; 32]).collect()
+    }
+
+    /// R2b H1: with 600,000 known to be ours, "our commitment" paying 1 to
+    /// to_local and the rest to a P2WSH the host chose, for the current
+    /// number and for a number never validated, and the whole of our side
+    /// in the host's P2WSH: each is refused, because none is a transaction
+    /// the device validated. The commitment it did validate signs.
+    #[test]
+    fn r2b_msg5_commitment_to_host_p2wsh_signed_despite_known_balance() {
+        let mut s = signer(Policy::Enforce);
+        track(&mut s, true, &[]);
+        for n in 0..2 {
+            assert!(matches!(validate(&mut s, n, 600_000, 399_000, 1_000), Outcome::Reply(_)));
+        }
+        assert!(matches!(revoke(&mut s, 0), Outcome::Reply(_)));
+        let st0 = st(&s).clone();
+        let remote_spk = s.kernel().p2wpkh_scriptpubkey(&point(&s, 2));
+        println!("recorded local_split {:?}, validated_through {:?}, revoked_through {:?}",
+                 st0.local_split, st0.validated_through, st0.revoked_through);
+        for n in [1u64, 5] {
+            let local_spk = policy::expected_htlc_tx_to_local(
+                s.kernel(), &PEER, DBID, &st0, Side::Local, &our_point(&s, n)).unwrap();
+            let tx = shaped(&s, n, &[(local_spk, 1), (host_p2wsh(), 599_999),
+                                     (remote_spk.clone(), 399_000), (Vec::new(), 1_000)]);
+            let o = s.handle(&req(sign_commitment_msg(&s, &tx, n)));
+            println!("R2b SIGN_COMMITMENT_TX #{n}: to_local 1, host P2WSH 599999, to_remote 399000: {}",
+                     verdict(&o));
+            match o {
+                Outcome::Reject(r) => assert!(r.contains(&format!(
+                    "commitment {n} (txid ")) && r.contains("is not one this device validated \
+                     (unrevoked validated commitments: [1])"), "{r}"),
+                o => panic!("signed an unvalidated commitment: {}", verdict(&o)),
+            }
+        }
+        // No to_local at all: the whole of our side in the host's P2WSH.
+        let tx = shaped(&s, 1, &[(host_p2wsh(), 600_000), (remote_spk.clone(), 399_000), (Vec::new(), 1_000)]);
+        let o = s.handle(&req(sign_commitment_msg(&s, &tx, 1)));
+        println!("R2b SIGN_COMMITMENT_TX #1: no to_local, host P2WSH 600000: {}", verdict(&o));
+        assert!(matches!(&o, Outcome::Reject(r) if r.contains("is not one this device validated")),
+                "{}", verdict(&o));
+        // The same split as a mutual close is refused.
+        let c = close(FUNDING_TXID, &[(host_p2wsh(), 600_000), (remote_spk, 399_000), (Vec::new(), 1_000)]);
+        let o = s.handle(&req(mutual_close_msg(&s, &c)));
+        println!("R2b the same value as a SIGN_MUTUAL_CLOSE_TX: {}", verdict(&o));
+        assert!(matches!(o, Outcome::Reject(_)));
+        // The commitment the device validated signs, under any claimed number.
+        let honest = local_commitment(&s, 1, 600_000, 399_000, 1_000);
+        for claimed in [1u64, 0, 9] {
+            let o = s.handle(&req(sign_commitment_msg(&s, &honest, claimed)));
+            println!("R2b SIGN_COMMITMENT_TX of validated #1 (claimed {claimed}): {}", verdict(&o));
+            assert!(matches!(o, Outcome::Reply(_)));
+        }
+        // ...but not with another remote funding key: the signature would be
+        // over a script that is not the funding output's.
+        let mut m = sign_commitment_msg(&s, &honest, 1);
+        let at = m.len() - 8 - 33;
+        m[at..at + 33].copy_from_slice(&point(&s, 6));
+        let o = s.handle(&req(m));
+        assert!(matches!(&o, Outcome::Reject(r) if r.contains("remote_funding_key differs")), "{}", verdict(&o));
+    }
+
+    /// A device with no record of validated commitments (a store from before
+    /// they were kept, or a lost store) signs none of our commitments for
+    /// broadcast until it validates one; and one only ever validated as
+    /// something else (the peer's commitment) does not count.
+    #[test]
+    fn no_validated_record_signs_no_commitment() {
+        let mut s = signer(Policy::Enforce);
+        track(&mut s, true, &[]);
+        let c0 = local_commitment(&s, 0, 600_000, 399_000, 1_000);
+        // Signing the peer's commitment records no commitment of ours.
+        assert!(matches!(sign_remote(&mut s, 0, 399_000, 600_000, 1_000), Outcome::Reply(_)));
+        let o = s.handle(&req(sign_commitment_msg(&s, &c0, 0)));
+        println!("SIGN_COMMITMENT_TX #0, nothing of ours validated: {}", verdict(&o));
+        assert!(matches!(&o, Outcome::Reject(r) if r.contains("unrevoked validated commitments: []")),
+                "{}", verdict(&o));
+        // A validation refused for a bad peer signature records nothing.
+        let mut bad = funding_sig(&s, &c0, &PEER_FUNDING_SECRET);
+        bad[3] ^= 1;
+        assert!(matches!(s.handle(&req(validate_msg(&c0, 0, &bad))), Outcome::Reject(_)));
+        assert!(st(&s).validated.is_empty());
+        assert!(matches!(s.handle(&req(sign_commitment_msg(&s, &c0, 0))), Outcome::Reject(_)));
+        // Validated: it signs; a re-sent validation adds nothing.
+        assert!(matches!(validate(&mut s, 0, 600_000, 399_000, 1_000), Outcome::Reply(_)));
+        assert!(matches!(validate(&mut s, 0, 600_000, 399_000, 1_000), Outcome::Reply(_)));
+        assert_eq!(st(&s).validated.len(), 1);
+        assert!(matches!(s.handle(&req(sign_commitment_msg(&s, &c0, 0))), Outcome::Reply(_)));
+        // Permissive mode (the kill-switch) signs as asked.
+        s.set_policy(Policy::Permissive);
+        let c5 = local_commitment(&s, 5, 1, 999_000, 999);
+        assert!(matches!(s.handle(&req(sign_commitment_msg(&s, &c5, 5))), Outcome::Reply(_)));
+    }
+
+    /// The record survives the store's round trip and setup_channel's
+    /// re-send, keeps only unrevoked entries, and is bounded.
+    #[test]
+    fn validated_record_persists_and_is_bounded() {
+        let mut s = signer(Policy::Enforce);
+        track(&mut s, true, &[]);
+        for n in 0..3 {
+            assert!(matches!(validate(&mut s, n, 600_000, 399_000, 1_000), Outcome::Reply(_)));
+        }
+        assert!(matches!(revoke(&mut s, 0), Outcome::Reply(_)));
+        let blob = s.export_channels();
+        let mut t = signer(Policy::Enforce);
+        assert_eq!(t.import_channels(&blob), Ok(1));
+        assert_eq!(st(&t).validated, st(&s).validated);
+        let c2 = local_commitment(&t, 2, 600_000, 399_000, 1_000);
+        assert!(matches!(t.handle(&req(sign_commitment_msg(&t, &c2, 2))), Outcome::Reply(_)));
+        // channeld's setup_channel at start keeps it.
+        track(&mut t, true, &[]);
+        assert_eq!(st(&t).validated.iter().map(|v| v.0).collect::<Vec<_>>(), vec![1, 2]);
+        // More than MAX_VALIDATED unrevoked: the oldest go.
+        for n in 3..(3 + policy::MAX_VALIDATED as u64 + 2) {
+            assert!(matches!(validate(&mut t, n, 600_000, 399_000, 1_000), Outcome::Reply(_)));
+        }
+        assert_eq!(st(&t).validated.len(), policy::MAX_VALIDATED);
+        assert_eq!(st(&t).validated[0].0, 5);
     }
 }

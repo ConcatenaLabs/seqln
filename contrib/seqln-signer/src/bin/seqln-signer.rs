@@ -20,8 +20,10 @@
 //! Either way the `hsm_secret` is loaded from the current working directory
 //! (mnemonic format).
 //!
-//! The channel store (each channel's parameters, its revocation counters and
-//! the balance its latest commitments give this side) is persisted to
+//! The channel store (each channel's parameters, its revocation counters, the
+//! balance its latest commitments give this side, and the unrevoked
+//! commitments of ours it validated, the only ones it signs for broadcast) is
+//! persisted to
 //! `seqln-signer-channels` in the same directory, or the path in
 //! `SEQLN_SIGNER_STORE`: loaded at start, and rewritten durably after every
 //! request that changed it, before the reply leaves. A restarted signer
