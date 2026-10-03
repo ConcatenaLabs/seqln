@@ -40123,6 +40123,12 @@
             "description": [
               "The UNIX timestamp when the HTLC was resolved, if it has been resolved."
             ]
+          },
+          "asset": {
+            "type": "hex",
+            "description": [
+              "On a Sequentia network, the 32-byte display id of the asset of the incoming channel: the amounts are in thousandths of its atoms, and a forward never leaves it."
+            ]
           }
         }
       }
@@ -40206,6 +40212,12 @@
             "type": "string",
             "description": [
               "The label of the paid invoice."
+            ]
+          },
+          "asset": {
+            "type": "hex",
+            "description": [
+              "On a Sequentia network, the 32-byte display id of the asset the payment arrived in, or the asset the invoice names when it was paid otherwise: `msat` is in thousandths of its atoms."
             ]
           }
         }
@@ -41479,6 +41491,13 @@
                 "description": [
                   "Optional TLV stream attached to the HTLC."
                 ]
+              },
+              "asset": {
+                "type": "hex",
+                "description": [
+                  "On a Sequentia network, the 32-byte display id of the asset of the channel the HTLC arrived on (the Sequence token's included): `amount_msat` is in thousandths of that asset's atoms.",
+                  "Absent on other networks."
+                ]
               }
             }
           },
@@ -41672,6 +41691,12 @@
                 "type": "msat",
                 "description": [
                   "Amount paid in millisatoshis."
+                ]
+              },
+              "asset": {
+                "type": "hex",
+                "description": [
+                  "On a Sequentia network, the 32-byte display id of the asset the payment arrived in (every part of a payment arrives in one asset), or the asset the invoice names when it was paid otherwise."
                 ]
               }
             },
