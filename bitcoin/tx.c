@@ -922,8 +922,9 @@ wally_tx_output_get_amount(const struct wally_tx_output *output)
 			amount.value = 0;
 		}
 	} else {
-		/* Do not assign amount.asset, we should never touch it in
-		 * non-elements scenarios. */
+		/* A chain without assets: the asset is all zeroes, never
+		 * whatever the stack held (the wallet stores it per UTXO). */
+		memset(&amount.asset, 0, sizeof(amount.asset));
 		amount.value = output->satoshi;
 	}
 

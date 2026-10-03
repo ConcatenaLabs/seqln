@@ -677,10 +677,12 @@ struct utxo **wallet_utxo_boost(const tal_t *ctx,
 	/* Asset-aware channels: only fund the fee-bump with the requested asset,
 	 * so a single-asset (e.g. GOLD) resolution tx stays single-asset -- and a
 	 * policy-asset tx never accidentally grabs an issued-asset UTXO.  NULL ->
-	 * the policy asset on elements. */
-	const u8 *want_asset = asset;
-	if (chainparams->is_elements && !want_asset)
-		want_asset = chainparams->fee_asset_tag;
+	 * the policy asset on elements.  A chain without assets has nothing to
+	 * filter on: there every channel's asset is all zeroes and a UTXO's asset
+	 * bytes say nothing, so comparing them would refuse every UTXO. */
+	const u8 *want_asset = NULL;
+	if (chainparams->is_elements)
+		want_asset = asset ? asset : chainparams->fee_asset_tag;
 
 	/* Select in random order */
 	tal_arr_randomize(all_utxos, struct utxo *);
@@ -867,10 +869,11 @@ struct utxo *wallet_find_utxo(const tal_t *ctx, struct wallet *w,
 	struct utxo *utxo;
 	/* Coin selection must never mix assets (asset-aware channels): only
 	 * pick UTXOs of a single asset.  A NULL @asset means the caller does
-	 * not care, which on elements is the policy (fee) asset. */
-	const u8 *want_asset = asset;
-	if (chainparams->is_elements && !want_asset)
-		want_asset = chainparams->fee_asset_tag;
+	 * not care, which on elements is the policy (fee) asset.  A chain
+	 * without assets has nothing to filter on (see wallet_utxo_boost). */
+	const u8 *want_asset = NULL;
+	if (chainparams->is_elements)
+		want_asset = asset ? asset : chainparams->fee_asset_tag;
 
 	/* Make sure these are in order if we're trying to remove entropy! */
 	if (w->ld->developer && getenv("CLN_DEV_ENTROPY_SEED")) {
