@@ -108,6 +108,30 @@ static void channel_update_fee_refused(struct lightningd *ld,
 	topo_refresh_feeexchangerates(topo);
 }
 
+/* The cap on HTLCs trimmed to dust in flight, valued at this node's rate for
+ * the channel asset on a Sequentia network.  `max-dust-htlc-exposure-msat` is
+ * an amount in reference atoms, like every fee setting; a channel in an asset
+ * worth a thousandth of a reference atom may therefore hold a thousand times
+ * as many of its atoms.  Without a rate for the asset, and on other networks,
+ * it is the configured amount as it stands. */
+static struct amount_msat channel_dust_cap(struct lightningd *ld,
+					   const struct channel *channel)
+{
+	struct amount_msat cap = channel->our_config.max_dust_htlc_exposure_msat;
+	u64 rate;
+	__uint128_t v;
+
+	if (!chainparams->has_anchor_header)
+		return cap;
+	rate = topo_asset_fee_rate(ld->topology, channel->channel_asset);
+	if (!rate)
+		return cap;
+	v = (__uint128_t)cap.millisatoshis * EXCHANGE_RATE_SCALE / rate;
+	if (v > UINT64_MAX)
+		v = UINT64_MAX;
+	return amount_msat((u64)v);
+}
+
 static u32 default_feerate(struct lightningd *ld, const struct channel *channel,
 			   bool add_offset)
 {
@@ -168,20 +192,22 @@ void channel_update_feerates(struct lightningd *ld, const struct channel *channe
 
 	log_debug(ld->log,
 		  "update_feerates: feerate = %u, min=%u, max=%u, penalty=%u,"
-		  " opening=%u, splicing: %u",
+		  " opening=%u, splicing: %u, dust cap %s",
 		  feerate,
 		  min_feerate,
 		  max_feerate,
 		  chan_feerate(ld, channel, penalty_feerate(ld->topology)),
 		  chan_feerate(ld, channel, opening_feerate(ld->topology)),
-		  feerate_splice);
+		  feerate_splice,
+		  fmt_amount_msat(tmpctx, channel_dust_cap(ld, channel)));
 
 	msg = towire_channeld_feerates(NULL, feerate,
 				       min_feerate,
 				       max_feerate,
 				       chan_feerate(ld, channel, penalty_feerate(ld->topology)),
 				       chan_feerate(ld, channel, opening_feerate(ld->topology)),
-				       feerate_splice);
+				       feerate_splice,
+				       channel_dust_cap(ld, channel));
 	subd_send_msg(channel->owner, take(msg));
 }
 
@@ -1805,6 +1831,7 @@ bool peer_start_channeld(struct channel *channel,
 	int hsmfd;
 	const struct existing_htlc **htlcs;
 	struct short_channel_id scid;
+	struct channel_config our_config;
 	u64 num_revocations;
 	struct lightningd *ld = channel->peer->ld;
 	const struct config *cfg = &ld->config;
@@ -1991,6 +2018,11 @@ bool peer_start_channeld(struct channel *channel,
 
 	feerate_splice = splice_feerate(ld->topology, ld);
 
+	/* channeld holds the dust cap valued at this node's rate from the
+	 * start; feerate updates carry it afterwards. */
+	our_config = channel->our_config;
+	our_config.max_dust_htlc_exposure_msat = channel_dust_cap(ld, channel);
+
 	initmsg = towire_channeld_init(tmpctx,
 				       chainparams,
 				       ld->our_features,
@@ -2004,7 +2036,7 @@ bool peer_start_channeld(struct channel *channel,
 				       curr_blockheight,
 				       channel->blockheight_states,
 				       channel->lease_expiry,
-				       &channel->our_config,
+				       &our_config,
 				       &channel->channel_info.their_config,
 				       channel->fee_states,
 				       feerate_splice,
@@ -2811,7 +2843,8 @@ static struct command_result *json_dev_feerate(struct command *cmd,
 				       feerate_max(cmd->ld, NULL),
 				       penalty_feerate(cmd->ld->topology),
 				       opening_feerate(cmd->ld->topology),
-				       splice_feerate(cmd->ld->topology, cmd->ld));
+				       splice_feerate(cmd->ld->topology, cmd->ld),
+				       channel_dust_cap(cmd->ld, channel));
 	subd_send_msg(channel->owner, take(msg));
 
 	response = json_stream_success(cmd);

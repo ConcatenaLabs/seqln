@@ -156,6 +156,14 @@ privileged fee asset), so a node returns no `estimatesmartfee`-style feerate:
   - a fundee with no rate for the channel asset refuses a channel in it, and in an open channel
     holds the opener to the last limits its rate gave, or, with none since it started, to the
     current feerate.
+- The cap on HTLCs trimmed to dust in flight (`--max-dust-htlc-exposure-msat`) is a reference
+  amount like the fee settings, so lightningd values it at the node's rate for the channel asset
+  (`channel_dust_cap()` in `lightningd/channel_control.c`) and channeld receives it at start and
+  with every feerate update (`channeld_feerates`). When a repriced asset would still take the
+  HTLCs in flight over the cap at the new feerate, the opener does not send the `update_fee` with
+  that commitment but commits what is pending, as BOLT 2 allows, and sends it with a later one
+  once the dust has cleared, instead of disconnecting at every reestablish
+  (`channeld/channeld.c` `send_commit()`). Bitcoin channels keep upstream's behaviour.
 
 ## 5. Asset-aware channels
 

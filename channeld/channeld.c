@@ -1478,21 +1478,39 @@ static void send_commit(struct peer *peer)
 			 */
 			/* Is this feerate update going to push the committed
 			 * htlcs over our allowed dust limits? */
-			if (!htlc_dust_ok(peer->channel, feerate_target, REMOTE)
-			    || !htlc_dust_ok(peer->channel, feerate_target, LOCAL))
-				peer_failed_warn(peer->pps, &peer->channel_id,
-						"Too much dust to update fee (Desired"
-						" feerate update %d)", feerate_target);
+			bool dust_ok = htlc_dust_ok(peer->channel, feerate_target, REMOTE)
+				&& htlc_dust_ok(peer->channel, feerate_target, LOCAL);
 
-			if (!channel_update_feerate(peer->channel, feerate_target))
-				status_failed(STATUS_FAIL_INTERNAL_ERROR,
-					      "Could not afford feerate %u"
-					      " (vs max %u)",
-					      feerate_target, approx_max_feerate(peer->channel));
+			/* On a Sequentia network a feerate in the channel
+			 * asset's atoms can jump by any factor when the asset
+			 * is repriced, trimming HTLCs in flight to dust.
+			 * Failing the connection then wedges the channel: every
+			 * reestablish fails the same way, so an HTLC that has
+			 * already settled is never committed.  Skip the
+			 * update_fee this round instead (BOLT 2: MAY NOT send
+			 * it) and commit what is pending; it is sent with a
+			 * later commitment, once the dust has cleared. */
+			if (!dust_ok && chainparams->has_anchor_header)
+				status_unusual("Too much dust to update fee"
+					       " (desired feerate update %u):"
+					       " not sending it with this"
+					       " commitment", feerate_target);
+			else {
+				if (!dust_ok)
+					peer_failed_warn(peer->pps, &peer->channel_id,
+							"Too much dust to update fee (Desired"
+							" feerate update %d)", feerate_target);
 
-			msg = towire_update_fee(NULL, &peer->channel_id,
-						feerate_target);
-			peer_write(peer->pps, take(msg));
+				if (!channel_update_feerate(peer->channel, feerate_target))
+					status_failed(STATUS_FAIL_INTERNAL_ERROR,
+						      "Could not afford feerate %u"
+						      " (vs max %u)",
+						      feerate_target, approx_max_feerate(peer->channel));
+
+				msg = towire_update_fee(NULL, &peer->channel_id,
+							feerate_target);
+				peer_write(peer->pps, take(msg));
+			}
 		}
 	}
 
@@ -6576,7 +6594,8 @@ static void handle_feerates(struct peer *peer, const u8 *inmsg)
 				        &peer->feerate_max,
 				        &peer->feerate_penalty,
 				        &peer->feerate_opening,
-				        &peer->feerate_splice))
+				        &peer->feerate_splice,
+					&peer->channel->config[LOCAL].max_dust_htlc_exposure_msat))
 		master_badmsg(WIRE_CHANNELD_FEERATES, inmsg);
 
 	/* BOLT #2:

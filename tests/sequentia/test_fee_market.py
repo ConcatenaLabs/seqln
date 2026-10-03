@@ -14,6 +14,7 @@ from fixtures import *  # noqa: F401,F403
 from pyln.client import RpcError
 from utils import TEST_NETWORK, only_one, sync_blockheight, wait_for
 
+import hashlib
 import os
 import pytest
 import re
@@ -231,6 +232,74 @@ def test_policy_asset_repriced(node_factory, bitcoind, executor):
     print("commitment after: fee {} atoms (= {} reference atoms at 1e5), vsize {}: {}"
           .format(atoms, atoms * 10**5 / PAR, vsize, res))
     assert res['allowed'], res
+
+
+HOLD_SEQ_PLUGIN = os.path.join(os.path.dirname(__file__), '..', '..', 'contrib',
+                               'holdinvoice-seq', 'holdinvoice.py')
+
+
+def reprice_with_held_htlc(node_factory, bitcoind, opener_opts):
+    """A channel in the Sequence token at par, estimates at the floor, a
+    200,000-atom HTLC held by the payee.  The token is repriced to a
+    thousandth of par, so the opener's feerate in its atoms becomes a
+    thousand times higher and the HTLC would be trimmed to dust; then the
+    payee settles.  Returns the two nodes, the payment's status and the
+    opener's disconnects over dust."""
+    bitcoind.set_fee_rates({bitcoind.POLICY_ASSET: PAR})
+    l1, l2 = node_factory.get_nodes(2, opts=[dict({'feerates': FLOOR, 'may_reconnect': True},
+                                                  **opener_opts),
+                                             {'feerates': FLOOR, 'plugin': HOLD_SEQ_PLUGIN,
+                                              'may_reconnect': True}])
+    open_chan(bitcoind, l1, l2, 10**8)
+    p = os.urandom(32)
+    h = hashlib.sha256(p).hexdigest()
+    amount = 200000 * 1000
+    l2.rpc.call('holdinvoice', {'payment_hash': h, 'amount_msat': amount})
+    scid = chan(l1, l2)['short_channel_id']
+    l1.rpc.sendpay([{'id': l2.info['id'], 'channel': scid, 'amount_msat': amount,
+                     'delay': 200}], h)
+    wait_for(lambda: l2.rpc.call('holdinvoicelookup', {'payment_hash': h})['state'] == 'accepted')
+    bitcoind.set_fee_rates({bitcoind.POLICY_ASSET: 10**5})
+    l1.daemon.wait_for_log(r'update_feerates: feerate = [0-9]{6,}')
+    l2.rpc.call('holdinvoicesettle', {'payment_hash': h, 'preimage': p.hex()})
+    try:
+        res = l1.rpc.waitsendpay(h, timeout=150)['status']
+    except RpcError as e:
+        res = 'not complete: {}'.format(e.error.get('message'))
+    dust = [line for line in l1.daemon.logs if 'Too much dust to update fee' in line
+            and 'Peer transient failure' in line]
+    print("payment after the reprice: {}; opener disconnects over dust: {}; feerate {}"
+          .format(res, len(dust), chan(l1, l2)['feerate']))
+    return l1, l2, res, dust
+
+
+def test_reprice_with_small_htlc_in_flight(node_factory, bitcoind):
+    """The dust cap is valued at the node's rate for the channel asset, so
+    the HTLC in flight does not exceed it at the new feerate: the payment
+    completes, and the feerate moves at once."""
+    l1, l2, res, dust = reprice_with_held_htlc(node_factory, bitcoind, {})
+    assert res == 'complete'
+    assert dust == []
+    assert l1.daemon.is_in_log(r'dust cap 50000000000msat')
+    wait_for(lambda: chan(l1, l2)['feerate']['perkw'] > 1000 * 253)
+    wait_for(lambda: chan(l1, l2)['htlcs'] == [])
+
+
+def test_reprice_skips_a_dusty_update_fee(node_factory, bitcoind):
+    """With a dust cap the HTLC in flight does exceed at the new feerate
+    (100 reference atoms: 100,000 of the repriced token's), the opener does
+    not send the update_fee with that commitment but commits the settled
+    HTLC, and sends the update_fee once the HTLC is gone."""
+    l1, l2, res, dust = reprice_with_held_htlc(
+        node_factory, bitcoind, {'max-dust-htlc-exposure-msat': 100000})
+    assert res == 'complete'
+    assert dust == []
+    assert l1.daemon.is_in_log(r'Too much dust to update fee \(desired feerate update [0-9]+\):'
+                               r' not sending it with this commitment')
+    wait_for(lambda: chan(l1, l2)['htlcs'] == [])
+    wait_for(lambda: chan(l1, l2)['feerate']['perkw'] > 1000 * 253, timeout=180)
+    assert chan(l2, l1)['state'] == 'CHANNELD_NORMAL'
+    assert pay(l1, l2, 'after-reprice', 10**7 * 1000) == 'paid'
 
 
 def test_rates_diverge_modestly(node_factory, bitcoind):

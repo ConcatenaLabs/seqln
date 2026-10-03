@@ -960,10 +960,11 @@ failed:
 static void handle_feerates(struct info *info, const u8 *inmsg)
 {
 	u32 feerate, min, max, penalty, opening, splicing;
+	struct amount_msat dust_cap;
 
 	if (!fromwire_channeld_feerates(inmsg, &feerate,
 					&min, &max, &penalty, &opening,
-					&splicing))
+					&splicing, &dust_cap))
 		master_badmsg(WIRE_CHANNELD_FEERATES, inmsg);
 
 	/* BOLT #2:

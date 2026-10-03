@@ -383,6 +383,7 @@ msgdata,channeld_feerates,max_feerate,u32,
 msgdata,channeld_feerates,penalty_feerate,u32,
 msgdata,channeld_feerates,opening_feerate,u32,
 msgdata,channeld_feerates,feerate_splice,u32,
+msgdata,channeld_feerates,max_dust_htlc_exposure_msat,amount_msat,
 
 # master -> channeld: do you have a memleak?
 msgtype,channeld_dev_memleak,1033
