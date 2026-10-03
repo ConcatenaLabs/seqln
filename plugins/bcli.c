@@ -890,8 +890,9 @@ static struct command_result *getutxout(struct command *cmd,
 
 /* Fetch the any-asset fee whitelist from the node and return it verbatim.
  * A thin passthrough of the node's `getfeeexchangerates` RPC: the node returns
- * an object mapping each accepted asset (display-hex id, or the policy asset's
- * label) to its exchange rate.  We wrap it as {"rates": <verbatim object>}.
+ * an object mapping each accepted asset (display-hex id, or a label such as
+ * the policy asset's "bitcoin") to its exchange rate.  We wrap it as
+ * {"rates": {...}} with every label resolved to its hex id.
  * A backend that doesn't support any-asset fees (e.g. plain bitcoind) yields an
  * empty whitelist rather than an error. */
 static struct command_result *getfeeexchangerates(struct command *cmd,
@@ -920,13 +921,15 @@ static struct command_result *getfeeexchangerates(struct command *cmd,
 		return command_err(cmd, res, "bad JSON: cannot parse rates");
 
 	/* The backend may serialise the rate keys as human-readable ticker
-	 * labels (e.g. "EURX") when it has an asset-label registry loaded.
+	 * labels (e.g. "EURX") when it has an asset-label registry loaded, and
+	 * always names its policy asset by the label "bitcoin".
 	 * lightningd's feeexchangerates_callback only understands 32-byte
 	 * display-hex asset ids and silently drops every other key, which
-	 * would zero out all asset fee rates.  So resolve each label back to
-	 * its hex id here before re-emitting.  We pull the label->hex map from
-	 * the same backend; a backend without one (plain bitcoind) yields no
-	 * labels and the keys (already hex) pass through unchanged. */
+	 * would zero out those rates.  So resolve each label back to its hex
+	 * id here before re-emitting: the policy asset is priced like any
+	 * other.  We pull the label->hex map from the same backend; a backend
+	 * without one (plain bitcoind) yields no labels and the keys (already
+	 * hex) pass through unchanged. */
 	labelres = run_bitcoin_cli(cmd, cmd->plugin, "dumpassetlabels", NULL);
 	if (labelres->exitstatus == 0 && labelres->output_len > 0) {
 		label_toks = json_parse_simple(labelres->output,
@@ -944,15 +947,8 @@ static struct command_result *getfeeexchangerates(struct command *cmd,
 		const char *key = json_strdup(tmpctx, res->output, keytok);
 		const jsmntok_t *hextok;
 
-		/* Keep the policy asset's label ("bitcoin") verbatim:
-		 * lightningd handles it 1:1 and skips it as a non-hex key. */
-		if (streq(key, "bitcoin")) {
-			json_add_tok(response, key, valtok, res->output);
-			continue;
-		}
-
-		/* Known ticker label -> emit its hex id; otherwise (already
-		 * hex, or unknown) pass the key through unchanged. */
+		/* Known label -> emit its hex id; otherwise (already hex, or
+		 * unknown) pass the key through unchanged. */
 		hextok = label_toks
 			? json_get_member(labelres->output, label_toks, key)
 			: NULL;

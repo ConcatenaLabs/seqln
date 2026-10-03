@@ -739,13 +739,26 @@ static void handle_peer_feechange(struct peer *peer, const u8 *msg)
 	 *       `error` and fail the channel.
 	 */
 	if (!feerate_same_or_better(peer->channel, feerate,
-				    peer->feerate_min, peer->feerate_max))
+				    peer->feerate_min, peer->feerate_max)) {
+		/* On a Sequentia network the range is this node's relay floor
+		 * and fee ceiling in the channel asset, at this node's own
+		 * rate for it, and the opener states its feerate at its rate.
+		 * The master decides whether this refusal is the last
+		 * (channel_update_fee_refused()): the same update_fee coming
+		 * back after it refreshed its rates fails the channel. */
+		if (chainparams->has_anchor_header)
+			wire_sync_write(MASTER_FD,
+					take(towire_channeld_update_fee_refused(NULL,
+						feerate,
+						peer->feerate_min,
+						peer->feerate_max)));
 		peer_failed_warn(peer->pps, &peer->channel_id,
 				 "update_fee %u outside range %u-%u"
 				 " (currently %u)",
 				 feerate,
 				 peer->feerate_min, peer->feerate_max,
 				 channel_feerate(peer->channel, LOCAL));
+	}
 
 	/* BOLT #2:
 	 *
@@ -6875,6 +6888,7 @@ static void req_in(struct peer *peer, const u8 *msg)
 	case WIRE_CHANNELD_SHUTDOWN_COMPLETE:
 	case WIRE_CHANNELD_DEV_REENABLE_COMMIT_REPLY:
 	case WIRE_CHANNELD_FAIL_FALLEN_BEHIND:
+	case WIRE_CHANNELD_UPDATE_FEE_REFUSED:
 	case WIRE_CHANNELD_DEV_MEMLEAK_REPLY:
 	case WIRE_CHANNELD_SEND_ERROR_REPLY:
 	case WIRE_CHANNELD_DEV_QUIESCE_REPLY:

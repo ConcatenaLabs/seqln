@@ -695,7 +695,7 @@ bool amount_msat_add_fee(struct amount_msat *amt,
 	return amount_msat_add(amt, *amt, fee);
 }
 
-struct amount_sat amount_tx_fee(u32 fee_per_kw, size_t weight)
+struct amount_sat amount_tx_fee_rounded_down(u32 fee_per_kw, size_t weight)
 {
 	struct amount_sat fee;
 
@@ -704,6 +704,27 @@ struct amount_sat amount_tx_fee(u32 fee_per_kw, size_t weight)
 	fee.satoshis = (u64)fee_per_kw * weight / 1000;
 
 	return fee;
+}
+
+struct amount_sat amount_tx_fee(u32 fee_per_kw, size_t weight)
+{
+	struct amount_sat fee;
+
+	/* On a Sequentia network every fee is paid in an asset, and one atom
+	 * of a valuable asset can be worth thousands of reference atoms.
+	 * Rounding down there leaves a transaction short of the feerate it
+	 * was sized for, by up to an atom, and a small transaction with a fee
+	 * of 0 atoms, which consensus refuses (bad-txns-fee-outofrange).  So
+	 * round up: the fee is worth at least the feerate times the weight,
+	 * and never 0 for a positive feerate.  Both sides of a channel size
+	 * its commitment and HTLC transactions with this, so they agree. */
+	if (chainparams && chainparams->has_anchor_header) {
+		assert(!mul_overflows_u64(fee_per_kw, weight));
+		fee.satoshis = ((u64)fee_per_kw * weight + 999) / 1000;
+		assert(fee.satoshis > 0 || fee_per_kw == 0 || weight == 0);
+		return fee;
+	}
+	return amount_tx_fee_rounded_down(fee_per_kw, weight);
 }
 
 char *fmt_asset_id(const tal_t *ctx, const u8 *asset_tag)

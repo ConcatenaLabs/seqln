@@ -55,7 +55,8 @@ testnet unless noted. The precise file-level change list, with known hazards, is
   Sequentia networks (`lightningd/options.c`): the node re-walks the chain from height 1 on every
   restart, so a Bitcoin-anchor reorg of any depth can never abort it; `--rescan` overrides.
 - **Sequence-token channels.** Channels in the policy asset, the Sequence token (tSEQ on testnet):
-  open, route, and mutually close, demonstrated live on the public testnet.
+  open, route, and mutually close, demonstrated live on the public testnet. Their fees are priced
+  at the node's own rate for the token, as for any asset.
 - **Asset channels.** `fundchannel ... asset=<32-byte hex asset id>` opens a single-funder channel
   denominated in any issued asset (e.g. GOLD): per-asset coin selection and funding, commitment
   transactions and HTLCs in the channel asset, force-close resolution and anchor CPFP in the

@@ -439,6 +439,31 @@ static bool grind_htlc_tx_fee(struct amount_sat *fee,
 			     weight, i);
 		return true;
 	}
+
+	/* A Sequentia channel's fees round up (amount_tx_fee), but HTLC
+	 * signatures exchanged by a build that rounded down still name the
+	 * BOLT 3 fee: try those too. */
+	if (!chainparams->has_anchor_header)
+		return false;
+	prev_fee = AMOUNT_SAT(UINT64_MAX);
+	for (u64 i = min_possible_feerate; i <= max_possible_feerate; i++) {
+		struct amount_sat out;
+
+		*fee = amount_tx_fee_rounded_down(i, weight);
+		if (amount_sat_eq(*fee, prev_fee))
+			continue;
+		prev_fee = *fee;
+		if (!amount_sat_sub(&out, input_amt, *fee))
+			break;
+		bitcoin_tx_output_set_amount(tx, 0, out);
+		bitcoin_tx_finalize(tx);
+		if (check_tx_sig(tx, 0, NULL, wscript,
+				 &keyset->other_htlc_key, remotesig)) {
+			status_debug("grind feerate_per_kw for %"PRIu64" = %"PRIu64
+				     " (rounded down)", weight, i);
+			return true;
+		}
+	}
 	return false;
 }
 

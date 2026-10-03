@@ -129,6 +129,8 @@ struct chain_topology {
 	 * EXCHANGE_RATE_SCALE); a NULL/empty array means the backend has no
 	 * whitelist (or we haven't polled yet). */
 	struct asset_fee_rate *asset_fee_rates;
+	/* How many times the backend has answered for those rates. */
+	u64 asset_fee_rates_gen;
 
 	/* Where to log things. */
 	struct logger *log;
@@ -180,10 +182,27 @@ struct txlocator {
 /* Get the minimum feerate that bitcoind will accept */
 u32 get_feerate_floor(const struct chain_topology *topo);
 
+/* The lowest commitment feerate (reference atoms per kw) this node proposes
+ * as a channel's opener on a Sequentia network, where each peer values the
+ * channel asset at its own rate: a feerate just at the relay floor by the
+ * opener's rate falls under the floor of a peer that values the asset even
+ * slightly lower, so it is half as much again as the floor, which a peer
+ * valuing the asset up to a third lower still sees clear its own floor.
+ * 0 on other networks (no floor beyond upstream's). */
+u32 commitment_feerate_floor(const struct chain_topology *topo);
+
+/* The lowest feerate (reference atoms per kw) this node accepts for a
+ * channel's commitment from its opener: on a Sequentia network, the relay
+ * floor (whether the commitment relays is all this node can judge, at its
+ * own rate); elsewhere the floor for anchor channels and feerate_min() for
+ * the rest, as upstream. */
+u32 peer_commitment_feerate_min(struct lightningd *ld, bool anchors);
+
 /* The any-asset fee exchange rate for @asset_tag (the 33-byte elements asset
- * tag).  Returns EXCHANGE_RATE_SCALE for the policy asset (1:1), the cached
- * rate R for a whitelisted asset, or 0 if the asset is unknown / not
- * whitelisted / the cache has not been populated yet. */
+ * tag): the cached rate R the node gives it (the policy asset included, on a
+ * Sequentia network; at par elsewhere), or 0 if the node does not accept it
+ * for fees.  On a Sequentia network the rates are read before any channel
+ * starts, and refreshed on the feerate poll. */
 u64 topo_asset_fee_rate(const struct chain_topology *topo, const u8 *asset_tag);
 
 /* A feerate (reference atoms per kw) re-expressed for a channel in `asset`:
@@ -194,6 +213,10 @@ u64 topo_asset_fee_rate(const struct chain_topology *topo, const u8 *asset_tag);
  * yet): callers treat that as "feerate unknown". */
 u32 channel_asset_feerate(const struct chain_topology *topo, const u8 *asset,
 			  u32 feerate);
+
+/* Ask the backend for the fee exchange rates now, rather than at the next
+ * poll. */
+void topo_refresh_feeexchangerates(struct chain_topology *topo);
 
 /* This is the number of blocks which would have to be mined to invalidate
  * the tx */

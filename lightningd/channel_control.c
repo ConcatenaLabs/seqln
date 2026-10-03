@@ -60,13 +60,65 @@ static u32 chan_feerate(struct lightningd *ld, const struct channel *channel,
 				     feerate);
 }
 
+/* channeld refused the peer's update_fee as outside this node's range, on a
+ * Sequentia network, and is about to warn and disconnect.  The first time,
+ * the range may come from a rate older than the peer's (both nodes poll their
+ * own rates): refresh them now, so the reconnected channeld judges the
+ * update_fee the peer sends again by the current rate.  If that one is
+ * refused too, within ten minutes, the two nodes value the channel asset too
+ * differently to agree a feerate: fail the channel once, rather than
+ * disconnect at every reconnect. */
+static void channel_update_fee_refused(struct lightningd *ld,
+				       struct channel *channel,
+				       const u8 *msg)
+{
+	u32 feerate, min, max;
+	struct chain_topology *topo = ld->topology;
+
+	if (!fromwire_channeld_update_fee_refused(msg, &feerate, &min, &max)) {
+		channel_internal_error(channel,
+				       "bad channeld_update_fee_refused %s",
+				       tal_hex(msg, msg));
+		return;
+	}
+
+	if (channel->update_fee_refused
+	    && channel->update_fee_refused_rates != topo->asset_fee_rates_gen
+	    && time_less(timemono_since(channel->update_fee_refused_time),
+			 time_from_sec(600))) {
+		channel_fail_permanent(channel, REASON_LOCAL,
+				       "update_fee %u outside range %u-%u"
+				       " again, judged by this node's fee"
+				       " exchange rates refreshed since the"
+				       " first refusal: the peers value the"
+				       " channel asset too differently to"
+				       " agree a feerate",
+				       feerate, min, max);
+		return;
+	}
+
+	channel->update_fee_refused = true;
+	channel->update_fee_refused_time = time_mono();
+	channel->update_fee_refused_rates = topo->asset_fee_rates_gen;
+	log_unusual(channel->log,
+		    "Refused the peer's update_fee %u, outside range %u-%u in"
+		    " the channel asset at this node's rate: refreshing the"
+		    " fee exchange rates before it reconnects",
+		    feerate, min, max);
+	topo_refresh_feeexchangerates(topo);
+}
+
 static u32 default_feerate(struct lightningd *ld, const struct channel *channel,
 			   bool add_offset)
 {
 	u32 max_feerate;
 	bool anchors = channel_type_has_anchors(channel->type);
-	u32 feerate = chan_feerate(ld, channel,
-				   unilateral_feerate(ld->topology, anchors));
+	u32 feerate = unilateral_feerate(ld->topology, anchors);
+
+	/* Leave the peer room to value the channel asset differently. */
+	if (feerate && feerate < commitment_feerate_floor(ld->topology))
+		feerate = commitment_feerate_floor(ld->topology);
+	feerate = chan_feerate(ld, channel, feerate);
 
 	/* Nothing to do if we don't know feerate. */
 	if (!feerate)
@@ -97,13 +149,17 @@ void channel_update_feerates(struct lightningd *ld, const struct channel *channe
 	if (!feerate)
 		return;
 
-	/* For anchors, we just need the commitment tx to relay. */
-	if (anchors)
-		min_feerate = get_feerate_floor(ld->topology);
-	else
-		min_feerate = feerate_min(ld, NULL);
-	min_feerate = chan_feerate(ld, channel, min_feerate);
+	min_feerate = chan_feerate(ld, channel,
+				   peer_commitment_feerate_min(ld, anchors));
 	max_feerate = chan_feerate(ld, channel, feerate_max(ld, NULL));
+
+	/* What a channeld started without a rate for the asset holds to. */
+	if (max_feerate) {
+		struct channel *c = cast_const(struct channel *, channel);
+		c->have_feerate_limits = true;
+		c->feerate_limits[0] = min_feerate;
+		c->feerate_limits[1] = max_feerate;
+	}
 
 	if (channel->ignore_fee_limits || ld->config.ignore_fee_limits) {
 		min_feerate = 1;
@@ -1636,6 +1692,9 @@ static unsigned channel_msg(struct subd *sd, const u8 *msg, const int *fds)
 	case WIRE_CHANNELD_FAIL_FALLEN_BEHIND:
 		channel_fail_fallen_behind(sd->channel, msg);
 		break;
+	case WIRE_CHANNELD_UPDATE_FEE_REFUSED:
+		channel_update_fee_refused(sd->ld, sd->channel, msg);
+		break;
 	case WIRE_CHANNELD_SEND_ERROR_REPLY:
 		handle_error_channel(sd->channel, msg);
 		break;
@@ -1848,18 +1907,33 @@ bool peer_start_channeld(struct channel *channel,
 		return false;
 	}
 
-	/* For anchors, we just need the commitment tx to relay. */
-	if (channel_type_has_anchors(channel->type))
-		min_feerate = get_feerate_floor(ld->topology);
-	else
-		min_feerate = feerate_min(ld, NULL);
-	min_feerate = chan_feerate(ld, channel, min_feerate);
+	min_feerate = chan_feerate(ld, channel,
+				   peer_commitment_feerate_min(ld, channel_type_has_anchors(channel->type)));
 	max_feerate = chan_feerate(ld, channel, feerate_max(ld, NULL));
 
-	/* An asset without a rate here yet: no limits until the next feerate
-	 * update brings one. */
-	if (channel->ignore_fee_limits || ld->config.ignore_fee_limits
-	    || !max_feerate) {
+	if (max_feerate) {
+		channel->have_feerate_limits = true;
+		channel->feerate_limits[0] = min_feerate;
+		channel->feerate_limits[1] = max_feerate;
+	} else if (channel->have_feerate_limits) {
+		/* No rate for the channel asset here now: hold the peer to
+		 * the last limits this node's rate gave. */
+		min_feerate = channel->feerate_limits[0];
+		max_feerate = channel->feerate_limits[1];
+		log_info(channel->log,
+			 "No fee exchange rate for the channel asset: holding"
+			 " the peer's feerate to the last limits, %u-%u",
+			 min_feerate, max_feerate);
+	} else {
+		/* Never had one: the feerate stays where it is. */
+		min_feerate = max_feerate
+			= get_feerate(channel->fee_states, channel->opener, LOCAL);
+		log_info(channel->log,
+			 "No fee exchange rate for the channel asset: holding"
+			 " the feerate at %u", min_feerate);
+	}
+
+	if (channel->ignore_fee_limits || ld->config.ignore_fee_limits) {
 		min_feerate = 1;
 		max_feerate = 0xFFFFFFFF;
 	}

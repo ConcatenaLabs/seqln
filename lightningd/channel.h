@@ -383,6 +383,20 @@ struct channel {
 	/* Do we allow the peer to set any fee it wants? */
 	bool ignore_fee_limits;
 
+	/* The last feerate limits (min, max, in the channel asset's atoms)
+	 * computed from this node's rate for the channel asset, for a
+	 * channeld started while the asset has no rate here.  In memory only:
+	 * lightningd reads the rates before any channel starts. */
+	bool have_feerate_limits;
+	u32 feerate_limits[2];
+
+	/* When channeld last refused the peer's update_fee as out of range,
+	 * and which refresh of the fee exchange rates it judged it by.  In
+	 * memory only. */
+	bool update_fee_refused;
+	struct timemono update_fee_refused_time;
+	u64 update_fee_refused_rates;
+
 	/* Last time we had a stable connection, if any (0 = none) */
 	u64 last_stable_connection;
 	struct oneshot *stable_conn_timer;

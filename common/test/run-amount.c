@@ -465,5 +465,27 @@ int main(int argc, char *argv[])
 	assert(feerate_in_asset(1, 10000000000ULL) == 1);
 	assert(feerate_in_asset(15000, 1) == UINT32_MAX);
 
+	/* amount_tx_fee: BOLT 3 rounds down, so a sweep of 807 weight at 1
+	 * atom per kw (an asset whose atom is worth more than ~253 reference
+	 * atoms, at the relay floor) pays 0.  On a Sequentia network it
+	 * rounds up and is never 0 for a positive feerate. */
+	chainparams = chainparams_for_network("regtest");
+	assert(amount_tx_fee(1, 807).satoshis == 0);
+	assert(amount_tx_fee(253, 724).satoshis == 183);
+	assert(amount_tx_fee_rounded_down(253, 724).satoshis == 183);
+	chainparams = chainparams_for_network("sequentia-regtest");
+	assert(chainparams->has_anchor_header);
+	assert(amount_tx_fee(1, 807).satoshis == 1);
+	assert(amount_tx_fee(1, 993).satoshis == 1);
+	assert(amount_tx_fee(1, 1001).satoshis == 2);
+	assert(amount_tx_fee(253, 724).satoshis == 184);
+	assert(amount_tx_fee(253, 1000).satoshis == 253);
+	assert(amount_tx_fee(0, 807).satoshis == 0);
+	assert(amount_tx_fee_rounded_down(1, 807).satoshis == 0);
+	for (u32 rate = 1; rate < 3000; rate += 7)
+		for (size_t w = 1; w < 2000; w += 13)
+			assert(amount_tx_fee(rate, w).satoshis * 1000
+			       >= (u64)rate * w);
+
 	common_shutdown();
 }
