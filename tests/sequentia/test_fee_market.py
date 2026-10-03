@@ -322,9 +322,11 @@ def test_rates_diverge_modestly(node_factory, bitcoind):
 def test_rates_diverge_beyond_the_ceiling(node_factory, bitcoind, executor):
     """Mid-channel, the fundee comes to value the asset at 25 times the
     opener's rate: the opener's next feerate is far above the fundee's
-    ceiling.  The fundee refuses it once and refreshes its rates; refused
-    again by the fresh rate, it fails the channel, saying why, instead of
-    refusing the same update_fee at every reconnect."""
+    ceiling.  The fundee refuses it and refreshes its rates, and keeps
+    refusing while its rate stays where it was (its feed may only be
+    lagging).  Once its own rate has moved and the update_fee is still
+    refused, it fails the channel, saying why, instead of refusing the same
+    update_fee at every reconnect."""
     gold = bitcoind.issue_asset(1000)
     bitcoind.set_fee_rates({bitcoind.POLICY_ASSET: PAR, gold: PAR})
     l1, l2 = node_factory.get_nodes(2, opts={'may_reconnect': True, 'may_fail': True})
@@ -334,23 +336,33 @@ def test_rates_diverge_beyond_the_ceiling(node_factory, bitcoind, executor):
     # left in the failed channel, so do not wait for the payment.
     executor.submit(pay, l1, l2, 'x1')
     l2.daemon.wait_for_log('Refused the peer\'s update_fee 11005, outside range 11-6000')
-    l2.daemon.wait_for_log('update_fee 11005 outside range 11-6000 again, judged by'
-                           ' this node\'s fee exchange rates refreshed since the first'
-                           ' refusal')
+    l2.daemon.wait_for_log('update_fee 11005, outside range 11-6000, again after [0-9]+'
+                           ' seconds: this node\'s rate for the channel asset has not'
+                           ' changed yet')
+    assert chan(l2, l1)['state'] == 'CHANNELD_NORMAL'
+    # The fundee's feed ticks, still at about 25 times.
+    mock_rates(l2, bitcoind, {gold: 25 * PAR + PAR // 100})
+    l2.daemon.wait_for_log('update_fee 11005 outside range 11-[0-9]+ again, judged by'
+                           ' this node\'s fee exchange rate for the channel asset,'
+                           ' which changed since the first refusal')
     wait_for(lambda: chan(l2, l1)['state'] != 'CHANNELD_NORMAL')
-    time.sleep(20)
     judged = [line for line in l2.daemon.logs if re.search(r'update_fee [0-9]+, range', line)]
-    print("fundee judged update_fee {} times: {}".format(len(judged), judged))
+    time.sleep(20)
+    l2.daemon.logs_catchup()
+    later = [line for line in l2.daemon.logs if re.search(r'update_fee [0-9]+, range', line)]
+    print("fundee judged update_fee {} times, {} after the failure".format(
+        len(judged), len(later) - len(judged)))
     print("states:", chan(l1, l2)['state'], chan(l2, l1)['state'])
     assert chan(l2, l1)['state'] in ('AWAITING_UNILATERAL', 'FUNDING_SPEND_SEEN', 'ONCHAIN')
-    # Twice, then no more: the channel failed instead of looping.
-    assert len(judged) == 2
+    # Then no more: the channel failed instead of looping.
+    assert len(later) == len(judged)
 
 
 def test_fundee_without_rate_keeps_its_limits(node_factory, bitcoind, executor):
     """The fundee no longer has a rate for the channel asset (dropped from its
     whitelist).  Reconnected, it still holds the opener's update_fee to the
-    limits its last rate gave."""
+    limits its last rate gave, and with no rate to judge by it holds rather
+    than fails the channel."""
     gold = bitcoind.issue_asset(1000)
     bitcoind.set_fee_rates({bitcoind.POLICY_ASSET: PAR, gold: PAR})
     l1, l2 = node_factory.get_nodes(2, opts={'may_reconnect': True, 'may_fail': True})
@@ -366,18 +378,23 @@ def test_fundee_without_rate_keeps_its_limits(node_factory, bitcoind, executor):
     # restates its feerate as they do.
     l1.set_feerates((1500000, 1500000, 1500000, 1500000), wait_for_effect=False)
     executor.submit(pay, l1, l2, 'k2')
-    l2.daemon.wait_for_log('outside range 253-150000 again')
+    l2.daemon.wait_for_log('outside range 253-150000, again after [0-9]+ seconds: no fee'
+                           ' exchange rate for the channel asset, so holding the feerate'
+                           ' rather than failing the channel')
     accepted = [int(m.group(1)) for m in
                 (re.search(r'peer updated fee to ([0-9]+)', line) for line in l2.daemon.logs) if m]
     print("fundee accepted feerates {}, then refused: {}".format(
         accepted, [line for line in l2.daemon.logs if 'outside range' in line][:2]))
     assert max(accepted) <= 150000
-    wait_for(lambda: chan(l2, l1)['state'] != 'CHANNELD_NORMAL')
+    time.sleep(10)
+    assert chan(l2, l1)['state'] == 'CHANNELD_NORMAL'
+    assert not l2.daemon.is_in_log('Peer permanent failure')
 
 
 def test_fundee_restarted_without_rate_holds_the_feerate(node_factory, bitcoind, executor):
     """Restarted with no rate for the channel asset, the fundee has no limits
-    of its own to hold: it keeps the feerate where it is."""
+    of its own to hold: it keeps the feerate where it is, and holds rather
+    than fails the channel."""
     gold = bitcoind.issue_asset(1000)
     bitcoind.set_fee_rates({bitcoind.POLICY_ASSET: PAR, gold: PAR})
     l1, l2 = node_factory.get_nodes(2, opts={'may_reconnect': True, 'may_fail': True})
@@ -398,9 +415,42 @@ def test_fundee_restarted_without_rate_holds_the_feerate(node_factory, bitcoind,
                            ' the feerate at {}'.format(current))
     l1.set_feerates((20000, 15000, 10000, 5000), wait_for_effect=False)
     executor.submit(pay, l1, l2, 'h2')
-    l2.daemon.wait_for_log('outside range {}-{} again'.format(current, current))
+    l2.daemon.wait_for_log('outside range {}-{}, again after [0-9]+ seconds: no fee exchange'
+                           ' rate for the channel asset, so holding'.format(current, current))
     print("restarted fundee:", [line for line in l2.daemon.logs[start:] if 'outside range' in line][:2])
     moved = [int(m.group(1)) for m in
              (re.search(r'peer updated fee to ([0-9]+)', line) for line in l2.daemon.logs[start:]) if m]
     assert set(moved) <= {current}, moved
-    wait_for(lambda: chan(l2, l1)['state'] != 'CHANNELD_NORMAL')
+    time.sleep(10)
+    assert chan(l2, l1)['state'] == 'CHANNELD_NORMAL'
+    assert not l2.daemon.is_in_log('Peer permanent failure')
+
+
+def test_opener_feed_leads_a_rise(node_factory, bitcoind, executor):
+    """The channel asset's price rises 60 percent.  The opener's price feed
+    takes it first, so its feerate in the asset's atoms falls below the
+    fundee's floor, judged by the fundee's old rate.  The fundee refuses it,
+    and keeps refusing while its own rate is unchanged; its feed catches up,
+    it accepts the feerate, and the channel lives."""
+    gold = bitcoind.issue_asset(1000)
+    bitcoind.set_fee_rates({bitcoind.POLICY_ASSET: PAR, gold: PAR})
+    l1, l2 = node_factory.get_nodes(2, opts={'feerates': FLOOR, 'may_reconnect': True})
+    open_chan(bitcoind, l1, l2, 10**8, gold)
+    assert pay(l1, l2, 'before') == 'paid'
+    before = chan(l2, l1)['feerate']['perkw']
+    mock_rates(l1, bitcoind, {gold: PAR * 16 // 10})
+    executor.submit(pay, l1, l2, 'during')
+    l2.daemon.wait_for_log('Refused the peer\'s update_fee')
+    l2.daemon.wait_for_log('again after [0-9]+ seconds: this node\'s rate for the channel'
+                           ' asset has not changed yet')
+    assert chan(l2, l1)['state'] == 'CHANNELD_NORMAL'
+    # The fundee's feed catches up.
+    mock_rates(l2, bitcoind, {gold: PAR * 16 // 10})
+    wait_for(lambda: chan(l2, l1)['feerate']['perkw'] < before)
+    wait_for(lambda: chan(l2, l1)['peer_connected'] and chan(l2, l1).get('owner') == 'channeld')
+    assert pay(l1, l2, 'after') == 'paid'
+    assert chan(l2, l1)['state'] == 'CHANNELD_NORMAL'
+    assert not l2.daemon.is_in_log('Peer permanent failure')
+    print("fundee feerate {} -> {}; refusals: {}".format(
+        before, chan(l2, l1)['feerate']['perkw'],
+        len([line for line in l2.daemon.logs if 'Refused the peer' in line])))

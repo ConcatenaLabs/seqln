@@ -390,12 +390,13 @@ struct channel {
 	bool have_feerate_limits;
 	u32 feerate_limits[2];
 
-	/* When channeld last refused the peer's update_fee as out of range,
-	 * and which refresh of the fee exchange rates it judged it by.  In
-	 * memory only. */
+	/* An episode of channeld refusing the peer's update_fee as out of
+	 * range: when it began, this node's rate for the channel asset then
+	 * (0: none), and when the last refusal came.  In memory only. */
 	bool update_fee_refused;
 	struct timemono update_fee_refused_time;
-	u64 update_fee_refused_rates;
+	u64 update_fee_refused_rate;
+	struct timemono update_fee_refused_last;
 
 	/* Last time we had a stable connection, if any (0 = none) */
 	u64 last_stable_connection;

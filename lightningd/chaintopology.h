@@ -129,8 +129,6 @@ struct chain_topology {
 	 * EXCHANGE_RATE_SCALE); a NULL/empty array means the backend has no
 	 * whitelist (or we haven't polled yet). */
 	struct asset_fee_rate *asset_fee_rates;
-	/* How many times the backend has answered for those rates. */
-	u64 asset_fee_rates_gen;
 
 	/* Where to log things. */
 	struct logger *log;
