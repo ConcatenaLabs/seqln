@@ -194,11 +194,12 @@ policy asset by default). File-level map of the threading:
   across restarts (DB migration), surfaced in `listpeerchannels` as `channel_asset` (32-byte
   display hex) for non-policy channels.
 - `wallet/wallet.c`, `wallet/reservation.c`, `wallet/walletrpc.c`: the on-chain wallet records
-  UTXOs of any issued asset, selects coins per-asset, funds single-asset transactions (change and
-  fee in the funding asset, fee sized per section 4), and `listfunds` shows an `asset` field on
-  issued-asset UTXOs (amounts are that asset's atoms). The per-asset selection, including the
-  fee-bump coins of anchor spends and HTLC transactions, applies on Sequentia networks only; a
-  Bitcoin node selects from all its UTXOs, as upstream does.
+  UTXOs of any issued asset (the output a peer's commitment pays this node, which onchaind hands
+  to the wallet, in the channel's asset), selects coins per-asset, funds single-asset
+  transactions (change and fee in the funding asset, fee sized per section 4), and `listfunds`
+  shows an `asset` field on issued-asset UTXOs (amounts are that asset's atoms). The per-asset
+  selection, including the fee-bump coins of anchor spends and HTLC transactions, applies on
+  Sequentia networks only; a Bitcoin node selects from all its UTXOs, as upstream does.
 - `plugins/spender/fundchannel.c`, `plugins/spender/multifundchannel.{c,h}`: the `asset` parameter
   (32-byte display-hex id); all channels in one funding tx must share one asset.
 - `onchaind/onchaind.c` + `onchaind/onchaind_wire.csv`, `lightningd/onchain_control.c`,
@@ -367,10 +368,12 @@ each Sequentia block (pass `advance_parent=False` to hold the parent still);
 opened the escaping stall. Lightning nodes run the network's own timelock and `rescan` defaults.
 The tests cover an asset channel opened, paid over and mutually closed, the anchor-burial gate,
 the certified-frontier clamp, a Bitcoin reorg unwinding Sequentia blocks under a running node,
-the network defaults, a breach of an asset channel with a pending HTLC answered by `speculad`
-while the victim is offline (`test_watchtower.py`), a keyless node, as either side of a channel,
-closing it and restarting with it closing (`test_keyless_close.py`), the fees of channels in
-assets of any value and between peers that value an asset differently (`test_fee_market.py`),
+the network defaults, the output a peer's commitment pays this node listed and spent in the
+channel's asset (`test_close_output_asset.py`), a breach of an asset channel with a pending HTLC
+answered by `speculad` while the victim is offline (`test_watchtower.py`), a keyless node, as
+either side of a channel, closing it and restarting with it closing (`test_keyless_close.py`), the
+fees of channels in assets of any value and between peers that value an asset differently
+(`test_fee_market.py`),
 and the asset plugins see on an HTLC, with `holdinvoice-seq` holding only the asset it was
 registered in, across a restart (`test_hold_asset.py`). They need `sequentiad`, `sequentia-cli`
 and a Bitcoin Core `bitcoind` on `PATH`, and the keyless test needs the device signer built
