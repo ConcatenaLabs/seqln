@@ -93,9 +93,18 @@ What enforce mode checks:
   revoke (or already revealed: channeld re-sends a revocation after a reconnect) and commitment
   n + 1 has been validated; and it never signs a commitment of ours numbered at or below the
   highest it revealed. The number is read off the transaction's obscured locktime and sequence,
-  not taken from the request. A device with no record of the channel's commitments (a store from
-  before they were recorded, or a channel armed from the node's own data) reveals only
-  commitment 0 until it has validated a later commitment.
+  not taken from the request. A device with no record of the channel's commitments (a channel
+  armed from the node's own data after the store was lost) reveals only commitment 0 until it has
+  validated a later commitment.
+- **Channels from a device that validated nothing**: every channel in a store older than version
+  6 (the version the first validating device wrote) predates validation. The device does not know
+  such a channel's state before it, and does not take the host's word for it: it signs no
+  commitment step for the channel, neither side's commitment, no revocation (not even of
+  commitment 0) and no close, so the channel moves no more. Its peer closes it, and the device
+  signs the spends of what that close pays this node (the "Close outputs" rule below). The mark is
+  kept in the store and never cleared. The native signer logs each such channel when it loads its
+  store; the WASM build reports them (`predatingChannels()`, and the SDK's `predatingChannels()`
+  and `onPredating`) so the wallet can tell the user the channel is not carried over.
 - **Sweeps, penalties and HTLC transactions**: they pay only the node's own outputs, and a sweep
   of a channel's commitment output pays it in the channel's asset (the one the device recorded
   from the channel's commitments; for a channel it never validated a commitment of, the one the
@@ -152,8 +161,9 @@ peer can sign commitments that move the balance without any HTLC, which the devi
 limit but cannot tell from a payment.
 
 The channel store (each channel's parameters, revocation counters, recorded balance, the
-unrevoked commitments it validated and its payment tracking, the approvals and charges against
-the payment limits, and the txids of the mutual closes the device signed) carries no secret and is authenticated by a MAC keyed from the seed. The native signer keeps it in
+unrevoked commitments it validated, its payment tracking and whether it predates validation, the
+approvals and charges against the payment limits, and the txids of the mutual closes the device
+signed) carries no secret and is authenticated by a MAC keyed from the seed. The native signer keeps it in
 `seqln-signer-channels` in its working directory (or the path in `SEQLN_SIGNER_STORE`): it
 loads the file at start and rewrites it durably (temporary file, sync, rename) after every
 request that changed it, before the reply leaves. If the file cannot be written it refuses the
@@ -161,15 +171,15 @@ request, and every request after it until a write succeeds, so channeld asking a
 was refused gets no answer the store does not record. The WASM build hands the same blob to the
 wallet's `channelStore` to keep.
 
-A channel whose record has no balance and no validated commitments (a store written by a device
-that did not keep them, or a lost store) can neither close mutually nor be closed unilaterally by
-the device until its next commitment step: a payment either way, or an `update_fee`, which the
-opener sends when its feerate changes. A device moved onto such a store therefore needs one
-commitment step on every channel before those channels can close. A channel already closing
-(`CLOSINGD_COMPLETE` or `AWAITING_UNILATERAL`) when the store lacks them stays closing:
-lightningd signs its closing transaction again at every start, the device refuses it, and
-lightningd logs the refusal and sends nothing. The channel closes when the peer's transaction
-confirms, and onchaind resolves it from the chain as it does any channel.
+A channel armed from the node's own data after the store was lost has no balance and no validated
+commitments: it can neither close mutually nor be closed unilaterally by the device until its
+next commitment step (a payment either way, or an `update_fee`, which the opener sends when its
+feerate changes). A channel that predates validation never gets that step: its peer closes it.
+A channel already closing (`CLOSINGD_COMPLETE` or `AWAITING_UNILATERAL`) when the device has no
+record of its closing transaction stays closing: lightningd signs that transaction again at every
+start, the device refuses it, and lightningd logs the refusal and sends nothing. The channel
+closes when the peer's transaction confirms, and onchaind resolves it from the chain as it does
+any channel.
 
 ## Layout
 

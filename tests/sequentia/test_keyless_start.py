@@ -7,8 +7,10 @@ CLOSINGD_COMPLETE or AWAITING_UNILATERAL, with the message it uses for its own
 commitment, and sends it.  A device whose store does not record that
 transaction refuses it, and is right to: the request carries no HTLC list, so a
 commitment the device did not validate itself could pay anything.  A store an
-older device wrote holds no validated commitments and no balance, so after an
-upgrade the device refuses every such closing transaction.
+older device wrote holds no validated commitments and no balance: the device
+that imports it marks each of its channels as predating validation, refuses
+every such closing transaction and every other commitment step for them, and
+its peer closes them.
 
 The node survives the refusal: it logs it with the channel, sends nothing, and
 goes on starting.  The channel stays in its state; once its funding is spent
@@ -32,6 +34,7 @@ import hashlib
 import hmac
 import os
 import pytest
+import re
 import sqlite3
 import struct
 import threading
@@ -55,6 +58,9 @@ SKIPPED = (r'The signing device refused to sign our {} transaction {} '
            r'.*in state {}: not broadcasting it')
 # The hub's connectd, when the keyless node's daemons go away mid-session.
 HUB_BROKEN = 'Subd did not close, forcing close'
+# The device's refusal of a step on a channel from the old store.
+PREDATES = r'POLICY REJECT: SIGN_{} refused: channel \d+ of peer [0-9a-f]+ predates validation'
+PREDATES_REVOKE = r'POLICY REJECT: REVOKE_COMMITMENT_TX refused: channel \d+ of peer [0-9a-f]+ predates validation'
 
 
 def coin(bitcoind):
@@ -127,7 +133,9 @@ def restart_device(device):
 # The device's channel store (contrib/seqln-signer/src/policy.rs): magic,
 # version, count, then each entry's fixed part and the fields later versions
 # add, then (from version 5) the payment ledger and (from version 7) the
-# closes the device signed; a MAC keyed from the seed closes it.
+# closes the device signed; a MAC keyed from the seed closes it.  A device
+# that imports a store older than version 6 marks every channel in it as
+# predating validation and signs no commitment step for it.
 ENTRY = 33 + 8 + 8 + 32 + 2 + 2 + 2 + 33 * 5 + 1 + 1
 
 
@@ -149,7 +157,8 @@ def store_as_version(device, version):
     blob = open(path, 'rb').read()
     payload, mac = blob[:-32], blob[-32:]
     assert hmac.compare_digest(store_mac(payload), mac)
-    assert payload[:4] == b'SQCH' and payload[4] in (6, 7), payload[:5]
+    assert payload[:4] == b'SQCH' and payload[4] in (6, 7, 8), payload[:5]
+    v = payload[4]
     count = struct.unpack('<I', payload[5:9])[0]
     o, entries = 9, []
 
@@ -194,6 +203,8 @@ def store_as_version(device, version):
         skip(8)
         if u8():                       # shutdown script's wallet index (6)
             skip(4)
+        if v >= 8:                     # predates validation (8)
+            skip(1)
         entries.append(entry)
     old = b'SQCH' + bytes([version]) + struct.pack('<I', count) + b''.join(entries)
     with open(path + '.tmp', 'wb') as f:
@@ -212,17 +223,38 @@ def usable(a, b):
                for c in a.rpc.listpeerchannels(b.info['id'])['channels'])
 
 
-def pays_both_ways(hub, keyless):
-    """A payment each way over what is left open between them."""
+def pays_both_ways(bitcoind, hub, keyless, asset):
+    """The channels that came through the old store predate validation and
+    move no more: the hub closes those still open, as the cutover does (each
+    reconnection otherwise ends in the device refusing their reestablish).
+    A channel the hub opens then is validated from its first commitment and
+    pays each way."""
     try:
         keyless.rpc.connect(hub.info['id'], 'localhost', hub.port)
     except RpcError:
         pass
+    closes, closed_fundings = [], []
+    for c in hub.rpc.listpeerchannels(keyless.info['id'])['channels']:
+        if c['state'] == 'CHANNELD_NORMAL':
+            closes += hub.rpc.close(c['short_channel_id'], unilateraltimeout=1)['txids']
+            closed_fundings.append(c['funding_txid'])
+    if closes:
+        bitcoind.generate_block(1, wait_for_mempool=closes)
+        # Both sides follow the closes before the new channel opens (the hub
+        # drops the connection once it sees each funding spent).
+        for a, b in ((hub, keyless), (keyless, hub)):
+            wait_for(lambda: all(c['state'] in ('ONCHAIN', 'FUNDING_SPEND_SEEN', 'CLOSED')
+                                 for c in a.rpc.listpeerchannels(b.info['id'])['channels']
+                                 if c.get('funding_txid') in closed_fundings))
+        try:
+            keyless.rpc.connect(hub.info['id'], 'localhost', hub.port)
+        except RpcError:
+            pass
+    scid = open_paid_channel(bitcoind, hub, keyless, asset)
     wait_for(lambda: usable(hub, keyless) and usable(keyless, hub))
-    inv = keyless.rpc.invoice(PAY * 1000 // 3, 'after-in', 'after')['bolt11']
-    assert hub.rpc.pay(inv)['status'] == 'complete'
     inv = hub.rpc.invoice(PAY * 1000 // 4, 'after-out', 'after')['bolt11']
     assert keyless.rpc.pay(inv)['status'] == 'complete'
+    return scid
 
 
 def spend_all(bitcoind, node, addr, asset):
@@ -306,14 +338,15 @@ def test_keyless_start_awaiting_unilateral(node_factory, bitcoind, directory):
     commitment lightningd signs again, the node logs that, starts, follows
     the hub's commitment on chain, and its wallet holds what that paid it,
     in the channel's asset.
-    A second channel still pays both ways.  The hub, with its own keys,
+    A channel opened afterwards pays both ways (the second one, from the old
+    store, predates validation and moves no more).  The hub, with its own keys,
     restarted with its commitment unconfirmed, sends it again as before."""
     asset = coin(bitcoind)
     device, l1 = kc.keyless_node(node_factory, directory, trace=True,
                                  broken_log='.*', may_reconnect=True)
     try:
         l2 = node_factory.get_node(may_reconnect=True, broken_log=HUB_BROKEN)
-        fund(bitcoind, l2, 3 * CAP, asset)
+        fund(bitcoind, l2, 4 * CAP, asset)
         closing = open_paid_channel(bitcoind, l2, l1, asset)
         open_paid_channel(bitcoind, l2, l1, asset)
 
@@ -342,8 +375,7 @@ def test_keyless_start_awaiting_unilateral(node_factory, bitcoind, directory):
         l1.start()
         l1.daemon.wait_for_log(SKIPPED.format('commitment', ours, 'AWAITING_UNILATERAL'))
         assert kc.answers(l1)
-        assert 'is not one this device validated (unrevoked validated commitments: [])' \
-            in device.output()
+        assert re.search(PREDATES.format('COMMITMENT_TX'), device.output())
 
         # The hub's commitment spent the funding: the node follows it, and
         # its wallet holds what the commitment paid it, in the channel's
@@ -356,7 +388,7 @@ def test_keyless_start_awaiting_unilateral(node_factory, bitcoind, directory):
         check_device_signed_none(device, asked, refused)
         with pytest.raises(JSONRPCError):
             bitcoind.rpc.getrawtransaction(ours)
-        pays_both_ways(l2, l1)
+        pays_both_ways(bitcoind, l2, l1, asset)
     finally:
         if kc.answers(l1, timeout=2):
             l1.stop()
@@ -383,17 +415,17 @@ def test_keyless_start_closing_sigexchange(node_factory, bitcoind, directory):
     CLOSINGD_SIGEXCHANGE, as it does when lightningd stops on a device
     refusing the close it signs again.  Its own broadcast never reaches the
     network; the hub's confirms.  The device is upgraded and the node starts
-    behind the chain: the hub reconnects and reports the funding spent, the
-    node fails the channel and signs its last closing transaction to send
-    it, and the device refuses.  The node logs that and goes on; once it
+    behind the chain: the hub reconnects, and the device refuses the
+    channel's reestablish (it predates validation), so the node never gets to
+    sign its closing transaction again.  The node keeps running; once it
     sees the close it follows it, and its wallet spends what the close paid
-    it.  A second channel still pays both ways."""
+    it.  A channel opened afterwards pays both ways."""
     asset = coin(bitcoind)
     device, l1 = kc.keyless_node(node_factory, directory, trace=True,
                                  broken_log='.*', may_reconnect=True)
     try:
         l2 = node_factory.get_node(may_reconnect=True, broken_log=HUB_BROKEN)
-        fund(bitcoind, l2, 3 * CAP, asset)
+        fund(bitcoind, l2, 4 * CAP, asset)
         closing = open_paid_channel(bitcoind, l2, l1, asset)
         open_paid_channel(bitcoind, l2, l1, asset)
 
@@ -419,12 +451,13 @@ def test_keyless_start_closing_sigexchange(node_factory, bitcoind, directory):
         asked, refused = device.requests(5), refusals(device)
         l1.start(wait_for_bitcoind_sync=False)
         l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
-        l1.daemon.wait_for_log('Peer permanent failure in CLOSINGD_SIGEXCHANGE')
-        l1.daemon.wait_for_log(SKIPPED.format('mutual close', close, 'AWAITING_UNILATERAL'))
+        # The channel predates validation: the device refuses the revocation
+        # channeld sends again at reestablish, so channeld stops before the
+        # hub's report that the funding is spent reaches the node, and the
+        # node never asks for its closing transaction.  It keeps running.
+        wait_for(lambda: re.search(PREDATES_REVOKE, device.output()))
         assert kc.answers(l1)
-        check_device_signed_none(device, asked, refused)
-        assert 'SIGN_COMMITMENT_TX refused: no balance is known for the channel yet' \
-            in device.output()
+        assert device.requests(5) - asked == refusals(device) - refused
 
         l1.daemon.rpcproxy.mock_rpc('getblockhash', None)
         wait_for(lambda: chan(l1, closing)['state'] == 'ONCHAIN')
@@ -433,7 +466,7 @@ def test_keyless_start_closing_sigexchange(node_factory, bitcoind, directory):
         print('the close {} paid {} to the keyless node, which sent it on in {}'
               .format(close, out['amount_msat'], swept))
         assert out['amount_msat'] >= PAY * 1000 * 9 // 10
-        pays_both_ways(l2, l1)
+        pays_both_ways(bitcoind, l2, l1, asset)
         # A second start finds the channel closed on chain: nothing to sign.
         asked = device.requests(5)
         l1.restart()
@@ -457,7 +490,7 @@ def test_keyless_start_closing_complete(node_factory, bitcoind, directory):
                                  broken_log='.*', may_reconnect=True)
     try:
         l2 = node_factory.get_node(may_reconnect=True, broken_log=HUB_BROKEN)
-        fund(bitcoind, l2, 3 * CAP, asset)
+        fund(bitcoind, l2, 4 * CAP, asset)
         closing = open_paid_channel(bitcoind, l2, l1, asset)
         open_paid_channel(bitcoind, l2, l1, asset)
 
@@ -475,8 +508,7 @@ def test_keyless_start_closing_complete(node_factory, bitcoind, directory):
         l1.start()
         l1.daemon.wait_for_log(SKIPPED.format('mutual close', close, 'CLOSINGD_COMPLETE'))
         assert kc.answers(l1)
-        assert 'SIGN_COMMITMENT_TX refused: no balance is known for the channel yet' \
-            in device.output()
+        assert re.search(PREDATES.format('COMMITMENT_TX'), device.output())
         assert chan(l1, closing)['state'] == 'CLOSINGD_COMPLETE'
 
         bitcoind.generate_block(1, wait_for_mempool=close)
@@ -486,7 +518,7 @@ def test_keyless_start_closing_complete(node_factory, bitcoind, directory):
         print('the close {} paid {} to the keyless node, which sent it on in {}'
               .format(close, out['amount_msat'], swept))
         check_device_signed_none(device, asked, refused)
-        pays_both_ways(l2, l1)
+        pays_both_ways(bitcoind, l2, l1, asset)
     finally:
         if kc.answers(l1, timeout=2):
             l1.stop()
@@ -501,14 +533,14 @@ def test_keyless_start_onchain_htlc(node_factory, bitcoind, directory):
     the HTLC expires; the node restarts.  It starts, times the HTLC out on
     chain with its device's signature, the payment fails, and its wallet
     spends what the timeout returned, with its device's signature.  A
-    second channel still pays."""
+    channel opened afterwards pays both ways."""
     asset = coin(bitcoind)
     device, l1 = kc.keyless_node(node_factory, directory, trace=True,
                                  broken_log='.*', may_reconnect=True)
     try:
         l2 = node_factory.get_node(may_reconnect=True, options={'plugin': HOLD},
                                    broken_log=HUB_BROKEN)
-        fund(bitcoind, l2, 3 * CAP, asset)
+        fund(bitcoind, l2, 4 * CAP, asset)
         closing = open_paid_channel(bitcoind, l2, l1, asset)
         open_paid_channel(bitcoind, l2, l1, asset)
 
@@ -563,7 +595,7 @@ def test_keyless_start_onchain_htlc(node_factory, bitcoind, directory):
         print('the HTLC timeout {} returned {} to the keyless node, which sent it on in {}'
               .format(timeout_tx, out['amount_msat'], swept))
         assert device.requests(5) == asked
-        pays_both_ways(l2, l1)
+        pays_both_ways(bitcoind, l2, l1, asset)
     finally:
         if kc.answers(l1, timeout=2):
             l1.stop()
@@ -583,7 +615,7 @@ def test_keyless_close_command_refused(node_factory, bitcoind, directory):
                                  broken_log='.*', may_reconnect=True)
     try:
         l2 = node_factory.get_node(may_reconnect=True, broken_log=HUB_BROKEN)
-        fund(bitcoind, l2, 3 * CAP, asset)
+        fund(bitcoind, l2, 4 * CAP, asset)
         closing = open_paid_channel(bitcoind, l2, l1, asset)
         l1.stop()
         device.stop()

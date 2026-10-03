@@ -126,6 +126,7 @@ fn channel(k: &Kernel) -> ChannelState {
         remote_split: None,
         validated: Vec::new(),
         pay: Default::default(),
+        predates_validation: false,
     }
 }
 
