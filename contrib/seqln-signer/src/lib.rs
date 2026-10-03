@@ -25,5 +25,6 @@ pub mod kernel;
 // (encryption + integrity + mutual static-key auth). Pure state machine; the
 // socket adapter lives in the binary (`bin/seqln-signer.rs`).
 pub mod noise;
+pub mod payments;
 pub mod policy;
 pub mod wire;

@@ -23,8 +23,26 @@ use seqln_signer::dispatch::{Outcome, Signer as InnerSigner};
 use seqln_signer::frame;
 use seqln_signer::hsm_secret;
 use seqln_signer::noise::{self, Initiator, Transport};
+use seqln_signer::payments::AssetKey;
 use seqln_signer::policy::{ChannelState, Policy};
 use wasm_bindgen::prelude::*;
+
+#[wasm_bindgen]
+extern "C" {
+    /// The page's clock (ms since the epoch): payment approvals and charges
+    /// expire against it.
+    #[wasm_bindgen(js_namespace = Date, js_name = now)]
+    fn date_now() -> f64;
+}
+
+/// A whole, non-negative number of atoms or seconds from JavaScript.
+fn whole(v: f64, what: &str) -> Result<u64, JsError> {
+    if v.is_finite() && v >= 0.0 && v.fract() == 0.0 && v <= 9_007_199_254_740_991.0 {
+        Ok(v as u64)
+    } else {
+        Err(JsError::new(&format!("{what} must be a whole, non-negative number, got {v}")))
+    }
+}
 
 fn arr32(b: &[u8], what: &str) -> Result<[u8; 32], JsError> {
     b.try_into()
@@ -100,8 +118,44 @@ impl Signer {
         self.last_reject.clone()
     }
 
+    /// Set the payment limit, in atoms per period, for one asset (`asset` a
+    /// display-order asset id or `"btc"`) or, with `asset` undefined, the
+    /// default for every asset. `atoms` undefined or null: no limit. The
+    /// default is 10,000,000 atoms of each asset per day.
+    #[wasm_bindgen(js_name = setPaymentLimit)]
+    pub fn set_payment_limit(&mut self, asset: Option<String>, atoms: Option<f64>) -> Result<(), JsError> {
+        let atoms = match atoms {
+            Some(a) => Some(whole(a, "atoms")?),
+            None => None,
+        };
+        let mut limits = self.inner.limits().clone();
+        match asset {
+            None => limits.default_atoms = atoms,
+            Some(a) => {
+                limits.per_asset.insert(AssetKey::parse(&a).map_err(|e| JsError::new(&e))?, atoms);
+            }
+        }
+        self.inner.set_limits(limits);
+        Ok(())
+    }
+
+    /// Set the period the payment limits apply over, in seconds (default a
+    /// day).
+    #[wasm_bindgen(js_name = setPaymentPeriod)]
+    pub fn set_payment_period(&mut self, seconds: f64) -> Result<(), JsError> {
+        let secs = whole(seconds, "seconds")?;
+        if secs == 0 {
+            return Err(JsError::new("the payment period must be at least a second"));
+        }
+        let mut limits = self.inner.limits().clone();
+        limits.period_secs = secs;
+        self.inner.set_limits(limits);
+        Ok(())
+    }
+
     #[wasm_bindgen(js_name = processFrame)]
     pub fn process_frame(&mut self, frame_bytes: &[u8]) -> Result<Vec<u8>, JsError> {
+        self.inner.set_now((date_now() / 1000.0) as u64);
         let mut rd: &[u8] = frame_bytes;
         let req = match frame::read_request(&mut rd) {
             Ok(Some(r)) => r,
@@ -239,6 +293,7 @@ impl Signer {
             local_split: None,
             remote_split: None,
             validated: Vec::new(),
+            pay: Default::default(),
         };
         self.inner
             .arm_channel(arr33(node_id, "node_id")?, dbid, st)

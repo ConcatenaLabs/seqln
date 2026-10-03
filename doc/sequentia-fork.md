@@ -266,7 +266,9 @@ a user device while a host runs the node:
   device side. It keeps a per-channel store (revocation counters, the balance its latest
   commitments give this side, the commitments of ours it validated) on the device, holds each
   close and revocation to it, and signs a commitment of ours for broadcast only when it is one it
-  validated and has not revoked. See
+  validated and has not revoked. It approves payments (`preapproveinvoice`, `preapprovekeysend`,
+  which `pay` and `keysend` call) within a per-asset limit, and refuses a commitment that adds an
+  HTLC this node offers for a payment it did not approve. See
   [its README](../contrib/seqln-signer/README.md).
 - A device that refuses a request on lightningd's own connection is dropped and the request is
   sent again when a device reconnects (a device that was missing state is re-primed then); a
