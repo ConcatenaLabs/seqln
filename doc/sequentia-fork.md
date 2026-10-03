@@ -196,7 +196,9 @@ policy asset by default). File-level map of the threading:
 - `wallet/wallet.c`, `wallet/reservation.c`, `wallet/walletrpc.c`: the on-chain wallet records
   UTXOs of any issued asset, selects coins per-asset, funds single-asset transactions (change and
   fee in the funding asset, fee sized per section 4), and `listfunds` shows an `asset` field on
-  issued-asset UTXOs (amounts are that asset's atoms).
+  issued-asset UTXOs (amounts are that asset's atoms). The per-asset selection, including the
+  fee-bump coins of anchor spends and HTLC transactions, applies on Sequentia networks only; a
+  Bitcoin node selects from all its UTXOs, as upstream does.
 - `plugins/spender/fundchannel.c`, `plugins/spender/multifundchannel.{c,h}`: the `asset` parameter
   (32-byte display-hex id); all channels in one funding tx must share one asset.
 - `onchaind/onchaind.c` + `onchaind/onchaind_wire.csv`, `lightningd/onchain_control.c`,
