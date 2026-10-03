@@ -1333,8 +1333,11 @@ pub fn validate_mutual_close(
 ///  * The peer's output may not exceed the funding less our share: dust
 ///    trimmed from us goes to the fee, never to the peer.
 ///  * With no balance known yet (a store from before balances were
-///    recorded, or a channel armed from the node), a close that pays this
-///    wallet nothing is refused.
+///    recorded, a lost store, or a channel armed from the node), every close
+///    is refused: the device cannot tell an honest close from one paying it
+///    a single atom until it has validated one of the channel's commitments
+///    (or signed one of the peer's), which the next commitment step gives
+///    it.
 pub fn check_close_balance(
     st: &ChannelState,
     ours_out: Option<u64>,
@@ -1352,11 +1355,12 @@ pub fn check_close_balance(
     }
     let (share, ceiling) = match known {
         Some(k) => k,
-        None if ours_out.is_some() => return Ok(()),
         None => {
-            return Err("the close pays this wallet nothing and no balance is known \
-                        for the channel yet"
-                .to_string())
+            return Err(format!(
+                "no balance is known for the channel yet (the close pays this wallet {}): a \
+                 mutual close needs one of its commitments validated first",
+                ours_out.map_or("nothing".to_string(), |v| v.to_string())
+            ))
         }
     };
     let fee_share = if st.is_outbound == Some(false) { 0 } else { close_fee.min(ceiling) };

@@ -7,9 +7,9 @@
 //! revokes commitment 0. A second session, a new process in the same directory,
 //! must then refuse to sign the revoked commitment 0 for broadcast and refuse a
 //! close that pays this wallet one atom, while still signing an honest close. A
-//! third session pointed at an empty store signs the one-atom close, and signs
-//! commitment 0 once it has validated commitments 0 and 1 itself: that is what
-//! a signer that forgot its store would do.
+//! third session pointed at an empty store refuses the honest close (it knows
+//! no balance) and signs commitment 0 once it has validated commitments 0 and
+//! 1 itself: the second session's answers come from the persisted store.
 
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -310,21 +310,26 @@ fn restarted_native_signer_keeps_its_counters_and_balance() {
             "the current commitment was refused");
     s.stop();
 
-    // Control: the same requests to a signer with an empty store are signed,
-    // so the refusals above come from the persisted store. With no record it
-    // signs no commitment of ours for broadcast at all; once it has validated
-    // commitments 0 and 1 itself, without revoking 0, it signs 0.
+    // Control: a signer with an empty store answers the same requests from
+    // what it learns itself, so the second session's answers came from the
+    // persisted store. With no balance it signs no close, the honest one
+    // included, and no commitment of ours for broadcast; once it has
+    // validated commitments 0 and 1, without revoking 0, it signs both.
     let mut s = Session::start(&dir, Some(&dir.join("empty-store")));
     assert!(!s.ask(false, &setup_msg(&k)).is_empty());
-    assert!(!s.ask(false, &mutual_close_msg(&k, 1, 998_999, 1_000)).is_empty(),
-            "control: the one-atom close refused without a store");
+    assert!(s.ask(false, &mutual_close_msg(&k, 600_500, 399_000, 500)).is_empty(),
+            "control: an honest close signed with no balance known");
+    assert!(s.ask(false, &mutual_close_msg(&k, 1, 998_999, 1_000)).is_empty(),
+            "control: the one-atom close signed with no balance known");
     assert!(s.ask(true, &sign_commitment_msg(&k, &commitment(&k, 0), 0)).is_empty(),
             "control: commitment 0 signed with nothing validated");
     assert!(!s.ask(false, &validate_msg(&k, 0)).is_empty(), "control: validate 0 refused");
     assert!(!s.ask(false, &validate_msg(&k, 1)).is_empty(), "control: validate 1 refused");
     assert!(!s.ask(true, &sign_commitment_msg(&k, &commitment(&k, 0), 0)).is_empty(),
-            "control: commitment 0 refused without a store");
-    println!("control, empty store: one-atom close SIGNED; commitment 0 REFUSED until \
+            "control: commitment 0 refused once validated");
+    assert!(!s.ask(false, &mutual_close_msg(&k, 600_500, 399_000, 500)).is_empty(),
+            "control: the honest close refused once validated");
+    println!("control, empty store: honest close and commitment 0 REFUSED until \
               validated, then SIGNED");
     s.stop();
 

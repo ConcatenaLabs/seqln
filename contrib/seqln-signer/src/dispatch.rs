@@ -2926,6 +2926,7 @@ mod close_and_revocation_tests {
     fn closing_transaction_signs_as_a_close() {
         let mut s = signer(Policy::Enforce);
         track(&mut s, true, &[]);
+        assert!(matches!(validate(&mut s, 0, 500_000, 499_000, 1_000), Outcome::Reply(_)));
         let ours = s.wallet_sweep_script(4, false);
         let good = close(FUNDING_TXID, &[(ours.clone(), 500_000), (peer_script(), 499_000), (Vec::new(), 1_000)]);
         // As msg 5 (lightningd's rebroadcast at closing complete and at start).
@@ -2956,6 +2957,7 @@ mod close_and_revocation_tests {
         // must go there.
         let mut s = signer(Policy::Enforce);
         track(&mut s, true, &peer_script());
+        assert!(matches!(validate(&mut s, 0, 500_000, 499_000, 1_000), Outcome::Reply(_)));
         assert_eq!(s.check_own_commitment(&sign_commitment_msg(&s, &good, 7)), Ok(()));
         refuse(&s, close(FUNDING_TXID, &[(ours.clone(), 500_000), ([0x51u8].to_vec(), 499_000)]), "recorded");
         // closingd's own request is held to the same policy.
@@ -3228,15 +3230,23 @@ mod close_and_revocation_tests {
         assert!(err.contains("pays this wallet 1, below its balance 601000"), "{err}");
     }
 
-    /// Until a balance is known, a close with an output to this wallet is
-    /// signed: the device cannot tell its size from a theft's.
+    /// Until a balance is known no close is signed, however much it pays
+    /// this wallet: the device cannot tell an honest close from a theft's.
+    /// One commitment step gives it the balance.
     #[test]
-    fn close_with_no_balance_known_needs_an_output_to_us() {
+    fn close_with_no_balance_known_is_refused() {
         let mut s = signer(Policy::Enforce);
         track(&mut s, true, &[]);
         let ours = s.wallet_sweep_script(4, false);
-        assert_eq!(sign_close(&mut s, &close(FUNDING_TXID,
-            &[(ours, 1), (peer_script(), FUNDING - 1_001), (Vec::new(), 1_000)])), Ok(()));
+        let honest = close(FUNDING_TXID, &[(ours.clone(), 600_500), (peer_script(), 399_000), (Vec::new(), 500)]);
+        for c in [close(FUNDING_TXID, &[(ours.clone(), 1), (peer_script(), FUNDING - 1_001), (Vec::new(), 1_000)]),
+                  honest.clone()] {
+            let err = sign_close(&mut s, &c).unwrap_err();
+            assert!(err.contains("no balance is known for the channel yet") &&
+                    err.contains("needs one of its commitments validated first"), "{err}");
+        }
+        assert!(matches!(validate(&mut s, 0, 600_000, 399_000, 1_000), Outcome::Reply(_)));
+        assert_eq!(sign_close(&mut s, &honest), Ok(()));
     }
 
     /// We opened: commitment 1 gives us to_local 600,000 and the 1,000 fee,
@@ -3925,5 +3935,68 @@ mod close_and_revocation_tests {
         let mut t = signer(Policy::Enforce);
         assert_eq!(t.import_channels(&blob), Ok(1));
         assert_eq!(st(&t).local_shutdown_wallet_index, Some(6000));
+    }
+
+    // ---- R2b M3: a store without balances refuses closes ----
+
+    /// The payload a version-2 device would have written for the same
+    /// channels: each entry's fixed part and version-2 fields, no ledger.
+    fn as_v2(s: &Signer) -> Vec<u8> {
+        let v6 = policy::encode_channel_store(&s.store);
+        let (entries, _) = policy::decode_channel_store(&v6).unwrap();
+        let mut out = v6[..9].to_vec();
+        out[4] = 2;
+        let mut at = 9;
+        for (_, st) in &entries {
+            let opt = |v: Option<u64>| if v.is_some() { 9 } else { 1 };
+            let len = policy::CHSTORE_ENTRY_LEN + 1 + opt(st.revoked_through) + opt(st.validated_through)
+                + 2 + st.local_shutdown_script.len() + 2 + st.remote_shutdown_script.len();
+            out.extend_from_slice(&v6[at..at + len]);
+            at += len;
+            // Skip the later versions' fields of this entry by re-encoding.
+            let mut one = ChannelStore::new();
+            one.insert(PEER, DBID, st.clone());
+            at += policy::encode_channel_store(&one).len() - 9 - len - 4;
+        }
+        out
+    }
+
+    /// R2b M3: a channel imported from a version-2 store has no balance
+    /// recorded. A close paying this wallet one atom, which a device on a
+    /// current store refuses as below the balance, is refused too: no close
+    /// is signed until the channel's next commitment gives the balance.
+    #[test]
+    fn r2b_v2_store_close_paying_one_atom_is_refused() {
+        let mut s = signer(Policy::Enforce);
+        track(&mut s, true, &[]);
+        for n in 0..2 {
+            assert!(matches!(validate(&mut s, n, 600_000, 399_000, 1_000), Outcome::Reply(_)));
+        }
+        assert!(matches!(revoke(&mut s, 0), Outcome::Reply(_)));
+        let v2 = as_v2(&s);
+        let mut s2 = signer(Policy::Enforce);
+        let (entries, ledger) = policy::decode_channel_store(&v2).unwrap();
+        assert_eq!(ledger, payments::Ledger::default());
+        for ((node, dbid), stv) in entries {
+            assert_eq!((stv.local_split, stv.remote_split), (None, None));
+            assert_eq!(stv.revoked_through, Some(0));
+            s2.store.insert(node, dbid, stv);
+        }
+        let ours = s.wallet_sweep_script(4, false);
+        let theft = close(FUNDING_TXID, &[(ours.clone(), 1), (host_script(), FUNDING - 1_001), (Vec::new(), 1_000)]);
+        let o3 = s.handle(&req(mutual_close_msg(&s, &theft)));
+        let o2 = s2.handle(&req(mutual_close_msg(&s2, &theft)));
+        println!("M3 one-atom close, device on a current store: {}", verdict(&o3));
+        println!("M3 one-atom close, same channel imported from a v2 store: {}", verdict(&o2));
+        assert!(matches!(&o3, Outcome::Reject(r) if r.contains("pays this wallet 1, below its balance 601000")),
+                "{}", verdict(&o3));
+        assert!(matches!(&o2, Outcome::Reject(r) if r.contains("no balance is known for the channel yet \
+            (the close pays this wallet 1)")), "{}", verdict(&o2));
+        // The honest close too, until the next commitment.
+        let honest = close(FUNDING_TXID, &[(ours, 600_500), (peer_script(), 399_000), (Vec::new(), 500)]);
+        assert!(matches!(s2.handle(&req(mutual_close_msg(&s2, &honest))), Outcome::Reject(_)));
+        assert!(matches!(validate(&mut s2, 2, 600_000, 399_000, 1_000), Outcome::Reply(_)));
+        assert!(matches!(s2.handle(&req(mutual_close_msg(&s2, &honest))), Outcome::Reply(_)));
+        assert!(matches!(s2.handle(&req(mutual_close_msg(&s2, &theft))), Outcome::Reject(_)));
     }
 }
