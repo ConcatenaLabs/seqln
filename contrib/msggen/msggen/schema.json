@@ -36290,6 +36290,12 @@
             "items": {
               "type": "outpoint"
             }
+          },
+          "asset": {
+            "type": "hex",
+            "description": [
+              "On an asset-aware chain, the 32-byte display id of the asset the outputs are in; their amounts are then in that asset's atoms, and change and fee are in the same asset. Without it, the asset of the inputs: the chain's policy asset, or the asset of the *utxos* given."
+            ]
           }
         }
       },
@@ -36821,6 +36827,12 @@
             "type": "boolean",
             "description": [
               "To signel that it needs emergency reserve for anchors so that we can lowball our commitment tx fees, and min-emergency-msat for reserving some sats for closing anchor channels."
+            ]
+          },
+          "asset": {
+            "type": "hex",
+            "description": [
+              "On an asset-aware chain, the 32-byte display id of the asset the *utxos* hold, each of them; *satoshi* is then in that asset's atoms, and change and fee are in the same asset. Without it, the asset the *utxos* hold, which must be one asset."
             ]
           }
         }
@@ -38812,6 +38824,12 @@
             "items": {
               "type": "outpoint"
             }
+          },
+          "asset": {
+            "type": "hex",
+            "description": [
+              "On an asset-aware chain, the 32-byte display id of the asset to withdraw; *satoshi* is then in that asset's atoms, and change and fee are in the same asset. Without it, the asset of the inputs: the chain's policy asset, or the asset of the *utxos* given."
+            ]
           }
         }
       },

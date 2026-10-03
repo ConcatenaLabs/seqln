@@ -47,6 +47,12 @@
         "items": {
           "type": "outpoint"
         }
+      },
+      "asset": {
+        "type": "hex",
+        "description": [
+          "On an asset-aware chain, the 32-byte display id of the asset to withdraw; *satoshi* is then in that asset's atoms, and change and fee are in the same asset. Without it, the asset of the inputs: the chain's policy asset, or the asset of the *utxos* given."
+        ]
       }
     }
   },

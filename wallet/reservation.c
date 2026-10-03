@@ -404,6 +404,11 @@ static struct command_result *finish_psbt(struct command *cmd,
 	 * byte-for-byte (rate == EXCHANGE_RATE_SCALE, or non-elements). */
 	bool nonpolicy = is_elements(chainparams) && rate != EXCHANGE_RATE_SCALE;
 
+	/* "all": the caller adds one output of @excess, everything the inputs
+	 * hold less the fee, so that is the amount being funded. */
+	if (amount_sat_eq(funding_amount, AMOUNT_SAT(-1ULL)))
+		funding_amount = excess;
+
 	/* Should we add a change output?  (Iff it can pay for itself!) */
 	if (nonpolicy) {
 		/* Fee we'd pay if we DO add a change output, in asset atoms. */
@@ -1141,6 +1146,8 @@ static struct command_result *json_utxopsbt(struct command *cmd,
 	bool all, *reserved_ok, *excess_as_change, *keep_emergency_funds;
 	struct amount_sat *amount, input, excess, change;
 	u32 current_height, *locktime, *reserve;
+	const u8 *asset = NULL;
+	u64 rate = EXCHANGE_RATE_SCALE;
 
 	if (!param_check(cmd, buffer, params,
 			 p_req("satoshi", param_sat_or_all, &amount),
@@ -1157,6 +1164,7 @@ static struct command_result *json_utxopsbt(struct command *cmd,
 				   &excess_as_change, false),
 			 p_opt_def("opening_anchor_channel", param_bool,
 				   &keep_emergency_funds, false),
+			 p_opt("asset", param_asset_tag, &asset),
 			 NULL))
 		return command_param_failed();
 
@@ -1164,6 +1172,35 @@ static struct command_result *json_utxopsbt(struct command *cmd,
 	 * emergency funds.  */
 	if (have_anchor_channel(cmd->ld))
 		*keep_emergency_funds = true;
+
+	/* The inputs are all of one asset, the one being moved, which also
+	 * pays the fee and takes the change: the named one, or, named none,
+	 * the asset of the inputs.  Never an implicit other asset. */
+	if (is_elements(chainparams)) {
+		for (size_t i = 0; i < tal_count(utxos); i++) {
+			if (!asset) {
+				asset = tal_dup_arr(cmd, u8, utxos[i]->asset,
+						    sizeof(utxos[i]->asset), 0);
+				continue;
+			}
+			if (memcmp(utxos[i]->asset, asset, sizeof(utxos[i]->asset)) != 0)
+				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+						    "UTXO %s is in asset %s, not %s:"
+						    " a transaction moves one asset",
+						    fmt_bitcoin_outpoint(tmpctx,
+									 &utxos[i]->outpoint),
+						    fmt_asset_id(tmpctx, utxos[i]->asset),
+						    fmt_asset_id(tmpctx, asset));
+		}
+		if (asset) {
+			rate = topo_asset_fee_rate(cmd->ld->topology, asset);
+			if (rate == 0)
+				return command_fail(cmd, FUND_CANNOT_AFFORD,
+						    "asset %s is not accepted for fees"
+						    " by the backend",
+						    fmt_asset_id(tmpctx, asset));
+		}
+	}
 
 	all = amount_sat_eq(*amount, AMOUNT_SAT(-1ULL));
 
@@ -1198,7 +1235,7 @@ static struct command_result *json_utxopsbt(struct command *cmd,
 		/* We need to afford one non-dust output, at least. */
 		if (!inputs_sufficient(input, AMOUNT_SAT(0),
 				       *feerate_per_kw, *weight,
-				       EXCHANGE_RATE_SCALE, &excess)
+				       rate, &excess)
 		    || amount_sat_less(excess, chainparams->dust_limit)) {
 			return command_fail(cmd, FUND_CANNOT_AFFORD,
 					    "Could not afford anything using UTXOs totalling %s with weight %u at feerate %u",
@@ -1209,7 +1246,7 @@ static struct command_result *json_utxopsbt(struct command *cmd,
 	} else {
 		if (!inputs_sufficient(input, *amount,
 				       *feerate_per_kw, *weight,
-				       EXCHANGE_RATE_SCALE, &excess)) {
+				       rate, &excess)) {
 			return command_fail(cmd, FUND_CANNOT_AFFORD,
 				    "Could not afford %s using UTXOs totalling %s with weight %u at feerate %u",
 					    fmt_amount_sat(tmpctx, *amount),
@@ -1239,8 +1276,8 @@ static struct command_result *json_utxopsbt(struct command *cmd,
 		return command_check_done(cmd);
 
 	return finish_psbt(cmd, utxos, *feerate_per_kw, *weight, excess,
-			   *reserve, locktime, change, NULL,
-			   EXCHANGE_RATE_SCALE, input, *amount);
+			   *reserve, locktime, change, asset,
+			   rate, input, *amount);
 }
 static const struct json_command utxopsbt_command = {
 	"utxopsbt",

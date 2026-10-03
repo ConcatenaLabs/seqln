@@ -1076,6 +1076,34 @@ void migrate_fail_pending_payments_without_htlcs(struct lightningd *ld,
 	db_exec_prepared_v2(take(stmt));
 }
 
+/* What a peer's commitment paid this node used to be recorded without its
+ * channel's asset, so on a Sequentia network it read back as the policy asset
+ * and could not be spent in its own.  Every output of a channel's commitment
+ * is in the channel's asset: give each such output, which names its channel,
+ * the asset recorded for that channel.  Rows whose channel is gone, or has no
+ * asset recorded, stay as they are. */
+void migrate_fill_close_output_asset(struct lightningd *ld,
+				     struct db *db)
+{
+	struct db_stmt *stmt;
+
+	if (!chainparams->is_elements)
+		return;
+
+	stmt = db_prepare_v2(db, SQL("UPDATE outputs"
+				     " SET asset = (SELECT channel_asset FROM channels"
+				     "  WHERE channels.id = outputs.channel_id)"
+				     " WHERE asset IS NULL"
+				     " AND channel_id IS NOT NULL"
+				     " AND EXISTS (SELECT 1 FROM channels"
+				     "  WHERE channels.id = outputs.channel_id"
+				     "  AND channels.channel_asset IS NOT NULL);"));
+	db_exec_prepared_v2(stmt);
+	log_info(ld->log, "Gave %zu close output(s) their channel's asset",
+		 db_count_changes(stmt));
+	tal_free(stmt);
+}
+
 void migrate_fix_payments_faildetail_type(struct lightningd *ld UNUSED,
 					  struct db *db)
 {

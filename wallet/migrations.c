@@ -1119,6 +1119,10 @@ static const struct db_migration dbmigrations[] = {
      * that held no channel when it issued them). */
     {SQL("ALTER TABLE invoices ADD asset BLOB DEFAULT NULL;"), NULL,
      SQL("ALTER TABLE invoices DROP COLUMN asset"), NULL},
+    /* Close outputs recorded without their channel's asset get it (see
+     * migrate_fill_close_output_asset).  An older binary reads the filled
+     * column as it reads any other asset, so there is nothing to revert. */
+    {NULL, migrate_fill_close_output_asset, NULL, NULL},
 };
 
 const struct db_migration *get_db_migrations(size_t *num)
