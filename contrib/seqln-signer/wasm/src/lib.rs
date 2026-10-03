@@ -288,6 +288,7 @@ impl Signer {
             is_outbound: None,
             local_shutdown_script: Vec::new(),
             remote_shutdown_script: Vec::new(),
+            local_shutdown_wallet_index: None,
             revoked_through: None,
             validated_through: None,
             local_split: None,

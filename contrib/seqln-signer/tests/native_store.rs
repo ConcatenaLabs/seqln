@@ -119,6 +119,7 @@ fn channel(k: &Kernel) -> ChannelState {
         is_outbound: Some(true),
         local_shutdown_script: Vec::new(),
         remote_shutdown_script: Vec::new(),
+        local_shutdown_wallet_index: None,
         revoked_through: None,
         validated_through: None,
         local_split: None,
@@ -325,6 +326,64 @@ fn restarted_native_signer_keeps_its_counters_and_balance() {
             "control: commitment 0 refused without a store");
     println!("control, empty store: one-atom close SIGNED; commitment 0 REFUSED until \
               validated, then SIGNED");
+    s.stop();
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A failed store write refuses the request, and every request after it until
+/// a write succeeds: the revocation channeld asks for again after the refusal
+/// is not answered while the store on disk does not record it, so a restarted
+/// signer never signs a commitment whose secret went out.
+#[test]
+fn store_write_failure_refuses_until_saved() {
+    use std::os::unix::fs::PermissionsExt;
+    let k = kernel();
+    let dir = scratch_dir();
+    let sub = dir.join("store-dir");
+    std::fs::create_dir_all(&sub).unwrap();
+    let store = sub.join("channels");
+
+    let mut s = Session::start(&dir, Some(&store));
+    assert!(!s.ask(false, &setup_msg(&k)).is_empty());
+    assert!(!s.ask(false, &validate_msg(&k, 0)).is_empty(), "validate 0 refused");
+    assert!(!s.ask(false, &validate_msg(&k, 1)).is_empty(), "validate 1 refused");
+    let saved = std::fs::read(&store).expect("store written");
+
+    // The store's directory stops accepting writes (and is made writable
+    // again however the test ends, so its scratch directory can go).
+    struct Writable<'a>(&'a Path);
+    impl Drop for Writable<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+    let _writable = Writable(&sub);
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let first = s.ask(false, &revoke_msg(0));
+    let second = s.ask(false, &revoke_msg(0));
+    let other = s.ask(true, &sign_commitment_msg(&k, &commitment(&k, 1), 1));
+    println!("store unwritable: REVOKE 0 {}, re-sent {}, SIGN_COMMITMENT_TX 1 {}",
+             if first.is_empty() { "REFUSED" } else { "REVEALED" },
+             if second.is_empty() { "REFUSED" } else { "REVEALED" },
+             if other.is_empty() { "REFUSED" } else { "SIGNED" });
+    assert!(first.is_empty(), "revealed with the store unwritable");
+    assert!(second.is_empty(), "the re-sent revocation was answered with the store unsaved");
+    assert!(other.is_empty(), "answered another request with the store unsaved");
+    assert_eq!(std::fs::read(&store).unwrap(), saved);
+
+    // Writable again: the re-sent revocation is answered and recorded.
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!s.ask(false, &revoke_msg(0)).is_empty(), "refused once the store is writable");
+    assert_ne!(std::fs::read(&store).unwrap(), saved);
+    s.stop();
+
+    // A restarted signer refuses the revoked commitment for broadcast.
+    let mut s = Session::start(&dir, Some(&store));
+    let sig = s.ask(true, &sign_commitment_msg(&k, &commitment(&k, 0), 0));
+    println!("after restart, SIGN_COMMITMENT_TX of revoked commitment 0: {}",
+             if sig.is_empty() { "REFUSED" } else { "SIGNED" });
+    assert!(sig.is_empty());
     s.stop();
 
     std::fs::remove_dir_all(&dir).unwrap();

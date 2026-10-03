@@ -533,6 +533,14 @@ impl Signer {
         std::mem::take(&mut self.store_dirty)
     }
 
+    /// The host could not persist the store it took: keep it marked as
+    /// changed, so the host refuses every reply until a save succeeds (a
+    /// re-sent request that changes nothing would otherwise be answered with
+    /// the record of it still unsaved).
+    pub fn mark_channels_dirty(&mut self) {
+        self.store_dirty = true;
+    }
+
     /// The most recent "no tracked channel" refusal (take-and-clear), as the
     /// host's cue to fetch that channel's parameters and `arm_channel`.
     pub fn take_last_untracked(&mut self) -> Option<([u8; 33], u64)> {
@@ -563,7 +571,8 @@ impl Signer {
                 let mut r = wire::Reader::new(&req.hsmd_msg);
                 r.u16().ok_or("malformed request")?;
                 let bt = wire::read_bitcoin_tx(&mut r).ok_or("malformed request")?;
-                policy::validate_mutual_close(st, self.own_sweep_script_set(), &bt.tx)
+                let own_close = self.own_close_script(st);
+                policy::validate_mutual_close(st, self.own_sweep_script_set(), own_close.as_deref(), &bt.tx)
             })();
             if let Err(reason) = check {
                 return Outcome::Reject(format!("SIGN_MUTUAL_CLOSE_TX refused: {reason}"));
@@ -979,7 +988,9 @@ impl Signer {
             return Err("remote_funding_key differs from setup_channel".to_string());
         }
         if !policy::is_commitment_shaped(&bt.tx) {
-            return policy::validate_mutual_close(st, self.own_sweep_script_set(), &bt.tx);
+            let own_close = self.own_close_script(st);
+            return policy::validate_mutual_close(
+                st, self.own_sweep_script_set(), own_close.as_deref(), &bt.tx);
         }
         let n = policy::commitment_number(self.kernel(), &peer_id, dbid, st, &bt.tx)
             .unwrap_or(commit_num);
@@ -1029,6 +1040,37 @@ impl Signer {
             }
             s
         })
+    }
+
+    /// The channel's local upfront shutdown script, when it is this device's:
+    /// one of the wallet scripts its keys give at the index `setup_channel`
+    /// named for it (P2WPKH, P2SH-wrapped P2WPKH or BIP-86 P2TR, of the
+    /// BIP-86 or the legacy key, the forms lightningd's wallet recognises).
+    fn own_close_script(&self, st: &ChannelState) -> Option<Vec<u8>> {
+        let i = st.local_shutdown_wallet_index?;
+        if st.local_shutdown_script.is_empty() || i >= 0x8000_0000 {
+            return None;
+        }
+        let k = self.kernel();
+        let p2sh = |wpkh: Vec<u8>| -> Vec<u8> {
+            let mut s = vec![0xa9, 0x14];
+            s.extend_from_slice(&kernel::hash160(&wpkh));
+            s.push(0x87);
+            s
+        };
+        let bip86 = k.p2wpkh_scriptpubkey(&k.bip86_child_pubkey(i));
+        let legacy = k.p2wpkh_scriptpubkey(&k.bip32_child_pubkey(i));
+        let candidates = [
+            p2sh(bip86.clone()),
+            p2sh(legacy.clone()),
+            bip86,
+            legacy,
+            k.bip86_p2tr_scriptpubkey(i),
+        ];
+        candidates
+            .iter()
+            .any(|c| *c == st.local_shutdown_script)
+            .then(|| st.local_shutdown_script.clone())
     }
 
     /// The node's OWN wallet sweep scriptPubKey for `index` (p2tr when `taproot`,
@@ -1880,9 +1922,7 @@ fn parse_setup_channel(m: &[u8]) -> Option<ChannelState> {
     let local_to_self_delay = r.u16()?;
     let lsl = r.u16()? as usize;
     let local_shutdown_script = r.take_bytes(lsl)?;
-    if r.bool()? {
-        r.u32()?; // local_shutdown_wallet_index (?u32)
-    }
+    let local_shutdown_wallet_index = if r.bool()? { Some(r.u32()?) } else { None };
     let remote_revocation = r.arr33()?;
     let remote_payment = r.arr33()?;
     let remote_htlc = r.arr33()?;
@@ -1910,6 +1950,7 @@ fn parse_setup_channel(m: &[u8]) -> Option<ChannelState> {
         is_outbound: Some(is_outbound),
         local_shutdown_script,
         remote_shutdown_script,
+        local_shutdown_wallet_index,
         revoked_through: None,
         validated_through: None,
         local_split: None,
@@ -2954,9 +2995,9 @@ mod close_and_revocation_tests {
         }
         assert!(matches!(sign_remote(&mut s, 0, 699_000, 300_000, 1_000), Outcome::Reply(_)));
         assert!(matches!(revoke(&mut s, 0), Outcome::Reply(_)));
-        let v5 = policy::encode_channel_store(&s.store);
-        assert_eq!(v5[4], 5);
-        let (back, ledger) = policy::decode_channel_store(&v5).unwrap();
+        let v6 = policy::encode_channel_store(&s.store);
+        assert_eq!(v6[4], 6);
+        let (back, ledger) = policy::decode_channel_store(&v6).unwrap();
         let (_, b) = &back[0];
         assert_eq!(b.revoked_through, Some(0));
         assert_eq!(b.is_outbound, Some(false));
@@ -2970,13 +3011,20 @@ mod close_and_revocation_tests {
         assert_eq!(b.pay, st(&s).pay);
         assert!(b.pay.asset.is_some() && b.pay.local.is_some() && b.pay.remote.is_some());
         assert_eq!(ledger, s.store.ledger);
+        assert_eq!(b.local_shutdown_wallet_index, None);
+        // A version-5 payload: the same entry without the wallet index.
+        let ledger_len = 2 + 40 * ledger.approvals.len() + 2 + 49 * ledger.spends.len();
+        let at = v6.len() - ledger_len - 1;
+        let mut v5 = [&v6[..at], &v6[at + 1..]].concat();
+        v5[4] = 5;
+        let (back, l5) = policy::decode_channel_store(&v5).unwrap();
+        assert_eq!((&back[0].1.pay, &l5), (&b.pay, &ledger));
         // A version-4 payload: the same entry without the payment tracking,
         // and no ledger.
         let side_len = |t: &Option<crate::payments::SideTrack>| {
             t.as_ref().map_or(1, |t| 1 + 24 + 2 + 44 * t.offered.len())
         };
         let pay_len = 34 + side_len(&b.pay.local) + side_len(&b.pay.remote) + 8;
-        let ledger_len = 2 + 40 * ledger.approvals.len() + 2 + 49 * ledger.spends.len();
         let mut v4 = v5[..v5.len() - ledger_len - pay_len].to_vec();
         v4[4] = 4;
         let (back, l4) = policy::decode_channel_store(&v4).unwrap();
@@ -3007,14 +3055,14 @@ mod close_and_revocation_tests {
         assert_eq!(b.funding_sats, FUNDING);
         assert_eq!((b.is_outbound, b.revoked_through), (None, None));
         assert!(b.remote_shutdown_script.is_empty());
-        // Truncated or padded payloads are refused, as is a version 6.
-        assert!(policy::decode_channel_store(&v5[..v5.len() - 1]).is_err());
-        let mut padded = v5.clone();
+        // Truncated or padded payloads are refused, as is a version 7.
+        assert!(policy::decode_channel_store(&v6[..v6.len() - 1]).is_err());
+        let mut padded = v6.clone();
         padded.push(0);
         assert!(policy::decode_channel_store(&padded).is_err());
-        let mut v6 = v5.clone();
-        v6[4] = 6;
-        assert!(policy::decode_channel_store(&v6).is_err());
+        let mut v7 = v6.clone();
+        v7[4] = 7;
+        assert!(policy::decode_channel_store(&v7).is_err());
     }
 
     // ---- Balance-held closes and store-miss revocations ----
@@ -3780,5 +3828,102 @@ mod close_and_revocation_tests {
         assert!(matches!(sign_remote_with(&mut s, 5, 399_000, 500_000, 1_000, &[a]), Outcome::Reply(_)));
         let b = htlc(0, 10_000_000, 0xB2);
         assert!(matches!(sign_remote_with(&mut s, 6, 399_000, 490_000, 1_000, &[a, b]), Outcome::Reject(_)));
+    }
+
+    // ---- R2b L2: a close to the local upfront shutdown script ----
+
+    /// setup_channel naming a local upfront shutdown script (`fundchannel
+    /// close_to=...`) and, when lightningd recognised it as its wallet's,
+    /// that script's wallet index.
+    fn setup_msg_local(s: &Signer, local_shutdown: &[u8], index: Option<u32>) -> Vec<u8> {
+        let mut w = Writer::new(msg::HSMD_SETUP_CHANNEL);
+        w.bool(true);
+        w.u64(FUNDING);
+        w.u64(0);
+        w.bytes(&FUNDING_TXID);
+        w.u16(0);
+        w.u16(144);
+        w.u16(local_shutdown.len() as u16);
+        w.bytes(local_shutdown);
+        match index {
+            Some(i) => {
+                w.bool(true);
+                w.u32(i);
+            }
+            None => w.bool(false),
+        }
+        for k in 1..=5u8 {
+            w.bytes(&point(s, k));
+        }
+        w.u16(144);
+        w.u16(0);
+        w.u16(2);
+        w.bytes(&[0x10, 0x00]);
+        w.into_vec()
+    }
+
+    /// A signer tracking a channel we opened with `close_to`, whose
+    /// commitment 0 gives us 600,000 and the 1,000 fee.
+    fn close_to_signer(close_to: &[u8], index: Option<u32>) -> Signer {
+        let mut s = signer(Policy::Enforce);
+        assert!(matches!(s.handle(&req(setup_msg_local(&s, close_to, index))), Outcome::Reply(_)));
+        assert!(matches!(validate(&mut s, 0, 600_000, 399_000, 1_000), Outcome::Reply(_)));
+        s
+    }
+
+    /// R2b L2: a close of our share to the channel's close_to script was
+    /// refused. It is signed when the script is this device's wallet address
+    /// at the index setup_channel named (here 6000, past the range the
+    /// device scans for its own scripts; P2WPKH, wrapped P2WPKH and P2TR),
+    /// and still refused when the device cannot derive it: setup_channel
+    /// comes from the host, so such a script could be the host's.
+    #[test]
+    fn r2b_close_to_upfront_script() {
+        let peer = peer_script();
+        let k = |s: &Signer| s.kernel().p2wpkh_scriptpubkey(&s.kernel().bip86_child_pubkey(6000));
+        let probe = signer(Policy::Enforce);
+        let wpkh = k(&probe);
+        let wrapped = {
+            let mut v = vec![0xa9, 0x14];
+            v.extend_from_slice(&kernel::hash160(&wpkh));
+            v.push(0x87);
+            v
+        };
+        let tr = probe.kernel().bip86_p2tr_scriptpubkey(6000);
+        assert!(!probe.own_sweep_script_set().contains(&wpkh));
+        for script in [wpkh.clone(), wrapped, tr] {
+            let mut s = close_to_signer(&script, Some(6000));
+            assert_eq!(st(&s).local_shutdown_wallet_index, Some(6000));
+            let c = close(FUNDING_TXID, &[(script.clone(), 600_500), (peer.clone(), 399_000), (Vec::new(), 500)]);
+            let o = sign_close(&mut s, &c);
+            println!("L2 close of our share to our close_to wallet address {}: {:?}", hexbytes(&script), o);
+            assert_eq!(o, Ok(()));
+            // Still held to the balance.
+            let short = close(FUNDING_TXID, &[(script.clone(), 500_500), (peer.clone(), 499_000), (Vec::new(), 500)]);
+            assert!(sign_close(&mut s, &short).unwrap_err().contains("below its balance 601000"));
+        }
+        // The same address under another index is not recognised.
+        let mut s = close_to_signer(&wpkh, Some(6001));
+        let c = close(FUNDING_TXID, &[(wpkh.clone(), 600_500), (peer.clone(), 399_000), (Vec::new(), 500)]);
+        let err = sign_close(&mut s, &c).unwrap_err();
+        println!("L2 close to a close_to script under a wrong index: {err}");
+        assert!(err.contains("0 outputs to us and 2 to the peer"), "{err}");
+        // A script the device cannot derive (the review's case).
+        let close_to: Vec<u8> = [0x00u8, 0x14].iter().copied().chain([0xCC; 20]).collect();
+        let mut s = close_to_signer(&close_to, None);
+        assert_eq!(st(&s).local_shutdown_script, close_to);
+        let c = close(FUNDING_TXID, &[(close_to.clone(), 600_500), (peer.clone(), 399_000), (Vec::new(), 500)]);
+        let err = sign_close(&mut s, &c).unwrap_err();
+        println!("L2 close to a close_to script the device cannot derive: {err}");
+        assert!(err.contains("0 outputs to us and 2 to the peer"), "{err}");
+        // setup_channel's re-send at channeld start keeps the recorded index.
+        let mut s = close_to_signer(&wpkh, Some(6000));
+        track(&mut s, true, &[]);
+        assert_eq!((st(&s).local_shutdown_script.clone(), st(&s).local_shutdown_wallet_index),
+                   (wpkh.clone(), Some(6000)));
+        let blob = s.export_channels();
+        let mut t = signer(Policy::Enforce);
+        assert_eq!(t.import_channels(&blob), Ok(1));
+        assert_eq!(st(&t).local_shutdown_wallet_index, Some(6000));
     }
 }

@@ -450,8 +450,10 @@ impl<S: Read + Write> Write for NoiseStream<S> {
 /// `UnixStream` (fd mode) or a `NoiseStream` over TCP (listen mode); both are
 /// `Read + Write` and the signer frame protocol is identical over either.
 /// A request that changed the channel store is answered only once the store
-/// is on disk; if it cannot be written the request is refused, so a revealed
-/// secret is never ahead of the record of having revealed it.
+/// is on disk; if it cannot be written the request is refused and the store
+/// stays marked as changed, so every later reply is refused too until a save
+/// succeeds: a revealed secret is never ahead of the record of having revealed
+/// it, even when channeld asks again for the one it was refused.
 fn serve<S: Read + Write>(
     stream: &mut S,
     signer: &mut Signer,
@@ -507,6 +509,7 @@ fn serve<S: Read + Write>(
             match save_store(store, &signer.export_channels()) {
                 Ok(()) => reply,
                 Err(e) => {
+                    signer.mark_channels_dirty();
                     logline(
                         log,
                         &format!(
