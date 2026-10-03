@@ -1045,7 +1045,8 @@ bool wallet_add_onchaind_utxo(struct wallet *w,
 		       ", spend_height"
 		       ", scriptpubkey"
 		       ", csv_lock"
-		       ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"));
+		       ", asset"
+		       ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"));
 	db_bind_txid(stmt, &outpoint->txid);
 	db_bind_int(stmt, outpoint->n);
 	db_bind_amount_sat(stmt, amount);
@@ -1068,6 +1069,10 @@ bool wallet_add_onchaind_utxo(struct wallet *w,
 	db_bind_blob(stmt, scriptpubkey, tal_bytelen(scriptpubkey));
 
 	db_bind_int(stmt, csv_lock);
+	/* Every output of a channel's commitment is in the channel's asset
+	 * (asset-aware channels; all zeroes on a chain without assets).  Left
+	 * out, it would read back as the policy asset. */
+	db_bind_blob(stmt, channel->channel_asset, sizeof(channel->channel_asset));
 
 	db_exec_prepared_v2(take(stmt));
 	return true;
