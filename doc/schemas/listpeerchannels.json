@@ -996,7 +996,7 @@
             "channel_asset": {
               "type": "hex",
               "description": [
-                "On an asset-aware chain, the 32-byte display id of the channel's asset when it is not the policy asset; the channel's amounts are in that asset's atoms."
+                "On an asset-aware chain, the 32-byte display id of the channel's asset, the policy asset included; the channel's amounts are in that asset's atoms."
               ]
             }
           },

@@ -20,9 +20,10 @@ in one asset, and only HTLCs that arrive in it are held and counted in
 `incorrect_or_unknown_payment_details`, and logged as "refused an htlc for H in
 asset X". The hold stays `waiting`, so a holder that settles only an `accepted`
 hold never reveals the preimage for a payment in the wrong asset. The plugin
-reads the asset from the `htlc_accepted` hook's `htlc.asset`; for a hold in the
-Sequence token (the policy asset) it checks the HTLC's channel in
-`listpeerchannels`. On other networks there are no assets and every HTLC counts.
+reads the asset from the `htlc_accepted` hook's `htlc.asset`, which names every
+asset, the Sequence token (the policy asset) like any other. A hold an older
+version of the plugin recorded as `"policy"` is read back as the network's
+policy asset. On other networks there are no assets and every HTLC counts.
 
 ## The full amount
 
@@ -46,7 +47,7 @@ counted once), and a settled hold resolves them with its preimage.
 
 ## RPC methods (match seqdex's `clnLNLeg`)
 - `holdinvoice payment_hash [amount_msat] [label] [description] [cltv] [asset] [mpp_timeout]`: register `H` to be held until the parts received reach `amount_msat`, failing them back after `mpp_timeout` seconds (default 60) if they do not. On a Sequentia network `asset` is the 32-byte hex id of the asset to hold the payment in; without it the hold is in the asset of this node's channels when they all hold one, and the call is refused when they hold several or none.
-- `holdinvoicelookup payment_hash`: `{state: waiting|accepted|settled|cancelled|unknown, amount_msat, received_msat, cltv_expiry, blockheight, asset}`. `received_msat` sums the held HTLCs in the hold's asset; `accepted` means it has reached `amount_msat`. `asset` is the hold's asset (absent for the Sequence token, as `listpeerchannels` has it, and on other networks). `cltv_expiry` is the earliest absolute expiry among the held HTLCs (the payer chose it); the holder caps any outgoing payment it makes against the hold so it resolves before that height. `blockheight` is the node's tip, the height that expiry is measured against.
+- `holdinvoicelookup payment_hash`: `{state: waiting|accepted|settled|cancelled|unknown, amount_msat, received_msat, cltv_expiry, blockheight, asset}`. `received_msat` sums the held HTLCs in the hold's asset; `accepted` means it has reached `amount_msat`. `asset` is the hold's asset, the Sequence token's included (absent on other networks). `cltv_expiry` is the earliest absolute expiry among the held HTLCs (the payer chose it); the holder caps any outgoing payment it makes against the hold so it resolves before that height. `blockheight` is the node's tip, the height that expiry is measured against.
 - `holdinvoicewait payment_hash [timeout=60]`: blocks until the hold leaves `waiting` (the whole amount is held, or the hold was settled or cancelled) or `timeout` seconds pass, then answers exactly as `holdinvoicelookup` would. A holder waiting on this acts the moment the HTLC lands instead of a poll interval later.
 - `holdinvoicesettle payment_hash preimage`: resolve held HTLC(s) with the preimage (must hash to `H`). Refused while the hold holds parts short of its amount. The answer carries `received_msat`.
 - `holdinvoicecancel payment_hash`: fail held HTLC(s) back to the payer. The answer carries `received_msat`.

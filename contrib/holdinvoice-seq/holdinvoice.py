@@ -73,10 +73,17 @@ plugin = Plugin()
 # The datastore key under which each hold is kept: [DATASTORE, payment_hash].
 DATASTORE = "holdinvoice-seq"
 
-# A hold registered in this node's policy asset when the caller named none:
-# listpeerchannels names a channel's asset only when it is not the policy
-# asset, so the plugin matches such a hold by the HTLC's channel.
-POLICY = "policy"
+# How a version of this plugin that predates listpeerchannels naming the
+# policy asset recorded a hold in it, with no asset id.  Such a record is
+# read back as the network's policy asset (POLICY_ASSETS).
+LEGACY_POLICY = "policy"
+
+# The policy asset (the Sequence token) of each Sequentia network, by display
+# id, as bitcoin/chainparams.c has it: only to read LEGACY_POLICY records.
+POLICY_ASSETS = {
+    "sequentia-testnet": "c8eccacf0953e1931cd31e434d8319101cc36e6c38b0e2104d8687552fae3e40",
+    "sequentia-regtest": "4d1b177ce67c24263c8a8f756b4e3525ec16fa5dd225e333c1d2d3d3ffe5e57f",
+}
 
 # payment_hash(hex) -> {state, preimage, amount_msat, received_msat,
 #                        cltv_expiry, asset, label, description, cltv,
@@ -126,6 +133,7 @@ def _new_entry(state="waiting", preimage=None, amount_msat=0, asset=None,
 def init(options, configuration, plugin, **kwargs):
     network = plugin.rpc.getinfo().get("network", "")
     ON_SEQUENTIA["value"] = network.startswith("sequentia")
+    policy = POLICY_ASSETS.get(network)
     restored = 0
     for d in plugin.rpc.call("listdatastore", {"key": [DATASTORE]}).get("datastore", []):
         key = d.get("key", [])
@@ -137,8 +145,11 @@ def init(options, configuration, plugin, **kwargs):
         # until lightningd replays the HTLCs it still holds.
         if state == "accepted":
             state = "waiting"
+        asset = rec.get("asset")
+        if asset == LEGACY_POLICY and policy:
+            asset = policy
         HELD[key[1]] = _new_entry(state, rec.get("preimage"),
-                                  rec.get("amount_msat", 0), rec.get("asset"),
+                                  rec.get("amount_msat", 0), asset,
                                   rec.get("label", ""), rec.get("description", ""),
                                   rec.get("cltv", 0),
                                   rec.get("mpp_timeout") or MPP_TIMEOUT)
@@ -167,9 +178,9 @@ def _state_of(plugin, ph):
            # The tip the holder measures that expiry against, so it needs no
            # second round trip to learn it.
            "blockheight": plugin.rpc.getinfo().get("blockheight")}
-    # The asset the hold is in (32-byte display id); absent for the policy
-    # asset, as listpeerchannels has it, and off Sequentia networks.
-    if e.get("asset") and e["asset"] != POLICY:
+    # The asset the hold is in (32-byte display id), the policy asset like
+    # any other; absent off Sequentia networks.
+    if e.get("asset"):
         res["asset"] = e["asset"]
     return res
 
@@ -186,25 +197,13 @@ def _wake_waiters(plugin, ph):
         req.set_result(result)
 
 
-def _channel_assets(plugin):
-    """The asset of each of this node's channels, by short_channel_id (and by
-    local alias): its display id, or POLICY."""
-    out = {}
-    for c in plugin.rpc.listpeerchannels().get("channels", []):
-        asset = c.get("channel_asset") or POLICY
-        for k in (c.get("short_channel_id"), (c.get("alias") or {}).get("local")):
-            if k:
-                out[k] = asset
-    return out
-
-
 def _default_asset(plugin):
     """The one asset this node's usable channels hold, or None."""
     held = set()
     for c in plugin.rpc.listpeerchannels().get("channels", []):
         if c.get("state") in ("CHANNELD_NORMAL", "CHANNELD_AWAITING_SPLICE"):
-            held.add(c.get("channel_asset") or POLICY)
-    return held.pop() if len(held) == 1 else None
+            held.add(c.get("channel_asset"))
+    return held.pop() if len(held) == 1 and None not in held else None
 
 
 @plugin.method("holdinvoice")
@@ -252,7 +251,7 @@ def holdinvoice(plugin, payment_hash, amount_msat=0, label="", description="",
     plugin.log(f"holdinvoice: registered hash {ph} to hold"
                + (f" in asset {asset}" if asset else ""), level="info")
     res = {"payment_hash": ph, "state": "waiting", "received_msat": 0, "bolt11": None}
-    if asset and asset != POLICY:
+    if asset:
         res["asset"] = asset
     return res
 
@@ -401,16 +400,10 @@ def _asset_matches(plugin, e, htlc):
     want = e.get("asset")
     if not want:
         return True, None
+    # The hook names the asset of the channel the HTLC arrived on; an HTLC
+    # without it cannot be judged, so it is refused.
     got = htlc.get("asset")
-    if want != POLICY:
-        # The hook names the asset of the channel the HTLC arrived on; an
-        # HTLC without it cannot be judged, so it is refused.
-        return got == want, got
-    # Held in the policy asset: the HTLC's channel must be one listpeerchannels
-    # shows without a channel_asset.
-    scid = htlc.get("short_channel_id")
-    arrived = _channel_assets(plugin).get(scid)
-    return arrived == POLICY, (got or arrived)
+    return got == want, got
 
 
 def on_htlc_accepted(onion, htlc, request, plugin, **kwargs):
