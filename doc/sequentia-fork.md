@@ -543,7 +543,8 @@ in each closing state and after `close` times out, and one with an HTLC on chain
 fees of channels in assets of any value and between peers that value an asset differently
 (`test_fee_market.py`),
 the asset plugins see on an HTLC, with `holdinvoice-seq` holding only the asset it was
-registered in, across a restart (`test_hold_asset.py`), and the asset an invoice names in its
+registered in, across a restart, and accepted only once the parts it holds reach its amount,
+a part short of it failed back with `mpp_timeout` at the hold's timeout (`test_hold_asset.py`), and the asset an invoice names in its
 `a` field: under its signature, required on decode, refused at creation without a channel in it,
 and the only asset its route hints are in (`test_invoice_asset.py`; `common/test/run-bolt11.c`
 covers the field's encoding and its meaning on Bitcoin), an invoice for another network decoded
