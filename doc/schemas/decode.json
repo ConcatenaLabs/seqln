@@ -2153,6 +2153,59 @@
           "additionalProperties": true,
           "properties": {
             "type": {
+              "type": "string",
+              "enum": [
+                "bolt11 invoice"
+              ]
+            },
+            "valid": {
+              "type": "boolean",
+              "enum": [
+                false
+              ]
+            }
+          }
+        },
+        "then": {
+          "required": [
+            "currency",
+            "warning_network"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "type": {},
+            "valid": {},
+            "currency": {},
+            "created_at": {},
+            "expiry": {},
+            "payee": {},
+            "amount_msat": {},
+            "payment_hash": {},
+            "signature": {},
+            "description": {},
+            "description_hash": {},
+            "min_final_cltv_expiry": {},
+            "payment_secret": {},
+            "features": {},
+            "payment_metadata": {},
+            "asset": {},
+            "fallbacks": {},
+            "routes": {},
+            "extra": {},
+            "warning_network": {
+              "type": "string",
+              "description": [
+                "On a Sequentia network, or for an invoice of one: the invoice is for another network than this node's. It names both networks and their invoice prefixes."
+              ]
+            }
+          }
+        }
+      },
+      {
+        "if": {
+          "additionalProperties": true,
+          "properties": {
+            "type": {
               "enum": [
                 "bolt12 payer_proof"
               ],

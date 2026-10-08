@@ -1854,9 +1854,27 @@ static struct command_result *json_decode(struct command *cmd,
 	if (decodable->payer_proof)
 		json_add_payer_proof(response, decodable->payer_proof);
 	if (decodable->b11) {
+		const struct chainparams *inv_chain = decodable->b11->chain;
 		/* The bolt11 decoder simply refuses to decode bad invs. */
 		json_add_bolt11(response, decodable->b11);
-		json_add_bool(response, "valid", true);
+		/* Sequentia: an invoice for another network is not one this
+		 * node can pay or be paid by, when either network is a
+		 * Sequentia one.  Between two Bitcoin networks, decode as
+		 * upstream does. */
+		if (inv_chain != chainparams
+		    && (chainparams->has_anchor_header
+			|| inv_chain->has_anchor_header)) {
+			json_add_string(response, "warning_network",
+					tal_fmt(tmpctx,
+						"the invoice is for %s (ln%s),"
+						" and this node runs %s (ln%s)",
+						inv_chain->network_name,
+						inv_chain->lightning_hrp,
+						chainparams->network_name,
+						chainparams->lightning_hrp));
+			json_add_bool(response, "valid", false);
+		} else
+			json_add_bool(response, "valid", true);
 	}
 	if (decodable->rune)
 		json_add_rune(cmd, response, decodable->rune);

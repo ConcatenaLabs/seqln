@@ -338,6 +338,10 @@ read `lntsqt...`) and one more tagged field, which carries the asset:
   invoice ("a: expected 52 characters"), as BOLT 11 requires for its fixed-length fields.
 - On any other chain `a` is an unknown field, which BOLT 11 readers skip, so a Bitcoin or
   Liquid invoice means what it always did.
+- An invoice for another network is not valid where either network is a Sequentia one: `decode`
+  shows its fields with `valid: false` and `warning_network` naming both networks ("the invoice
+  is for regtest (lnbcrt), and this node runs sequentia-regtest (lnsqrt)"), and `pay` refuses
+  it. Between two Bitcoin networks `decode` reads an invoice as upstream does.
 
 Invoice amounts are numeric msat fields read as thousandths of the asset's atoms.
 
@@ -542,7 +546,9 @@ the asset plugins see on an HTLC, with `holdinvoice-seq` holding only the asset 
 registered in, across a restart (`test_hold_asset.py`), and the asset an invoice names in its
 `a` field: under its signature, required on decode, refused at creation without a channel in it,
 and the only asset its route hints are in (`test_invoice_asset.py`; `common/test/run-bolt11.c`
-covers the field's encoding and its meaning on Bitcoin), and route finding in that asset: a payer
+covers the field's encoding and its meaning on Bitcoin), an invoice for another network decoded
+`valid: false` with both networks named, on Bitcoin regtest too (`test_decode_network.py`), and
+route finding in that asset: a payer
 with channels in two assets paying each invoice in its own, to a direct peer as well as over two
 hops, `getroute` in one asset, an unannounced first hop, and an invoice in an asset the payer
 cannot send refused with no HTLC offered anywhere, and a route whose first hop carries less than
