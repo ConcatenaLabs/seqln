@@ -424,10 +424,16 @@ host can defend the channel while the device is offline, without ever holding a 
   not a plugin and not spawned by `lightningd`, that loads the store, watches each channel's
   funding output through the node's CLI, and on a revoked commitment confirming broadcasts its
   justice set as one transaction. It never loads a secret. It pays the fee from a box-owned
-  node wallet (`--fee-wallet`) holding UTXOs in the channel asset: it appends one fee input and
-  change, pays the fee in the channel asset at the node's exchange rate for it
-  (`getfeeexchangerates`; `--fee-base-perkw` and `--fee-max-perkw` are in reference atoms), and
-  raises it by replacement each round until the justice confirms. A round costs a few CLI calls
+  node wallet (`--fee-wallet`): it appends one fee input and its change, and pays the fee in that
+  coin's asset at the node's exchange rate for it (`getfeeexchangerates`; `--fee-base-perkw` and
+  `--fee-max-perkw` are in reference atoms), raising it by replacement each round until the
+  justice confirms. The fee coin is chosen as a wallet chooses the fee coin of an exit: in the
+  channel's asset when the node accepts that for fees and the wallet holds it; otherwise in the
+  accepted asset whose largest coin covers the most fees (its value over the fee of a kilo-vbyte
+  in it), with no asset preferred for what it is. The swept outputs stay in the channel asset, so
+  a justice transaction may carry two assets. The tower logs the asset and amount of each fee it
+  pays and why it is not the channel asset; a tower holding no coin in an accepted asset says so
+  once and tries again every round. A round costs a few CLI calls
   per channel; the stored revoked commitments are polled only once a channel's funding output is
   spent. It needs the node to run with `txindex=1`.
 
@@ -490,7 +496,8 @@ keyless node
 started on a version-1 store, whose device signs no step of the channels in it while the hub
 closes them, moves what the closes paid it to its own address, and pays both ways over a channel
 opened afterwards (`test_predating_store.py`), a breach of an asset channel with a pending HTLC
-answered by `speculad` while the victim is offline (`test_watchtower.py`), a keyless node, as
+answered by `speculad` while the victim is offline, also once the node has delisted the channel's
+asset, with the fee paid from another asset the tower holds (`test_watchtower.py`), a keyless node, as
 either side of a channel, closing it and restarting with it closing (`test_keyless_close.py`), a
 keyless node whose device, moved onto an older store, refuses its closing transaction, at start
 in each closing state and after `close` times out, and one with an HTLC on chain
@@ -560,7 +567,7 @@ Each verified present in the code as of 2026-07-08:
    issued-asset channel, and a breach of one answered by `speculad`, run in `tests/sequentia/`,
    and force-close resolution has been exercised on the testnet, but no test covers a penalty
    across a Bitcoin-anchor tail truncation.
-6. **`speculad` pays a justice transaction's fee only in the channel asset.** If the node stops
-   accepting that asset for fees, the tower cannot fund the justice transaction (it logs the
-   asset and broadcasts it unfunded, which the network refuses). Its fee wallet must also hold a
-   UTXO in each channel asset it defends.
+6. **`speculad` needs a fee coin in an asset the node accepts.** Its fee wallet must hold at
+   least one P2WPKH coin in an accepted asset, large enough for the fee of every output of one
+   breach; while it holds none, a breach goes unanswered (the tower logs it and retries each
+   round), and the cheater's delayed outputs become spendable after the channel's delay.

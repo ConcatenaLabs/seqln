@@ -5,7 +5,9 @@ pre-sign a justice set for every commitment its peer revokes.  speculad, which
 holds no key, reads that store and answers a breach while the node is down.
 These tests break a channel in an asset priced away from par while the victim
 is offline and check that speculad sweeps every output of the revoked
-commitment to the victim, in the channel asset, with a fee the network relays.
+commitment to the victim, in the channel asset, with a fee the network relays:
+in the channel asset, or, once the node has delisted it, in another asset the
+tower holds.
 Run with TEST_NETWORK=sequentia-regtest (README.md, "Testing").
 """
 from decimal import Decimal
@@ -94,21 +96,29 @@ def cli(bitcoind, *args):
          '-conf=' + bitcoind.conf_file] + list(args)).decode().strip()
 
 
-def fee_wallet(bitcoind, asset):
+def fee_wallet(bitcoind, asset, holdings=None):
     """A wallet of its own for the tower, holding `asset` in exactly one
-    P2WPKH output: everything the tower broadcasts for one breach must share
-    it.  Wallet RPCs through the fixture stop working once a second wallet is
-    loaded, so this is the last thing a test funds."""
+    P2WPKH output (or one output per (asset, amount) of `holdings`):
+    everything the tower broadcasts for one breach must share it.  Wallet
+    RPCs through the fixture stop working once a second wallet is loaded, so
+    this is the last thing a test funds through the fixture."""
     name = 'speculad-fee'
     bitcoind.rpc.createwallet(name)
-    addr = cli(bitcoind, '-rpcwallet=' + name, 'getnewaddress', '', 'bech32')
-    txid = cli(bitcoind, '-rpcwallet=lightningd-tests', '-named', 'sendtoaddress',
-               'address=' + addr, 'amount=1', 'assetlabel=' + asset,
-               'fee_asset_label=' + asset)
-    bitcoind.generate_block(1, wait_for_mempool=txid)
+    holdings = holdings or [(asset, 1)]
+    txids = [fund_fee_wallet(bitcoind, name, a, amount) for a, amount in holdings]
+    bitcoind.generate_block(1, wait_for_mempool=txids)
     utxos = json.loads(cli(bitcoind, '-rpcwallet=' + name, 'listunspent'))
-    assert [u['asset'] for u in utxos] == [asset], utxos
+    assert sorted(u['asset'] for u in utxos) == sorted(a for a, _ in holdings), utxos
     return name
+
+
+def fund_fee_wallet(bitcoind, name, asset, amount):
+    """Send `amount` units of `asset` to the fee wallet `name`, paying the fee
+    in the asset itself; returns the txid (unconfirmed)."""
+    addr = cli(bitcoind, '-rpcwallet=' + name, 'getnewaddress', '', 'bech32')
+    return cli(bitcoind, '-rpcwallet=lightningd-tests', '-named', 'sendtoaddress',
+               'address=' + addr, 'amount={}'.format(amount), 'assetlabel=' + asset,
+               'fee_asset_label=' + bitcoind.POLICY_ASSET)
 
 
 def db_query(node, query):
@@ -170,12 +180,17 @@ def spenders(bitcoind, txids, txid):
     return found
 
 
-def breach(node_factory, bitcoind, executor, directory, rate, victim_offers):
+def breach(node_factory, bitcoind, executor, directory, rate, victim_offers,
+           tower_phase=None):
     """l1 cheats l2 on a channel in an asset priced at `rate`: it broadcasts
     a commitment, revoked since, that carries a pending HTLC (offered by l2
     when `victim_offers`, by l1 otherwise) while l2 is down.  speculad, for
-    l2, must sweep every output of it but l2's own to l2.  Returns the
-    revoked commitment and the justice transactions, decoded."""
+    l2, must sweep every output of it but l2's own to l2.  `tower_phase`,
+    when given, is called as tower_phase(bitcoind, asset) once the revoked
+    commitment is mined, and returns the tower's fee wallet and a function
+    run once the tower has started (or None).  Returns the nodes, the
+    asset, the revoked commitment, the justice transactions decoded, and
+    the tower's log."""
     hold = {'plugin': HOLD_PLUGIN}
     # The dust-exposure limit is a number of atoms of the channel asset, and
     # its default leaves no room for an HTLC on a channel whose feerate in
@@ -232,9 +247,15 @@ def breach(node_factory, bitcoind, executor, directory, rate, victim_offers):
     bitcoind.rpc.sendrawtransaction(snapshot)
     bitcoind.generate_block(1, wait_for_mempool=revoked_txid)
 
-    tower = Speculad(l2, bitcoind, fee_wallet(bitcoind, asset), directory)
+    if tower_phase:
+        wallet, started = tower_phase(bitcoind, asset)
+    else:
+        wallet, started = fee_wallet(bitcoind, asset), None
+    tower = Speculad(l2, bitcoind, wallet, directory)
     tower.start()
     try:
+        if started:
+            started(tower)
         outs = {o['n']: o for o in revoked['vout']}
         # Every output l1 could claim is revocable: P2WSH, to_local and HTLCs.
         targets = [n for n, o in outs.items()
@@ -270,7 +291,7 @@ def breach(node_factory, bitcoind, executor, directory, rate, victim_offers):
               if n not in targets and o['scriptPubKey']['type'] != 'fee']
     for n in others:
         assert outs[n]['scriptPubKey']['type'] == 'witness_v0_keyhash'
-    return l1, l2, asset, revoked, list(justice.values())
+    return l1, l2, asset, revoked, list(justice.values()), tower.output()
 
 
 @pytest.mark.parametrize('rate', [PAR, CHEAP, DEAR], ids=['par', 'cheap', 'dear'])
@@ -280,8 +301,8 @@ def test_watchtower_sweeps_asset_breach(node_factory, bitcoind, executor,
     """A breach with a pending HTLC on an asset channel, the victim offline:
     the tower sweeps the cheater's balance and the HTLC to the victim, in the
     asset, paying a fee that is worth at least the relay minimum."""
-    l1, l2, asset, revoked, justice = breach(node_factory, bitcoind, executor,
-                                             directory, rate, victim_offers)
+    l1, l2, asset, revoked, justice, _ = breach(node_factory, bitcoind, executor,
+                                                directory, rate, victim_offers)
     for j in justice:
         atoms = fee_atoms(j, asset)
         value = atoms * rate / PAR
@@ -289,6 +310,72 @@ def test_watchtower_sweeps_asset_breach(node_factory, bitcoind, executor,
         print("justice {}: {} vB, fee {} atoms = {} reference atoms, relay floor {}"
               .format(j['txid'], j['vsize'], atoms, value, floor))
         assert value >= floor
+
+
+@pytest.mark.parametrize('victim_offers', [False, True], ids=['cheater-offered', 'victim-offered'])
+def test_watchtower_fee_in_another_asset(node_factory, bitcoind, executor,
+                                         directory, victim_offers):
+    """The channel's asset is delisted between the breach and the tower's
+    answer.  The tower holds that asset, a small coin of the policy asset and
+    a large coin of another accepted asset: it pays the justice fee from the
+    accepted asset whose largest coin covers the most fees, the other asset
+    here, never preferring the policy asset, and says so; every output is
+    still swept to the victim in the channel asset."""
+    other = bitcoind.issue_asset(1000)
+    # One atom of OTHER is worth ten reference atoms.
+    other_rate = 10**9
+
+    def tower_phase(bitcoind, asset):
+        bitcoind.set_fee_rates({bitcoind.POLICY_ASSET: PAR, other: other_rate})
+        return fee_wallet(bitcoind, asset, [(asset, 1),
+                                            (bitcoind.POLICY_ASSET, Decimal('0.01')),
+                                            (other, 1)]), None
+
+    l1, l2, asset, revoked, justice, log = breach(node_factory, bitcoind, executor,
+                                                  directory, DEAR, victim_offers,
+                                                  tower_phase)
+    assert asset not in json.dumps(bitcoind.rpc.getfeeexchangerates())
+    for j in justice:
+        fee = only_one([o for o in j['vout'] if o['scriptPubKey']['type'] == 'fee'])
+        atoms = int(Decimal(fee['value']) * PAR)
+        value = atoms * other_rate / PAR
+        floor = MIN_RELAY_PER_KVB * j['vsize'] / 1000
+        print("justice {}: {} vB, fee {} atoms of {} = {} reference atoms, relay floor {}"
+              .format(j['txid'], j['vsize'], atoms, fee['asset'], value, floor))
+        assert fee['asset'] == other
+        assert value >= floor
+    assert 'fee {} atoms of asset {}, the channel asset is not accepted for fees by this node'.format(
+        atoms, other) in log
+
+
+def test_watchtower_fee_coin_missing_then_funded(node_factory, bitcoind, executor,
+                                                 directory):
+    """A tower holding no coin of an asset the node accepts says so, and
+    funds the justice once it holds one."""
+    other = bitcoind.issue_asset(1000)
+
+    def tower_phase(bitcoind, asset):
+        bitcoind.set_fee_rates({bitcoind.POLICY_ASSET: PAR, other: PAR})
+        name = fee_wallet(bitcoind, asset)
+
+        def started(tower):
+            wait_for(lambda: 'the fee wallet holds no coin in an asset this node '
+                     'accepts for fees, nor is the channel asset accepted (it holds: '
+                     '100000000 atoms of {}); trying again every round'.format(asset)
+                     in tower.output())
+            # No justice goes out meanwhile.
+            assert bitcoind.rpc.getrawmempool() == []
+            txid = fund_fee_wallet(bitcoind, name, other, 1)
+            bitcoind.generate_block(1, wait_for_mempool=txid)
+        return name, started
+
+    l1, l2, asset, revoked, justice, log = breach(node_factory, bitcoind, executor,
+                                                  directory, CHEAP, False,
+                                                  tower_phase)
+    for j in justice:
+        fee = only_one([o for o in j['vout'] if o['scriptPubKey']['type'] == 'fee'])
+        assert fee['asset'] == other
+    assert log.count('trying again every round') == 1
 
 
 def test_watchtower_store_bounded(node_factory, bitcoind, directory):
