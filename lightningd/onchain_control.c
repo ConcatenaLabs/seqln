@@ -692,12 +692,13 @@ static u32 infinite_block_deadline(const struct chain_topology *topo)
  * linearly increasing the confirmation target until we get
  * close. However, we also don't want to panic and set a target that
  * is too close, in order not to waste too many funds on the sweep
- * fees.
+ * fees.  `from` is the height the window is measured from: the current
+ * one, or the one at which the output can first be spent.
  */
 static u32 slow_sweep_deadline(const struct chain_topology *topo,
-			       const struct channel *c)
+			       const struct channel *c, u32 from)
 {
-	u32 closeheight, deadline, height = get_block_height(topo);
+	u32 closeheight, deadline, height = from;
 
 	if (c->close_blockheight) {
 		closeheight = *c->close_blockheight;
@@ -1385,9 +1386,25 @@ static void handle_onchaind_spend_to_us(struct channel *channel,
 		return;
 	}
 
-	/* No real deadline on this, it's just returning to our wallet. */
+	/* No real deadline on this, it's just returning to our wallet.  But
+	 * it cannot be spent before `minblock`, when its delay has run
+	 * (`to_self_delay`, about a day of blocks on a Sequentia network):
+	 * a deadline that falls before that, or within the slow sweep's
+	 * shortest window (12 blocks) after it, would have the sweep bid
+	 * the feerate for the next block from its first attempt.  Then the
+	 * window is measured from the block it can first be mined in. */
 	info->deadline_block =
-	    slow_sweep_deadline(channel->peer->ld->topology, channel);
+	    slow_sweep_deadline(channel->peer->ld->topology, channel,
+				get_block_height(channel->peer->ld->topology));
+	if (info->deadline_block < info->minblock + 12) {
+		log_debug(channel->log,
+			  "Sweep deadline %u falls before its output can be"
+			  " spent (block %u): measuring from there",
+			  info->deadline_block, info->minblock);
+		info->deadline_block =
+		    slow_sweep_deadline(channel->peer->ld->topology, channel,
+					info->minblock);
+	}
 
 	/* sequence is usually channel->channel_info.their_config.to_self_delay,
 	 * but for leases it can be greater. */
