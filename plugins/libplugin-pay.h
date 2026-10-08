@@ -501,4 +501,11 @@ const u8 *payment_default_asset(const tal_t *ctx, struct command *cmd,
 const char *payment_asset_unsendable(const tal_t *ctx, struct command *cmd,
 				     const u8 *asset);
 
+/* Sequentia: parse a 32-byte hex asset id (display order) into its 33-byte
+ * tag (0x01 || id in serialization order), the form channels and the
+ * gossip record it in. */
+struct command_result *param_asset_id(struct command *cmd, const char *name,
+				      const char *buffer, const jsmntok_t *tok,
+				      const u8 **asset);
+
 #endif /* LIGHTNING_PLUGINS_LIBPLUGIN_PAY_H */

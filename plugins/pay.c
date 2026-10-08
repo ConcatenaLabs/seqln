@@ -867,29 +867,6 @@ preapproveinvoice_succeed(struct command *cmd,
 
 	return start_payment(cmd, p);
 }
-/* Sequentia: parse a 32-byte hex asset id into its 33-byte on-chain tag
- * (0x01 || reversed), matching fundchannel's `asset` param and a channel's
- * gossip-recorded asset, so `pay asset=<id>` routes only over that asset. */
-static struct command_result *param_asset_tag(struct command *cmd,
-					      const char *name,
-					      const char *buffer,
-					      const jsmntok_t *tok,
-					      const u8 **asset)
-{
-	u8 id[32], *tag;
-
-	if (!hex_decode(buffer + tok->start, tok->end - tok->start,
-			id, sizeof(id)))
-		return command_fail_badparam(cmd, name, buffer, tok,
-					     "expected a 32-byte hex asset id");
-	tag = tal_arr(cmd, u8, 33);
-	tag[0] = 0x01;
-	for (size_t i = 0; i < sizeof(id); i++)
-		tag[1 + i] = id[sizeof(id) - 1 - i];
-	*asset = tag;
-	return NULL;
-}
-
 static struct command_result *json_pay(struct command *cmd,
 				       const char *buf,
 				       const jsmntok_t *params)
@@ -944,7 +921,7 @@ static struct command_result *json_pay(struct command *cmd,
 		   p_opt("maxfee", param_msat, &maxfee),
 		   p_opt("description", param_escaped_string, &description),
 		   p_opt("partial_msat", param_msat, &partial),
-		   p_opt("asset", param_asset_tag, &asset),
+		   p_opt("asset", param_asset_id, &asset),
 		   p_opt_dev("dev_use_shadow", param_bool, &dev_use_shadow, true),
 		      NULL))
 		return command_param_failed();

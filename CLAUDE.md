@@ -106,8 +106,9 @@ strings puts a node in a re-exec loop.
 - **Asset channels must use single-funder `fundchannel`.** Dual-funded (v2) opens and splicing are
   not asset-aware: `amount_asset_to_sat()` still asserts the policy asset, and the interactive-tx
   and dualopend paths abort the daemon on a non-policy output.
-- **Only `pay` keeps a payment in one asset.** xpay, askrene, renepay and keysend are
-  asset-blind, and xpay does not take over `pay` on Sequentia networks for that reason. An
+- **Only `pay`, `keysend` and `getroute` keep a payment in one asset.** xpay, askrene and
+  renepay are asset-blind, and xpay does not take over `pay` on Sequentia networks for that
+  reason. An
   invoice on a Sequentia network names its asset in the BOLT11 field `a`, and one without it
   does not decode (`doc/sequentia-fork.md` section 6).
 - **Policy-asset asserts fire on asset channels and take the whole daemon down.** Reading an output

@@ -190,6 +190,7 @@ static struct command_result *json_keysend(struct command *cmd, const char *buf,
 	struct tlv_field *extra_fields;
 	bool *dev_use_shadow;
 	struct out_req *req;
+	const u8 *asset;
 
 	/* BOLT #4:
 	 * ## `max_htlc_cltv` Selection
@@ -210,9 +211,29 @@ static struct command_result *json_keysend(struct command *cmd, const char *buf,
 		   p_opt("extratlvs", param_extra_tlvs, &extra_fields),
 		   p_opt("routehints", param_routehint_array, &hints),
 		   p_opt("maxfee", param_msat, &maxfee),
+		   p_opt("asset", param_asset_id, &asset),
 		   p_opt_dev("dev_use_shadow", param_bool, &dev_use_shadow, true),
 		   NULL))
 		return command_param_failed();
+
+	/* Sequentia: a keysend is in one asset, the one named, else the
+	 * asset of this node's channels when they all hold one.  It routes
+	 * only over channels in it, so no route mixes assets, and an asset
+	 * this node cannot send is refused before any HTLC is offered. */
+	if (chainparams->has_anchor_header && chainparams->fee_asset_tag) {
+		const char *why;
+
+		if (!asset) {
+			asset = payment_default_asset(cmd, cmd, &why);
+			if (!asset)
+				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+						    "%s", why);
+		}
+		why = payment_asset_unsendable(tmpctx, cmd, asset);
+		if (why)
+			return command_fail(cmd, PAY_INSUFFICIENT_FUNDS,
+					    "%s", why);
+	}
 
 	p = payment_new(cmd, cmd, NULL /* No parent */, global_hints, pay_mods);
 	p->local_id = &my_id;
@@ -226,8 +247,14 @@ static struct command_result *json_keysend(struct command *cmd, const char *buf,
 	 * caller to provide keysend secret */
 	p->our_amount = p->final_amount = *msat;
 	p->routes = tal_steal(p, hints);
+	p->asset = asset ? tal_steal(p, asset) : NULL;
 	// 42 is the Rust-Lightning default and the highest minimum we know of.
 	p->min_final_cltv_expiry = 42;
+	/* Sequentia: a payee's final delta defaults to 180 blocks here, not
+	 * Bitcoin's 18 (lightningd/options.c), so 42 is refused as too soon.
+	 * Keep the same margin over it that 42 keeps over 18. */
+	if (chainparams->has_anchor_header)
+		p->min_final_cltv_expiry = 420;
 	p->features = NULL;
 	p->invstring = NULL;
 	/* Don't try to use invstring to hand to sendonion! */
@@ -295,9 +322,11 @@ static struct command_result *json_keysend(struct command *cmd, const char *buf,
 
 static const struct plugin_command commands[] = {
     {
+	    /* Not deprecated here as upstream has it: its replacement,
+	     * xpay's keysend, knows nothing of assets, and this one routes
+	     * in a Sequentia asset. */
 	    "keysend",
 	    json_keysend,
-	    "v26.06", "v27.03",
     },
 };
 
