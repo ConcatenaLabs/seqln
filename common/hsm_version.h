@@ -35,6 +35,7 @@
  * v6 with bip86_base in TLV: 6bb6e6ee256f22a6fb41856c90feebde3065a9074e79a46731e453a932be83f0
  * v6 with hsmd_sign_local_htlc_tx removed: 0e28ca3699196cf9d26d38f8f621d1bf68c76cf5e2cdc1f4157a6937b02dc2f6
  * v6 with sign_commitment_tx_refused (Sequentia hsmd proxy): 5672f896e39766d6fc91903b9fb9b0b48a0ff93abb7ec0448bcca2f9078685a9
+ * v6 with setup_channel dust limits and reserves (Sequentia, a TLV): e5b9838099bb644ba32fdc2e616b7170e07cc1908a688e108f4788efb1365391
  */
 #define HSM_MIN_VERSION 5
 #define HSM_MAX_VERSION 6
