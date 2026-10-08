@@ -11,16 +11,15 @@
 
 /* NOTE on WT_TMPL_STEAL_HTLC_TX_PENALTY (2nd-stage penalty):
  *
- * This spends an output on the COUNTERPARTY's HTLC-success/HTLC-timeout tx.
- * That tx's txid does not exist until the cheater broadcasts it post-breach,
- * so under SIGHASH_SINGLE|ANYONECANPAY (which binds the input outpoint) the
- * blob cannot be pre-signed at revoke_and_ack time.  We therefore do NOT emit
- * it from the revoke-time justice set; it is a device-online-only fallback.
- * The revoke-time set relies instead on the first-stage steal_htlc penalty
- * (kind 1), whose outpoint IS known (an output of the revoked commitment tx),
- * given a tight/bumpable fee so speculad sweeps the HTLC commitment output
- * before the counterparty's HTLC-tx can confirm.  The enum value is retained
- * so Phase C can slot the fallback in without reshaping the store schema.
+ * This spends the output of the COUNTERPARTY's HTLC-success/HTLC-timeout tx
+ * on a revoked commitment, through the revocation key.  Channels here have
+ * no anchors, so that tx is SIGHASH_ALL-signed by us when the commitment is
+ * signed: its txid and output value are fixed then, long before the peer
+ * could broadcast it.  channeld records both in the penalty base
+ * (penalty_htlc.stage2_txid, stage2_amount) and pre-signs this blob at
+ * revoke_and_ack, beside the first-stage steal_htlc penalty (kind 1).
+ * speculad broadcasts it only once the peer's second-stage tx has confirmed,
+ * i.e. when the peer has won the race for the commitment's HTLC output.
  *
  * NOTE on TIER-2 (HTLC_TIMEOUT / HTLC_SUCCESS): the current-state HTLC
  * 2nd-stage txs are peer-co-signed (remote_htlc_sig) and, absent anchors, only

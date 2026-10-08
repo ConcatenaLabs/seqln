@@ -32,9 +32,9 @@ enum wt_tmpl_kind {
 	WT_TMPL_TO_LOCAL_PENALTY = 0,	  /* counterparty to_local; witness <sig> 0x01 */
 	WT_TMPL_STEAL_HTLC_PENALTY = 1,	  /* revoked HTLC output; witness <sig> <revocationpubkey> */
 
-	/* Justice, NOT revoke-time pre-signable (input is the cheater's future
-	 * HTLC-tx, txid unknown until they broadcast).  Kept as a device-online
-	 * fallback / Phase-C seam; see note in presign_templates.c. */
+	/* Justice on the output of the cheater's second-stage HTLC transaction
+	 * (HTLC-timeout or HTLC-success of the revoked commitment); witness
+	 * <sig> 0x01.  See the note in presign_templates.c. */
 	WT_TMPL_STEAL_HTLC_TX_PENALTY = 2,
 
 	/* Current-state honest sweeps (refreshed each advance): */

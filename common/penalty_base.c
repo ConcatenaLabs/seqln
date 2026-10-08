@@ -2,6 +2,7 @@
 #include <assert.h>
 #include <common/penalty_base.h>
 #include <common/utils.h>
+#include <string.h>
 #include <wire/wire.h>
 
 /* txout must be within tx! */
@@ -42,7 +43,9 @@ void penalty_base_add_htlc(struct penalty_base *pbase,
 			   struct amount_sat amount,
 			   const struct sha256 *payment_hash,
 			   u32 cltv_expiry,
-			   bool remote_offered)
+			   bool remote_offered,
+			   const struct bitcoin_txid *stage2_txid,
+			   struct amount_sat stage2_amount)
 {
 	struct penalty_htlc h;
 
@@ -51,6 +54,11 @@ void penalty_base_add_htlc(struct penalty_base *pbase,
 	h.payment_hash = *payment_hash;
 	h.cltv_expiry = cltv_expiry;
 	h.remote_offered = remote_offered;
+	if (stage2_txid)
+		h.stage2_txid = *stage2_txid;
+	else
+		memset(&h.stage2_txid, 0, sizeof(h.stage2_txid));
+	h.stage2_amount = stage2_txid ? stage2_amount : AMOUNT_SAT(0);
 	tal_arr_expand(&pbase->htlcs, h);
 }
 
@@ -67,6 +75,8 @@ void towire_penalty_base(u8 **pptr, const struct penalty_base *pbase)
 		towire_sha256(pptr, &pbase->htlcs[i].payment_hash);
 		towire_u32(pptr, pbase->htlcs[i].cltv_expiry);
 		towire_bool(pptr, pbase->htlcs[i].remote_offered);
+		towire_bitcoin_txid(pptr, &pbase->htlcs[i].stage2_txid);
+		towire_amount_sat(pptr, pbase->htlcs[i].stage2_amount);
 	}
 }
 
@@ -101,6 +111,8 @@ struct penalty_base *fromwire_penalty_base(const tal_t *ctx,
 		fromwire_sha256(pptr, max, &pbase->htlcs[i].payment_hash);
 		pbase->htlcs[i].cltv_expiry = fromwire_u32(pptr, max);
 		pbase->htlcs[i].remote_offered = fromwire_bool(pptr, max);
+		fromwire_bitcoin_txid(pptr, max, &pbase->htlcs[i].stage2_txid);
+		pbase->htlcs[i].stage2_amount = fromwire_amount_sat(pptr, max);
 	}
 	return pbase;
 }

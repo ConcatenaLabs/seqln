@@ -403,10 +403,11 @@ def test_watchtower_store_bounded(node_factory, bitcoind, directory):
     print("{} payments: {} justice files, sizes {}..{} bytes, {} bytes in all"
           .format(payments, len(files), sizes[0], sizes[-1], sum(sizes)))
     # One file per commitment l1 revoked, two per payment.  Its size is fixed
-    # by what that commitment held: one blob for l1's balance and one per HTLC
-    # (none or one here), never by how many states came before it.
+    # by what that commitment held: one blob for l1's balance and two per
+    # HTLC (its output, and the output of l1's second-stage transaction for
+    # it; none or one HTLC here), never by how many states came before it.
     assert len(files) == 2 * payments
-    assert sizes[-1] < 3 * sizes[0]
+    assert sizes[-1] < 4 * sizes[0]
 
     # Used penalty bases are dropped: what is left is the commitments the
     # peer has not revoked yet.
@@ -440,3 +441,175 @@ def test_watchtower_store_bounded(node_factory, bitcoind, directory):
     bitcoind.generate_block(100)
     wait_for(lambda: l2.rpc.listpeerchannels()['channels'] == [])
     assert not os.path.exists(store)
+
+
+def sqlite_backup(node, dest):
+    """A consistent copy of `node`'s live database (it runs in WAL mode)."""
+    path = os.path.join(node.daemon.lightning_dir, TEST_NETWORK, 'lightningd.sqlite3')
+    src = sqlite3.connect('file:{}?mode=ro'.format(path), uri=True)
+    dst = sqlite3.connect(dest)
+    try:
+        src.backup(dst)
+    finally:
+        src.close()
+        dst.close()
+
+
+def sqlite_restore(node, backup):
+    netdir = os.path.join(node.daemon.lightning_dir, TEST_NETWORK)
+    for suffix in ('-wal', '-shm'):
+        if os.path.exists(os.path.join(netdir, 'lightningd.sqlite3' + suffix)):
+            os.unlink(os.path.join(netdir, 'lightningd.sqlite3' + suffix))
+    with open(backup, 'rb') as f, open(os.path.join(netdir, 'lightningd.sqlite3'), 'wb') as t:
+        t.write(f.read())
+
+
+@pytest.mark.parametrize('second_stage', ['htlc-success', 'htlc-timeout'])
+def test_watchtower_punishes_second_stage_in_delisted_asset(node_factory, bitcoind,
+                                                            executor, directory,
+                                                            second_stage):
+    """The cheater broadcasts a revoked commitment carrying an HTLC and wins
+    the race for the HTLC output with its own second-stage transaction
+    (HTLC-success for an HTLC it received, HTLC-timeout for one it offered),
+    which the victim signed for that commitment.  Then the node delists the
+    channel's asset.  The tower, the victim offline, sweeps the cheater's
+    balance and the output of that second-stage transaction to the victim,
+    in the channel asset, paying the fee in another asset it holds."""
+    other = bitcoind.issue_asset(1000)
+    other_rate = 10**9
+    success = second_stage == 'htlc-success'
+    hold = {'plugin': HOLD_PLUGIN}
+    dust = {'max-dust-htlc-exposure-msat': 10**12}
+    victim = {'watchtower-store': 'on', **dust, 'may_reconnect': True}
+    cheater = {**dust, 'may_fail': True, 'may_reconnect': True,
+               'broken_log': '.*'}
+    if success:
+        # The cheater learns the preimage of the HTLC it receives, and stops
+        # before telling the victim: its commitment still carries the HTLC.
+        cheater['disconnect'] = ['-WIRE_UPDATE_FULFILL_HTLC']
+        opts = [cheater, victim]
+    else:
+        opts = [cheater, {**victim, **hold}]
+    l1, l2, asset = asset_channel(node_factory, bitcoind, DEAR, 10**8, opts)
+
+    amount_msat = 2 * 10**6 * 1000
+    if success:
+        inv = l2.rpc.invoice(2 * amount_msat, 'fund-l2', 'fund l2')['bolt11']
+        l1.rpc.pay(inv)
+        inv = l1.rpc.invoice(amount_msat, 'held', 'held')['bolt11']
+        paying = executor.submit(l2.rpc.pay, inv)
+        l1.daemon.wait_for_log('dev_disconnect: -WIRE_UPDATE_FULFILL_HTLC')
+        assert [h['direction'] for h in channel(l1, l2)['htlcs']] == ['in']
+    else:
+        inv = l2.rpc.invoice(amount_msat, 'held', 'held')['bolt11']
+        paying = executor.submit(l1.rpc.pay, inv)
+        wait_for(lambda: [h['state'] for h in channel(l1, l2)['htlcs']]
+                 == ['SENT_ADD_ACK_REVOCATION'])
+        l2.daemon.wait_for_log('Calling invoice_payment hook')
+
+    # The cheater keeps a copy of this state.
+    backup = os.path.join(directory, 'cheater.sqlite3')
+    sqlite_backup(l1, backup)
+
+    # Both sides move on, and the cheater revokes the state it kept.
+    if success:
+        l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    else:
+        unhold(l2)
+    paying.result(TIMEOUT)
+    for a, b in ((l1, l2), (l2, l1)):
+        wait_for(lambda: channel(a, b)['htlcs'] == [])
+    inv = l2.rpc.invoice(10**6, 'move-on', 'move on')['bolt11']
+    l1.rpc.pay(inv)
+    victim_addrs = set(a.get('bech32') for a in l2.rpc.call('listaddresses')['addresses'])
+    store = os.path.join(l2.daemon.lightning_dir, TEST_NETWORK, 'watchtower')
+
+    # The victim goes down.  The cheater comes back on the state it kept and
+    # closes the channel with it.
+    l2.stop()
+    l1.stop()
+    sqlite_restore(l1, backup)
+    l1.start()
+    l1.rpc.close(l2.info['id'], 1)
+    l1.daemon.wait_for_log('sendrawtx exit 0')
+    revoked_txid = only_one(bitcoind.rpc.getrawmempool())
+    revoked = bitcoind.rpc.getrawtransaction(revoked_txid, True)
+    assert any(os.path.exists(os.path.join(store, d, 'justice', revoked_txid))
+               for d in os.listdir(store)), "the victim's store has no justice for it"
+    bitcoind.generate_block(1, wait_for_mempool=revoked_txid)
+
+    # Its second-stage transaction for the HTLC output.
+    if success:
+        rawtx, stage2_txid, blocks = l1.wait_for_onchaind_tx(
+            'OUR_HTLC_SUCCESS_TX', 'OUR_UNILATERAL/THEIR_HTLC')
+    else:
+        rawtx, stage2_txid, blocks = l1.wait_for_onchaind_tx(
+            'OUR_HTLC_TIMEOUT_TX', 'OUR_UNILATERAL/OUR_HTLC')
+    l1.stop()
+    if blocks > 0:
+        bitcoind.generate_block(blocks)
+    bitcoind.rpc.sendrawtransaction(rawtx)
+    bitcoind.generate_block(1, wait_for_mempool=stage2_txid)
+    stage2 = bitcoind.rpc.getrawtransaction(stage2_txid, True)
+    htlc_out = only_one(stage2['vin'])['vout']
+    assert only_one(stage2['vin'])['txid'] == revoked_txid
+    print("{}: {} spends HTLC output {} of the revoked commitment {}"
+          .format(second_stage, stage2_txid, htlc_out, revoked_txid))
+
+    # The node no longer accepts the channel's asset for fees.
+    bitcoind.set_fee_rates({bitcoind.POLICY_ASSET: PAR, other: other_rate})
+    wallet = fee_wallet(bitcoind, asset, [(asset, 1), (other, 1)])
+
+    outs = {o['n']: o for o in revoked['vout']}
+    targets = [(revoked_txid, n) for n, o in outs.items()
+               if o['scriptPubKey']['type'] == 'witness_v0_scripthash' and n != htlc_out]
+    targets.append((stage2_txid, 0))
+    values = {(revoked_txid, n): outs[n]['value'] for n in outs}
+    values[(stage2_txid, 0)] = stage2['vout'][0]['value']
+
+    def punished(txids):
+        found = {}
+        for t in txids:
+            try:
+                dec = bitcoind.rpc.getrawtransaction(t, True)
+            except Exception:
+                continue        # replaced since the mempool was listed
+            for i, vin in enumerate(dec.get('vin', [])):
+                key = (vin.get('txid'), vin.get('vout'))
+                if key in targets:
+                    found[key] = (dec, i)
+        return found
+
+    tower = Speculad(l2, bitcoind, wallet, directory)
+    tower.start()
+    try:
+        deadline = time.time() + TIMEOUT
+        while True:
+            pending = punished(bitcoind.rpc.getrawmempool())
+            if set(targets) <= set(pending) or time.time() > deadline:
+                break
+            time.sleep(1)
+        print(tower.output())
+        unpunished = sorted(set(targets) - set(pending))
+        assert unpunished == [], "unpunished: {}".format(unpunished)
+        block = bitcoind.generate_block(1)[0]
+    finally:
+        tower.stop()
+
+    mined = punished(bitcoind.rpc.getblock(block)['tx'])
+    assert set(mined) == set(targets), (mined.keys(), targets)
+    for key, (j, i) in mined.items():
+        sweep = j['vout'][i]
+        assert sweep['asset'] == asset
+        assert sweep['scriptPubKey']['address'] in victim_addrs
+        assert Decimal(sweep['value']) == Decimal(values[key])
+        fee = only_one([o for o in j['vout'] if o['scriptPubKey']['type'] == 'fee'])
+        assert fee['asset'] == other
+    for j in {j['txid']: j for j, _ in mined.values()}.values():
+        fee = only_one([o for o in j['vout'] if o['scriptPubKey']['type'] == 'fee'])
+        atoms = int(Decimal(fee['value']) * PAR)
+        print("justice {}: {} vB, spends {}, fee {} atoms of {} = {} reference atoms"
+              .format(j['txid'], j['vsize'],
+                      [(v['txid'][:8], v['vout']) for v in j['vin']],
+                      atoms, fee['asset'], atoms * other_rate / PAR))
+        assert atoms * other_rate / PAR >= MIN_RELAY_PER_KVB * j['vsize'] / 1000

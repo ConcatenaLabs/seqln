@@ -10,7 +10,10 @@
  *      out to the configured CLI over the box's node);
  *   3. on seeing a REVOKED commitment confirm on-chain (a breach), broadcasts
  *      the matching device-pre-signed CLASS-A justice blobs via
- *      sendrawtransaction, while the signing device is offline.
+ *      sendrawtransaction, while the signing device is offline: one for the
+ *      cheater's to_local output, one per HTLC output, and, once the cheater
+ *      has won the race for an HTLC output with its HTLC-timeout or
+ *      HTLC-success transaction, one for that transaction's output.
  *
  * COST PER ROUND: a revoked commitment can only be on chain once its channel's
  * funding output is spent, so each round looks at each channel's funding
@@ -1277,29 +1280,38 @@ static void defend_breach(struct revoked_commit *rc, long breach_confs,
 	const char **extra;
 
 	/* Phase E (seam #2): REORG-SAFE de-dup.  The gate is the confirmed
-	 * UTXO-set status of each REVOKED outpoint (rc->locator :
-	 * b->output_index) -- NOT a persistent "confirmed" latch.  If it is
-	 * SPENT, justice has landed (our tx or the peer's own spend), so we
-	 * leave it out THIS round only; a later reorg that re-exposes the
-	 * outpoint flips this back to UNSPENT and it rejoins the set
-	 * (principle #1, no finality).  UNKNOWN (RPC error) conservatively
-	 * keeps defending.
-	 *
-	 * NOTE: current CLASS-A blobs all spend a commitment output, so
-	 * (locator, output_index) is exactly the spent prevout.  A future
-	 * steal_htlc_tx 2nd-stage blob spends the HTLC-tx, not the commitment,
-	 * so it must instead query its OWN tx's input-0 prevout. */
+	 * UTXO-set status of the outpoint each blob spends (its input 0) --
+	 * NOT a persistent "confirmed" latch.  A blob is live while that
+	 * outpoint is unspent in the confirmed UTXO set: a revoked
+	 * commitment's output (kinds 0 and 1) until our justice or the
+	 * peer's own spend lands, and the output of the peer's second-stage
+	 * HTLC transaction (kind 2) only once that transaction has confirmed,
+	 * which is when the peer has won the race for the commitment's HTLC
+	 * output.  Spent (or not yet created) leaves it out THIS round only; a
+	 * later reorg that re-exposes the outpoint flips it back to UNSPENT
+	 * and it rejoins the set (principle #1, no finality).  UNKNOWN (RPC
+	 * error) conservatively keeps defending. */
 	for (size_t k = 0; k < tal_count(rc->blobs); k++) {
 		struct spd_blob *b = rc->blobs[k];
+		struct bitcoin_outpoint op;
+		const char *op_txid;
 
-		if (rpc_txout_state(tmpctx, rc->locator, b->output_index)
-		    == SPD_TXOUT_SPENT) {
-			fprintf(stderr, "speculad: revoked outpoint %s:%u SPENT "
-				"(our last justice %s) -- done this round\n",
-				rc->locator, b->output_index,
-				st->broadcast_txid ? st->broadcast_txid : "none");
+		bitcoin_tx_input_get_outpoint(b->tx, 0, &op);
+		op_txid = fmt_bitcoin_txid(tmpctx, &op.txid);
+		if (rpc_txout_state(tmpctx, op_txid, op.n) == SPD_TXOUT_SPENT) {
+			if (b->kind != WT_TMPL_STEAL_HTLC_TX_PENALTY)
+				fprintf(stderr, "speculad: revoked outpoint "
+					"%s:%u SPENT (our last justice %s) -- "
+					"done this round\n", op_txid, op.n,
+					st->broadcast_txid ? st->broadcast_txid
+					: "none");
 			continue;
 		}
+		if (b->kind == WT_TMPL_STEAL_HTLC_TX_PENALTY)
+			fprintf(stderr, "speculad: the peer's second-stage HTLC "
+				"transaction %s for output %u of %s is confirmed: "
+				"punishing its output\n", op_txid,
+				b->output_index, rc->locator);
 		tal_arr_expand(&live, b);
 	}
 	if (tal_count(live) == 0 || !may_broadcast)
