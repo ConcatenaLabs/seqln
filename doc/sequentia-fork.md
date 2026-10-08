@@ -93,6 +93,14 @@ that honestly, all gated on `has_anchor_header`:
   each at least its Bitcoin-mainnet wall-clock equivalent: `locktime_blocks` (to_self_delay) 1440
   (~1 day), `cltv_expiry_delta` 270 (~4.3h), `cltv_final` 180 (~2.9h), `max_htlc_cltv` 20160
   (~2 weeks). These are defaults; operators and per-open flags can still override.
+- **The sweep of a node's own delayed output** (`lightningd/onchain_control.c`
+  `handle_onchaind_spend_to_us()`): onchaind prices it toward a deadline at most 300 blocks ahead,
+  set when the output first appears. A `to_self_delay` of 1440 puts that deadline long before the
+  output can be spent, so the sweep would bid the feerate for the next block from its first
+  attempt. When the deadline falls within 12 blocks of the block the output can first be mined in,
+  the window is measured from that block instead: the first attempt, once the delay has run, is at
+  the floor, and the feerate rises from there as the deadline nears. Bitcoin's default delay of
+  144 blocks leaves the deadline where it was.
 - **Two-stage SCID / anchor-burial announcement gate** (`lightningd/chaintopology.c`
   `topo_anchor_buried()`, `lightningd/channel_gossip.c` `has_announce_depth()`): a certified block
   can still fall to tail truncation until its Bitcoin anchor is buried, and a
