@@ -769,10 +769,10 @@ impl Signer {
             return Outcome::Reject(format!("SIGN_REMOTE_COMMITMENT_TX refused: {reason}"));
         }
         let checked = self.check_remote_commitment(req);
-        let split = checked.clone().map(|(n, sp, _)| (n, sp));
-        let plan = match (&split, parse_remote_commitment(&req.hsmd_msg)) {
-            (Ok((n, sp)), Some((bt, _, _, htlcs, _))) => {
-                Some(self.payment_plan(&req.node_id, req.dbid, false, *n, &bt, &htlcs, sp))
+        let split = checked.clone().map(|(n, sp, _, _)| (n, sp));
+        let plan = match (&checked, parse_remote_commitment(&req.hsmd_msg)) {
+            (Ok((n, sp, _, trimmed)), Some((bt, _, _, htlcs, _))) => {
+                Some(self.payment_plan(&req.node_id, req.dbid, false, *n, &bt, &htlcs, sp, *trimmed))
             }
             _ => None,
         };
@@ -780,7 +780,7 @@ impl Signer {
             if let Err(reason) = &split {
                 return Outcome::Reject(format!("SIGN_REMOTE_COMMITMENT_TX refused: {reason}"));
             }
-            if let (Ok((_, _, theirs)), Some(st)) = (&checked, self.store.get(&req.node_id, req.dbid)) {
+            if let (Ok((_, _, theirs, _)), Some(st)) = (&checked, self.store.get(&req.node_id, req.dbid)) {
                 if let Err(reason) = policy::check_peer_reserve(st, *theirs) {
                     return Outcome::Reject(format!("SIGN_REMOTE_COMMITMENT_TX refused: {reason}"));
                 }
@@ -811,7 +811,7 @@ impl Signer {
                     st.remote_split = Some((n, sp));
                     self.store_dirty = true;
                 }
-                if let Ok((_, _, theirs)) = checked {
+                if let Ok((_, _, theirs, _)) = checked {
                     if policy::note_peer_balance(st, theirs) {
                         self.store_dirty = true;
                     }
@@ -833,10 +833,10 @@ impl Signer {
             return Outcome::Reject(format!("VALIDATE_COMMITMENT_TX refused: {reason}"));
         }
         let checked = self.check_local_commitment(req);
-        let split = checked.clone().map(|(n, sp, _)| (n, sp));
-        let plan = match (&split, parse_local_commitment(&req.hsmd_msg)) {
-            (Ok((n, sp)), Some((bt, htlcs, _))) => {
-                Some(self.payment_plan(&req.node_id, req.dbid, true, *n, &bt, &htlcs, sp))
+        let split = checked.clone().map(|(n, sp, _, _)| (n, sp));
+        let plan = match (&checked, parse_local_commitment(&req.hsmd_msg)) {
+            (Ok((n, sp, _, trimmed)), Some((bt, htlcs, _))) => {
+                Some(self.payment_plan(&req.node_id, req.dbid, true, *n, &bt, &htlcs, sp, *trimmed))
             }
             _ => None,
         };
@@ -844,7 +844,7 @@ impl Signer {
             if let Err(reason) = &split {
                 return Outcome::Reject(format!("VALIDATE_COMMITMENT_TX refused: {reason}"));
             }
-            if let (Ok((_, _, theirs)), Some(st)) = (&checked, self.store.get(&req.node_id, req.dbid)) {
+            if let (Ok((_, _, theirs, _)), Some(st)) = (&checked, self.store.get(&req.node_id, req.dbid)) {
                 if let Err(reason) = policy::check_peer_reserve(st, *theirs) {
                     return Outcome::Reject(format!("VALIDATE_COMMITMENT_TX refused: {reason}"));
                 }
@@ -883,7 +883,7 @@ impl Signer {
                         st.local_split = Some((n, sp));
                         self.store_dirty = true;
                     }
-                    if let Ok((_, _, theirs)) = checked {
+                    if let Ok((_, _, theirs, _)) = checked {
                         if policy::note_peer_balance(st, theirs) {
                             self.store_dirty = true;
                         }
@@ -1000,6 +1000,7 @@ impl Signer {
         bt: &BitcoinTx,
         htlcs: &[Htlc],
         sp: &Split,
+        trimmed: u64,
     ) -> Result<Plan, String> {
         let st = self.store.get(peer, dbid).ok_or_else(|| self.untracked(peer, dbid))?;
         let asset = commitment_asset(&bt.tx)?;
@@ -1009,13 +1010,25 @@ impl Signer {
             .map(|h| Offered { amount_msat: h.amount_msat, hash: h.payment_hash, cltv: h.cltv_expiry })
             .collect();
         let offered_atoms = offered.iter().fold(0u64, |s, h| s.saturating_add(h.amount_msat / 1000));
-        let value = sp.share(st.is_outbound).saturating_add(offered_atoms);
-        Ok(st.pay.plan(local, n, asset, value, offered))
+        // What the commitment leaves this side: its main output, the fee and
+        // anchors when it opened the channel, and every HTLC it offered,
+        // trimmed or not. A trimmed HTLC's value is in the fee, whoever
+        // offered it, so it is taken out of the opener's fee: this side's
+        // value then moves only with HTLCs, whatever is trimmed, and a fee
+        // change moves it not at all.
+        let mut value = sp.share(st.is_outbound).saturating_add(offered_atoms);
+        if st.is_outbound == Some(true) {
+            value = value.saturating_sub(trimmed);
+        }
+        Ok(st.pay.plan(local, n, asset, value, offered, htlcs.len()))
     }
 
     /// Every HTLC the commitment newly offers carries an approved payment
     /// hash, and what it pays away fits in the asset's allowance.
     fn check_plan(&self, plan: &Plan) -> Result<(), String> {
+        if let Some(refusal) = plan.balance.and_then(|b| b.refusal()) {
+            return Err(refusal);
+        }
         for h in &plan.new_offered {
             if !self.store.ledger.is_approved(&h.hash, self.now, self.limits.period_secs) {
                 return Err(format!(
@@ -1047,7 +1060,7 @@ impl Signer {
 
     /// Full validation of a peer commitment (`side = REMOTE`): its number,
     /// what it pays this side and the peer's main output.
-    fn check_remote_commitment(&self, req: &Request) -> Result<(u64, Split, u64), String> {
+    fn check_remote_commitment(&self, req: &Request) -> Result<(u64, Split, u64, u64), String> {
         let st = self
             .store
             .get(&req.node_id, req.dbid)
@@ -1068,7 +1081,7 @@ impl Signer {
             &htlcs,
             &bt.tx,
         )
-        .map(|(sp, theirs)| (commit_num, sp, theirs))
+        .map(|v| (commit_num, v.split, v.theirs, v.trimmed))
     }
 
     /// Full validation of our local commitment (`side = LOCAL`); the point is
@@ -1077,7 +1090,7 @@ impl Signer {
     /// funding key: a commitment counts as validated, for the revocation
     /// counters and for the balance a close is held to, only when the peer
     /// has committed to it, never on the host's word alone.
-    fn check_local_commitment(&self, req: &Request) -> Result<(u64, Split, u64), String> {
+    fn check_local_commitment(&self, req: &Request) -> Result<(u64, Split, u64, u64), String> {
         let st = self
             .store
             .get(&req.node_id, req.dbid)
@@ -1103,7 +1116,7 @@ impl Signer {
             &htlcs,
             &bt.tx,
         )
-        .map(|(sp, theirs)| (commit_num, sp, theirs))
+        .map(|v| (commit_num, v.split, v.theirs, v.trimmed))
     }
 
     /// Whether `sig` is the peer's signature, by the channel's remote funding
@@ -4217,21 +4230,31 @@ mod close_and_revocation_tests {
         let mut s = signer(Policy::Enforce);
         track_with_limits(&mut s, true, [5_460, 5_460, 10_000, 10_000]);
         // The fundee starts with nothing: below its reserve, as BOLT 2 allows.
+        // Its balance grows by payments this side makes, each an approved
+        // HTLC that the next commitment settles.
         assert!(matches!(validate(&mut s, 0, 999_000, 0, 1_000), Outcome::Reply(_)));
-        assert!(matches!(validate(&mut s, 1, 994_000, 5_000, 1_000), Outcome::Reply(_)));
+        let pay = |s: &mut Signer, n: u64, ours: u64, theirs: u64, amount: u64, k: u8| {
+            assert!(preapprove_keysend(s, k, amount * 1000, false));
+            let h = htlc(0, amount * 1000, k);
+            let o = validate_with(s, n, ours, theirs, 1_000, &[h]);
+            assert!(matches!(o, Outcome::Reply(_)), "{}", verdict(&o));
+            let o = validate(s, n + 1, ours, theirs + amount, 1_000);
+            assert!(matches!(o, Outcome::Reply(_)), "{}", verdict(&o));
+        };
+        pay(&mut s, 1, 994_000, 0, 5_000, 0xA1);
         assert!(!st(&s).peer_reached_reserve);
-        assert!(matches!(validate(&mut s, 2, 979_000, 20_000, 1_000), Outcome::Reply(_)));
+        pay(&mut s, 3, 979_000, 5_000, 15_000, 0xA2);
         assert!(st(&s).peer_reached_reserve);
         // Paying it out below the reserve, by our commitment or by its own.
-        let o = validate(&mut s, 3, 989_001, 9_999, 1_000);
+        let o = validate(&mut s, 5, 989_001, 9_999, 1_000);
         println!("our commitment leaving the peer 9999: {}", outcome(&o));
         assert!(outcome(&o).contains("VALIDATE_COMMITMENT_TX refused: it leaves the peer 9999, below the reserve of 10000 it must keep"), "{}", outcome(&o));
-        let o = sign_remote(&mut s, 3, 9_999, 989_001, 1_000);
+        let o = sign_remote(&mut s, 5, 9_999, 989_001, 1_000);
         println!("the peer's commitment leaving it 9999: {}", outcome(&o));
         assert!(outcome(&o).contains("SIGN_REMOTE_COMMITMENT_TX refused: it leaves the peer 9999, below the reserve of 10000 it must keep"), "{}", outcome(&o));
         // Down to the reserve itself is fine.
-        assert!(matches!(validate(&mut s, 3, 989_000, 10_000, 1_000), Outcome::Reply(_)));
-        assert!(matches!(sign_remote(&mut s, 3, 10_000, 989_000, 1_000), Outcome::Reply(_)));
+        assert!(matches!(validate(&mut s, 5, 989_000, 10_000, 1_000), Outcome::Reply(_)));
+        assert!(matches!(sign_remote(&mut s, 5, 10_000, 989_000, 1_000), Outcome::Reply(_)));
         // The mark survives the store.
         let (back, _, _) = policy::decode_channel_store(&policy::encode_channel_store(&s.store)).unwrap();
         assert!(back[0].1.peer_reached_reserve);
@@ -4717,34 +4740,143 @@ mod close_and_revocation_tests {
         assert!(!preapprove_invoice(&mut s, "lnsqrt", false));
     }
 
+    /// VALIDATE_COMMITMENT_TX for our commitment n listing `listed` (every
+    /// HTLC it carries) but with outputs only for `outputs`: the rest are
+    /// trimmed, their value in the fee.
+    fn validate_trimmed(s: &mut Signer, n: u64, to_local: u64, to_remote: u64, fee: u64,
+                        outputs: &[Htlc], listed: &[Htlc]) -> Outcome {
+        let tx = commitment_with(s, true, n, to_local, to_remote, fee, outputs);
+        let sig = funding_sig(s, &tx, &PEER_FUNDING_SECRET);
+        let psbt = funding_psbt();
+        let mut w = Writer::new(msg::HSMD_VALIDATE_COMMITMENT_TX);
+        w.u32(tx.len() as u32);
+        w.bytes(&tx);
+        w.u32(psbt.len() as u32);
+        w.bytes(&psbt);
+        put_htlcs(&mut w, listed);
+        w.u64(n);
+        w.u32(7500);
+        w.bytes(&sig);
+        w.u8(SIGHASH_ALL as u8);
+        s.handle(&req(w.into_vec()))
+    }
+
+    /// SIGN_REMOTE_COMMITMENT_TX, the same way.
+    fn sign_remote_trimmed(s: &mut Signer, n: u64, to_local: u64, to_remote: u64, fee: u64,
+                           outputs: &[Htlc], listed: &[Htlc]) -> Outcome {
+        let tx = commitment_with(s, false, n, to_local, to_remote, fee, outputs);
+        let psbt = funding_psbt();
+        let mut w = Writer::new(msg::HSMD_SIGN_REMOTE_COMMITMENT_TX);
+        w.u32(tx.len() as u32);
+        w.bytes(&tx);
+        w.u32(psbt.len() as u32);
+        w.bytes(&psbt);
+        w.bytes(&point(s, 5));
+        w.bytes(&point(s, 9));
+        w.bool(true);
+        w.u64(n);
+        put_htlcs(&mut w, listed);
+        w.u32(7500);
+        s.handle(&req(w.into_vec()))
+    }
+
+    /// Every commitment is held to the balance the device tracks: value
+    /// leaves this side only through an HTLC it offered, listed (trimmed or
+    /// not) and settled; any other drop is refused, never charged.
     #[test]
-    fn r2b_h2_value_leaving_without_a_listed_htlc_is_charged() {
-        // We did not open: a trimmed HTLC we offer takes our to_local down
-        // (its value goes to the fee) with nothing listed.
+    fn commitment_is_held_to_the_tracked_balance() {
+        // We did not open. A commitment taking 5,000 atoms from our to_local
+        // into the fee, with nothing listed: refused.
         let mut s = paying_signer(false, 10_000, 300_000, 699_000);
         let o = validate_with(&mut s, 1, 295_000, 699_000, 6_000, &[]);
+        println!("fundee, 5000 atoms gone with no HTLC: {}", verdict(&o));
+        assert!(matches!(&o, Outcome::Reject(r) if r == "VALIDATE_COMMITMENT_TX refused: it leaves \
+            this wallet 295000 atoms of the channel, 4998 fewer than it tracks: 300000 by commitment \
+            0, less 0 of HTLCs it offered and this commitment settles; no payment it approved \
+            accounts for the difference"), "{}", verdict(&o));
+        let o = sign_remote_with(&mut s, 1, 699_000, 295_000, 6_000, &[]);
+        assert!(matches!(&o, Outcome::Reject(r) if r.starts_with("SIGN_REMOTE_COMMITMENT_TX refused: it leaves \
+            this wallet 295000 atoms")), "{}", verdict(&o));
+        assert_eq!(spent(&s), 0);
+        // The same commitment listing the trimmed HTLC that moved them: its
+        // payment must be approved, and is then charged as a payment.
+        let t = htlc(0, 5_000_000, 0xA1);
+        let o = validate_trimmed(&mut s, 1, 295_000, 699_000, 6_000, &[], &[t]);
+        assert!(matches!(&o, Outcome::Reject(r) if r.contains("not approved")), "{}", verdict(&o));
+        assert!(preapprove_keysend(&mut s, 0xA1, 5_000_000, false));
+        let o = validate_trimmed(&mut s, 1, 295_000, 699_000, 6_000, &[], &[t]);
         assert!(matches!(o, Outcome::Reply(_)), "{}", verdict(&o));
-        assert_eq!(spent(&s), 4_999_000);
-        // The peer's commitment shows the same loss: charged once.
-        assert!(matches!(sign_remote_with(&mut s, 1, 699_000, 295_000, 6_000, &[]), Outcome::Reply(_)));
-        assert_eq!(spent(&s), 4_999_000);
-        // Another 6,000 would pass the 10,000 limit.
-        let o = validate_with(&mut s, 2, 289_000, 699_000, 12_000, &[]);
-        println!("H2 a further 6000 atoms gone with no listed HTLC, 10000 a day: {}", verdict(&o));
-        assert!(matches!(&o, Outcome::Reject(r) if r.contains("would pass its limit")), "{}", verdict(&o));
-        // The trimmed HTLC failing returns the value: nothing charged.
-        assert!(matches!(validate_with(&mut s, 2, 300_000, 699_000, 1_000, &[]), Outcome::Reply(_)));
-        assert_eq!(spent(&s), 4_999_000);
+        assert!(matches!(sign_remote_trimmed(&mut s, 1, 699_000, 295_000, 6_000, &[], &[t]), Outcome::Reply(_)));
+        assert_eq!(spent(&s), 5_000_000);
+        // Fulfilled: the peer is credited with it, the fee drops back.
+        assert!(matches!(validate(&mut s, 2, 295_000, 704_000, 1_000), Outcome::Reply(_)));
+        assert!(matches!(sign_remote(&mut s, 2, 704_000, 295_000, 1_000), Outcome::Reply(_)));
+        assert_eq!(spent(&s), 5_000_000);
 
-        // We opened: the fee is ours, so a feerate rise is not a payment,
-        // and a trimmed HTLC is charged when the peer is credited with it.
+        // We opened: the fee is ours, so a feerate rise moves nothing.
         let mut s = paying_signer(true, 10_000, 600_000, 399_000);
         assert!(matches!(validate_with(&mut s, 1, 598_000, 399_000, 3_000, &[]), Outcome::Reply(_)));
-        assert_eq!(spent(&s), 0);
-        assert!(matches!(validate_with(&mut s, 2, 593_000, 399_000, 8_000, &[]), Outcome::Reply(_)));
-        assert_eq!(spent(&s), 0);
-        assert!(matches!(validate_with(&mut s, 3, 593_000, 404_000, 3_000, &[]), Outcome::Reply(_)));
-        assert_eq!(spent(&s), 4_999_000);
+        // A trimmed HTLC the peer offers us: its value is in the fee, and
+        // listed it is not counted as ours; failed, the fee drops back.
+        let r = htlc(1, 5_000_000, 0xB2);
+        assert!(matches!(validate_trimmed(&mut s, 2, 598_000, 394_000, 8_000, &[], &[r]), Outcome::Reply(_)));
+        assert!(matches!(validate_with(&mut s, 3, 598_000, 399_000, 3_000, &[]), Outcome::Reply(_)));
+        // A trimmed HTLC we offer, fulfilled: the peer credited with it.
+        assert!(preapprove_keysend(&mut s, 0xA3, 5_000_000, false));
+        let t = htlc(0, 5_000_000, 0xA3);
+        assert!(matches!(validate_trimmed(&mut s, 4, 593_000, 399_000, 8_000, &[], &[t]), Outcome::Reply(_)));
+        assert!(matches!(validate_with(&mut s, 5, 593_000, 404_000, 3_000, &[]), Outcome::Reply(_)));
+        assert_eq!(spent(&s), 5_000_000);
+        // A commitment moving 90,000 atoms of ours to the peer with no HTLC:
+        // refused, whatever the limit would allow.
+        let o = validate_with(&mut s, 6, 503_000, 494_000, 3_000, &[]);
+        println!("opener, 90000 atoms moved to the peer with no HTLC: {}", verdict(&o));
+        assert!(matches!(&o, Outcome::Reject(r) if r.contains("it leaves this wallet 506000 atoms \
+            of the channel, 89998 fewer than it tracks: 596000 by commitment 5")), "{}", verdict(&o));
+        // In permissive mode the shortfall is signed and charged.
+        s.policy = Policy::Permissive;
+        assert!(matches!(validate_with(&mut s, 6, 503_000, 494_000, 3_000, &[]), Outcome::Reply(_)));
+    }
+
+    /// Every output of a commitment or a close is in the channel's one
+    /// asset, and the funding input issues none.
+    #[test]
+    fn commitment_and_close_pay_in_the_channel_asset_only() {
+        let mut s = paying_signer(false, 10_000_000, 300_000, 699_000);
+        let ours = s.wallet_sweep_script(4, false);
+        let honest = close(FUNDING_TXID, &[(ours.clone(), 300_000), (peer_script(), 698_500), (Vec::new(), 1_500)]);
+        // Our output in another asset (bytes 0x77..), the rest unchanged.
+        let mut other = honest.clone();
+        let at = 4 + 1 + 1 + 32 + 4 + 1 + 4 + 1 + 1;
+        assert_eq!(&other[at..at + 32], &[0x55; 32]);
+        other[at..at + 32].copy_from_slice(&[0x77; 32]);
+        let err = sign_close(&mut s, &other).unwrap_err();
+        println!("close paying this wallet in another asset: {err}");
+        assert!(err.contains("the close pays in two assets: output 1 is in 5555"), "{err}");
+        // An issuance on the funding input.
+        let mut issuing = honest[..4 + 1 + 1 + 32].to_vec();
+        issuing.extend_from_slice(&(0u32 | 0x8000_0000).to_le_bytes());
+        issuing.push(0x00);
+        issuing.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+        issuing.extend_from_slice(&[0u8; 64]);
+        issuing.push(0x01);
+        issuing.extend_from_slice(&300_000u64.to_be_bytes());
+        issuing.push(0x00);
+        issuing.push(0x08);
+        issuing.extend_from_slice(&honest[4 + 1 + 1 + 32 + 4 + 1 + 4..]);
+        let err = sign_close(&mut s, &issuing).unwrap_err();
+        println!("close issuing an asset on its funding input: {err}");
+        assert!(err.contains("the close issues an asset on its funding input"), "{err}");
+        assert_eq!(sign_close(&mut s, &honest), Ok(()));
+        // A commitment output in another asset.
+        let tx = local_commitment(&s, 1, 300_000, 699_000, 1_000);
+        let mut bad = tx.clone();
+        let pos = bad.windows(32).rposition(|w| w == [0x55; 32]).unwrap();
+        bad[pos..pos + 32].copy_from_slice(&[0x77; 32]);
+        let sig = funding_sig(&s, &bad, &PEER_FUNDING_SECRET);
+        let o = s.handle(&req(validate_msg(&bad, 1, &sig)));
+        println!("commitment with an output in another asset: {}", verdict(&o));
+        assert!(matches!(&o, Outcome::Reject(r) if r.contains("the commitment pays in two assets")), "{}", verdict(&o));
     }
 
     /// A channel the device tracked before it kept payment records: the first

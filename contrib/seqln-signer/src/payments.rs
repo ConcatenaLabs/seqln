@@ -10,11 +10,15 @@
 //!    allowance left among the assets of the device's channels.
 //!  * Every commitment the device signs or validates. An HTLC we offer that a
 //!    commitment lists for the first time must carry an approved payment hash,
-//!    and its amount is charged to the channel asset's allowance. Value that
-//!    leaves our side without a listed HTLC (an HTLC trimmed as dust has no
-//!    output, so the commitment request does not list it) is charged too, once
-//!    the commitments show it gone. A commitment that would take the asset
-//!    over its limit is refused.
+//!    and its amount is charged to the channel asset's allowance. A
+//!    commitment that would take the asset over its limit is refused.
+//!  * Every commitment is also held to the balance the device tracks for this
+//!    side: what the latest commitment on the same side left it, less the
+//!    HTLCs it offered that the new one settles. The request lists every HTLC
+//!    the commitment carries, including those trimmed as dust (whose value is
+//!    in the fee), so an honest step moves the balance only by HTLCs; one
+//!    that leaves this side less is refused ([`BalanceCheck`]). In permissive
+//!    mode the shortfall is charged to the allowance instead.
 //!
 //! The limit is an amount per asset, in the asset's own atoms, over a sliding
 //! period; Bitcoin is an asset like any other. An offered HTLC is charged when
@@ -480,6 +484,46 @@ pub struct Plan {
     pub new_offered: Vec<Offered>,
     pub charge_msat: u64,
     pub track: PayTrack,
+    /// The balance check of this commitment against the latest one on its
+    /// side: `None` with no earlier one to hold it to (the baseline, or a
+    /// re-sent older commitment), else what it is held to.
+    pub balance: Option<BalanceCheck>,
+}
+
+/// What a commitment leaves this side, against what the device tracks for
+/// it: the value the latest commitment on the same side left it, less the
+/// HTLCs it offered that the new one no longer carries (settled to the peer
+/// at most). A commitment that leaves less moves this side's value with no
+/// payment it approved to account for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BalanceCheck {
+    /// The number of the commitment it is held to, and the value that left.
+    pub prev_n: u64,
+    pub prev_value: u64,
+    /// The HTLCs we offered that the new commitment no longer carries.
+    pub removed_atoms: u64,
+    /// What the new commitment leaves this side.
+    pub value: u64,
+    /// The atoms it is short by, beyond rounding (0: it matches).
+    pub short: u64,
+}
+
+impl BalanceCheck {
+    /// The refusal, in the device's words, when the commitment is short.
+    pub fn refusal(&self) -> Option<String> {
+        (self.short > 0).then(|| {
+            format!(
+                "it leaves this wallet {} atoms of the channel, {} fewer than it tracks: \
+                 {} by commitment {}, less {} of HTLCs it offered and this commitment \
+                 settles; no payment it approved accounts for the difference",
+                self.value,
+                self.short,
+                self.prev_value,
+                self.prev_n,
+                self.removed_atoms
+            )
+        })
+    }
 }
 
 impl PayTrack {
@@ -488,7 +532,19 @@ impl PayTrack {
     /// `offered`. With no record of either side (a channel this device has
     /// tracked only since before it kept one), the commitment is the
     /// baseline: what it carries is taken as already approved and charged.
-    pub fn plan(&self, local: bool, n: u64, asset: AssetKey, value: u64, mut offered: Vec<Offered>) -> Plan {
+    ///
+    /// `listed` is the number of HTLCs the commitment carries, offered and
+    /// received, trimmed or not: each moves a value rounded down to whole
+    /// atoms, which the balance check allows for.
+    pub fn plan(
+        &self,
+        local: bool,
+        n: u64,
+        asset: AssetKey,
+        value: u64,
+        mut offered: Vec<Offered>,
+        listed: usize,
+    ) -> Plan {
         offered.sort();
         offered.truncate(MAX_OFFERED);
         let (this, other) = if local { (&self.local, &self.remote) } else { (&self.remote, &self.local) };
@@ -505,20 +561,30 @@ impl PayTrack {
             // An older commitment than the latest on this side (a re-send):
             // its new HTLCs are checked and charged, the record stays.
             Some(t) if n < t.n => {
-                return Plan { asset, new_offered, charge_msat: new_msat, track };
+                return Plan { asset, new_offered, charge_msat: new_msat, track, balance: None };
             }
             _ => {}
         }
-        let lost = match this {
-            None => 0,
+        let (lost, balance) = match this {
+            None => (0, None),
             Some(t) => {
                 let removed = minus(&t.offered, &offered);
                 let removed_atoms = removed.iter().fold(0u64, |s, h| s.saturating_add(h.amount_msat / 1000));
                 // Rounding each amount down to whole atoms moves a value by
-                // at most an atom per HTLC added or removed.
-                let tolerance = 1 + new_offered.len() as u64 + removed.len() as u64;
+                // at most an atom per HTLC the two commitments carry, and an
+                // atom for each side's main output.
+                let tolerance = 2 + listed as u64 + t.offered.len() as u64 + removed.len() as u64;
                 let step = t.value.saturating_sub(value).saturating_sub(removed_atoms).saturating_sub(tolerance);
-                t.lost.saturating_add(step)
+                (
+                    t.lost.saturating_add(step),
+                    Some(BalanceCheck {
+                        prev_n: t.n,
+                        prev_value: t.value,
+                        removed_atoms,
+                        value,
+                        short: step,
+                    }),
+                )
             }
         };
         let side = SideTrack { n, value, offered, lost };
@@ -536,6 +602,7 @@ impl PayTrack {
             new_offered,
             charge_msat: new_msat.saturating_add(lost_charge.saturating_mul(1000)),
             track,
+            balance,
         }
     }
 }
@@ -614,38 +681,41 @@ mod tests {
         let a = AssetKey::Asset([7; 32]);
         let t = PayTrack::default();
         // Commitment 0, ours, as the baseline.
-        let p = t.plan(true, 0, a, 600_000, vec![]);
+        let p = t.plan(true, 0, a, 600_000, vec![], 0);
         assert_eq!((p.new_offered.len(), p.charge_msat), (0, 0));
         let t = p.track;
-        let p = t.plan(false, 0, a, 600_000, vec![]);
+        let p = t.plan(false, 0, a, 600_000, vec![], 0);
         let t = p.track;
         // We offer 100,000 atoms: on the peer's commitment first, then ours.
-        let p = t.plan(false, 1, a, 600_000, vec![h(1, 100_000_000)]);
+        let p = t.plan(false, 1, a, 600_000, vec![h(1, 100_000_000)], 0);
         assert_eq!((p.new_offered.len(), p.charge_msat), (1, 100_000_000));
         let t = p.track;
-        let p = t.plan(true, 1, a, 600_000, vec![h(1, 100_000_000)]);
+        let p = t.plan(true, 1, a, 600_000, vec![h(1, 100_000_000)], 0);
         assert_eq!((p.new_offered.len(), p.charge_msat), (0, 0));
         let t = p.track;
         // It is fulfilled: gone from both, our value down by it; no charge.
-        let p = t.plan(true, 2, a, 500_000, vec![]);
+        let p = t.plan(true, 2, a, 500_000, vec![], 0);
         assert_eq!(p.charge_msat, 0);
         let t = p.track;
-        let p = t.plan(false, 2, a, 500_000, vec![]);
+        let p = t.plan(false, 2, a, 500_000, vec![], 0);
         assert_eq!(p.charge_msat, 0);
         let t = p.track;
         // 5,000 atoms leave with no listed HTLC (a trimmed one): charged
         // once, though both sides show it.
-        let p = t.plan(true, 3, a, 495_000, vec![]);
-        assert_eq!(p.charge_msat, (5_000 - 1) * 1000);
+        let p = t.plan(true, 3, a, 495_000, vec![], 0);
+        assert_eq!(p.charge_msat, (5_000 - 2) * 1000);
+        let b = p.balance.unwrap();
+        assert_eq!((b.prev_n, b.prev_value, b.removed_atoms, b.value, b.short), (2, 500_000, 0, 495_000, 4_998));
+        assert!(b.refusal().unwrap().starts_with("it leaves this wallet 495000 atoms of the channel, 4998 fewer"));
         let t = p.track;
-        let p = t.plan(false, 3, a, 495_000, vec![]);
+        let p = t.plan(false, 3, a, 495_000, vec![], 0);
         assert_eq!(p.charge_msat, 0);
         let t = p.track;
         // An HTLC offered again after it resolved is a new one.
-        let p = t.plan(false, 4, a, 495_000, vec![h(1, 100_000_000)]);
+        let p = t.plan(false, 4, a, 495_000, vec![h(1, 100_000_000)], 0);
         assert_eq!(p.new_offered.len(), 1);
         // An older commitment does not move the record.
-        let p2 = p.track.plan(false, 2, a, 1, vec![]);
+        let p2 = p.track.plan(false, 2, a, 1, vec![], 0);
         assert_eq!(p2.track.remote.as_ref().unwrap().n, 4);
     }
 }

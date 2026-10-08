@@ -355,8 +355,14 @@ a user device while a host runs the node:
   commitments give this side, the commitments of ours it validated) on the device, holds each
   close and revocation to it, and signs a commitment of ours for broadcast only when it is one it
   validated and has not revoked. It approves payments (`preapproveinvoice`, `preapprovekeysend`,
-  which `pay` and `keysend` call) within a per-asset limit, and refuses a commitment that adds an
-  HTLC this node offers for a payment it did not approve. See
+  which `pay` and `keysend` call) within a per-asset limit, refuses a commitment that adds an
+  HTLC this node offers for a payment it did not approve, and refuses one that leaves this side
+  less than the balance it tracks: value leaves this side only through an HTLC it offered and
+  the next commitment settles. For that, channeld lists every HTLC a commitment carries in the
+  signing request (`collect_htlcs`, `channeld/channeld.c`), those trimmed as dust included,
+  whose value is in the fee. Every output of a commitment or a close must be in the channel's one
+  asset, with no issuance on the funding input. The native signer never runs without its store:
+  one it cannot restore, or a missing one once it has made one, stops it at start. See
   [its README](../contrib/seqln-signer/README.md).
 - A device that refuses a request on lightningd's own connection is dropped and the request is
   sent again when a device reconnects (a device that was missing state is re-primed then); a
@@ -508,6 +514,10 @@ answered by `speculad` while the victim is offline, also once the node has delis
 asset, with the fee paid from another asset the tower holds, and one the cheater races with its
 HTLC-success or HTLC-timeout transaction, whose output the tower takes (`test_watchtower.py`), a keyless node, as
 either side of a channel, closing it and restarting with it closing (`test_keyless_close.py`), a
+keyless node paying and receiving payments trimmed as dust with nothing refused, and one whose
+host misstates its balance in its own database, which has its device refuse the next commitment,
+and which closes unilaterally on the balance the device tracked
+(`test_keyless_balance.py`), a
 keyless node whose device, moved onto an older store, refuses its closing transaction, at start
 in each closing state and after `close` times out, and one with an HTLC on chain
 (`test_keyless_start.py`, which runs on Bitcoin regtest too, with `TEST_NETWORK=regtest`), the

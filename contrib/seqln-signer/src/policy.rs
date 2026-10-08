@@ -1275,6 +1275,64 @@ fn expected_scripts(ks: &Keyset, st: &ChannelState, side: Side, htlcs: &[Htlc]) 
     set
 }
 
+/// Every output of a transaction spending the funding output is in one
+/// explicit asset, the channel's (`st.pay.asset`, once a commitment has
+/// recorded it), and its input carries no issuance. The funding output holds
+/// one asset; with an issuance on its spend, a transaction could pay this
+/// side in a fresh, worthless asset while the channel's own value goes to
+/// the peer or the fee, and every check of amounts would still pass. With one
+/// asset in every output and no issuance, consensus balance makes it the
+/// funding output's. Nothing to check on Bitcoin.
+fn check_single_asset(st: &ChannelState, tx: &ElementsTx, what: &str) -> Result<(), String> {
+    if tx.network != Network::Elements {
+        return Ok(());
+    }
+    if tx.inputs.iter().any(|i| i.is_issuance) {
+        return Err(format!("{what} issues an asset on its funding input"));
+    }
+    let first = match tx.outputs.first() {
+        Some(o) => &o.asset,
+        None => return Ok(()),
+    };
+    for (i, o) in tx.outputs.iter().enumerate() {
+        if o.asset.len() != 33 || o.asset[0] != 0x01 {
+            return Err(format!("{what} output {i} has a non-explicit asset"));
+        }
+        if o.asset != *first {
+            return Err(format!(
+                "{what} pays in two assets: output {i} is in {}, output 0 in {}",
+                display_asset(&o.asset),
+                display_asset(first)
+            ));
+        }
+    }
+    if let Some(crate::payments::AssetKey::Asset(id)) = st.pay.asset {
+        if first[1..] != id {
+            return Err(format!(
+                "{what} pays in asset {}, not the channel's {}",
+                display_asset(first),
+                display_asset(&[&[0x01u8][..], &id[..]].concat())
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A 33-byte explicit asset in display order.
+fn display_asset(a: &[u8]) -> String {
+    a.iter().skip(1).rev().map(|b| format!("{b:02x}")).collect()
+}
+
+/// What a validated commitment pays: this side's split, the peer's main
+/// output (0 when trimmed), and the value of the HTLCs it carries that have
+/// no output, trimmed as dust (their value is in the commitment's fee).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Validated {
+    pub split: Split,
+    pub theirs: u64,
+    pub trimmed: u64,
+}
+
 /// FULL commitment validation (used for the peer's commitment and — since it
 /// also carries the HTLC set — our own local commitment). Returns what the
 /// commitment pays this side, and the peer's main output (0 when trimmed),
@@ -1290,7 +1348,7 @@ pub fn validate_commitment(
     point: &[u8; 33],
     htlcs: &[Htlc],
     tx: &ElementsTx,
-) -> Result<(Split, u64), String> {
+) -> Result<Validated, String> {
     let static_remotekey = st.option_static_remotekey || st.option_anchors;
     let our_bp = kernel.channel_basepoints(node_id, dbid);
     let ks = build_keyset(kernel, st, &our_bp, side, point, static_remotekey)?;
@@ -1307,6 +1365,7 @@ pub fn validate_commitment(
     if inp.txhash != st.funding_txid || inp.index as u16 != st.funding_txout {
         return Err("commitment input is not the tracked funding outpoint".to_string());
     }
+    check_single_asset(st, tx, "the commitment")?;
 
     // This side's main output: to_local on our commitment, to_remote (the
     // OTHER side's payment script) on the peer's. expected_scripts puts
@@ -1352,7 +1411,24 @@ pub fn validate_commitment(
         ));
     }
     split.fee = (st.funding_sats as u128 - not_fee) as u64;
-    Ok((split, theirs))
+
+    // The HTLCs listed with no output of their own (script and value) were
+    // trimmed: their value is in the fee. Each output pays at most one.
+    let first_htlc = if st.option_anchors { 4 } else { 2 };
+    let mut taken = vec![false; tx.outputs.len()];
+    let mut trimmed = 0u64;
+    for (k, h) in htlcs.iter().enumerate() {
+        let script = &whitelist[first_htlc + k];
+        let atoms = h.amount_msat / 1000;
+        let found = tx.outputs.iter().enumerate().position(|(i, o)| {
+            !taken[i] && o.script == *script && output_value(o, tx.network) == Some(atoms)
+        });
+        match found {
+            Some(i) => taken[i] = true,
+            None => trimmed = trimmed.saturating_add(atoms),
+        }
+    }
+    Ok(Validated { split, theirs, trimmed })
 }
 
 /// Hold the peer to the reserve this side requires of it (BOLT 2: a side's
@@ -1487,6 +1563,7 @@ pub fn validate_mutual_close(
     if inp.txhash != st.funding_txid || inp.index as u16 != st.funding_txout {
         return Err("close input is not the tracked funding outpoint".to_string());
     }
+    check_single_asset(st, tx, "the close")?;
     let (mut total, mut ours, mut theirs) = (0u128, 0usize, 0usize);
     let (mut ours_value, mut theirs_value) = (0u64, 0u64);
     for (i, o) in tx.outputs.iter().enumerate() {

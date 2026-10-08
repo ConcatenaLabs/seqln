@@ -37,6 +37,15 @@ struct Session {
 
 impl Session {
     fn start(dir: &Path, store: Option<&Path>) -> Session {
+        match Session::try_start(dir, store) {
+            Ok(s) => s,
+            Err(why) => panic!("the signer did not start: {why}"),
+        }
+    }
+
+    /// Start the signer; `Err` with its exit status and what it said when it
+    /// stops before answering INIT.
+    fn try_start(dir: &Path, store: Option<&Path>) -> Result<Session, String> {
         let (parent, child_end) = UnixStream::pair().expect("socketpair");
         let child_fd = child_end.as_raw_fd();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_seqln-signer"));
@@ -45,7 +54,7 @@ impl Session {
             .env_remove("SEQLN_SIGNER_POLICY")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         match store {
             Some(p) => cmd.env("SEQLN_SIGNER_STORE", p),
             None => cmd.env_remove("SEQLN_SIGNER_STORE"),
@@ -61,8 +70,16 @@ impl Session {
         let child = cmd.spawn().expect("spawn seqln-signer");
         drop(child_end);
         let mut s = Session { child, stream: Some(parent) };
-        assert!(!s.ask(true, &init_msg()).is_empty(), "INIT failed");
-        s
+        let st = s.stream.as_mut().unwrap();
+        frame::write_request(st, true, &PEER, DBID, u64::MAX, &init_msg()).expect("write INIT");
+        match frame::read_reply(st) {
+            Ok(Some(r)) if !r.is_empty() => Ok(s),
+            _ => {
+                drop(s.stream.take());
+                let out = s.child.wait_with_output().expect("wait");
+                Err(format!("{}: {}", out.status, String::from_utf8_lossy(&out.stderr).trim()))
+            }
+        }
     }
 
     /// Send one request; the reply bytes (empty: refused).
@@ -318,7 +335,8 @@ fn restarted_native_signer_keeps_its_counters_and_balance() {
     // persisted store. With no balance it signs no close, the honest one
     // included, and no commitment of ours for broadcast; once it has
     // validated commitments 0 and 1, without revoking 0, it signs both.
-    let mut s = Session::start(&dir, Some(&dir.join("empty-store")));
+    let fresh = scratch_dir();
+    let mut s = Session::start(&fresh, None);
     assert!(!s.ask(false, &setup_msg(&k)).is_empty());
     assert!(s.ask(false, &mutual_close_msg(&k, 600_500, 399_000, 500)).is_empty(),
             "control: an honest close signed with no balance known");
@@ -334,6 +352,87 @@ fn restarted_native_signer_keeps_its_counters_and_balance() {
             "control: the honest close refused once validated");
     println!("control, empty store: honest close and commitment 0 REFUSED until \
               validated, then SIGNED");
+    s.stop();
+
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_dir_all(&fresh).unwrap();
+}
+
+/// A restarted signer never runs without its store. Without it, a host
+/// replaying the channel's old commitments, all signed by the peer, has it
+/// validate commitment 0 again and sign it for broadcast although it was
+/// revoked: the control above shows a fresh signer doing exactly that. So a
+/// store that is missing (once the device has made one), fails its MAC, or
+/// was written by a newer signer stops it before it answers anything, and
+/// the store put back restores it.
+#[test]
+fn restarted_signer_never_starts_without_its_store() {
+    let k = kernel();
+    let dir = scratch_dir();
+    let file = dir.join("seqln-signer-channels");
+
+    let mut s = Session::start(&dir, None);
+    assert!(!s.ask(false, &setup_msg(&k)).is_empty());
+    assert!(!s.ask(false, &validate_msg(&k, 0)).is_empty(), "validate 0 refused");
+    assert!(!s.ask(false, &validate_msg(&k, 1)).is_empty(), "validate 1 refused");
+    assert!(!s.ask(false, &revoke_msg(0)).is_empty(), "revoke 0 refused");
+    s.stop();
+    let good = std::fs::read(&file).expect("the store file was written");
+
+    // What a host can do with a signer that started without the store.
+    let replay = |s: &mut Session| -> bool {
+        s.ask(false, &setup_msg(&k));
+        s.ask(false, &validate_msg(&k, 0));
+        s.ask(false, &validate_msg(&k, 1));
+        !s.ask(true, &sign_commitment_msg(&k, &commitment(&k, 0), 0)).is_empty()
+    };
+    let mut cases: Vec<(&str, Option<Vec<u8>>)> = vec![("missing", None)];
+    let mut flipped = good.clone();
+    let last = flipped.len() - 1;
+    flipped[last] ^= 0x01;
+    cases.push(("its MAC broken", Some(flipped)));
+    // Version 0xfe under a valid MAC: a store this signer cannot read.
+    let mut newer = good[..good.len() - 32].to_vec();
+    newer[4] = 0xfe;
+    let mac = {
+        use hmac::{Hmac, Mac};
+        let key = kernel::hkdf_sha256(32, b"seqln-signer chstore mac v1",
+                                      &kernel::bip39_seed(MNEMONIC, ""), b"");
+        let mut m = <Hmac<sha2::Sha256> as Mac>::new_from_slice(&key).unwrap();
+        m.update(&newer);
+        m.finalize().into_bytes()
+    };
+    newer.extend_from_slice(&mac);
+    cases.push(("written by a newer signer", Some(newer)));
+    let mut started = Vec::new();
+    for (what, contents) in cases {
+        match &contents {
+            None => std::fs::remove_file(&file).unwrap(),
+            Some(b) => std::fs::write(&file, b).unwrap(),
+        }
+        match Session::try_start(&dir, None) {
+            Ok(mut s) => {
+                let signed = replay(&mut s);
+                s.stop();
+                let line = format!("store {what}: the signer started, and the host's replay had it \
+                                    {} revoked commitment 0", if signed { "SIGN" } else { "refuse" });
+                println!("{line}");
+                started.push(line);
+            }
+            Err(why) => {
+                println!("store {what}: the signer refused to start ({why})");
+                assert!(why.contains("refusing to start without it"), "{why}");
+            }
+        }
+    }
+
+    assert!(started.is_empty(), "{started:?}");
+
+    // The store put back: the signer starts and refuses the replay.
+    std::fs::write(&file, &good).unwrap();
+    let mut s = Session::start(&dir, None);
+    assert!(!replay(&mut s), "signed revoked commitment 0 with its store restored");
+    println!("store restored: the signer starts and refuses revoked commitment 0");
     s.stop();
 
     std::fs::remove_dir_all(&dir).unwrap();

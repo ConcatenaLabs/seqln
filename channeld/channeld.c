@@ -978,23 +978,28 @@ static u8 *master_wait_sync_reply(const tal_t *ctx,
 	return reply;
 }
 
+/* The HTLCs a commitment of @side carries, for the signer: every one,
+ * including those trimmed as dust, which have no output.  A device that
+ * holds the user's balance needs the trimmed ones to account for the value
+ * they move: a trimmed HTLC's value is in the commitment's fee. */
 static struct hsm_htlc *collect_htlcs(const tal_t *ctx,
-				      const struct htlc **htlc_map)
+				      const struct channel *channel,
+				      enum side side)
 {
 	struct hsm_htlc *htlcs;
+	const struct htlc **committed
+		= channel_committed_htlcs(tmpctx, channel, side);
 
 	htlcs = tal_arr(ctx, struct hsm_htlc, 0);
-	size_t num_entries = tal_count(htlc_map);
-	for (size_t ndx = 0; ndx < num_entries; ++ndx) {
-		struct htlc const *hh = htlc_map[ndx];
-		if (hh) {
-			struct hsm_htlc htlc;
-			htlc.side = htlc_state_owner(hh->state);
-			htlc.amount = hh->amount;
-			htlc.payment_hash = hh->rhash;
-			htlc.cltv_expiry = hh->expiry.locktime;
-			tal_arr_expand(&htlcs, htlc);
-		}
+	for (size_t ndx = 0; ndx < tal_count(committed); ++ndx) {
+		struct htlc const *hh = committed[ndx];
+		struct hsm_htlc htlc;
+
+		htlc.side = htlc_state_owner(hh->state);
+		htlc.amount = hh->amount;
+		htlc.payment_hash = hh->rhash;
+		htlc.cltv_expiry = hh->expiry.locktime;
+		tal_arr_expand(&htlcs, htlc);
 	}
 	return htlcs;
 }
@@ -1021,7 +1026,7 @@ static struct bitcoin_signature *calc_commitsigs(const tal_t *ctx,
 		     ctx, peer, txs, funding_wscript, htlc_map,
 		     (int)commit_index, remote_per_commit, commit_sig);
 
-	htlcs = collect_htlcs(tmpctx, htlc_map);
+	htlcs = collect_htlcs(tmpctx, peer->channel, REMOTE);
 	msg = towire_hsmd_sign_remote_commitment_tx(NULL, txs[0],
 						    &remote_funding_pubkey,
 						    remote_per_commit,
@@ -2338,7 +2343,7 @@ static struct commitsig_info *handle_peer_commit_sig(struct peer *peer,
 	}
 
 	/* As of HSM_VERSION 5 returned old_secret is always NULL (revoke returns it instead) */
-	htlcs = collect_htlcs(NULL, htlc_map);
+	htlcs = collect_htlcs(NULL, peer->channel, LOCAL);
 	msg2 = towire_hsmd_validate_commitment_tx(NULL,
 						  txs[0],
 						  htlcs,
