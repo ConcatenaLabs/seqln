@@ -288,7 +288,9 @@ policy asset by default). File-level map of the threading:
 - `lightningd/peer_htlcs.c` `forward_htlc()`: the backstop. A node refuses to forward an HTLC
   across an asset boundary (incoming and outgoing `channel_asset` must match), failing with
   `unknown_next_peer`, so a hand-crafted or buggy cross-asset route can never swap one asset for
-  another at par.
+  another at par. A conversion at a quoted rate is the plugin `contrib/crossasset-seq`, which
+  takes a quoted HTLC on the `htlc_accepted` hook before it reaches this check and sends the next
+  hop itself; without the plugin the check refuses the same route.
 - `lightningd/htlc_end.c` `new_htlc_out()`: a payment whose first hop carries less than it
   delivers is what a payment converted across assets on the way looks like (the two amounts are
   in different assets). The payer records no routing fee for it; upstream treats the negative
@@ -473,6 +475,7 @@ The Specula design note is not yet published in this repository; the header comm
 | `channeld`, `lightningd/onchain_presign.c`, `speculad` | Specula watchtower: pre-signed justice/sweep sets and their offline broadcaster (section 7b) |
 | `lightningd/plugin.c` | Startup fix: skip the `plugins_config` wait loop when every plugin is already `INIT_COMPLETE` (a hang reachable with a minimal plugin set, not Sequentia-specific) |
 | `contrib/holdinvoice-seq/` | New plugin: hold-invoice primitive for pure-Lightning swaps |
+| `contrib/crossasset-seq/` | New plugin: quoted cross-asset forwarding (signed quotes, one forward per quote, settle or fail both HTLCs together) |
 | `contrib/seqln-signer/` | New crate: Rust device signer (native + WASM) |
 
 ## 9. libwally dependency
@@ -543,7 +546,12 @@ it delivers sent by the payer and refused at the asset boundary by the next hop
 payment split over two channels in its asset beside a larger one in another, a payment beyond what
 the payer can spend in the asset failing with every part it offered in that asset, and keysend in
 an asset, one hop and two, refused when the payer must name the asset or no route in it exists
-(`test_asset_mpp_keysend.py`). They need `sequentiad`, `sequentia-cli`
+(`test_asset_mpp_keysend.py`), and a payment converted through one quoting node: both HTLCs
+settled on one preimage with the three nodes' books equal to the quote, an HTLC one atom off the
+quote, a quote past its expiry and a quote used twice refused with nothing sent on, a payee that
+fails the payment failing both HTLCs, the cap on open forwards per asset, the Sequence token as
+one leg like any other, a restart of the quoting node mid-forward, and lightningd refusing the
+same route without the plugin (`test_crossasset_forward.py`). They need `sequentiad`, `sequentia-cli`
 and a Bitcoin Core `bitcoind` on `PATH`, and the keyless tests need the device signer built
 (`cargo build --release` in `contrib/seqln-signer`, or `SEQLN_SIGNER=/path/to/seqln-signer`).
 The test plugins run under the `python3` on `PATH`, which needs the `pyln` packages, so the
@@ -585,7 +593,7 @@ Each verified present in the code as of 2026-07-08:
 2. **Payment paths other than `pay` and `keysend` are asset-blind.** xpay, askrene and renepay
    know no asset. Use `pay`, which pays in the asset the invoice names, or `keysend asset=`. A plugin that settles
    HTLCs itself must check the `asset` the `htlc_accepted` hook names, as
-   `contrib/holdinvoice-seq` does.
+   `contrib/holdinvoice-seq` and `contrib/crossasset-seq` do.
 3. **Mainnet chainparams are placeholders.** All-zero genesis, NULL fee asset; the `sequentia`
    network entry must not be used.
 4. **Committee-stall fail-open.** If the certified frontier is more than 144 blocks behind the tip

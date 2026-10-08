@@ -124,7 +124,9 @@ strings puts a node in a re-exec loop.
   wire encoding was unchanged and old and new daemons interoperate. Keep that discipline.
 - **The testnet was re-genesised on 2026-07-05.** Older chain state is invalid.
 - **Cross-asset forwards are refused** at `forward_htlc()` as a deliberate backstop. Do not
-  "fix" it into forwarding.
+  "fix" it into forwarding. Conversion at a signed quote is the plugin `contrib/crossasset-seq`,
+  which holds the incoming HTLC itself; while it has a forward open it must stay loaded, or
+  lightningd fails the incoming HTLC back at this backstop with the outgoing one still out.
 - The certified-frontier committee-stall check **fails open** with a warning when the frontier is
   more than 144 blocks behind. Penalty across an induced anchor reorg is untested.
 - Asset ids are stored as a 33-byte version+tag blob; `NULL` means the policy asset. RPCs and the

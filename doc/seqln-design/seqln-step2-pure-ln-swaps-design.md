@@ -194,6 +194,13 @@ refund). Non-custodial by construction; a capitalized, reputable maker dominates
 Cannot be removed (you cannot conjure cross-network liquidity). Honest and documented.
 
 ### 5.6 Intra-Sequentia cross-asset (GOLD↔USDX) — deliberately OUT of scope for v1
+
+The single-onion edge forward is built as a plugin, `contrib/crossasset-seq` (its README is the
+reference). It needs neither a unit-changing `check_fwd_amount` nor a quote reference in the onion:
+the converting node takes the HTLC on the `htlc_accepted` hook and sends the next hop itself with
+`sendonion`, and its signed quote binds the payment hash and both amounts. The rest of this section
+is the reasoning that deferred it from the swap work.
+
 A same-network asset↔asset swap (both legs on SeqLN-on-Sequentia) could in principle be a **single-onion edge
 forward** (one payment, the edge node converting GOLD→USDX mid-route per the RFQ quote) — true Taproot-Assets
 edge forwarding, and the direct inverse of Step-1's cross-asset *guard*. But it requires the harder work of a
