@@ -151,15 +151,21 @@ def test_close_output_asset_migration(node_factory, bitcoind):
     assert before['asset'] == bitcoind.POLICY_ASSET
     assert n == []
 
-    # A database from before the upgrade: one version back.
+    # A database from before the upgrade: back to the version before the
+    # migration that fills the asset in.  The migrations after it add the
+    # penalty_htlcs second-stage columns, which such a database lacks too.
     l2.stop()
     version = query("SELECT version FROM version")[0][0]
-    query("UPDATE version SET version=?", version - 1)
+    later = ('stage2_txid', 'stage2_amount')
+    for column in later:
+        query("ALTER TABLE penalty_htlcs DROP COLUMN {}".format(column))
+    back = version - 1 - len(later)
+    query("UPDATE version SET version=?", back)
     l2.daemon.opts['database-upgrade'] = 'true'
     l2.start()
     with open(os.path.join(l2.daemon.lightning_dir, 'log')) as f:
         log = f.read()
-    assert 'Updating database from version {} to {}'.format(version - 1, version) in log
+    assert 'Updating database from version {} to {}'.format(back, version) in log
     assert "Gave 1 close output(s) their channel's asset" in log
     assert query("SELECT version FROM version")[0][0] == version
     after = only_one([o for o in l2.rpc.listfunds()['outputs'] if o['txid'] == commitment])
