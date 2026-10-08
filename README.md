@@ -85,7 +85,8 @@ testnet unless noted. The precise file-level change list, with known hazards, is
   secret-free on-disk store (`lightningd/watchtower_store.c`, DB table `penalty_htlcs`);
   `speculad/speculad` is a standalone daemon that watches the chain through the node's CLI and
   broadcasts them while the signing device is offline, paying each breach's justice transaction
-  from a box-owned wallet in the channel asset at the node's exchange rate for it (see
+  from a box-owned wallet at the node's exchange rate: in the channel asset when the node accepts
+  it for fees, else in another accepted asset the wallet holds (see
   `speculad/speculad.c` and [doc/sequentia-fork.md](doc/sequentia-fork.md#7b-specula-keyless-watchtower)).
   The design note is not yet published in this repository.
 

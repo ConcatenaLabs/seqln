@@ -32,12 +32,13 @@
  * (Phase A) -- output 0 carries the full swept value and pays NO fee.  speculad
  * puts every still-unspent blob of one breach into ONE transaction (blob k's
  * input and output at index k) and appends its OWN fee input (+ change) from a
- * box-owned wallet (--fee-wallet) holding UTXOs in the channel asset, then
- * RBF-escalates toward the deadline, never needing the device.  The fee is paid
- * in the channel asset, so it is converted at the node's exchange rate for that
- * asset (getfeeexchangerates): the feerates are in reference atoms, the fee in
- * the asset's own atoms.  An asset the node does not accept for fees cannot pay
- * one, and its justice is then broadcast unfunded (and refused).
+ * box-owned wallet (--fee-wallet), then RBF-escalates toward the deadline,
+ * never needing the device.  The fee coin is in the channel asset when the
+ * node accepts that for fees and the wallet holds it, else in the accepted
+ * asset whose largest coin covers the most fees (choose_fee_coin), as a wallet
+ * chooses an exit's fee coin; the fee is converted at the node's exchange rate
+ * for that asset (getfeeexchangerates): the feerates are in reference atoms,
+ * the fee in the asset's own atoms.
  *
  * CLASS-B honest-force-close sweeps + HTLC 2nd-stage: lightningd/onchain_presign.c
  * device-master-signs the current-state honest-close set (kind 3 to_local-delayed
@@ -48,6 +49,7 @@
  * loop as the justice set.
  */
 #include "config.h"
+#include <assert.h>
 #include <bitcoin/chainparams.h>
 #include <bitcoin/feerate.h>
 #include <bitcoin/script.h>
@@ -152,8 +154,12 @@ struct justice_state {
 	struct bitcoin_outpoint feeutxo;
 	u64 feeutxo_val;		/* satoshis (exact) */
 	u8 *feeutxo_spk;		/* fee UTXO scriptPubKey (change goes back here) */
+	u8 fee_asset33[33];		/* the fee UTXO's asset */
+	char *fee_asset_hex;		/* the same, display order */
+	char *no_fee_coin;		/* why no fee coin was found, as last said */
 	u32 rung;			/* RBF escalation counter */
 	char *broadcast_txid;		/* last justice txid we broadcast */
+	struct amount_sat fee_paid;	/* its fee, in atoms of fee_asset33 */
 };
 static struct justice_state **g_states;	/* persistent registry */
 static const tal_t *g_state_ctx;	/* owns g_states + entries (== top) */
@@ -176,6 +182,9 @@ static struct justice_state *spd_get_state(const char *key)
 	st->have_feeutxo = false;
 	st->feeutxo_val = 0;
 	st->feeutxo_spk = NULL;
+	st->fee_asset_hex = NULL;
+	st->no_fee_coin = NULL;
+	st->fee_paid = AMOUNT_SAT(0);
 	st->rung = 0;
 	st->broadcast_txid = NULL;
 	tal_arr_expand(&g_states, st);
@@ -758,20 +767,6 @@ static bool json_find_btc_sat(const char *s, const char *key, u64 *sat_out)
 	return true;
 }
 
-/* Look for "key": true within a (bounded) JSON fragment. */
-static bool json_bool_true(const char *s, const char *key)
-{
-	char *needle = tal_fmt(tmpctx, "\"%s\"", key);
-	const char *p = s ? strstr(s, needle) : NULL;
-
-	if (!p)
-		return false;
-	p += strlen(needle);
-	while (*p == ' ' || *p == ':')
-		p++;
-	return strncmp(p, "true", 4) == 0;
-}
-
 /* The RPC-display asset hex (reversed 32-byte tag) of the 33-byte version+tag. */
 static char *asset33_to_rpchex(const tal_t *ctx, const u8 asset33[33])
 {
@@ -782,56 +777,165 @@ static char *asset33_to_rpchex(const tal_t *ctx, const u8 asset33[33])
 	return tal_hexstr(ctx, tag, 32);
 }
 
-/* Select one spendable, confirmed fee UTXO in @asset_hex with value >= min_sat
- * from the fee wallet (listunspent asset-filtered).  Confirmed-only keeps RBF
+/* One spendable, confirmed coin of the fee wallet.  Confirmed-only keeps RBF
  * replacements from adding new *unconfirmed* inputs (BIP125). */
-static bool pick_fee_utxo(const tal_t *ctx, const char *asset_hex, u64 min_sat,
-			  struct bitcoin_outpoint *out_op, u64 *out_val,
-			  u8 **out_spk)
+struct fee_coin {
+	u8 asset33[33];			/* 0x01 + id, internal byte order */
+	char *asset_hex;		/* display order, as the RPC shows it */
+	struct bitcoin_outpoint op;
+	u64 value;			/* atoms of asset33 */
+	u8 *spk;
+};
+
+/* The 33-byte version+tag of a display-hex asset id. */
+static bool asset_from_rpchex(const char *hex, u8 asset33[33])
 {
-	const char **extra = tal_arr(tmpctx, const char *, 5);
+	if (strlen(hex) != 64 || !hex_decode(hex, 64, asset33 + 1, 32))
+		return false;
+	reverse_bytes(asset33 + 1, 32);
+	asset33[0] = 0x01;
+	return true;
+}
+
+/* Every spendable, confirmed coin of the fee wallet, in any asset. */
+static struct fee_coin *list_fee_coins(const tal_t *ctx)
+{
+	const char **extra = tal_arr(tmpctx, const char *, 4);
+	struct fee_coin *coins = tal_arr(ctx, struct fee_coin, 0);
+	const jsmntok_t *toks, *t;
 	char *res;
-	const char *p;
+	size_t i;
 
 	extra[0] = "1";			/* minconf: confirmed only */
 	extra[1] = "9999999";		/* maxconf */
 	extra[2] = "[]";		/* addresses */
 	extra[3] = "false";		/* include_unsafe */
-	extra[4] = tal_fmt(tmpctx, "{\"asset\":\"%s\"}", asset_hex);
 	res = run_cli_wallet(tmpctx, "listunspent", extra);
 	if (!res)
-		return false;
+		return coins;
+	toks = json_parse_simple(tmpctx, res, strlen(res));
+	if (!toks || toks[0].type != JSMN_ARRAY)
+		return coins;
+	json_for_each_arr(i, t, toks) {
+		const jsmntok_t *txid = json_get_member(res, t, "txid");
+		const jsmntok_t *vout = json_get_member(res, t, "vout");
+		const jsmntok_t *spk = json_get_member(res, t, "scriptPubKey");
+		const jsmntok_t *asset = json_get_member(res, t, "asset");
+		const jsmntok_t *spendable = json_get_member(res, t, "spendable");
+		const char *obj = json_strdup(tmpctx, res, t);
+		struct fee_coin c;
+		char *hex;
+		u32 n;
+		bool can_spend;
 
-	/* Walk each result object (each begins with its "txid" field). */
-	p = res;
-	while ((p = strstr(p, "\"txid\"")) != NULL) {
-		const char *nextobj = strstr(p + 6, "\"txid\"");
-		size_t objlen = nextobj ? (size_t)(nextobj - p) : strlen(p);
-		char *obj = tal_strndup(tmpctx, p, objlen);
-		char *txid_hex = json_find_string(tmpctx, obj, "txid");
-		char *spk_hex = json_find_string(tmpctx, obj, "scriptPubKey");
-		long vout = json_find_int(obj, "vout");
-		bool spendable = json_bool_true(obj, "spendable");
-		u64 val = 0;
-		bool haveval = json_find_btc_sat(obj, "amount", &val);
-
-		p = nextobj ? nextobj : (p + strlen(p));
-
-		if (!txid_hex || !spk_hex || vout < 0 || !haveval || !spendable)
+		if (!txid || !vout || !spk || !asset || !spendable
+		    || !json_to_bool(res, spendable, &can_spend) || !can_spend
+		    || !json_to_u32(res, vout, &n)
+		    || !json_find_btc_sat(obj, "amount", &c.value))
 			continue;
-		if (val < min_sat)
+		hex = json_strdup(tmpctx, res, txid);
+		if (!bitcoin_txid_from_hex(hex, strlen(hex), &c.op.txid))
 			continue;
-		if (!bitcoin_txid_from_hex(txid_hex, strlen(txid_hex),
-					   &out_op->txid))
+		c.op.n = n;
+		c.asset_hex = json_strdup(coins, res, asset);
+		if (!asset_from_rpchex(c.asset_hex, c.asset33))
 			continue;
-		out_op->n = (u32)vout;
-		*out_val = val;
-		*out_spk = tal_hexdata(ctx, spk_hex, strlen(spk_hex));
-		if (!*out_spk)
+		hex = json_strdup(tmpctx, res, spk);
+		c.spk = tal_hexdata(coins, hex, strlen(hex));
+		if (!c.spk)
 			continue;
-		return true;
+		tal_arr_expand(&coins, c);
 	}
-	return false;
+	return coins;
+}
+
+static u64 asset_rate(const char *asset_hex);
+
+/* The fee of 1,000 vbytes at the base feerate in an asset at @rate, at
+ * least one atom: what one kvB of this tower's transactions costs in it. */
+static u64 per_kvb(u64 rate)
+{
+	u64 f = amount_tx_fee(feerate_in_asset(g_fee_base_perkw, rate),
+			      4000).satoshis;	/* Raw: an atom count */
+	return f ? f : 1;
+}
+
+/* The fee coin of a justice or sweep transaction in @channel_asset33, chosen
+ * as a wallet chooses the fee coin of an exit: in the channel's own asset
+ * when the node accepts it for fees and the wallet holds it, otherwise in the
+ * accepted asset whose largest coin covers the most fees (its value over the
+ * fee of a kvB in it), no asset preferred for what it is; ties go to the
+ * lower asset id.  The coin is the largest of that asset, and must cover
+ * @need of it (a function of the asset's rate).  Returns false, with *why
+ * saying so, when the wallet holds no such coin. */
+static bool choose_fee_coin(const tal_t *ctx, const u8 channel_asset33[33],
+			    size_t weight, struct fee_coin *out,
+			    const char **why)
+{
+	struct fee_coin *coins = list_fee_coins(tmpctx);
+	const struct fee_coin *best = NULL, *own = NULL;
+	u64 best_cover = 0;
+	struct amount_sat need;
+
+	/* The largest coin of each accepted asset. */
+	for (size_t i = 0; i < tal_count(coins); i++) {
+		const struct fee_coin *c = &coins[i];
+		bool largest = true;
+
+		if (asset_rate(c->asset_hex) == 0)
+			continue;
+		for (size_t j = 0; j < tal_count(coins); j++)
+			if (j != i
+			    && memcmp(coins[j].asset33, c->asset33, 33) == 0
+			    && (coins[j].value > c->value
+				|| (coins[j].value == c->value && j < i)))
+				largest = false;
+		if (!largest)
+			continue;
+		if (memcmp(c->asset33, channel_asset33, 33) == 0)
+			own = c;
+		{
+			u64 cover = c->value / per_kvb(asset_rate(c->asset_hex));
+			if (!best || cover > best_cover
+			    || (cover == best_cover
+				&& memcmp(c->asset33, best->asset33, 33) < 0)) {
+				best = c;
+				best_cover = cover;
+			}
+		}
+	}
+	if (own)
+		best = own;
+	if (!best) {
+		char *held = tal_strdup(tmpctx, "");
+
+		for (size_t i = 0; i < tal_count(coins); i++)
+			tal_append_fmt(&held, "%s%"PRIu64" atoms of %s",
+				       i ? ", " : "", coins[i].value,
+				       coins[i].asset_hex);
+		*why = tal_fmt(ctx, "the fee wallet holds no coin in an asset "
+			       "this node accepts for fees%s (it holds: %s)",
+			       asset_rate(asset33_to_rpchex(tmpctx, channel_asset33)) == 0
+			       ? ", nor is the channel asset accepted" : "",
+			       tal_count(coins) ? held : "nothing");
+		return false;
+	}
+	if (!amount_sat_add(&need,
+			    amount_tx_fee(feerate_in_asset(g_fee_base_perkw,
+							   asset_rate(best->asset_hex)),
+					  weight),
+			    SPD_DUST_SAT)
+	    || best->value < need.satoshis) {	/* Raw: an atom count */
+		*why = tal_fmt(ctx, "the fee wallet's largest coin of asset %s "
+			       "(%"PRIu64" atoms) does not cover %s of fee and "
+			       "change", best->asset_hex, best->value,
+			       fmt_amount_sat(tmpctx, need));
+		return false;
+	}
+	*out = *best;
+	out->asset_hex = tal_strdup(ctx, best->asset_hex);
+	out->spk = tal_dup_talarr(ctx, u8, best->spk);
+	return true;
 }
 
 /* Escalating feerate: base -> max as the breach ages toward its deadline
@@ -866,9 +970,9 @@ static u32 spd_feerate_perkw(const struct spd_blob *b, long breach_confs,
 }
 
 /* ---- Fee exchange rates ---------------------------------------------------- *
- * A justice or sweep transaction pays its fee in the channel asset, and every
- * node values that fee through its own exchange rate for the asset (the open
- * fee market).  The feerates above are in reference atoms per kw; the fee is
+ * A justice or sweep transaction pays its fee in the asset of its fee coin, and
+ * every node values that fee through its own exchange rate for the asset (the
+ * open fee market).  The feerates above are in reference atoms per kw; the fee is
  * the same value in atoms of the asset: feerate_in_asset() (common/amount.h).
  * The node's whitelist is read once per round, keys resolved from ticker
  * labels to display-hex ids as plugins/bcli.c does. */
@@ -940,8 +1044,9 @@ static u64 asset_rate(const char *asset_hex)
  * Such a signature covers its own input and the output at the same index and
  * nothing else, so the blobs of one breach go into ONE transaction: blob k's
  * input at index k, its output at index k, then OUR fee input, a change output
- * and the explicit fee output.  One fee input pays for the whole breach, so a
- * fee wallet with a single UTXO in the asset defends every output, and the
+ * and the explicit fee output, those three in the fee coin's asset (which may
+ * not be the blobs').  One fee input pays for the whole breach, so a fee
+ * wallet with a single UTXO in an accepted asset defends every output, and the
  * replacements of a later round replace the whole set at once.  Only the fee
  * input is signed here, with the fee-wallet key.
  *
@@ -980,7 +1085,7 @@ static char *attach_fee_and_sign(const tal_t *ctx,
 	const char **extra;
 	u64 uval;
 	u8 *raw;
-	int change_idx;
+	int change_idx, fee_idx;
 	struct spd_blob *b;
 
 	if (!g_fee_wallet || n == 0)
@@ -1006,43 +1111,53 @@ static char *attach_fee_and_sign(const tal_t *ctx,
 		}
 	}
 
-	/* The fee is paid in this asset, so it must be worth the feerate at
-	 * the node's rate for it.  An asset the node does not accept for fees
-	 * cannot pay one at all. */
-	rate = asset_rate(asset_hex);
-	if (rate == 0) {
-		fprintf(stderr, "speculad: asset %s is not accepted for fees "
-			"by this node; cannot fund the blob for output %u\n",
-			asset_hex, b->output_index);
-		return NULL;
+	/* A chosen fee coin whose asset the node no longer accepts is given
+	 * up: the next one is chosen afresh. */
+	if (st->have_feeutxo && asset_rate(st->fee_asset_hex) == 0) {
+		fprintf(stderr, "speculad: %s: fee asset %s is no longer "
+			"accepted for fees by this node; choosing again\n",
+			st->key, st->fee_asset_hex);
+		st->have_feeutxo = false;
 	}
 
-	/* Choose the fee UTXO once, then REUSE it for every RBF rung so each
-	 * replacement keeps the same fee input (only fee/change move). */
+	/* Choose the fee coin once, then REUSE it for every RBF rung so each
+	 * replacement keeps the same fee input (only fee/change move).  The
+	 * fee is paid in the coin's asset, which is the channel asset only
+	 * when the node accepts that for fees and the wallet holds it. */
 	if (!st->have_feeutxo) {
-		struct bitcoin_outpoint op;
-		u8 *spk;
-		u64 v;
-		struct amount_sat need;
+		struct fee_coin coin;
+		const char *why;
 
-		if (!amount_sat_add(&need,
-				    amount_tx_fee(feerate_in_asset(g_fee_base_perkw,
-								   rate),
-						  500 * (n + 1)),
-				    SPD_DUST_SAT))
+		if (!choose_fee_coin(tmpctx, asset33, 500 * (n + 1), &coin,
+				     &why)) {
+			/* Said once until it changes; every round tries again. */
+			if (!st->no_fee_coin || !streq(st->no_fee_coin, why)) {
+				fprintf(stderr, "speculad: %s: cannot fund the "
+					"justice for %zu output(s) in asset %s: "
+					"%s; trying again every round\n",
+					st->key, n, asset_hex, why);
+				tal_free(st->no_fee_coin);
+				st->no_fee_coin = tal_strdup(g_state_ctx, why);
+			}
 			return NULL;
-		if (!pick_fee_utxo(ctx, asset_hex, need.satoshis, &op, &v, &spk))
-			return NULL;
-		st->feeutxo = op;
-		st->feeutxo_val = v;
-		st->feeutxo_spk = tal_steal(g_state_ctx, spk);
+		}
+		st->no_fee_coin = tal_free(st->no_fee_coin);
+		st->feeutxo = coin.op;
+		st->feeutxo_val = coin.value;
+		tal_free(st->feeutxo_spk);
+		st->feeutxo_spk = tal_steal(g_state_ctx, coin.spk);
+		memcpy(st->fee_asset33, coin.asset33, 33);
+		tal_free(st->fee_asset_hex);
+		st->fee_asset_hex = tal_strdup(g_state_ctx, coin.asset_hex);
 		st->have_feeutxo = true;
 	}
 	uval = st->feeutxo_val;
+	rate = asset_rate(st->fee_asset_hex);
 
-	tx = bitcoin_tx(ctx, chainparams, n + 1, n + 1, b->tx->wtx->locktime);
+	tx = bitcoin_tx(ctx, chainparams, n + 1, n + 2, b->tx->wtx->locktime);
 	tx->wtx->version = b->tx->wtx->version;
-	bitcoin_tx_set_output_asset(tx, asset33);	/* every output in the asset */
+	/* Blob k's input and output, in the channel asset. */
+	bitcoin_tx_set_output_asset(tx, asset33);
 	for (size_t k = 0; k < n; k++) {
 		struct bitcoin_outpoint op;
 		const struct wally_tx_output *o = &blobs[k]->tx->wtx->outputs[0];
@@ -1056,13 +1171,17 @@ static char *attach_fee_and_sign(const tal_t *ctx,
 						      o->script_len, 0),
 				      NULL, blobs[k]->amount);
 	}
+	/* The fee input, its change and the explicit fee output, all in the
+	 * fee coin's asset: the blobs balance among themselves, so the fee
+	 * is the fee input less its change. */
+	bitcoin_tx_set_output_asset(tx, st->fee_asset33);
 	bitcoin_tx_add_input(tx, &st->feeutxo, SPD_RBF_SEQUENCE, NULL,
 			     amount_sat(uval), st->feeutxo_spk, NULL);
-	/* Change back to the fee wallet (amount set below). */
 	change_idx = bitcoin_tx_add_output(tx, st->feeutxo_spk, NULL,
 					   amount_sat(uval));
-	/* Adds the explicit fee output, so the weight below counts it. */
-	bitcoin_tx_finalize(tx);
+	fee_idx = -1;
+	if (chainparams->is_elements)
+		fee_idx = bitcoin_tx_add_output(tx, NULL, NULL, AMOUNT_SAT(0));
 
 	/* Weight incl. the p2wpkh fee-input witness (~108wu). */
 	weight = bitcoin_tx_weight(tx) + 108;
@@ -1074,7 +1193,7 @@ static char *attach_fee_and_sign(const tal_t *ctx,
 	if (amount_sat_less(feeamt, minfee))
 		feeamt = minfee;
 	/* Cap the fee so change stays >= dust (a too-small UTXO caps the max
-	 * feerate: the fee wallet must hold adequately-sized per-asset UTXOs). */
+	 * feerate: the fee wallet must hold adequately-sized UTXOs). */
 	if (!amount_sat_sub(&maxfee, amount_sat(uval), SPD_DUST_SAT))
 		return NULL;
 	if (amount_sat_greater(feeamt, maxfee))
@@ -1082,9 +1201,10 @@ static char *attach_fee_and_sign(const tal_t *ctx,
 	if (!amount_sat_sub(&changeamt, amount_sat(uval), feeamt))
 		return NULL;
 	bitcoin_tx_output_set_amount(tx, change_idx, changeamt);
-	/* Re-values the explicit fee output (empty scriptPubKey) to
-	 * sum(inputs) - sum(non-fee outputs) = feeamt. */
-	bitcoin_tx_finalize(tx);
+	if (fee_idx >= 0)
+		bitcoin_tx_output_set_amount(tx, fee_idx, feeamt);
+	st->fee_paid = feeamt;
+	assert(bitcoin_tx_check(tx));
 
 	/* NON-CUSTODY GUARD: output k is byte-for-byte blob k's output 0. */
 	for (size_t k = 0; k < n; k++) {
@@ -1211,10 +1331,21 @@ static void defend_breach(struct revoked_commit *rc, long breach_confs,
 		st->rung++;		/* next poll escalates the feerate (RBF) */
 		fprintf(stderr, "speculad: broadcast justice %s for %zu "
 			"output(s) -> txid %s (rung %u, feerate ~%u reference "
-			"atoms/kw)\n", key, tal_count(live), st->broadcast_txid,
+			"atoms/kw, fee %"PRIu64" atoms of asset %s, %s)\n",
+			key, tal_count(live), st->broadcast_txid,
 			st->rung, spd_feerate_perkw(live[0], breach_confs,
 						    st->rung - 1,
-						    remote_to_self_delay));
+						    remote_to_self_delay),
+			st->fee_paid.satoshis, /* Raw: an atom count */
+			st->fee_asset_hex,
+			memcmp(st->fee_asset33,
+			       bitcoin_tx_output_get_amount(live[0]->tx, 0).asset,
+			       33) == 0
+			? "the channel asset"
+			: asset_rate(asset33_to_rpchex(tmpctx,
+				bitcoin_tx_output_get_amount(live[0]->tx, 0).asset)) == 0
+			? "the channel asset is not accepted for fees by this node"
+			: "the fee wallet holds no coin of the channel asset");
 	} else {
 		fprintf(stderr, "speculad: sendrawtransaction rejected for "
 			"%s (%zu output(s))\n", key, tal_count(live));
@@ -1545,10 +1676,12 @@ static void usage_and_exit(const char *argv0)
 		"Repeat --cli to build the full elements-cli invocation (path +\n"
 		"connection flags).\n"
 		"\n"
-		"--fee-wallet names the box-owned node wallet holding per-asset\n"
-		"fee UTXOs (bech32/p2wpkh) that speculad appends to SINGLE|ACP justice\n"
-		"blobs (+ change + explicit fee output) and RBFs; the fee is paid in\n"
-		"the channel asset, converted at the node's exchange rate for it.\n"
+		"--fee-wallet names the box-owned node wallet holding fee UTXOs\n"
+		"(bech32/p2wpkh) that speculad appends to SINGLE|ACP justice blobs\n"
+		"(+ change + explicit fee output) and RBFs; the fee is paid in the\n"
+		"channel asset when the node accepts it and the wallet holds it, else\n"
+		"in the accepted asset whose largest coin covers the most fees,\n"
+		"converted at the node's exchange rate for it.\n"
 		"--fee-base-perkw and --fee-max-perkw are in reference atoms.\n"
 		"Requires the node to run with txindex=1 (breach + confirmation\n"
 		"detection use getrawtransaction).  Without --fee-wallet the zero-fee\n"
