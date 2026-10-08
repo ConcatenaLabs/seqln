@@ -6036,7 +6036,9 @@ void wallet_penalty_base_add(struct wallet *w, u64 chan_id,
 					  ", payment_hash"
 					  ", cltv_expiry"
 					  ", remote_offered"
-					  ") VALUES (?, ?, ?, ?, ?, ?, ?);"));
+					  ", stage2_txid"
+					  ", stage2_amount"
+					  ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);"));
 		db_bind_u64(hstmt, chan_id);
 		db_bind_u64(hstmt, pb->commitment_num);
 		db_bind_int(hstmt, h->outnum);
@@ -6044,6 +6046,8 @@ void wallet_penalty_base_add(struct wallet *w, u64 chan_id,
 		db_bind_sha256(hstmt, &h->payment_hash);
 		db_bind_int(hstmt, h->cltv_expiry);
 		db_bind_int(hstmt, h->remote_offered ? 1 : 0);
+		db_bind_txid(hstmt, &h->stage2_txid);
+		db_bind_amount_sat(hstmt, h->stage2_amount);
 		db_exec_prepared_v2(take(hstmt));
 	}
 }
@@ -6091,7 +6095,7 @@ struct penalty_base **wallet_penalty_base_load_for_channel(const tal_t *ctx,
 		hstmt = db_prepare_v2(
 			w->db,
 			SQL("SELECT outnum, amount, payment_hash, cltv_expiry"
-			    ", remote_offered "
+			    ", remote_offered, stage2_txid, stage2_amount "
 			    "FROM penalty_htlcs "
 			    "WHERE channel_id = ? AND commitnum = ?"));
 		db_bind_u64(hstmt, chan_id);
@@ -6105,6 +6109,14 @@ struct penalty_base **wallet_penalty_base_load_for_channel(const tal_t *ctx,
 			db_col_sha256(hstmt, "payment_hash", &h.payment_hash);
 			h.cltv_expiry = db_col_int(hstmt, "cltv_expiry");
 			h.remote_offered = db_col_int(hstmt, "remote_offered") != 0;
+			if (db_col_is_null(hstmt, "stage2_txid")) {
+				memset(&h.stage2_txid, 0, sizeof(h.stage2_txid));
+				h.stage2_amount = AMOUNT_SAT(0);
+				db_col_ignore(hstmt, "stage2_amount");
+			} else {
+				db_col_txid(hstmt, "stage2_txid", &h.stage2_txid);
+				h.stage2_amount = db_col_amount_sat(hstmt, "stage2_amount");
+			}
 			tal_arr_expand(&htlcs, h);
 		}
 		tal_free(hstmt);

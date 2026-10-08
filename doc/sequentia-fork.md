@@ -400,9 +400,15 @@ host can defend the channel while the device is offline, without ever holding a 
 
 - `channeld/watchtower.{c,h}`, `common/penalty_base.{c,h}`, `common/presign_templates.{c,h}`: at
   every commitment advance channeld has the signer pre-sign the justice (penalty) set for the
-  newly revoked commitment: one transaction for the peer's `to_local` output and one for each
-  non-dust HTLC output, in the channel asset. A commitment that carries HTLC outputs but no
-  `to_local` (a peer with no balance of its own) gets a justice set too. The templates are
+  newly revoked commitment: one transaction for the peer's `to_local` output, one for each
+  non-dust HTLC output, and one for the output of the peer's second-stage transaction for each
+  of those HTLCs (its HTLC-timeout or HTLC-success, which the peer can race the HTLC justice
+  with), all in the channel asset. Channels here have no anchors, so that second-stage
+  transaction is fixed by the signature we gave the peer for the commitment: channeld records
+  its txid and output value in the penalty base when it signs (`penalty_htlcs.stage2_txid`,
+  `stage2_amount`), and the justice binds its output before the peer could broadcast it. A
+  commitment that carries HTLC outputs but no `to_local` (a peer with no balance of its own)
+  gets a justice set too. The templates are
   `SIGHASH_SINGLE|ANYONECANPAY`, so output 0 carries the swept value and a fee input can be
   attached later without the device.
 - The penalty transaction channeld builds for each revoked commitment and hands to lightningd
@@ -423,7 +429,9 @@ host can defend the channel while the device is offline, without ever holding a 
 - `speculad/speculad.c` (built as `speculad/speculad`, `speculad/Makefile`): a standalone daemon,
   not a plugin and not spawned by `lightningd`, that loads the store, watches each channel's
   funding output through the node's CLI, and on a revoked commitment confirming broadcasts its
-  justice set as one transaction. It never loads a secret. It pays the fee from a box-owned
+  justice set as one transaction, every blob whose input is in the confirmed UTXO set: the
+  revoked commitment's outputs until they are spent, and the output of the peer's second-stage
+  transaction once that has confirmed. It never loads a secret. It pays the fee from a box-owned
   node wallet (`--fee-wallet`): it appends one fee input and its change, and pays the fee in that
   coin's asset at the node's exchange rate for it (`getfeeexchangerates`; `--fee-base-perkw` and
   `--fee-max-perkw` are in reference atoms), raising it by replacement each round until the
@@ -497,7 +505,8 @@ started on a version-1 store, whose device signs no step of the channels in it w
 closes them, moves what the closes paid it to its own address, and pays both ways over a channel
 opened afterwards (`test_predating_store.py`), a breach of an asset channel with a pending HTLC
 answered by `speculad` while the victim is offline, also once the node has delisted the channel's
-asset, with the fee paid from another asset the tower holds (`test_watchtower.py`), a keyless node, as
+asset, with the fee paid from another asset the tower holds, and one the cheater races with its
+HTLC-success or HTLC-timeout transaction, whose output the tower takes (`test_watchtower.py`), a keyless node, as
 either side of a channel, closing it and restarting with it closing (`test_keyless_close.py`), a
 keyless node whose device, moved onto an older store, refuses its closing transaction, at start
 in each closing state and after `close` times out, and one with an HTLC on chain

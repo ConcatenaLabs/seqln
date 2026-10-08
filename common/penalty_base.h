@@ -21,6 +21,15 @@ struct penalty_htlc {
 	 * commitment -> bitcoin_wscript_htlc_offer); false if we offered it
 	 * (a RECEIVED output -> bitcoin_wscript_htlc_receive). */
 	bool remote_offered;
+	/* The peer's second-stage transaction for this output (HTLC-timeout
+	 * when it offered the HTLC, HTLC-success when it received it), as we
+	 * signed it for that commitment: its txid, and the value of its one
+	 * output, the delayed revocable output the peer reaches through it.
+	 * Without anchors the transaction is fixed by our signature, so its
+	 * txid is known before the peer ever broadcasts it.  A zero amount:
+	 * not known (a penalty base recorded before it was kept). */
+	struct bitcoin_txid stage2_txid;
+	struct amount_sat stage2_amount;
 };
 
 /* To create a penalty, all we need are these. */
@@ -58,7 +67,9 @@ void penalty_base_add_htlc(struct penalty_base *pbase,
 			   struct amount_sat amount,
 			   const struct sha256 *payment_hash,
 			   u32 cltv_expiry,
-			   bool remote_offered);
+			   bool remote_offered,
+			   const struct bitcoin_txid *stage2_txid,
+			   struct amount_sat stage2_amount);
 
 void towire_penalty_base(u8 **pptr, const struct penalty_base *pbase);
 /* Wiregen varsize type: pbase (and its htlcs) are allocated off ctx, so the

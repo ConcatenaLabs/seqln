@@ -1123,6 +1123,14 @@ static const struct db_migration dbmigrations[] = {
      * migrate_fill_close_output_asset).  An older binary reads the filled
      * column as it reads any other asset, so there is nothing to revert. */
     {NULL, migrate_fill_close_output_asset, NULL, NULL},
+    /* The peer's second-stage transaction for each penalty HTLC (txid and
+     * output value), so the justice set of a revoked commitment can punish
+     * an HTLC-success or HTLC-timeout transaction the peer races it with.
+     * NULL/0 on rows from before: no second-stage justice for them. */
+    {SQL("ALTER TABLE penalty_htlcs ADD stage2_txid BLOB DEFAULT NULL;"), NULL,
+     SQL("ALTER TABLE penalty_htlcs DROP COLUMN stage2_txid"), NULL},
+    {SQL("ALTER TABLE penalty_htlcs ADD stage2_amount BIGINT DEFAULT 0;"), NULL,
+     SQL("ALTER TABLE penalty_htlcs DROP COLUMN stage2_amount"), NULL},
 };
 
 const struct db_migration *get_db_migrations(size_t *num)

@@ -1268,12 +1268,19 @@ static u8 *send_commit_part(const tal_t *ctx,
 	 * revoke time, so we only need the per-HTLC identity here.
 	 * Every output of the commitment is in the channel asset, which
 	 * is the policy asset only on a policy-asset channel. */
-	for (size_t hi = 0; hi < tal_count(htlc_map); hi++) {
+	/* txs[1 + k] is the peer's second-stage transaction for the k-th
+	 * HTLC output, in output order (channel_txs). */
+	for (size_t hi = 0, k = 0; hi < tal_count(htlc_map); hi++) {
 		const struct htlc *h = htlc_map[hi];
-		struct amount_asset asset;
+		struct amount_asset asset, stage2_asset;
+		struct bitcoin_txid stage2_txid;
+		const struct bitcoin_tx *stage2;
 
 		if (!h)
 			continue;
+		stage2 = txs[1 + k++];
+		bitcoin_txid(stage2, &stage2_txid);
+		stage2_asset = wally_tx_output_get_amount(&stage2->wtx->outputs[0]);
 		asset = wally_tx_output_get_amount(&txs[0]->wtx->outputs[hi]);
 		if (!amount_asset_is(&asset, peer->channel->channel_asset)) {
 			status_broken("watchtower: HTLC output %zu of commitment"
@@ -1287,7 +1294,12 @@ static u8 *send_commit_part(const tal_t *ctx,
 							    txs[0]);
 		penalty_base_add_htlc(pbase, hi, amount_sat(asset.value),
 				      &h->rhash, h->expiry.locktime,
-				      htlc_state_owner(h->state) == REMOTE);
+				      htlc_state_owner(h->state) == REMOTE,
+				      &stage2_txid,
+				      amount_asset_is(&stage2_asset,
+						      peer->channel->channel_asset)
+				      ? amount_sat(stage2_asset.value)
+				      : AMOUNT_SAT(0));
 	}
 
 	/* Add the penalty_base to our in-memory list as well, so we

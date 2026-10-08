@@ -314,5 +314,45 @@ build_watchtower_justice_set(const tal_t *ctx,
 			tal_arr_expand(&blobs, b);
 	}
 
+	/* (3) one penalty per HTLC output on the peer's second-stage
+	 * transaction (witness <sig> 0x01), immediate.  The peer can race the
+	 * justice of (2) with the HTLC-timeout or HTLC-success transaction we
+	 * signed for this commitment; its one output pays the peer only after
+	 * the delay we impose on it, and the revocation key takes it until
+	 * then.  Without anchors that transaction is fixed by our signature,
+	 * so its txid is known now and this blob binds its output.  The delay
+	 * is ours, config[LOCAL], as channel_txs gave it to the peer's
+	 * second-stage transactions. */
+	for (size_t i = 0; i < tal_count(pbase->htlcs); i++) {
+		const struct penalty_htlc *h = &pbase->htlcs[i];
+		struct bitcoin_outpoint outpoint;
+		u8 *wscript;
+		struct bitcoin_tx *tx;
+
+		if (anchor_outputs || anchors_zero_fee
+		    || amount_sat_less_eq(h->stage2_amount, dust_limit))
+			continue;
+
+		outpoint.txid = h->stage2_txid;
+		outpoint.n = 0;
+		wscript = bitcoin_wscript_htlc_tx(tmpctx,
+						  channel->config[LOCAL].to_self_delay,
+						  &keyset.self_revocation_key,
+						  &keyset.self_delayed_payment_key);
+		tx = presign_sweep_tx(tmpctx, &outpoint, h->stage2_amount,
+				      wscript, 0xFFFFFFFF, 0, penalty_feerate,
+				      dust_limit,
+				      true /* SINGLE|ACP: no fee deduction */,
+				      channel->channel_asset,
+				      final_index, final_ext_key,
+				      final_scriptpubkey);
+		b = make_penalty_blob(blobs, WT_TMPL_STEAL_HTLC_TX_PENALTY,
+				      pbase->commitment_num, h->outnum,
+				      h->stage2_amount, 0, tx, wscript, &secret,
+				      &ONE, sizeof(ONE));
+		if (b)
+			tal_arr_expand(&blobs, b);
+	}
+
 	return blobs;
 }

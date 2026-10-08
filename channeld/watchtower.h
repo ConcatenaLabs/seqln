@@ -20,8 +20,9 @@ penalty_tx_create(const tal_t *ctx,
 		  int hsm_fd);
 
 /* Watchtower Phase B: build + sign the FULL justice set for the just-revoked
- * remote state -- the counterparty to_local penalty plus one steal_htlc
- * penalty per revoked HTLC output recorded in pbase.  Each tx is signed at the
+ * remote state -- the counterparty to_local penalty, one steal_htlc
+ * penalty per revoked HTLC output recorded in pbase, and one penalty on the
+ * output of the peer's second-stage transaction for each of those HTLCs.  Each tx is signed at the
  * channel HSM fd (fail-soft, as penalty_tx_create) via sign_penalty_to_us and
  * returned as a tal array of struct watchtower_blob (the channeld_got_revoke
  * wire subtype), ready for lightningd to persist to the fsync-durable store.
