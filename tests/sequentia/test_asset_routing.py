@@ -222,3 +222,28 @@ def test_direct_peer_paid_in_invoice_asset(node_factory, bitcoind):
         wait_for(lambda: balance(l2, l1, a) == before[a] + 3_000_000)
         assert balance(l2, l1, other) == before[other]
         assert only_one(l2.rpc.listinvoices(label)['invoices'])['status'] == 'paid'
+
+
+def test_send_that_delivers_more_than_it_sends(node_factory, bitcoind):
+    """A route whose first hop carries less than it delivers is what a
+    payment converted across assets on the way looks like: here 50,000 msat
+    of GOLD to deliver 5,000,000 msat of SILV.  The payer's lightningd sends
+    it (it counts no routing fee), and the next hop, which converts nothing,
+    refuses it at the asset boundary."""
+    gold, silv = assets(bitcoind, 2)
+    l1, l2, l3 = line(node_factory, bitcoind, [[(gold, PAR)], [(silv, PAR)]])
+    i = l1.rpc.decode(inv(l3, 5_000_000, 's', silv))
+    route = [{'id': l2.info['id'], 'channel': channel_in(l1, l2, gold)['short_channel_id'],
+              'amount_msat': 50_000, 'delay': 450},
+             {'id': l3.info['id'], 'channel': channel_in(l2, l3, silv)['short_channel_id'],
+              'amount_msat': 5_000_000, 'delay': 180}]
+    l1.rpc.sendpay(route, i['payment_hash'], payment_secret=i['payment_secret'],
+                   amount_msat=5_000_000)
+    with pytest.raises(RpcError) as err:
+        l1.rpc.waitsendpay(i['payment_hash'])
+    print("payer:", err.value.error['message'])
+    assert err.value.error['data']['erring_node'] == l2.info['id']
+    assert l2.daemon.is_in_log('Refusing to forward HTLC across an asset boundary')
+    pay = only_one(l1.rpc.listsendpays(payment_hash=i['payment_hash'])['payments'])
+    assert (pay['status'], pay['amount_sent_msat'], pay['amount_msat']) == ('failed', 50_000, 5_000_000)
+    assert l1.rpc.getinfo()['id'] == l1.info['id']

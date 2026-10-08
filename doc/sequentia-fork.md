@@ -289,6 +289,10 @@ policy asset by default). File-level map of the threading:
   across an asset boundary (incoming and outgoing `channel_asset` must match), failing with
   `unknown_next_peer`, so a hand-crafted or buggy cross-asset route can never swap one asset for
   another at par.
+- `lightningd/htlc_end.c` `new_htlc_out()`: a payment whose first hop carries less than it
+  delivers is what a payment converted across assets on the way looks like (the two amounts are
+  in different assets). The payer records no routing fee for it; upstream treats the negative
+  fee as a corrupt HTLC and aborts the daemon, from the payer's own `sendpay` or `sendonion`.
 - `common/bolt11.{c,h}`, `common/bolt11_json.c`, `lightningd/invoice.c`, `lightningd/routehint.c`,
   `wallet/invoices.c` (column `invoices.asset`): an invoice names the asset it is paid in, in the
   BOLT11 field `a` described below, and the payee records it. `invoice ... asset=<id>` sets it;
@@ -533,7 +537,9 @@ and the only asset its route hints are in (`test_invoice_asset.py`; `common/test
 covers the field's encoding and its meaning on Bitcoin), and route finding in that asset: a payer
 with channels in two assets paying each invoice in its own, to a direct peer as well as over two
 hops, `getroute` in one asset, an unannounced first hop, and an invoice in an asset the payer
-cannot send refused with no HTLC offered anywhere (`test_asset_routing.py`), and a multi-part
+cannot send refused with no HTLC offered anywhere, and a route whose first hop carries less than
+it delivers sent by the payer and refused at the asset boundary by the next hop
+(`test_asset_routing.py`), and a multi-part
 payment split over two channels in its asset beside a larger one in another, a payment beyond what
 the payer can spend in the asset failing with every part it offered in that asset, and keysend in
 an asset, one hop and two, refused when the payer must name the asset or no route in it exists

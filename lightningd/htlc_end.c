@@ -308,13 +308,15 @@ struct htlc_out *new_htlc_out(const tal_t *ctx,
 		hout->partid = partid;
 		hout->groupid = groupid;
 
-		/* Stash the fees (for accounting) */
+		/* Stash the fees (for accounting).  A payment that delivers
+		 * more than its first hop carries is one converted across
+		 * assets on the way (on Sequentia, a quoted cross-asset
+		 * forward: the two amounts are in different assets), or a
+		 * route the next hop will refuse; either way this node paid
+		 * no routing fee it could count, and the caller's own RPC
+		 * must not abort the daemon. */
 		if (!amount_msat_sub(&hout->fees, msat, final_msat))
-			return corrupt("new_htlc_out",
-				       "overflow subtract %s-%s",
-				       fmt_amount_msat(tmpctx, msat),
-				       fmt_amount_msat(tmpctx, final_msat));
-
+			hout->fees = AMOUNT_MSAT(0);
 	}
 	hout->in = NULL;
 	if (in) {
