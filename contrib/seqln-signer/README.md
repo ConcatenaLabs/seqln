@@ -181,8 +181,11 @@ What enforce mode checks:
 - **Payments** (`src/payments.rs`): `pay` and `keysend` ask the device to approve each payment
   (`PREAPPROVE_INVOICE`, `PREAPPROVE_KEYSEND`) before offering an HTLC. The device approves the
   payment hash when the amount, with a routing-fee allowance (half a percent, at least 5,000
-  msat), fits in what the payment limit leaves for the period; the request does not name the
-  asset, so it must fit for every asset the device has channels in. A commitment, ours or the
+  msat), fits in what the payment limit leaves for the period. An invoice names the asset it is
+  paid in (its `a` field on a Sequentia network, where an invoice without one is declined;
+  bitcoin on a Bitcoin network), and the amount must fit in that asset's limit. A keysend
+  request names no asset, so its amount must fit for every asset the device has channels in.
+  A commitment, ours or the
   peer's, that lists for the first time an HTLC this node offers is signed only when that HTLC's
   payment hash was approved, and its amount is charged to the channel asset; that holds for an
   HTLC trimmed as dust too, which the request lists although it has no output. A commitment that
