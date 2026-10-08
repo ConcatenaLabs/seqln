@@ -85,4 +85,13 @@ const char *chainparams_get_network_names(const tal_t *ctx);
  * network if the chainparams is initialized, otherwise 9735 as mock port
  */
 int chainparams_get_ln_port(const struct chainparams *params);
+
+/**
+ * chainparams_max_htlc_cltv - The most blocks an HTLC may be locked for on
+ * this network: lightningd's `max_htlc_cltv`, and the default `maxdelay`
+ * a payer allows its payment.  BOLT #4's 2016 blocks are two weeks of
+ * Bitcoin's ten-minute blocks; a Sequentia network keeps the two weeks at
+ * its one-minute blocks, 20160.  With no params (a plugin before init), 2016.
+ */
+u32 chainparams_max_htlc_cltv(const struct chainparams *params);
 #endif /* LIGHTNING_BITCOIN_CHAINPARAMS_H */

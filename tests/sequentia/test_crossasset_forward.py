@@ -490,3 +490,28 @@ def test_lightningd_alone_never_converts(node_factory, bitcoind):
     assert l2.daemon.is_in_log('Refusing to forward HTLC across an asset boundary')
     wait_for(lambda: no_htlcs(l1, l2, l3))
     assert books(l1, l2, l3, gold, silv) == before
+
+
+def test_default_maxdelay_is_the_networks_cap(node_factory, bitcoind):
+    """An invoice whose final lock time is 5,000 blocks (an Arca receive
+    invoice) is paid by crossassetpay with its default maxdelay, the
+    network's cap of 20,160 blocks; a maxdelay below the route's lock time
+    still refuses it with nothing sent."""
+    l1, l2, l3, gold, silv = network(node_factory, bitcoind,
+                                     quoter_opts={'crossasset-max-out-cltv': 6000})
+    bolt11 = l3.rpc.call('invoice', {'amount_msat': AMOUNT_OUT, 'label': 'long',
+                                     'description': 'long', 'asset': silv,
+                                     'cltv': 5000})['bolt11']
+    assert l1.rpc.decode(bolt11)['min_final_cltv_expiry'] == 5000
+
+    with pytest.raises(RpcError, match=r'would lock this payment for \d+ blocks, above maxdelay 5000') as err:
+        l1.rpc.call('crossassetpay', {'bolt11': bolt11, 'node_id': l2.info['id'],
+                                      'maxamount_in_msat': AMOUNT_IN, 'maxdelay': 5000})
+    print("crossassetpay maxdelay 5000:", err.value.error['message'])
+    assert l1.rpc.listsendpays(bolt11)['payments'] == []
+
+    res = l1.rpc.call('crossassetpay', {'bolt11': bolt11, 'node_id': l2.info['id'],
+                                        'maxamount_in_msat': AMOUNT_IN})
+    print("crossassetpay with the default maxdelay: delivered", res['delivered_msat'],
+          "quote cltv_delta", res['quote']['cltv_delta'])
+    assert only_one(l3.rpc.listinvoices('long')['invoices'])['status'] == 'paid'

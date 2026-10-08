@@ -55,7 +55,8 @@
         "type": "u32",
         "description": [
           "Number of blocks the payment may be delayed."
-        ]
+        ],
+        "default": "the network's cap on an HTLC's lock time: 2016 blocks on Bitcoin, 20160 (two weeks of one-minute blocks) on a Sequentia network"
       },
       "exemptfee": {
         "type": "msat",

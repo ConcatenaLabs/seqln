@@ -222,6 +222,10 @@ def _open_forwards(asset_out):
 def init(options, configuration, plugin, **kwargs):
     info = plugin.rpc.getinfo()
     STATE["network"] = info.get("network", "")
+    # crossassetpay's default maxdelay: the network's own cap on an HTLC's
+    # lock time, as pay's (chainparams_max_htlc_cltv()): two weeks of
+    # blocks, 20160 at Sequentia's one minute and 2016 at Bitcoin's ten.
+    STATE["max_delay"] = 20160 if STATE["network"].startswith("sequentia") else 2016
     STATE["node_id"] = info["id"]
     STATE["seconds"] = int(options["crossasset-quote-seconds"])
     STATE["max_open"] = int(options["crossasset-max-open"])
@@ -720,7 +724,7 @@ def _route_after(plugin, inv, node_id, asset_out):
 
 @plugin.async_method("crossassetpay")
 def crossassetpay_rpc(plugin, request, bolt11, node_id, maxamount_in_msat,
-                      asset_in=None, maxdelay=1008, retry_for=60):
+                      asset_in=None, maxdelay=None, retry_for=60):
     """Pay bolt11, an invoice in one asset, with at most maxamount_in_msat of
     another asset, converted by node_id: see crossassetpay."""
     _in_thread(request, crossassetpay, plugin, bolt11, node_id, maxamount_in_msat,
@@ -728,14 +732,16 @@ def crossassetpay_rpc(plugin, request, bolt11, node_id, maxamount_in_msat,
 
 
 def crossassetpay(plugin, bolt11, node_id, maxamount_in_msat, asset_in=None,
-                  maxdelay=1008, retry_for=60):
+                  maxdelay=None, retry_for=60):
     """Pay bolt11, an invoice in one asset, with another asset, converted by
     node_id, a peer that quotes the pair.  asset_in is the asset to pay in
     (default: the one asset this node's channels to node_id hold).  Nothing
     is sent if the quote asks more than maxamount_in_msat of it, the most
     this payer will give: only the payer can say what the conversion is
     worth to it.  Nor if the payer's HTLC would be locked for more than
-    maxdelay blocks."""
+    maxdelay blocks (by default the network's cap, as pay's)."""
+    if maxdelay is None:
+        maxdelay = STATE["max_delay"]
     inv = plugin.rpc.call("decode", {"string": bolt11})
     if not inv.get("valid"):
         raise ValueError("the invoice does not decode")
