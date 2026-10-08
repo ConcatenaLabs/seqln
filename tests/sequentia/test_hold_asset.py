@@ -216,3 +216,88 @@ def test_payment_set_stays_in_one_asset(node_factory, bitcoind):
     assert (l2.daemon.is_in_log('in asset {}, the payment set is in asset {}'.format(silv, gold))
             or l2.daemon.is_in_log('paid in asset {}, invoice wants {}'.format(silv, gold)))
     assert only_one(l2.rpc.listinvoices('mixed')['invoices'])['status'] == 'unpaid'
+
+
+def test_hold_accepted_only_at_the_full_amount(node_factory, bitcoind):
+    """A hold is accepted only once the parts it holds reach its amount in
+    its asset.  A part short of it leaves the hold waiting, cannot be
+    settled, and is failed back with mpp_timeout when the rest does not
+    come within the hold's timeout; nothing moves.  A hold registered with
+    no amount is accepted on its first part."""
+    l1, l2, gold, silv = two_asset_channels(node_factory, bitcoind, [{}, {'plugin': HOLD}])
+    scid = chan_in(l1, l2, gold)['short_channel_id']
+    amount = 6 * 10**6 * 1000
+    half = amount // 2
+
+    def part(h, partid, amt, total):
+        route = [{'id': l2.info['id'], 'channel': scid, 'amount_msat': amt, 'delay': 200}]
+        l1.rpc.call('sendpay', {'route': route, 'payment_hash': h,
+                                'payment_secret': '22' * 32, 'amount_msat': total,
+                                'partid': partid, 'groupid': 1})
+
+    def look(h):
+        return l2.rpc.call('holdinvoicelookup', {'payment_hash': h})
+
+    # Two halves: waiting at the first, accepted at the second.
+    p1 = os.urandom(32)
+    h1 = hashlib.sha256(p1).hexdigest()
+    reg = l2.rpc.call('holdinvoice', {'payment_hash': h1, 'amount_msat': amount,
+                                      'asset': gold})
+    part(h1, 1, half, amount)
+    wait_for(lambda: look(h1)['received_msat'] == half)
+    print("one half held:", look(h1))
+    assert look(h1)['state'] == 'waiting'
+    assert reg['received_msat'] == 0
+    w = l2.rpc.call('holdinvoicewait', {'payment_hash': h1, 'timeout': 2})
+    assert (w['state'], w['received_msat']) == ('waiting', half)
+    with pytest.raises(RpcError, match=r'the hold has received {}msat of {}msat'
+                       .format(half, amount)) as err:
+        l2.rpc.call('holdinvoicesettle', {'payment_hash': h1, 'preimage': p1.hex()})
+    print("settle at one half:", err.value.error['message'])
+    part(h1, 2, half, amount)
+    wait_for(lambda: look(h1)['state'] == 'accepted')
+    print("both halves held:", look(h1))
+    assert look(h1)['received_msat'] == amount
+    settled = l2.rpc.call('holdinvoicesettle', {'payment_hash': h1, 'preimage': p1.hex()})
+    assert settled['resolved_htlcs'] == 2 and settled['received_msat'] == amount
+    for partid in (1, 2):
+        assert l1.rpc.waitsendpay(h1, partid=partid, groupid=1)['status'] == 'complete'
+
+    # One half and no more: failed back at the hold's timeout.
+    wait_for(lambda: chan_in(l2, l1, gold)['htlcs'] == [])
+    before = {a: chan_in(l2, l1, a)['to_us_msat'] for a in (gold, silv)}
+    p2 = os.urandom(32)
+    h2 = hashlib.sha256(p2).hexdigest()
+    l2.rpc.call('holdinvoice', {'payment_hash': h2, 'amount_msat': amount, 'asset': gold,
+                                'mpp_timeout': 5})
+    part(h2, 1, half, amount)
+    wait_for(lambda: look(h2)['received_msat'] == half)
+    with pytest.raises(RpcError) as err:
+        l1.rpc.waitsendpay(h2, partid=1, groupid=1)
+    print("payer, a half held past the timeout:", err.value.error['message'],
+          "failcode", err.value.error['data']['failcode'])
+    assert err.value.error['data']['failcode'] == 0x17  # mpp_timeout
+    assert l2.daemon.is_in_log(r'holdinvoice: failed back 1 part\(s\) for {}: {}msat of {}msat'
+                               r' after 5s'.format(h2, half, amount))
+    after_look = look(h2)
+    print("hold after the timeout:", after_look)
+    assert (after_look['state'], after_look['received_msat']) == ('waiting', 0)
+    wait_for(lambda: chan_in(l2, l1, gold)['htlcs'] == [])
+    assert {a: chan_in(l2, l1, a)['to_us_msat'] for a in (gold, silv)} == before
+
+    # Still waiting: the whole amount, sent afterwards, is held and settles.
+    part(h2, 2, amount, amount)
+    wait_for(lambda: look(h2)['state'] == 'accepted')
+    l2.rpc.call('holdinvoicesettle', {'payment_hash': h2, 'preimage': p2.hex()})
+    assert l1.rpc.waitsendpay(h2, partid=2, groupid=1)['status'] == 'complete'
+
+    # No amount registered: the first part is accepted.
+    p3 = os.urandom(32)
+    h3 = hashlib.sha256(p3).hexdigest()
+    l2.rpc.call('holdinvoice', {'payment_hash': h3, 'asset': gold})
+    part(h3, 1, half, amount)
+    wait_for(lambda: look(h3)['state'] == 'accepted')
+    assert look(h3)['received_msat'] == half
+    l2.rpc.call('holdinvoicecancel', {'payment_hash': h3})
+    with pytest.raises(RpcError):
+        l1.rpc.waitsendpay(h3, partid=1, groupid=1)
