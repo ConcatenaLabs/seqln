@@ -606,7 +606,13 @@ static enum likely_type guess_type(const char *buffer, const jsmntok_t *tok)
 	if (tok_pull(buffer, &tok_copy, "lnbcrt")
 	    || tok_pull(buffer, &tok_copy, "lnbc")
 	    || tok_pull(buffer, &tok_copy, "lntbs")
-	    || tok_pull(buffer, &tok_copy, "lntb")) {
+	    || tok_pull(buffer, &tok_copy, "lntb")
+	    /* Sequentia: this node's own network, so a Sequentia invoice
+	     * that fails to decode says why. */
+	    || (chainparams->has_anchor_header
+		&& tok_pull(buffer, &tok_copy,
+			    tal_fmt(tmpctx, "ln%s",
+				    chainparams->lightning_hrp)))) {
 		/* Now find last '1', which separates hrp from data */
 		const char *delim = memrchr(buffer + tok_copy.start, '1',
 					    tok_copy.end - tok_copy.start);

@@ -2013,6 +2013,12 @@
                 "The payment_metadata to put in the payment."
               ]
             },
+            "asset": {
+              "type": "hex",
+              "description": [
+                "On a Sequentia network, the 32-byte display id of the asset the invoice is to be paid in, from its `a` field: the amounts are in thousandths of that asset's atoms. An invoice on a Sequentia network without it does not decode."
+              ]
+            },
             "fallbacks": {
               "type": "array",
               "description": [

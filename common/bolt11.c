@@ -649,10 +649,47 @@ struct bolt11 *new_bolt11(const tal_t *ctx,
 	b11->min_final_cltv_expiry = 18;
 	b11->payment_secret = NULL;
 	b11->metadata = NULL;
+	b11->asset = NULL;
 
 	if (msat)
 		b11->msat = tal_dup(b11, struct amount_msat, msat);
 	return b11;
+}
+
+/* Sequentia: `a` (29): `data_length` 52.  The 32-byte id of the asset the
+ * invoice is to be paid in, in the order its hex is displayed (the order the
+ * node's RPC and explorers print it; the reverse of its serialization in a
+ * transaction).  It is read only on a Sequentia network: on any other chain
+ * `a` is an unknown field and is skipped. */
+static const char *decode_a(struct bolt11 *b11,
+			    const struct feature_set *our_features,
+			    struct hash_u5 *hu5,
+			    const u5 **data, size_t *field_len,
+			    bool *have_a)
+{
+	u8 id[32];
+	const char *err;
+
+	assert(!*have_a);
+	if (!b11->chain->has_anchor_header)
+		return unknown_field(b11, hu5, data, field_len, 'a');
+
+	/* Like the other fixed-length fields, a wrong length fails the
+	 * invoice rather than being skipped: skipping it would leave an
+	 * invoice that names no asset. */
+	if (*field_len != 52)
+		return tal_fmt(b11, "a: expected 52 characters, got %zu",
+			       *field_len);
+
+	err = pull_bits(hu5, data, field_len, id, *field_len * 5, false);
+	if (err)
+		return err;
+	*have_a = true;
+	b11->asset = tal_arr(b11, u8, 33);
+	b11->asset[0] = 0x01;
+	for (size_t i = 0; i < sizeof(id); i++)
+		b11->asset[1 + i] = id[sizeof(id) - 1 - i];
+	return NULL;
 }
 
 struct decoder {
@@ -693,6 +730,7 @@ static const struct decoder decoders[] = {
 	{ 'r', true, decode_r },
 	{ '9', false, decode_9 },
 	{ 'm', false, decode_m },
+	{ 'a', false, decode_a },
 };
 
 static const struct decoder *find_decoder(char c)
@@ -967,6 +1005,16 @@ struct bolt11 *bolt11_decode_nosig(const tal_t *ctx, const char *str,
 		return decode_fail(b11, fail,
 				   "must have either 'd' or 'h' field");
 
+	/* Sequentia: an invoice names the asset it is paid in.  No asset is
+	 * implied by its absence: the Sequence token is one asset among
+	 * equals, so an invoice without `a` is not an invoice for it. */
+	if (b11->chain->has_anchor_header
+	    && !have_field[bech32_charset_rev['a']])
+		return decode_fail(b11, fail,
+				   "a: missing: an invoice on %s must name"
+				   " the asset it is paid in",
+				   b11->chain->network_name);
+
 	hash_u5_done(&hu5, hash);
 	*sig = tal_dup_arr(ctx, u5, data, data_len, 0);
 
@@ -1131,6 +1179,16 @@ static void push_fallback_addr(u5 **data, u5 version, const void *addr, u16 addr
 static void encode_p(u5 **data, const struct sha256 *hash)
 {
 	push_field(data, 'p', hash, 256);
+}
+
+/* Sequentia: the asset id in display order (see decode_a). */
+static void encode_a(u5 **data, const u8 *asset)
+{
+	u8 id[32];
+
+	for (size_t i = 0; i < sizeof(id); i++)
+		id[i] = asset[sizeof(id) - i];
+	push_field(data, 'a', id, 256);
 }
 
 static void encode_m(u5 **data, const u8 *metadata)
@@ -1349,6 +1407,9 @@ char *bolt11_encode_(const tal_t *ctx,
 
 	if (b11->metadata)
 		encode_m(&data, b11->metadata);
+
+	if (b11->asset)
+		encode_a(&data, b11->asset);
 
 	if (n_field)
 		encode_n(&data, &b11->receiver_id);

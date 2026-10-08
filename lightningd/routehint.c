@@ -1,4 +1,5 @@
 #include "config.h"
+#include <ccan/mem/mem.h>
 #include <lightningd/channel.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/routehint.h>
@@ -30,6 +31,7 @@ routehint_candidates(const tal_t *ctx,
 		     const jsmntok_t *toks,
 		     const bool *expose_all_private,
 		     const struct short_channel_id *hints,
+		     const u8 *asset,
 		     bool *none_public,
 		     struct amount_msat *avail_capacity,
 		     struct amount_msat *private_capacity,
@@ -121,6 +123,15 @@ routehint_candidates(const tal_t *ctx,
 		/* Check channel is in CHANNELD_NORMAL or CHANNELD_AWAITING_SPLICE */
 		if (!channel_state_can_add_htlc(candidate.c->state)) {
 			log_debug(ld->log, "%s: abnormal channel",
+				  fmt_short_channel_id(tmpctx,
+						       r->short_channel_id));
+			continue;
+		}
+
+		/* Sequentia: an invoice is paid in one asset, and only a
+		 * channel in it can carry the payment to us. */
+		if (asset && !memeq(asset, 33, candidate.c->channel_asset, 33)) {
+			log_debug(ld->log, "%s: in another asset",
 				  fmt_short_channel_id(tmpctx,
 						       r->short_channel_id));
 			continue;

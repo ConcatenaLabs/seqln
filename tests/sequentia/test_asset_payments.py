@@ -1,11 +1,11 @@
 """Payments on nodes that hold channels in more than one asset.
 
 An HTLC's amount is read in the atoms of whatever asset its channel holds:
-nothing in an invoice or an onion names the asset.  So the payer must pick
-channels of one asset, every forwarding node must keep a payment in the
-asset it arrived in, and a payee must refuse an HTLC in an asset its invoice
-was not issued in.  Run with TEST_NETWORK=sequentia-regtest (README.md,
-"Testing").
+nothing in an onion names the asset, and an invoice names it only for the
+payer to read.  So the payer must pick channels of one asset, every
+forwarding node must keep a payment in the asset it arrived in, and a payee
+must refuse an HTLC in an asset its invoice was not issued in.  Run with
+TEST_NETWORK=sequentia-regtest (README.md, "Testing").
 """
 from fixtures import *  # noqa: F401,F403
 from pyln.client import RpcError
@@ -121,10 +121,11 @@ def test_no_asset_blind_first_hop(node_factory, bitcoind):
                        payment_secret=decoded['payment_secret'])
     assert only_one(l2.rpc.listinvoices('any')['invoices'])['status'] == 'unpaid'
 
-    # On a node with channels in several assets, an invoice that names none
-    # does not pick one for the caller.
-    l2.rpc.invoice(1_000_000, 'unnamed', 'unnamed')
-    assert 'asset' not in only_one(l2.rpc.listinvoices('unnamed')['invoices'])
+    # On a node with channels in several assets, an invoice does not pick
+    # one for the caller: it asks which.
+    with pytest.raises(RpcError, match=r'several assets: name the asset'):
+        l2.rpc.invoice(1_000_000, 'unnamed', 'unnamed')
+    assert l2.rpc.listinvoices('unnamed')['invoices'] == []
 
 
 def test_one_asset_node_pays_without_asset(node_factory, bitcoind):

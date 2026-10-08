@@ -949,6 +949,74 @@ int main(int argc, char *argv[])
 	assert(!bolt11_decode(tmpctx, "lnbc1qqygh9qpp50qzxqqqqqpqqrzjcqqqqqqqqqqqqqqqqqqqqqqqqqqcqpjqqqqqqrzjcqqqqqcqpjqqqqqqqqqqqqqqqqqqqqqqqqqcq9qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqlqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqlqqqqqqqqqqqqqqqqqqqqqqq4murj7", NULL, NULL, NULL, &fail));
 	assert(streq(fail, "r: hop 0 pubkey invalid"));
 
+	/* Sequentia: the asset field `a`, the 32-byte asset id in display
+	 * order, read only on a Sequentia network and required there. */
+	{
+		const struct chainparams *seq
+			= chainparams_for_network("sequentia-regtest");
+		struct bolt11 *a11 = new_bolt11(tmpctx, NULL);
+		struct bolt11 *d;
+		struct bolt11_field *bad;
+		struct node_id signer;
+		u8 asset[33];
+		char *s;
+
+		/* `node` was reset by the examples above: the signer is
+		 * the BOLT #11 example key's 03e7156a... node. */
+		if (!node_id_from_hexstr("03e7156ae33b0a208d0744199163177e909e80176e55d97a2f221ede0f934dd9ad", 66, &signer))
+			abort();
+
+		asset[0] = 0x01;
+		for (size_t i = 0; i < 32; i++)
+			asset[1 + i] = i + 1;
+		a11->chain = seq;
+		a11->timestamp = 1496314658;
+		a11->payment_hash = b11->payment_hash;
+		a11->receiver_id = signer;
+		a11->payment_secret = tal(a11, struct secret);
+		memset(a11->payment_secret, 0x11, sizeof(*a11->payment_secret));
+		a11->description = "asset";
+		a11->asset = tal_dup_arr(a11, u8, asset, 33, 0);
+
+		s = bolt11_encode(tmpctx, a11, false, test_sign, NULL);
+		assert(strstarts(s, "lnsqrt1"));
+		d = bolt11_decode(tmpctx, s, NULL, NULL, NULL, &fail);
+		assert(d);
+		assert(memeq(d->asset, tal_bytelen(d->asset), asset, 33));
+		assert(streq(fmt_asset_id(tmpctx, d->asset),
+			     "201f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090807060504030201"));
+		/* Under the signature: the payee is recovered from it. */
+		assert(node_id_eq(&d->receiver_id, &signer));
+		assert(list_empty(&d->extra_fields));
+
+		/* No `a`: not an invoice on a Sequentia network. */
+		a11->asset = NULL;
+		s = bolt11_encode(tmpctx, a11, false, test_sign, NULL);
+		assert(!bolt11_decode(tmpctx, s, NULL, NULL, NULL, &fail));
+		assert(streq(fail, "a: missing: an invoice on sequentia-regtest"
+			     " must name the asset it is paid in"));
+
+		/* A wrong length fails rather than being skipped. */
+		bad = tal(a11, struct bolt11_field);
+		bad->tag = 'a';
+		bad->data = tal_arrz(bad, u5, 51);
+		list_add_tail(&a11->extra_fields, &bad->list);
+		s = bolt11_encode(tmpctx, a11, false, test_sign, NULL);
+		assert(!bolt11_decode(tmpctx, s, NULL, NULL, NULL, &fail));
+		assert(streq(fail, "a: expected 52 characters, got 51"));
+		list_head_init(&a11->extra_fields);
+
+		/* On Bitcoin `a` means nothing: it is an unknown field. */
+		a11->chain = chainparams_for_network("bitcoin");
+		a11->asset = tal_dup_arr(a11, u8, asset, 33, 0);
+		s = bolt11_encode(tmpctx, a11, false, test_sign, NULL);
+		d = bolt11_decode(tmpctx, s, NULL, NULL, NULL, &fail);
+		assert(d);
+		assert(!d->asset);
+		extra = list_top(&d->extra_fields, struct bolt11_field, list);
+		assert(extra && extra->tag == 'a');
+	}
+
 	/* FIXME: Test the others! */
 	common_shutdown();
 }

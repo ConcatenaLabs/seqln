@@ -79,6 +79,11 @@ struct bolt11 {
 	/* Optional metadata to send with payment. */
 	u8 *metadata;
 
+	/* Sequentia: the asset the invoice is to be paid in, as a 33-byte
+	 * tag (0x01 || id in serialization order), from the `a` field.
+	 * Every invoice on a Sequentia network has one; NULL elsewhere. */
+	u8 *asset;
+
 	struct list_head extra_fields;
 };
 

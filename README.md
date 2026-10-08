@@ -96,8 +96,6 @@ Experimental / known limitations (details and file pointers in
   ordinary single-funder `fundchannel`.
 - `pay` is the payment command that keeps a payment in one asset; xpay, renepay and keysend
   route over channels of any asset.
-- BOLT11 invoices carry no asset field: the payee records and enforces the asset, and the payer
-  names it with `pay ... asset=<id>`.
 
 ## Building from source
 

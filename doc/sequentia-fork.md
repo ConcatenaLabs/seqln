@@ -238,12 +238,18 @@ policy asset by default). File-level map of the threading:
   across an asset boundary (incoming and outgoing `channel_asset` must match), failing with
   `unknown_next_peer`, so a hand-crafted or buggy cross-asset route can never swap one asset for
   another at par.
-- `lightningd/invoice.c`, `wallet/invoices.c` (column `invoices.asset`): `invoice ... asset=<id>`
-  records the asset an invoice is to be paid in, and `invoice_check_payment()` refuses an HTLC
-  arriving on a channel in any other asset (`incorrect_or_unknown_payment_details`, logged as
-  "paid in asset X, invoice wants Y"). Without `asset=`, the invoice records the asset of this
-  node's channels when they all hold one; on a node with channels in several assets, or none, it
-  names no asset and accepts any. `listinvoices` and the `wait*invoice` results show it.
+- `common/bolt11.{c,h}`, `common/bolt11_json.c`, `lightningd/invoice.c`, `lightningd/routehint.c`,
+  `wallet/invoices.c` (column `invoices.asset`): an invoice names the asset it is paid in, in the
+  BOLT11 field `a` described below, and the payee records it. `invoice ... asset=<id>` sets it;
+  without `asset=` it is the asset of this node's channels when they all hold one, and a node
+  with channels in several assets, or none, refuses until the caller names one. An invoice in an
+  asset the node holds no channel in (an opening one counts) is refused unless
+  `allow_unfunded=true`, since nothing could pay it. Route hints name only channels in the
+  invoice's asset. `createinvoice` records the asset its `a` field names, and the backfilled
+  invoice of an incoming keysend names the asset the HTLC arrived in. `invoice_check_payment()`
+  refuses an HTLC arriving on a channel in any other asset (`incorrect_or_unknown_payment_details`,
+  logged as "paid in asset X, invoice wants Y"). `decode`, `listinvoices` and the `wait*invoice`
+  results show the asset.
 - `lightningd/htlc_set.c`: the parts of one payment must arrive in one asset; a part in another
   asset than the first is refused (`incorrect_or_unknown_payment_details`, logged as "in asset X,
   the payment set is in asset Y"), so an invoice that names no asset never adds one asset's atoms
@@ -257,9 +263,21 @@ policy asset by default). File-level map of the threading:
   (`.msggen.json`, `cln-rpc`, `cln-grpc`) are not regenerated from them, so a typed client does
   not see the fields.
 
-Invoices: standard BOLT11 with the `tsqt` HRP, and no asset field: the asset an invoice wants is
-known to the payee, which enforces it, and is told to the payer out of band (`pay ... asset=`).
-Invoice amounts are numeric msat fields read as thousandths of the payment asset's atoms.
+Invoices: standard BOLT11 with the network's Lightning HRP (`tsqt` on the testnet, so invoices
+read `lntsqt...`) and one more tagged field, which carries the asset:
+
+- `a` (29): `data_length` 52. The 32-byte id of the asset the invoice is to be paid in, in the
+  order its hex is displayed (the order RPC results and explorers print it; the reverse of its
+  serialization in a transaction). Like every field it is covered by the invoice's signature.
+- On a Sequentia network a reader requires it: an invoice without `a` fails to decode ("a:
+  missing: an invoice on <network> must name the asset it is paid in"), whatever it is for. The
+  Sequence token is one asset among equals, so no asset is implied by the field's absence, and
+  an invoice for the token names it like any other. A field of another length also fails the
+  invoice ("a: expected 52 characters"), as BOLT 11 requires for its fixed-length fields.
+- On any other chain `a` is an unknown field, which BOLT 11 readers skip, so a Bitcoin or
+  Liquid invoice means what it always did.
+
+Invoice amounts are numeric msat fields read as thousandths of the asset's atoms.
 
 ## 7. Signer split (hsmd proxy + out-of-process signer)
 
@@ -428,8 +446,11 @@ in each closing state and after `close` times out, and one with an HTLC on chain
 (`test_keyless_start.py`, which runs on Bitcoin regtest too, with `TEST_NETWORK=regtest`), the
 fees of channels in assets of any value and between peers that value an asset differently
 (`test_fee_market.py`),
-and the asset plugins see on an HTLC, with `holdinvoice-seq` holding only the asset it was
-registered in, across a restart (`test_hold_asset.py`). They need `sequentiad`, `sequentia-cli`
+the asset plugins see on an HTLC, with `holdinvoice-seq` holding only the asset it was
+registered in, across a restart (`test_hold_asset.py`), and the asset an invoice names in its
+`a` field: under its signature, required on decode, refused at creation without a channel in it,
+and the only asset its route hints are in (`test_invoice_asset.py`; `common/test/run-bolt11.c`
+covers the field's encoding and its meaning on Bitcoin). They need `sequentiad`, `sequentia-cli`
 and a Bitcoin Core `bitcoind` on `PATH`, and the keyless tests need the device signer built
 (`cargo build --release` in `contrib/seqln-signer`, or `SEQLN_SIGNER=/path/to/seqln-signer`).
 The test plugins run under the `python3` on `PATH`, which needs the `pyln` packages, so the
@@ -475,18 +496,16 @@ Each verified present in the code as of 2026-07-08:
 3. **Local/private channels have no asset record in pathfinding.** The gossmap local
    modifications (`common/gossmods_listpeerchannels.c`) carry no asset, so unannounced channels
    are treated as policy-asset channels by the `pay`/`getroute` asset filter.
-4. **No asset field in invoices.** A payee enforces the asset its invoice was issued in, but the
-   BOLT11 string does not carry it: the payer learns it out of band and passes `pay ... asset=`.
-5. **Mainnet chainparams are placeholders.** All-zero genesis, NULL fee asset; the `sequentia`
+4. **Mainnet chainparams are placeholders.** All-zero genesis, NULL fee asset; the `sequentia`
    network entry must not be used.
-6. **Committee-stall fail-open.** If the certified frontier is more than 144 blocks behind the tip
+5. **Committee-stall fail-open.** If the certified frontier is more than 144 blocks behind the tip
    (a stalled committee), the bcli clamp fails open with a warning rather than halting; operators
    should monitor for that log message.
-7. **Penalty across an induced anchor reorg is untested.** Open, payment and mutual close of an
+6. **Penalty across an induced anchor reorg is untested.** Open, payment and mutual close of an
    issued-asset channel, and a breach of one answered by `speculad`, run in `tests/sequentia/`,
    and force-close resolution has been exercised on the testnet, but no test covers a penalty
    across a Bitcoin-anchor tail truncation.
-8. **`speculad` pays a justice transaction's fee only in the channel asset.** If the node stops
+7. **`speculad` pays a justice transaction's fee only in the channel asset.** If the node stops
    accepting that asset for fees, the tower cannot fund the justice transaction (it logs the
    asset and broadcasts it unfunded, which the network refuses). Its fee wallet must also hold a
    UTXO in each channel asset it defends.
