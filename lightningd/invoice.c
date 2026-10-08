@@ -41,14 +41,16 @@ const char *invoice_status_str(enum invoice_status state)
 }
 
 /* The single asset this node's usable channels hold, or NULL if they hold
- * none or several. */
+ * none or several (*several says which). */
 static const u8 *invoice_default_asset(const tal_t *ctx,
-				       struct lightningd *ld)
+				       struct lightningd *ld,
+				       bool *several)
 {
 	struct peer *peer;
 	struct peer_node_id_map_iter it;
 	const u8 *found = NULL;
 
+	*several = false;
 	for (peer = peer_node_id_map_first(ld->peers, &it);
 	     peer;
 	     peer = peer_node_id_map_next(ld->peers, &it)) {
@@ -58,11 +60,44 @@ static const u8 *invoice_default_asset(const tal_t *ctx,
 				continue;
 			if (!found)
 				found = c->channel_asset;
-			else if (!memeq(found, 33, c->channel_asset, 33))
+			else if (!memeq(found, 33, c->channel_asset, 33)) {
+				*several = true;
 				return NULL;
+			}
 		}
 	}
 	return found ? tal_dup_arr(ctx, u8, found, 33, 0) : NULL;
+}
+
+/* Sequentia: NULL if this node holds a channel in @asset that can carry, or
+ * will soon carry, a payment to it; otherwise what it holds instead. */
+static const char *invoice_unfunded_asset(const tal_t *ctx,
+					  struct lightningd *ld,
+					  const u8 *asset)
+{
+	struct peer *peer;
+	struct peer_node_id_map_iter it;
+	char *others = tal_strdup(ctx, "");
+
+	for (peer = peer_node_id_map_first(ld->peers, &it);
+	     peer;
+	     peer = peer_node_id_map_next(ld->peers, &it)) {
+		struct channel *c;
+		list_for_each(&peer->channels, c, list) {
+			if (!channel_state_can_add_htlc(c->state)
+			    && c->state != CHANNELD_AWAITING_LOCKIN)
+				continue;
+			if (memeq(asset, 33, c->channel_asset, 33))
+				return NULL;
+			tal_append_fmt(&others, "%s%s in %s",
+				       others[0] ? ", " : "",
+				       c->scid
+				       ? fmt_short_channel_id(tmpctx, *c->scid)
+				       : fmt_channel_id(tmpctx, &c->cid),
+				       fmt_asset_id(tmpctx, c->channel_asset));
+		}
+	}
+	return others[0] ? others : "no open channel";
 }
 
 static void json_add_invoice_fields(struct json_stream *response,
@@ -785,6 +820,8 @@ add_routehints(struct invoice_info *info,
 					  buffer, toks,
 					  chanhints ? &chanhints->expose_all_private : NULL,
 					  chanhints ? chanhints->hints : NULL,
+					  chainparams->has_anchor_header
+					  ? info->asset : NULL,
 					  &node_unpublished,
 					  &avail_capacity,
 					  &private_capacity,
@@ -1188,7 +1225,7 @@ static struct command_result *json_invoice(struct command *cmd,
 	u32 *cltv;
 	struct jsonrpc_request *req;
 	struct plugin *plugin;
-	bool *hashonly;
+	bool *hashonly, *allow_unfunded;
 	const size_t inv_max_label_len = 128;
 	const jsmntok_t *dev_routes;
 
@@ -1209,15 +1246,48 @@ static struct command_result *json_invoice(struct command *cmd,
 			 p_opt_def("deschashonly", param_bool, &hashonly, false),
 			 p_opt("dev-routes", param_array, &dev_routes),
 			 p_opt("asset", param_asset_tag, &info->asset),
+			 p_opt_def("allow_unfunded", param_bool, &allow_unfunded,
+				   false),
 			 NULL))
 		return command_param_failed();
 
-	/* With no asset named, an invoice is paid in the asset of this node's
-	 * channels when they all hold one.  With channels in several it names
-	 * none and accepts any, as it always has: picking one would be our
-	 * choice, not the caller's. */
-	if (!info->asset && chainparams->has_anchor_header)
-		info->asset = invoice_default_asset(cmd, cmd->ld);
+	/* Sequentia: every invoice names the asset it is paid in (the BOLT11
+	 * `a` field).  With none named, it is the asset of this node's
+	 * channels when they all hold one; with channels in several, or none,
+	 * the caller names it: picking one would be our choice, not theirs,
+	 * and the Sequence token is no default. */
+	if (chainparams->has_anchor_header) {
+		const char *unfunded;
+
+		if (!info->asset) {
+			bool several;
+			info->asset = invoice_default_asset(cmd, cmd->ld,
+							    &several);
+			if (!info->asset)
+				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+						    "%s: name the asset this"
+						    " invoice is paid in with"
+						    " asset=",
+						    several
+						    ? "This node's channels hold"
+						    " several assets"
+						    : "This node has no channel"
+						    " that can receive");
+		}
+		/* An invoice in an asset we hold no channel in cannot be
+		 * paid to us; make one only when the caller says a channel
+		 * is coming. */
+		unfunded = invoice_unfunded_asset(cmd, cmd->ld, info->asset);
+		if (unfunded && !*allow_unfunded)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "This node holds no channel in"
+					    " asset %s (it holds %s), so an"
+					    " invoice in it cannot be paid:"
+					    " pass allow_unfunded=true to"
+					    " make it anyway",
+					    fmt_asset_id(tmpctx, info->asset),
+					    unfunded);
+	}
 
 	if (dev_routes && !cmd->ld->developer)
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
@@ -1316,6 +1386,10 @@ static struct command_result *json_invoice(struct command *cmd,
 	info->b11->features = tal_dup_talarr(info->b11, u8,
 					     cmd->ld->our_features
 					     ->bits[BOLT11_FEATURE]);
+	/* Sequentia: the asset goes into the invoice, under its signature. */
+	if (chainparams->has_anchor_header)
+		info->b11->asset = tal_dup_arr(info->b11, u8, info->asset,
+					       33, 0);
 
 	info->b11->routes = unpack_routes(info->b11, buffer, dev_routes);
 
@@ -1788,6 +1862,12 @@ static struct command_result *json_createinvoice(struct command *cmd,
 				     &payment_hash,
 				     NULL))
 			return fail_exists(cmd, label);
+
+		/* Sequentia: the asset the invoice names (decoding refused
+		 * one that names none). */
+		if (b11->asset)
+			invoices_set_asset(cmd->ld->wallet->invoices, inv_dbid,
+					   b11->asset);
 
 		notify_invoice_creation(cmd->ld, b11->msat, preimage, label, NULL);
 	} else {

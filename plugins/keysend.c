@@ -448,6 +448,7 @@ static struct command_result *htlc_accepted_call(struct command *cmd,
 	u64 *allowed;
 	size_t err_off;
 	u64 err_type;
+	const jsmntok_t *asset_tok;
 
 	err = json_scan(tmpctx, buf, params,
 			"{onion:{payload:%},htlc:{payment_hash:%}}",
@@ -455,6 +456,10 @@ static struct command_result *htlc_accepted_call(struct command *cmd,
 			JSON_SCAN(json_to_sha256, &payment_hash));
 	if (err)
 		return htlc_accepted_continue(cmd, NULL);
+	/* Sequentia: the asset the HTLC arrived in, which the invoice we
+	 * backfill names (an invoice on a Sequentia network names one). */
+	asset_tok = json_get_member(buf, json_get_member(buf, params, "htlc"),
+				    "asset");
 
 	max = tal_bytelen(rawpayload);
 
@@ -564,6 +569,8 @@ static struct command_result *htlc_accepted_call(struct command *cmd,
 		json_add_string(req->js, "description", "keysend");
 	}
 	json_add_preimage(req->js, "preimage", &ki->payment_preimage);
+	if (asset_tok)
+		json_add_tok(req->js, "asset", asset_tok, buf);
 
 	return send_outreq(req);
 }

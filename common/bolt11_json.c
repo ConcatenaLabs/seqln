@@ -2,6 +2,7 @@
 #include <bitcoin/script.h>
 #include <ccan/tal/str/str.h>
 #include <common/addr.h>
+#include <common/amount.h>
 #include <common/bech32.h>
 #include <common/bolt11.h>
 #include <common/bolt11_json.h>
@@ -58,6 +59,10 @@ void json_add_bolt11(struct json_stream *response,
 		json_add_hex_talarr(response, "features", b11->features);
 	if (b11->metadata)
 		json_add_hex_talarr(response, "payment_metadata", b11->metadata);
+	/* Sequentia: the asset it is paid in, as a 32-byte display id. */
+	if (b11->asset)
+		json_add_string(response, "asset",
+				fmt_asset_id(tmpctx, b11->asset));
         if (tal_count(b11->fallbacks)) {
 		json_array_start(response, "fallbacks");
 		for (size_t i = 0; i < tal_count(b11->fallbacks); i++)

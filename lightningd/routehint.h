@@ -23,6 +23,8 @@ struct routehint_candidate {
  * @buf, @toks: output of listincoming command
  * @expose_all_private: trinary.  NULL=iff no public, true=always, false=never.
  * @hints: only consider these channels (if !expose_all_private).
+ * @asset: Sequentia: only consider channels in this asset (33-byte tag), or
+ *   NULL for any.
  * @none_public: set to true if we used private channels because none were public.
  * @avail_capacity: total capacity of usable channels.
  * @private_capacity: total capacity of unused private channels.
@@ -36,6 +38,7 @@ routehint_candidates(const tal_t *ctx,
 		     const jsmntok_t *toks,
 		     const bool *expose_all_private,
 		     const struct short_channel_id *hints,
+		     const u8 *asset,
 		     bool *none_public,
 		     struct amount_msat *avail_capacity,
 		     struct amount_msat *private_capacity,

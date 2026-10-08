@@ -17,7 +17,7 @@
       "invstring": {
         "type": "string",
         "description": [
-          "The bolt11/bolt12 invoice, but the final signature is ignored. Minimal sanity checks are done."
+          "The bolt11/bolt12 invoice, but the final signature is ignored. Minimal sanity checks are done. On a Sequentia network a bolt11 invoice must name its asset (the `a` field), and the invoice is recorded as payable only in that asset."
         ]
       },
       "label": {

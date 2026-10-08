@@ -6637,7 +6637,7 @@
           "invstring": {
             "type": "string",
             "description": [
-              "The bolt11/bolt12 invoice, but the final signature is ignored. Minimal sanity checks are done."
+              "The bolt11/bolt12 invoice, but the final signature is ignored. Minimal sanity checks are done. On a Sequentia network a bolt11 invoice must name its asset (the `a` field), and the invoice is recorded as payable only in that asset."
             ]
           },
           "label": {
@@ -10111,6 +10111,12 @@
                   "type": "hex",
                   "description": [
                     "The payment_metadata to put in the payment."
+                  ]
+                },
+                "asset": {
+                  "type": "hex",
+                  "description": [
+                    "On a Sequentia network, the 32-byte display id of the asset the invoice is to be paid in, from its `a` field: the amounts are in thousandths of that asset's atoms. An invoice on a Sequentia network without it does not decode."
                   ]
                 },
                 "fallbacks": {
@@ -17328,8 +17334,15 @@
           "asset": {
             "type": "hex",
             "description": [
-              "On an asset-aware chain, the 32-byte display id of the asset the invoice is to be paid in: an HTLC arriving on a channel in any other asset is refused. The default is the asset of this node's channels when they all hold one; on a node with channels in several assets, or none, the invoice names no asset and accepts any."
+              "On an asset-aware chain, the 32-byte display id of the asset the invoice is to be paid in: an HTLC arriving on a channel in any other asset is refused. On a Sequentia network the invoice carries it in its `a` field, under its signature, and a payer reads it from there. The default is the asset of this node's channels when they all hold one; a node with channels in several assets, or none, must name it."
             ]
+          },
+          "allow_unfunded": {
+            "type": "boolean",
+            "description": [
+              "On a Sequentia network, make the invoice even though this node holds no channel in its *asset* (one opening counts), for a caller that will have one by the time it is paid. Without it, such an invoice is refused, since nothing could pay it."
+            ],
+            "default": "False"
           }
         }
       },

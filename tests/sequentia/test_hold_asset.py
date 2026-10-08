@@ -197,13 +197,13 @@ def test_hold_in_the_one_asset_of_the_node(node_factory, bitcoind):
 
 
 def test_payment_set_stays_in_one_asset(node_factory, bitcoind):
-    """An invoice that names no asset, on a node with channels in two: the
-    parts of one payment must all be in the asset of the first, or the node
-    would add SILV atoms to GOLD ones at par."""
+    """The parts of one payment, on a node with channels in two assets,
+    must all be in one asset, the invoice's: a SILV part of a GOLD payment
+    is refused, or the node would add SILV atoms to GOLD ones at par."""
     l1, l2, gold, silv = two_asset_channels(node_factory, bitcoind, [{}, {}])
     part = 5 * 10**6 * 1000  # not dust in SILV at its feerate
-    inv = l2.rpc.invoice(2 * part, 'mixed', 'mixed')
-    assert 'asset' not in inv or inv.get('asset') is None
+    inv = l2.rpc.call('invoice', {'amount_msat': 2 * part, 'label': 'mixed',
+                                  'description': 'mixed', 'asset': gold})
     h = inv['payment_hash']
     secret = inv['payment_secret']
     for i, a in enumerate((gold, silv)):
@@ -213,5 +213,6 @@ def test_payment_set_stays_in_one_asset(node_factory, bitcoind):
                                 'amount_msat': 2 * part, 'partid': i + 1, 'groupid': 1})
     with pytest.raises(RpcError):
         l1.rpc.waitsendpay(h, partid=2, groupid=1)
-    assert l2.daemon.is_in_log('in asset {}, the payment set is in asset {}'.format(silv, gold))
+    assert (l2.daemon.is_in_log('in asset {}, the payment set is in asset {}'.format(silv, gold))
+            or l2.daemon.is_in_log('paid in asset {}, invoice wants {}'.format(silv, gold)))
     assert only_one(l2.rpc.listinvoices('mixed')['invoices'])['status'] == 'unpaid'

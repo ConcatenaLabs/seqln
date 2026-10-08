@@ -107,8 +107,9 @@ strings puts a node in a re-exec loop.
   not asset-aware: `amount_asset_to_sat()` still asserts the policy asset, and the interactive-tx
   and dualopend paths abort the daemon on a non-policy output.
 - **Only `pay` keeps a payment in one asset.** xpay, askrene, renepay and keysend are
-  asset-blind, and xpay does not take over `pay` on Sequentia networks for that reason. Invoices
-  record their asset on the payee (`invoice ... asset=`); the BOLT11 string does not carry it.
+  asset-blind, and xpay does not take over `pay` on Sequentia networks for that reason. An
+  invoice on a Sequentia network names its asset in the BOLT11 field `a`, and one without it
+  does not decode (`doc/sequentia-fork.md` section 6).
 - **Policy-asset asserts fire on asset channels and take the whole daemon down.** Reading an output
   amount with the policy-asset-asserting helper on an asset-denominated channel SIGABRTs
   `lightningd` on *both* sides the moment a commitment is negotiated. Read amounts asset-agnostically.
@@ -125,8 +126,8 @@ strings puts a node in a re-exec loop.
   "fix" it into forwarding.
 - The certified-frontier committee-stall check **fails open** with a warning when the frontier is
   more than 144 blocks behind. Penalty across an induced anchor reorg is untested.
-- Asset ids are stored as a 33-byte version+tag blob; `NULL` means the policy asset. There is no
-  asset field in BOLT11 invoices — selection is payer-side only.
+- Asset ids are stored as a 33-byte version+tag blob; `NULL` means the policy asset. RPCs and the
+  BOLT11 `a` field show the 32-byte id in display order, the reverse of the tag's bytes.
 
 The Specula watchtower layer (`speculad/`, `channeld/watchtower.*`, `lightningd/watchtower_store.*`,
 `lightningd/onchain_presign.*`, `common/presign_templates.*`, the `penalty_htlcs` table, the

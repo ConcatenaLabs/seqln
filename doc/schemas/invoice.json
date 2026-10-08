@@ -104,8 +104,15 @@
       "asset": {
         "type": "hex",
         "description": [
-          "On an asset-aware chain, the 32-byte display id of the asset the invoice is to be paid in: an HTLC arriving on a channel in any other asset is refused. The default is the asset of this node's channels when they all hold one; on a node with channels in several assets, or none, the invoice names no asset and accepts any."
+          "On an asset-aware chain, the 32-byte display id of the asset the invoice is to be paid in: an HTLC arriving on a channel in any other asset is refused. On a Sequentia network the invoice carries it in its `a` field, under its signature, and a payer reads it from there. The default is the asset of this node's channels when they all hold one; a node with channels in several assets, or none, must name it."
         ]
+      },
+      "allow_unfunded": {
+        "type": "boolean",
+        "description": [
+          "On a Sequentia network, make the invoice even though this node holds no channel in its *asset* (one opening counts), for a caller that will have one by the time it is paid. Without it, such an invoice is refused, since nothing could pay it."
+        ],
+        "default": "False"
       }
     }
   },
