@@ -63,7 +63,8 @@
         "type": "u16",
         "description": [
           "A payment may be delayed for up to `maxdelay` blocks by another node; clients should be prepared for this worst case."
-        ]
+        ],
+        "default": "the network's cap on an HTLC's lock time: 2016 blocks on Bitcoin, 20160 (two weeks of one-minute blocks) on a Sequentia network"
       },
       "exemptfee": {
         "type": "msat",

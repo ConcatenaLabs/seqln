@@ -1881,8 +1881,9 @@ void handle_early_opts(struct lightningd *ld, int argc, char *argv[])
 		/* terminal (final-hop) CLTV ~2.9h (Bitcoin mainnet 18 ~= 3h). */
 		ld->config.cltv_final = 180;
 		/* max HTLC CLTV ~2 weeks (Bitcoin 2016 blocks); without scaling,
-		 * an HTLC would cap at 2016 blocks ~= 32h on Sequentia. */
-		ld->config.max_htlc_cltv = 20160;
+		 * an HTLC would cap at 2016 blocks ~= 32h on Sequentia.  pay and
+		 * keysend default their maxdelay to the same value. */
+		ld->config.max_htlc_cltv = chainparams_max_htlc_cltv(chainparams);
 
 		/* SEQUENTIA anchoring supremacy (first principle #1): a
 		 * Sequentia block references a Bitcoin header and is reorged

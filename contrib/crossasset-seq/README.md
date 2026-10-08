@@ -157,7 +157,8 @@ is a fair one, so only the payer can set that bound. It:
 3. asks the quoting node for a quote for the amount that path needs;
 4. checks the quote (below); refuses it if it asks more than
    `maxamount_in_msat` of `asset_in`, or if its `cltv_delta` would lock the
-   payer's HTLC for more than `maxdelay` blocks (default 1008);
+   payer's HTLC for more than `maxdelay` blocks (default: the network's cap,
+   20,160 blocks on a Sequentia network, 2016 elsewhere);
 5. sends one HTLC with `sendpay`: its first hop pays the quoting node
    `amount_in_msat` in `asset_in`, and its onion has the quoting node
    forward `amount_out_msat` toward the payee, which gets the invoice's

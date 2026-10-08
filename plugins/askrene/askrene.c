@@ -898,7 +898,8 @@ static struct command_result *json_getroutes(struct command *cmd,
 	 * historical value deployed by Lightning implementations.
 	 */
 	/* FIXME: Typo in spec for CLTV in descripton! But it breaks our spelling check, so we omit it above */
-	const u32 maxdelay_allowed = 2016;
+	/* Sequentia: two weeks of its one-minute blocks, 20160. */
+	const u32 maxdelay_allowed = chainparams_max_htlc_cltv(chainparams);
 	struct askrene *askrene = get_askrene(cmd->plugin);
 	const u32 default_maxparts = 100;
 	struct getroutes_info *info = tal(cmd, struct getroutes_info);

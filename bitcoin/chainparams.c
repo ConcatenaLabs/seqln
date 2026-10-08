@@ -360,6 +360,22 @@ const struct chainparams *chainparams_by_lightning_hrp(const char *lightning_hrp
 	return NULL;
 }
 
+u32 chainparams_max_htlc_cltv(const struct chainparams *params)
+{
+	/* BOLT #4:
+	 * ## `max_htlc_cltv` Selection
+	 *
+	 * This ... value is defined as 2016 blocks, based on historical value
+	 * deployed by Lightning implementations.
+	 */
+	/* A plugin evaluates its commands' parameter defaults to describe
+	 * them (getmanifest) before init tells it its network: that pass
+	 * uses no value, so it gets BOLT #4's. */
+	if (!params)
+		return 2016;
+	return params->has_anchor_header ? 20160 : 2016;
+}
+
 const char *chainparams_get_network_names(const tal_t *ctx)
 {
     char *networks_string = tal_strdup(ctx, networks[0].network_name);

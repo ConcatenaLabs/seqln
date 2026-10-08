@@ -63,16 +63,16 @@
       "final_cltv": {
         "type": "u32",
         "description": [
-          "Number of blocks for the final node.  We need to know this because no HTLC is allowed to have a CLTV delay more than 2016 blocks."
+          "Number of blocks for the final node.  We need to know this because no HTLC is allowed to have a CLTV delay more than the network's cap: 2016 blocks on Bitcoin, 20160 on a Sequentia network."
         ]
       },
       "maxdelay": {
         "type": "u32",
         "added": "v25.02",
         "description": [
-          "Maximum number of blocks of delay for the route. Cannot be bigger than 2016."
+          "Maximum number of blocks of delay for the route. Cannot be bigger than the network's cap: 2016 blocks on Bitcoin, 20160 on a Sequentia network."
         ],
-        "default": "2016"
+        "default": "the network's cap: 2016 on Bitcoin, 20160 on a Sequentia network"
       },
       "maxparts": {
         "type": "u32",

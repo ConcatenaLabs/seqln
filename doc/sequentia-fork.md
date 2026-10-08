@@ -92,7 +92,12 @@ that honestly, all gated on `has_anchor_header`:
   at Sequentia's 60-second block spacing (the consensus minimum since the testnet's 93,800 fork),
   each at least its Bitcoin-mainnet wall-clock equivalent: `locktime_blocks` (to_self_delay) 1440
   (~1 day), `cltv_expiry_delta` 270 (~4.3h), `cltv_final` 180 (~2.9h), `max_htlc_cltv` 20160
-  (~2 weeks). These are defaults; operators and per-open flags can still override.
+  (~2 weeks). These are defaults; operators and per-open flags can still override. `pay`,
+  `keysend`, `crossassetpay` and askrene's `getroutes` default `maxdelay`, the longest a payer
+  lets its payment be locked, to the same 20160 (`chainparams_max_htlc_cltv()`; `getroutes`
+  also takes it as its limit), so a payer accepts an invoice
+  with a final lock time of several thousand blocks, such as an Arca receive invoice's; a
+  Bitcoin payer keeps BOLT #4's 2016.
 - **The sweep of a node's own delayed output** (`lightningd/onchain_control.c`
   `handle_onchaind_spend_to_us()`): onchaind prices it toward a deadline at most 300 blocks ahead,
   set when the output first appears. A `to_self_delay` of 1440 puts that deadline long before the
@@ -550,8 +555,12 @@ an asset, one hop and two, refused when the payer must name the asset or no rout
 settled on one preimage with the three nodes' books equal to the quote, an HTLC one atom off the
 quote, a quote past its expiry and a quote used twice refused with nothing sent on, a payee that
 fails the payment failing both HTLCs, the cap on open forwards per asset, the Sequence token as
-one leg like any other, a restart of the quoting node mid-forward, and lightningd refusing the
-same route without the plugin (`test_crossasset_forward.py`). They need `sequentiad`, `sequentia-cli`
+one leg like any other, a restart of the quoting node mid-forward, lightningd refusing the
+same route without the plugin, and a payment locked for 5,000 blocks paid under
+`crossassetpay`'s default `maxdelay` (`test_crossasset_forward.py`), and a payer's default
+`maxdelay`, the network's own cap: an invoice with a final lock time of 5,000 blocks paid by
+a default `pay`, and returned by `getroute` and askrene's `getroutes`, on Sequentia and
+refused on Bitcoin regtest (`test_pay_maxdelay.py`, on Bitcoin regtest too). They need `sequentiad`, `sequentia-cli`
 and a Bitcoin Core `bitcoind` on `PATH`, and the keyless tests need the device signer built
 (`cargo build --release` in `contrib/seqln-signer`, or `SEQLN_SIGNER=/path/to/seqln-signer`).
 The test plugins run under the `python3` on `PATH`, which needs the `pyln` packages, so the
