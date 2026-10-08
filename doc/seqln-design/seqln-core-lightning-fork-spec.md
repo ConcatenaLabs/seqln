@@ -184,7 +184,8 @@ explicit rate-locked boundaries. SeqLN adopts all of it, simplified by native El
 - Routing v1: require same-asset end-to-end paths. Gossip carries chain_hash already (BOLT 7); extend
   channel_announcement with the asset id (or run asset channels unannounced in v1, see 5.4). No cross-asset
   auto-routing.
-- Cross-asset hops (later): only via a signed RFQ quote with a short absolute expiry (seconds, following
+- Cross-asset hops (built as the plugin `contrib/crossasset-seq`, whose quote binds the payment
+  hash in place of an onion quote id): only via a signed RFQ quote with a short absolute expiry (seconds, following
   tapd's 10-second minimum) and a maker-priced spread, carried in an onion TLV referencing the quote id.
   Never offer open-ended cross-asset forwarding: an unpriced cross-asset HTLC forwarder is writing a free
   American call option (the canonical reason multi-asset LN routing was declared dead, and the mechanism that

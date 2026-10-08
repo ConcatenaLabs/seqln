@@ -69,6 +69,12 @@ testnet unless noted. The precise file-level change list, with known hazards, is
   may hold channels in several assets, to one peer or many: it forwards each HTLC in the asset it
   arrived in and refuses to forward across an asset boundary (no silent at-par asset swaps), and
   `invoice ... asset=<id>` makes the payee refuse an HTLC in any other asset.
+- **Quoted cross-asset forwarding.** `contrib/crossasset-seq/` lets a node that holds channels in
+  two assets convert a payment between them: it signs a quote (amount in, amount out, expiry) for
+  one payment hash, takes the incoming HTLC in one asset and forwards the outgoing one in the
+  other, and settles or fails both together. The rate is the node's own; a payer checks the quote
+  and pays an invoice in one asset with another (`crossassetpay`). lightningd itself never
+  converts.
 - **Pure-Lightning swap primitive.** `contrib/holdinvoice-seq/` is a hold-invoice plugin (hold an
   externally-supplied payment hash until settle/cancel), the safety primitive for pure-Lightning
   asset↔BTC swaps. A hold is in one asset and refuses HTLCs in any other, and it survives a
