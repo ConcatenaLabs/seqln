@@ -61,7 +61,8 @@ def free_port():
 class Device(object):
     """The device signer, reconnecting whenever its session ends, as a
     browser does."""
-    def __init__(self, directory, port, priv, host_pub, trace=False, pay_limit=TEST_PAY_LIMIT):
+    def __init__(self, directory, port, priv, host_pub, trace=False, pay_limit=TEST_PAY_LIMIT,
+                 pay_limits=None):
         self.dir = os.path.join(directory, 'device')
         os.makedirs(self.dir, exist_ok=True)
         with open(os.path.join(self.dir, 'hsm_secret'), 'wb') as f:
@@ -71,6 +72,8 @@ class Device(object):
                         SEQLN_HOST_PEER_PUBKEY=host_pub,
                         SEQLN_SIGNER_POLICY='enforce',
                         SEQLN_SIGNER_PAY_LIMIT=pay_limit)
+        if pay_limits:
+            self.env['SEQLN_SIGNER_PAY_LIMITS'] = pay_limits
         if trace:
             self.env['SEQLN_SIGNER_TRACE'] = '1'
         if DEVICE == 'wasm':
@@ -108,12 +111,14 @@ class Device(object):
             return f.read().count('TRACE req type=Some({}) '.format(msgtype))
 
 
-def keyless_node(node_factory, directory, trace=False, pay_limit=TEST_PAY_LIMIT, **node_opts):
-    """A node whose hsmd is the proxy, served by a device in enforce mode."""
+def keyless_node(node_factory, directory, trace=False, pay_limit=TEST_PAY_LIMIT, pay_limits=None,
+                 **node_opts):
+    """A node whose hsmd is the proxy, served by a device in enforce mode.
+    `pay_limits` is SEQLN_SIGNER_PAY_LIMITS (`<asset>=<atoms>,...`)."""
     port = free_port()
     host_priv, host_pub = genkey()
     dev_priv, dev_pub = genkey()
-    device = Device(directory, port, dev_priv, host_pub, trace, pay_limit)
+    device = Device(directory, port, dev_priv, host_pub, trace, pay_limit, pay_limits)
     device.start()
     node = node_factory.get_node(start=False, may_fail=True,
                                  options={'subdaemon': 'hsmd:' + PROXY}, **node_opts)

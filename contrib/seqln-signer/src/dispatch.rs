@@ -906,10 +906,13 @@ impl Signer {
 
     /// PREAPPROVE_INVOICE (38), PREAPPROVE_KEYSEND (39) and their
     /// check-only forms (51, 52): approve the payment hash when the stated
-    /// amount, with a routing-fee allowance, fits in the smallest allowance
-    /// left among the device's channel assets (the request does not say which
-    /// asset will pay). A check-only request records nothing. The reply is
-    /// the one libhsmd gives, with the decision in it.
+    /// amount, with a routing-fee allowance, fits in what the limit leaves.
+    /// An invoice names its asset (`a` on a Sequentia network, bitcoin on a
+    /// Bitcoin network), and the amount must fit in that asset's allowance;
+    /// a keysend request names none, so its amount must fit in the smallest
+    /// allowance left among the device's channel assets. A check-only request
+    /// records nothing. The reply is the one libhsmd gives, with the decision
+    /// in it.
     fn preapprove(&mut self, req: &Request, t: u16) -> Outcome {
         let parsed = match t {
             msg::HSMD_PREAPPROVE_INVOICE | msg::HSMD_PREAPPROVE_INVOICE_CHECK => {
@@ -917,7 +920,9 @@ impl Signer {
                     .map(|(inv, check)| (payments::decode_bolt11(&inv), check))
             }
             _ => parse_preapprove_keysend(&req.hsmd_msg, t == msg::HSMD_PREAPPROVE_KEYSEND_CHECK)
-                .map(|(hash, amount, check)| (Ok((hash, Some(amount))), check)),
+                .map(|(hash, amount, check)| {
+                    (Ok(payments::Invoice { hash, amount_msat: Some(amount), asset: None }), check)
+                }),
         };
         let reply_type = match t {
             msg::HSMD_PREAPPROVE_INVOICE | msg::HSMD_PREAPPROVE_INVOICE_CHECK => {
@@ -929,11 +934,11 @@ impl Signer {
             Some(p) => p,
             None => return Outcome::Sentinel,
         };
-        let decision = decoded.and_then(|(hash, amount)| {
+        let decision = decoded.and_then(|inv| {
             if self.policy.is_enforce() {
-                self.payment_fits(amount)?;
+                self.payment_fits(inv.amount_msat, inv.asset.as_ref())?;
             }
-            Ok(hash)
+            Ok(inv.hash)
         });
         match decision {
             Ok(hash) => {
@@ -951,14 +956,28 @@ impl Signer {
         }
     }
 
-    /// Whether a payment of `amount_msat` (and its fee allowance) fits in
-    /// what every channel asset has left this period.
-    fn payment_fits(&self, amount_msat: Option<u64>) -> Result<(), String> {
+    /// Whether a payment of `amount_msat` (and its fee allowance) fits: in
+    /// what `asset` has left this period when the payment names its asset,
+    /// else in what every channel asset has left.
+    fn payment_fits(&self, amount_msat: Option<u64>, asset: Option<&AssetKey>) -> Result<(), String> {
         let a = match amount_msat {
             Some(a) => a,
             None => return Ok(()),
         };
         let need = a.saturating_add(payments::fee_allowance_msat(a));
+        if let Some(asset) = asset {
+            if let Some(left) = self.store.ledger.remaining_msat(&self.limits, asset, self.now) {
+                if need > left {
+                    return Err(format!(
+                        "a payment of {a} msat of asset {} (with {} of fee allowance) does not fit \
+                         in the {left} msat left this period for that asset",
+                        asset.display(),
+                        need - a
+                    ));
+                }
+            }
+            return Ok(());
+        }
         let assets = self.store.assets();
         if assets.is_empty() {
             if let Some(l) = self.limits.default_atoms.map(|x| x.saturating_mul(1000)) {
@@ -4722,9 +4741,10 @@ mod close_and_revocation_tests {
 
     #[test]
     fn r2b_h2_invoice_approval() {
-        // 300m: 30,000,000 atoms, over the default limit of 10,000,000.
-        let inv = "lnsqrt300m1p4vqc54sp55mylrq4dfn3cjs7zxjg0urxrpxxnzxhkdx7rdwefsf2m57elkk9qpp5z63d3a3qx6qs73qvuth2pvmz9khh3jy6um87fy9hueuxse8mlw8sdq9da6hgxqyjw5qcqz959qxpqysgqhk7a8uc3wl6vu0mgxc4d59q0y3qkfjpxqe3t06w5ks5caha8xsp8rrt3fqvj7favpmpge79amfserdywnsy8g3jkqe43a7jjx7wj6esq387l4s";
-        let (hash, _) = payments::decode_bolt11(inv).unwrap();
+        // 300m: 30,000,000 atoms of an asset, over the default limit of 10,000,000.
+        let gold = "d024f89a8119d84ecf31fcabc87bc94e2b7d7966bc47dfb76b6237e75f2defdb";
+        let inv = &payments::testvec::invoice("lnsqrt300m", &[0x5a; 32], &[gold]);
+        let hash = payments::decode_bolt11(inv).unwrap().hash;
         let mut s = signer(Policy::Enforce);
         assert!(!preapprove_invoice(&mut s, inv, false));
         assert!(!s.store.ledger.is_approved(&hash, 0, payments::DEFAULT_PERIOD_SECS));
@@ -4738,6 +4758,50 @@ mod close_and_revocation_tests {
         // A malformed invoice is declined, not answered with an error.
         assert!(!preapprove_invoice(&mut s, &inv[..inv.len() - 1], false));
         assert!(!preapprove_invoice(&mut s, "lnsqrt", false));
+        // So is a Sequentia invoice that names no asset.
+        let bare = &payments::testvec::invoice("lnsqrt1m", &[0x5b; 32], &[]);
+        assert!(!preapprove_invoice(&mut s, bare, false));
+        // The node's own invoice, with its `a` field, is approved.
+        assert!(preapprove_invoice(&mut s, payments::testvec::REAL_SEQ_INVOICE, true));
+    }
+
+    #[test]
+    fn invoice_approval_charges_the_asset_it_names() {
+        // A channel in the commitments' asset, 100,000 of whose 300,000 atoms
+        // a day are spent; another asset with a limit of 50,000 and nothing
+        // spent.
+        let mut s = paying_signer(true, 300_000, 600_000, 399_000);
+        let chan = st(&s).pay.asset.expect("asset known");
+        let other = "a3e9000000000000000000000000000000000000000000000000000000000001";
+        let mut l = s.limits.clone();
+        l.per_asset.insert(AssetKey::parse(other).unwrap(), Some(50_000));
+        s.set_limits(l);
+        assert!(preapprove_keysend(&mut s, 0xA1, 100_000_000, false));
+        let a = htlc(0, 100_000_000, 0xA1);
+        assert!(matches!(sign_remote_with(&mut s, 1, 399_000, 500_000, 1_000, &[a]), Outcome::Reply(_)));
+        let inv = |amt: &str, k: u8, asset: &str| payments::testvec::invoice(&format!("lnsqrt{amt}"), &[k; 32], &[asset]);
+        // 150,000 atoms (1500u) in the channel's asset: within its 200,000 left.
+        assert!(preapprove_invoice(&mut s, &inv("1500u", 0xB1, &chan.display()), true));
+        // 250,000 in it: over, and the refusal names the asset.
+        assert!(!preapprove_invoice(&mut s, &inv("2500u", 0xB2, &chan.display()), false));
+        // 40,000 (400u) in the other asset: within its own 50,000, though no
+        // channel holds it.
+        assert!(preapprove_invoice(&mut s, &inv("400u", 0xB3, other), false));
+        // 60,000 in the other asset: over its limit of 50,000, though the
+        // channel's asset has 200,000 left.
+        assert!(!preapprove_invoice(&mut s, &inv("600u", 0xB4, other), false));
+        // A keysend names no asset: its amount must fit in the smallest
+        // allowance among the channels' assets (only the channel's here).
+        assert!(!preapprove_keysend(&mut s, 0xB5, 250_000_000, true));
+        assert!(preapprove_keysend(&mut s, 0xB6, 150_000_000, true));
+        // Approving charges nothing; the commitment charges the channel asset.
+        assert_eq!(spent(&s), 100_000_000);
+        let reason = s.payment_fits(Some(250_000_000), Some(&chan)).unwrap_err();
+        println!("PREAPPROVE_INVOICE of 250000 atoms of the channel asset: {reason}");
+        assert!(reason.contains(&format!("of asset {}", chan.display())) && reason.contains("the 200000000 msat left"));
+        let reason = s.payment_fits(Some(60_000_000), Some(&AssetKey::parse(other).unwrap())).unwrap_err();
+        println!("PREAPPROVE_INVOICE of 60000 atoms of the other asset: {reason}");
+        assert!(reason.contains(other) && reason.contains("the 50000000 msat left"));
     }
 
     /// VALIDATE_COMMITMENT_TX for our commitment n listing `listed` (every

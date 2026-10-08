@@ -5,9 +5,12 @@
 //!  * `PREAPPROVE_INVOICE` / `PREAPPROVE_KEYSEND`, which `pay` and `keysend`
 //!    send before they offer an HTLC. The device records the payment hash as
 //!    approved and answers no when the payment cannot fit in what the limit
-//!    leaves for the period. The request does not name the asset, so the
-//!    amount (with a routing-fee allowance) must fit in the smallest
-//!    allowance left among the assets of the device's channels.
+//!    leaves for the period. An invoice names the asset it is paid in (its
+//!    `a` field on a Sequentia network; bitcoin on a Bitcoin network), and
+//!    the amount (with a routing-fee allowance) must fit in what that
+//!    asset's limit leaves. A keysend request names no asset, so its amount
+//!    must fit in the smallest allowance left among the assets of the
+//!    device's channels.
 //!  * Every commitment the device signs or validates. An HTLC we offer that a
 //!    commitment lists for the first time must carry an approved payment hash,
 //!    and its amount is charged to the channel asset's allowance. A
@@ -355,10 +358,59 @@ fn hrp_amount_msat(hrp: &str) -> Result<Option<u64>, String> {
     u64::try_from(msat).map(Some).map_err(|_| format!("invoice amount {amt:?} is too large"))
 }
 
-/// Decode a BOLT 11 invoice far enough for approval: its payment hash and
-/// the amount it states (msat), checking the bech32 checksum. The signature is
-/// not checked: approval binds the hash, whoever made the invoice.
-pub fn decode_bolt11(invoice: &str) -> Result<([u8; 32], Option<u64>), String> {
+/// The network a BOLT 11 human-readable part names: the letters between `ln`
+/// and the amount.
+fn hrp_network(hrp: &str) -> &str {
+    let rest = hrp.strip_prefix("ln").unwrap_or(hrp);
+    match rest.find(|c: char| c.is_ascii_digit()) {
+        Some(i) => &rest[..i],
+        None => rest,
+    }
+}
+
+/// The invoice prefixes of the Sequentia networks (mainnet, testnet,
+/// regtest), on which an invoice must name its asset in its `a` field.
+pub const SEQUENTIA_HRPS: [&str; 3] = ["sqt", "tsqt", "sqrt"];
+/// The invoice prefixes of the Bitcoin networks, on which an invoice is paid
+/// in bitcoin.
+pub const BITCOIN_HRPS: [&str; 4] = ["bc", "tb", "bcrt", "tbs"];
+
+/// What approval reads from an invoice.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Invoice {
+    pub hash: [u8; 32],
+    /// The amount it states, in msat (`None` for an invoice without one).
+    pub amount_msat: Option<u64>,
+    /// The asset it is paid in: the `a` field's on a Sequentia network,
+    /// bitcoin on a Bitcoin network, `None` on any other network.
+    pub asset: Option<AssetKey>,
+}
+
+/// Pack 5-bit words into bytes, big-endian, dropping the padding bits.
+fn words_to_bytes(words: &[u8]) -> Vec<u8> {
+    let mut acc: u32 = 0;
+    let mut bits = 0;
+    let mut out = Vec::with_capacity(words.len() * 5 / 8);
+    for &w in words {
+        acc = (acc << 5) | w as u32;
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    out
+}
+
+/// Decode a BOLT 11 invoice far enough for approval: its payment hash, the
+/// amount it states (msat) and the asset it is paid in, checking the bech32
+/// checksum. The signature is not checked: approval binds the hash, whoever
+/// made the invoice. On a Sequentia network an invoice without an `a` field,
+/// or with one of the wrong length, is refused, as the node refuses it:
+/// no asset is implied by its absence. Where a field appears twice, the
+/// first counts, as for the node.
+pub fn decode_bolt11(invoice: &str) -> Result<Invoice, String> {
     let s = invoice.trim().to_ascii_lowercase();
     let s = s.strip_prefix("lightning:").unwrap_or(&s);
     let sep = s.rfind('1').ok_or("invoice has no bech32 separator")?;
@@ -378,33 +430,47 @@ pub fn decode_bolt11(invoice: &str) -> Result<([u8; 32], Option<u64>), String> {
     if polymod(&chk) != 1 {
         return Err("invoice checksum does not verify".to_string());
     }
-    let amount = hrp_amount_msat(hrp)?;
+    let amount_msat = hrp_amount_msat(hrp)?;
+    let net = hrp_network(hrp);
+    let sequentia = SEQUENTIA_HRPS.contains(&net);
     // timestamp (7 words), tagged fields, signature (104 words), checksum (6).
     let fields = &words[7..words.len() - 104 - 6];
+    let (mut hash, mut asset) = (None, None);
     let mut i = 0;
     while i + 3 <= fields.len() {
         let tag = fields[i];
         let len = fields[i + 1] as usize * 32 + fields[i + 2] as usize;
         let body = fields.get(i + 3..i + 3 + len).ok_or("invoice field runs past its end")?;
-        if tag == 1 && len == 52 {
-            let mut acc: u32 = 0;
-            let mut bits = 0;
-            let mut out = Vec::with_capacity(33);
-            for &w in body {
-                acc = (acc << 5) | w as u32;
-                bits += 5;
-                if bits >= 8 {
-                    bits -= 8;
-                    out.push((acc >> bits) as u8);
-                    acc &= (1 << bits) - 1;
-                }
+        // `p` (1): the payment hash, 52 words.
+        if tag == 1 && len == 52 && hash.is_none() {
+            hash = Some(<[u8; 32]>::try_from(&words_to_bytes(body)[..32]).unwrap());
+        }
+        // `a` (29): the asset id in display order, 52 words; read only on a
+        // Sequentia network, where its length is checked as the node checks it.
+        if tag == 29 && sequentia && asset.is_none() {
+            if len != 52 {
+                return Err(format!("a: expected 52 characters, got {len}"));
             }
-            let hash: [u8; 32] = out[..32].try_into().unwrap();
-            return Ok((hash, amount));
+            let display = words_to_bytes(body);
+            let mut id = [0u8; 32];
+            for k in 0..32 {
+                id[k] = display[31 - k];
+            }
+            asset = Some(AssetKey::Asset(id));
         }
         i += 3 + len;
     }
-    Err("invoice carries no payment hash".to_string())
+    let hash = hash.ok_or("invoice carries no payment hash")?;
+    let asset = if sequentia {
+        Some(asset.ok_or_else(|| {
+            format!("a: missing: an invoice on a Sequentia network (ln{net}) must name the asset it is paid in")
+        })?)
+    } else if BITCOIN_HRPS.contains(&net) {
+        Some(AssetKey::Btc)
+    } else {
+        None
+    };
+    Ok(Invoice { hash, amount_msat, asset })
 }
 
 // ---------------------------------------------------------------------------
@@ -613,18 +679,54 @@ mod tests {
 
     #[test]
     fn decodes_a_seqln_invoice() {
-        // A sequentia-regtest invoice for 300m (0.3 units), from a test run;
-        // its hash decoded independently.
+        // A sequentia-regtest invoice for 300m (0.3 units) made before
+        // invoices named their asset: on a Sequentia network it is refused
+        // now, as the node refuses it. Its checksum and hash still read.
         let inv = "lnsqrt300m1p4vqc54sp55mylrq4dfn3cjs7zxjg0urxrpxxnzxhkdx7rdwefsf2m57elkk9qpp5z63d3a3qx6qs73qvuth2pvmz9khh3jy6um87fy9hueuxse8mlw8sdq9da6hgxqyjw5qcqz959qxpqysgqhk7a8uc3wl6vu0mgxc4d59q0y3qkfjpxqe3t06w5ks5caha8xsp8rrt3fqvj7favpmpge79amfserdywnsy8g3jkqe43a7jjx7wj6esq387l4s";
-        let (hash, amount) = decode_bolt11(inv).unwrap();
-        assert_eq!(amount, Some(30_000_000_000));
-        let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(hex, "16a2d8f62036810f440ce2eea0b3622daf78c89ae6cfe490b7e6786864fbfb8f");
+        let e = decode_bolt11(inv).unwrap_err();
+        assert!(e.contains("a: missing"), "{e}");
         // A flipped character fails the checksum.
         let mut bad = inv.to_string();
         bad.replace_range(40..41, if &inv[40..41] == "q" { "p" } else { "q" });
         assert!(decode_bolt11(&bad).unwrap_err().contains("checksum"));
         assert!(decode_bolt11("lnsqrt1qqqq").is_err());
+        // An invoice the node made with its asset (REAL_SEQ_INVOICE): hash,
+        // amount and asset, the asset as the node displays it.
+        let i = decode_bolt11(testvec::REAL_SEQ_INVOICE).unwrap();
+        let hex: String = i.hash.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, testvec::REAL_SEQ_HASH);
+        assert_eq!(i.amount_msat, Some(testvec::REAL_SEQ_MSAT));
+        assert_eq!(i.asset.unwrap().display(), testvec::REAL_SEQ_ASSET);
+    }
+
+    #[test]
+    fn the_a_field() {
+        let gold = "d024f89a35ac14d4c1c7fd2e3e3f4d0b6aa0e5bbcbc1e0d3a6b1f7e0a5c4d3e2";
+        let silv = "a3e9000000000000000000000000000000000000000000000000000000000001";
+        let h = [0x11u8; 32];
+        // On each Sequentia network the asset is read, in display order.
+        for net in SEQUENTIA_HRPS {
+            let inv = testvec::invoice(&format!("ln{net}2500u"), &h, &[gold]);
+            let d = decode_bolt11(&inv).unwrap();
+            assert_eq!(d.asset.unwrap().display(), gold);
+            assert_eq!(d.amount_msat, Some(250_000_000));
+            assert_eq!(d.hash, h);
+        }
+        // The first `a` counts.
+        let inv = testvec::invoice("lnsqrt1m", &h, &[silv, gold]);
+        assert_eq!(decode_bolt11(&inv).unwrap().asset.unwrap().display(), silv);
+        // None, or one of the wrong length: refused.
+        let e = decode_bolt11(&testvec::invoice("lntsqt1m", &h, &[])).unwrap_err();
+        assert!(e.contains("a: missing") && e.contains("lntsqt"), "{e}");
+        let e = decode_bolt11(&testvec::invoice_raw("lnsqrt1m", &h, &[(29, vec![3u8; 31])])).unwrap_err();
+        assert!(e.contains("a: expected 52 characters, got 50"), "{e}");
+        // On Bitcoin an invoice is paid in bitcoin; `a` is an unknown field.
+        assert_eq!(decode_bolt11(&testvec::invoice("lnbcrt1m", &h, &[])).unwrap().asset, Some(AssetKey::Btc));
+        assert_eq!(decode_bolt11(&testvec::invoice("lntb1m", &h, &[gold])).unwrap().asset, Some(AssetKey::Btc));
+        assert_eq!(decode_bolt11(&testvec::invoice_raw("lnbcrt1m", &h, &[(29, vec![3u8; 31])])).unwrap().asset,
+                   Some(AssetKey::Btc));
+        // Another network: no asset is read.
+        assert_eq!(decode_bolt11(&testvec::invoice("lnex1m", &h, &[gold])).unwrap().asset, None);
     }
 
     #[test]
@@ -717,5 +819,74 @@ mod tests {
         // An older commitment does not move the record.
         let p2 = p.track.plan(false, 2, a, 1, vec![], 0);
         assert_eq!(p2.track.remote.as_ref().unwrap().n, 4);
+    }
+}
+
+/// Invoices for tests: bech32-encoded with zero signatures (approval does
+/// not check the signature), and one the node made.
+#[cfg(test)]
+pub mod testvec {
+    use super::{polymod, CHARSET};
+
+    /// A sequentia-regtest invoice the node made, naming its asset.
+    pub const REAL_SEQ_INVOICE: &str = "lnsqrt2500u1p4vw55msp5ff8xy2dtczxuhsjctsn57f7f496jkz434hkp9jkq89rgem6zwnxspp53xx98drfa537svcqkhhhtl8tee729wsn20z86s32mmml9mdtgz3qdq2wejkxar0wgap56qj03x5pr8vyane3lj4us77ffc4h67txh3raldmtvgm7whedaldsxqyjw5qcqz959qxpqysgqhe48tu4zx3q0c0v0wfj23zndyyhw5m09npxgjs3v7etjm0kh3lhrxmj4ny0hkhsrw5xcd2jf76dacmfsshqykdcvyy4y37klh3x023cp8756dq";
+    pub const REAL_SEQ_HASH: &str = "898c53b469ed23e83300b5ef75fcebce7ca2ba1353c47d422adef7f2edab40a2";
+    pub const REAL_SEQ_ASSET: &str = "d024f89a8119d84ecf31fcabc87bc94e2b7d7966bc47dfb76b6237e75f2defdb";
+    pub const REAL_SEQ_MSAT: u64 = 250000000;
+
+    fn to_words(bytes: &[u8]) -> Vec<u8> {
+        let mut acc: u32 = 0;
+        let mut bits = 0;
+        let mut out = Vec::new();
+        for &b in bytes {
+            acc = (acc << 8) | b as u32;
+            bits += 8;
+            while bits >= 5 {
+                bits -= 5;
+                out.push(((acc >> bits) & 31) as u8);
+            }
+            acc &= (1 << bits) - 1;
+        }
+        if bits > 0 {
+            out.push(((acc << (5 - bits)) & 31) as u8);
+        }
+        out
+    }
+
+    /// An invoice with the payment hash and the given raw fields (tag, bytes).
+    pub fn invoice_raw(hrp: &str, hash: &[u8; 32], extra: &[(u8, Vec<u8>)]) -> String {
+        let mut w: Vec<u8> = vec![0; 7];
+        let mut push = |tag: u8, bytes: &[u8]| {
+            let d = to_words(bytes);
+            w.push(tag);
+            w.push((d.len() / 32) as u8);
+            w.push((d.len() % 32) as u8);
+            w.extend(d);
+        };
+        push(1, hash);
+        for (t, b) in extra {
+            push(*t, b);
+        }
+        w.extend(std::iter::repeat(0).take(104));
+        let mut chk: Vec<u8> = hrp.bytes().map(|c| c >> 5).collect();
+        chk.push(0);
+        chk.extend(hrp.bytes().map(|c| c & 31));
+        chk.extend_from_slice(&w);
+        chk.extend([0u8; 6]);
+        let pm = polymod(&chk) ^ 1;
+        for i in 0..6 {
+            w.push(((pm >> (5 * (5 - i))) & 31) as u8);
+        }
+        let data: String = w.iter().map(|&x| CHARSET[x as usize] as char).collect();
+        format!("{hrp}1{data}")
+    }
+
+    /// An invoice naming each asset given (display-order hex) in an `a` field.
+    pub fn invoice(hrp: &str, hash: &[u8; 32], assets: &[&str]) -> String {
+        let fields: Vec<(u8, Vec<u8>)> = assets
+            .iter()
+            .map(|a| (29u8, (0..32).map(|i| u8::from_str_radix(&a[2 * i..2 * i + 2], 16).unwrap()).collect()))
+            .collect();
+        invoice_raw(hrp, hash, &fields)
     }
 }
