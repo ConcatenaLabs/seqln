@@ -27,7 +27,11 @@
 //! `seqln-signer-channels` in the same directory, or the path in
 //! `SEQLN_SIGNER_STORE`: loaded at start, and rewritten durably after every
 //! request that changed it, before the reply leaves. A restarted signer
-//! therefore never forgets which commitments it revoked.
+//! therefore never forgets which commitments it revoked. It never starts
+//! without its store: one it cannot read or restore stops it, and so does a
+//! missing one once the device has made one (`seqln-signer-store-made`
+//! beside `hsm_secret` records that); a device that has never made one
+//! creates it, empty, at its first start.
 //!
 //! ============================ SECURITY ====================================
 //! listen mode is fail-closed: it REFUSES to start without both its own static
@@ -158,12 +162,21 @@ fn main() {
 /// `SEQLN_SIGNER_STORE` names another path.
 const STORE_FILE: &str = "seqln-signer-channels";
 
-/// Restore the persisted channel store, if there is one. A blob that fails
-/// its seed-keyed MAC or does not parse is logged and left out: the signer
-/// then starts with no record of those channels, and its store-miss rules
-/// (no revocation past commitment 0, no close paying this wallet nothing,
-/// until it validates a commitment) keep it safe.
+/// The marker a device leaves beside its `hsm_secret` once it has made a
+/// channel store: from then on a missing store is a lost one.
+const STORE_MADE: &str = "seqln-signer-store-made";
+
+/// Restore the persisted channel store, or refuse to start. The store is
+/// never missed: a signer that started without it would take the host's word
+/// for every channel's history, and a host could then have it validate, and
+/// sign for broadcast, a commitment it revoked long ago. So a store that
+/// cannot be read, or fails its seed-keyed MAC, or does not parse (one
+/// written by a newer signer, say), stops the signer; so does a missing one
+/// once this device has made one ([`STORE_MADE`], in the working directory
+/// beside `hsm_secret`). A device that has never made one creates it, empty,
+/// before it serves anything.
 fn load_store(path: &Path, signer: &mut Signer, log: &mut Option<File>) {
+    let made = Path::new(STORE_MADE);
     match std::fs::read(path) {
         Ok(bytes) => match signer.import_channels(&bytes) {
             Ok(n) => {
@@ -185,20 +198,61 @@ fn load_store(path: &Path, signer: &mut Signer, log: &mut Option<File>) {
                     eprintln!("{line}");
                 }
             }
-            Err(e) => {
-                logline(log, &format!("seqln-signer: channel store {} NOT restored: {e}", path.display()));
-                eprintln!("seqln-signer: channel store {} not restored: {e}", path.display());
-            }
+            Err(e) => store_fatal(
+                log,
+                &format!(
+                    "channel store {} cannot be restored ({e}); refusing to start without it: \
+                     restore it from a backup, or run the signer that wrote it",
+                    path.display()
+                ),
+            ),
         },
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => {
-            logline(log, &format!("seqln-signer: channel store {} unreadable: {e}", path.display()));
-            eprintln!("seqln-signer: channel store {} unreadable: {e}", path.display());
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            if made.exists() {
+                store_fatal(
+                    log,
+                    &format!(
+                        "channel store {} is missing, but this device made one ({} is here); \
+                         refusing to start without it: restore it from a backup. Without its \
+                         store the device knows none of its channels' revocations",
+                        path.display(),
+                        STORE_MADE
+                    ),
+                );
+            }
+            if let Err(e) = save_store(path, &signer.export_channels()) {
+                store_fatal(log, &format!("channel store {} cannot be created: {e}", path.display()));
+            }
+            logline(log, &format!("seqln-signer: created an empty channel store {}", path.display()));
+        }
+        Err(e) => store_fatal(
+            log,
+            &format!(
+                "channel store {} is unreadable ({e}); refusing to start without it",
+                path.display()
+            ),
+        ),
+    }
+    if !made.exists() {
+        let marked = File::create(made)
+            .and_then(|mut f| {
+                f.write_all(format!("{}\n", path.display()).as_bytes())?;
+                f.sync_all()
+            })
+            .and_then(|_| File::open(".")?.sync_all());
+        if let Err(e) = marked {
+            store_fatal(log, &format!("cannot write {STORE_MADE}: {e}"));
         }
     }
     // What was just read is what the file holds; a store older than this
     // signer's is rewritten in its format at the next change.
     let _ = signer.take_channels_dirty();
+}
+
+/// Log a store failure and stop.
+fn store_fatal(log: &mut Option<File>, msg: &str) -> ! {
+    logline(log, &format!("seqln-signer: {msg}"));
+    fatal(msg)
 }
 
 /// Write the channel store durably: a temporary file beside it, synced, then

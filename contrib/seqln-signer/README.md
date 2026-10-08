@@ -59,11 +59,24 @@ signing. Messages outside the subset return an error sentinel rather than a wron
 
 What enforce mode checks:
 
-- **Commitments**, ours and the peer's: every output is one the channel's keys produce. A
+- **Commitments**, ours and the peer's: every output is one the channel's keys produce, every
+  output is in the channel's one asset, and the funding input issues no asset (with an issuance
+  there, a commitment or a close could pay this side in a fresh, worthless asset while the
+  channel's own value went to the peer). A
   commitment of ours counts as validated only when the peer's signature on it verifies against
   the channel's remote funding key. From the latest of our commitments it validated, and the
   latest of the peer's it signed, the device records this side's balance: its own output, plus
-  the fee and anchors when this side opened the channel. When this side opened the channel, and
+  the fee and anchors when this side opened the channel.
+- **The balance split of every commitment**, ours and the peer's: the device holds each
+  commitment to the balance it tracks for this side, against the latest commitment on the same
+  side. This side's value there is its main output, the HTLCs it offered, and, when it opened
+  the channel, the fee and anchors less the HTLCs trimmed as dust (whose value is in the fee).
+  channeld lists every HTLC a commitment carries, trimmed ones included, so between two honest
+  commitments that value moves only with HTLCs: it falls by the HTLCs this side offered that the
+  new commitment settles, and by nothing else; a fee change moves none of it. A commitment that
+  leaves this side less, beyond an atom of rounding per HTLC, is refused ("it leaves this wallet
+  … atoms of the channel, … fewer than it tracks"), whatever the payment limit would allow. In
+  permissive mode the shortfall is signed and charged to the limit instead. When this side opened the channel, and
   so pays the commitment's fee, that fee is at most the payment limit of the channel's asset: a
   host that also ran the peer could otherwise raise the feerate (`update_fee`, which the opener
   sends) until our balance was the fee, and on Sequentia a fee goes to the block proposer.
@@ -76,7 +89,8 @@ What enforce mode checks:
   broadcast until the channel's next commitment step.
 - **Mutual closes** (closingd's request, and the closing transaction lightningd signs again with
   the commitment message when a close completes and whenever it starts with a channel closing):
-  one input, the funding output; at most one output to this device's own wallet and at most one
+  one input, the funding output, issuing no asset; every output in one asset, the channel's; at
+  most one output to this device's own wallet and at most one
   to the peer, which must be the peer's upfront shutdown script when the channel named one; no
   value created. A close paying our share anywhere but our own wallet is refused, and so is one
   whose fee, when this side opened the channel and pays it, is over the payment limit. The local
@@ -170,10 +184,9 @@ What enforce mode checks:
   msat), fits in what the payment limit leaves for the period; the request does not name the
   asset, so it must fit for every asset the device has channels in. A commitment, ours or the
   peer's, that lists for the first time an HTLC this node offers is signed only when that HTLC's
-  payment hash was approved, and its amount is charged to the channel asset. Value that leaves
-  this side without a listed HTLC (an HTLC trimmed as dust has no output, so the request does not
-  list it) is charged too, once the commitments show it gone. A commitment that would take the
-  asset over its limit is refused. A payment sent without approval (`sendpay`, `sendonion` or
+  payment hash was approved, and its amount is charged to the channel asset; that holds for an
+  HTLC trimmed as dust too, which the request lists although it has no output. A commitment that
+  would take the asset over its limit is refused. A payment sent without approval (`sendpay`, `sendonion` or
   `xpay` on their own) is therefore refused at the commitment: channeld stops, lightningd fails
   the HTLC back, and the channel is idle until the peer reconnects. Call `preapproveinvoice` or
   `preapprovekeysend` first.
@@ -185,16 +198,15 @@ channel can hold more than. What withdrawals let leave (their fees) counts again
 `SEQLN_SIGNER_PAY_PERIOD` (seconds); the signer refuses to start on a malformed value. WASM:
 `setPaymentLimit(asset, atoms)` and `setPaymentPeriod(seconds)`, or the SDK's `paymentLimits`
 option. An HTLC is charged when it is first committed, so an attempt that then fails still counts
-until the period has passed; one whose amount lies between the two commitments' dust thresholds
-(listed on one, trimmed on the other: a band worth a few hundred reference atoms at floor feerates) is charged twice. A channel the device tracked before it kept payment records takes
-its first commitment as the baseline, whatever HTLCs it carries.
+until the period has passed. A channel the device tracked before it kept payment records takes
+its first commitment as the baseline, whatever HTLCs it carries, and so does the first commitment
+the device sees on each side of a channel.
 
-Not checked: how a commitment splits the channel between the two sides beyond what the payment
-accounting and the peer's reserve see. So the device does not protect a user from a host that also runs the channel's
-peer. Such a host can broadcast a commitment the device signed for the watchtower's preempt slot
-before the device revoked it, which the peer then takes whole with the revocation secret; and the
-peer can sign commitments that move the balance without any HTLC, which the device charges to the
-limit but cannot tell from a payment.
+Not checked: whether an HTLC paid to this side was settled. The device never sees a preimage, so
+a commitment that drops an HTLC the peer offered us, without crediting it, looks to it like a
+failed payment. And the device does not protect a user from a host that also runs the channel's
+peer: such a host can broadcast a commitment the device signed for the watchtower's preempt slot
+before the device revoked it, which the peer then takes whole with the revocation secret.
 
 The channel store (each channel's parameters, dust limits and reserves, revocation counters,
 recorded balance, whether the peer has reached its reserve, the unrevoked commitments it validated,
@@ -205,8 +217,15 @@ signed) carries no secret and is authenticated by a MAC keyed from the seed. The
 loads the file at start and rewrites it durably (temporary file, sync, rename) after every
 request that changed it, before the reply leaves. If the file cannot be written it refuses the
 request, and every request after it until a write succeeds, so channeld asking again for what
-was refused gets no answer the store does not record. The WASM build hands the same blob to the
-wallet's `channelStore` to keep.
+was refused gets no answer the store does not record. It never runs without the store: a store
+it cannot read, whose MAC fails, or that a newer signer wrote stops it at start, and so does a
+missing one once the device has made one (it leaves `seqln-signer-store-made` beside
+`hsm_secret` when it does). A signer started without its store would take the host's word for
+every channel: a host could replay a channel's old commitments, all signed by the peer, and have
+it validate and sign for broadcast one it revoked long ago. A device that has never made a store
+creates it, empty, at its first start. Restore a lost store from a backup; removing the marker
+starts the device afresh, with every existing channel's revocations forgotten. The WASM build
+hands the same blob to the wallet's `channelStore` to keep.
 
 A channel armed from the node's own data after the store was lost has no balance and no validated
 commitments: it can neither close mutually nor be closed unilaterally by the device until its
@@ -237,7 +256,7 @@ any channel.
 | `src/bin/emit_elements_vector.rs` | Emits an Elements v2 PSET `sign_withdrawal` vector for the conformance harness's `SEQLN_WITHDRAWAL_VECTOR` mode. |
 | `tests/tamper.rs` | Enforce-mode theft-rejection test (skips without a captured corpus). |
 | `tests/chstore.rs` | Channel-store persistence contract (`export_channels`/`import_channels` round-trip, MAC refusal, merge semantics). The store carries each channel's opener, upfront shutdown scripts (and the local one's wallet index), dust limits and reserves, revocation counters, recorded balance and unrevoked validated commitments, and imports an older store without them. |
-| `tests/native_store.rs` | The native binary keeps its store across a restart: a new process refuses a revoked commitment and a close below the recorded balance, which a signer with an empty store signs (the commitment once it has validated it itself). With the store unwritable it refuses every request, a re-sent revocation included, until a write succeeds. |
+| `tests/native_store.rs` | The native binary keeps its store across a restart: a new process refuses a revoked commitment and a close below the recorded balance, which a signer with an empty store signs (the commitment once it has validated it itself). It refuses to start with its store missing, failing its MAC or written by a newer signer, and starts again once the store is back. With the store unwritable it refuses every request, a re-sent revocation included, until a write succeeds. |
 | `wasm/` | `wasm-bindgen` build of the same library for browsers/Node, plus SDK, relay, tests, demo page. |
 | `wasm/test/version_floor.mjs` | The WASM build refuses an INIT below version 6, first or later, and returns no secret with a commitment point. |
 | `wasm/test/enforce.mjs` | WASM enforce-mode proof: corpus replay byte-exact, tampered commitment refused. |

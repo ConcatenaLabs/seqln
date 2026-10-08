@@ -210,6 +210,16 @@ static size_t gather_htlcs(const tal_t *ctx,
 	return num_other_side;
 }
 
+const struct htlc **channel_committed_htlcs(const tal_t *ctx,
+					     const struct channel *channel,
+					     enum side side)
+{
+	const struct htlc **committed;
+
+	gather_htlcs(ctx, channel, side, &committed, NULL, NULL);
+	return committed;
+}
+
 static bool sum_offered_msatoshis(struct amount_msat *total,
 				  const struct htlc **htlcs,
 				  enum side side)

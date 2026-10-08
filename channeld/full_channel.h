@@ -72,6 +72,15 @@ struct channel *new_full_channel(const tal_t *ctx,
  * for @side, followed by the htlc transactions in output order and
  * fills in @htlc_map, or NULL on key derivation failure.
  */
+/**
+ * channel_committed_htlcs: every HTLC @side's next commitment carries,
+ * trimmed or not (channel_txs gives an output only to those above the dust
+ * limit).
+ */
+const struct htlc **channel_committed_htlcs(const tal_t *ctx,
+					     const struct channel *channel,
+					     enum side side);
+
 struct bitcoin_tx **channel_txs(const tal_t *ctx,
 				const struct bitcoin_outpoint *funding,
 				struct amount_sat funding_sats,
