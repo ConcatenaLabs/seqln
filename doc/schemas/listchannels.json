@@ -100,6 +100,12 @@
                 "The total capacity of this channel (always a whole number of satoshis)."
               ]
             },
+            "asset": {
+              "type": "hex",
+              "description": [
+                "On a Sequentia network, the 32-byte display id of the asset the channel is in, which this node learned from the channel's funding output on chain when it checked the announcement: `amount_msat` and the fee and HTLC amounts are in thousandths of its atoms, and a route uses only channels in one asset."
+              ]
+            },
             "message_flags": {
               "type": "u8",
               "description": [

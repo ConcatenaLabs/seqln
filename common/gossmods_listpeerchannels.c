@@ -1,5 +1,7 @@
 #include "config.h"
+#include <bitcoin/chainparams.h>
 #include <ccan/err/err.h>
+#include <ccan/str/hex/hex.h>
 #include <common/gossmap.h>
 #include <common/gossmods_listpeerchannels.h>
 #include <plugins/libplugin.h>
@@ -36,6 +38,30 @@ void gossmod_add_localchan(struct gossmap_localmods *mods,
 				 &fee_base,
 				 &fee_proportional,
 				 &cltv_delta);
+}
+
+/* Sequentia: the asset of a channel in listpeerchannels, as a 33-byte tag.
+ * It names a channel's asset when it is not the policy asset. */
+static bool listpeerchannels_chan_asset(const char *buf,
+					const jsmntok_t *channel,
+					u8 tag[33])
+{
+	const jsmntok_t *atok = json_get_member(buf, channel, "channel_asset");
+	u8 id[32];
+
+	if (!atok) {
+		if (!chainparams->fee_asset_tag)
+			return false;
+		memcpy(tag, chainparams->fee_asset_tag, 33);
+		return true;
+	}
+	if (!hex_decode(buf + atok->start, atok->end - atok->start,
+			id, sizeof(id)))
+		return false;
+	tag[0] = 0x01;
+	for (size_t i = 0; i < sizeof(id); i++)
+		tag[1 + i] = id[sizeof(id) - 1 - i];
+	return true;
 }
 
 struct gossmap_localmods *
@@ -163,6 +189,14 @@ gossmods_from_listpeerchannels_(const tal_t *ctx,
 		   htlc_min[LOCAL], htlc_max[LOCAL],
 		   spendable, max_total_out_htlc, fee_base[LOCAL], fee_proportional[LOCAL],
 		   cltv_delta[LOCAL], enabled, buf, channel, cbarg);
+
+		/* Sequentia: an unannounced channel has no asset in the
+		 * gossip store; route finding learns it here. */
+		if (chainparams->is_elements) {
+			u8 tag[33];
+			if (listpeerchannels_chan_asset(buf, channel, tag))
+				gossmap_local_setasset(mods, scidd.scid, tag);
+		}
 
 		/* If we didn't have a remote update, it's not usable yet */
 		if (fee_proportional[REMOTE] == -1U)

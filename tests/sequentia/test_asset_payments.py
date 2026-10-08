@@ -91,8 +91,19 @@ def test_payee_refuses_wrong_asset(node_factory, bitcoind):
     l1, l2, l3, gold, silv = two_asset_line(node_factory, bitcoind)
 
     inv = invoice(l3, 1_000_000, 'wants-gold', gold)
-    with pytest.raises(RpcError):
+    # pay will not send it in SILV: the invoice names GOLD.
+    with pytest.raises(RpcError, match=r'The invoice is to be paid in asset'):
         l1.rpc.call('pay', {'bolt11': inv, 'asset': silv})
+    # A payer that ignores the invoice's asset and sends a SILV HTLC by
+    # hand is refused by the payee.
+    dec = l1.rpc.decode(inv)
+    route = l1.rpc.call('getroute', {'id': l3.info['id'], 'amount_msat': 1_000_000,
+                                     'riskfactor': 1, 'asset': silv,
+                                     'cltv': dec['min_final_cltv_expiry'] + 5})['route']
+    l1.rpc.call('sendpay', {'route': route, 'payment_hash': dec['payment_hash'],
+                            'payment_secret': dec['payment_secret']})
+    with pytest.raises(RpcError):
+        l1.rpc.waitsendpay(dec['payment_hash'])
     assert only_one(l3.rpc.listinvoices('wants-gold')['invoices'])['status'] == 'unpaid'
     l3.daemon.wait_for_log(r'paid in asset {}, invoice wants {}'.format(silv, gold))
 
@@ -103,14 +114,12 @@ def test_payee_refuses_wrong_asset(node_factory, bitcoind):
 
 
 def test_no_asset_blind_first_hop(node_factory, bitcoind):
-    """A payer holding channels in two assets must say which to pay in:
-    `pay` without `asset=` and a first hop of "any channel" both refuse
-    rather than pick one."""
+    """A payer holding channels in two assets never picks one blindly:
+    `pay` takes the invoice's asset, and a first hop of "any channel"
+    refuses rather than pick one."""
     l1, l2, l3, gold, silv = two_asset_line(node_factory, bitcoind)
 
     inv = invoice(l2, 1_000_000, 'any', gold)
-    with pytest.raises(RpcError, match=r'asset'):
-        l1.rpc.pay(inv)
 
     # sendpay with an all-zero first hop: "any channel to this peer".
     decoded = l1.rpc.decode(inv)
@@ -120,6 +129,12 @@ def test_no_asset_blind_first_hop(node_factory, bitcoind):
         l1.rpc.sendpay(route, decoded['payment_hash'],
                        payment_secret=decoded['payment_secret'])
     assert only_one(l2.rpc.listinvoices('any')['invoices'])['status'] == 'unpaid'
+
+    # pay reads the asset from the invoice and pays over the GOLD channel.
+    before = balance(l2, l1, gold)
+    l1.rpc.pay(inv)
+    wait_for(lambda: balance(l2, l1, gold) == before + 1_000_000)
+    assert only_one(l2.rpc.listinvoices('any')['invoices'])['status'] == 'paid'
 
     # On a node with channels in several assets, an invoice does not pick
     # one for the caller: it asks which.

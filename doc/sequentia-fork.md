@@ -214,22 +214,41 @@ policy asset by default). File-level map of the threading:
 
 ## 6. Asset-aware gossip, routing, payments
 
-- `common/gossip_store_wire.csv`: `gossip_store_channel_asset` (4108) records a channel's
-  denominating asset immediately after its amount record; absent means the policy asset.
-- `gossipd/gossipd.c`, `gossipd/gossmap_manage.{c,h}`, `gossipd/gossipd_wire.csv`,
-  `lightningd/gossip_control.c`: the asset is learned on-chain from the funding output during
-  announcement verification (`gossipd_get_txout_reply` gains an asset field) and written to the
-  gossip store.
-- `common/gossmap.{c,h}`: `gossmap_chan_get_asset()` reads it back.
-- `plugins/topology.c`: `getroute ... asset=<id>` filters pathfinding to channels of that asset.
-- `plugins/pay.c`, `plugins/libplugin-pay.{c,h}`: `pay ... asset=<id>` stores the asset on the
-  root payment; `payment_route_check()` (the single choke point for all routing variants,
-  including MPP splits) skips any channel whose gossip-recorded asset differs, and a routehint
-  through a channel the gossip records in another asset is dropped. Without `asset=`, `pay`
-  pays in the asset of this node's channels when they all hold one, and refuses when they hold
-  several: which asset to pay in is then the caller's choice. On Sequentia networks xpay does not
-  take over `pay` (`plugins/xpay/xpay.c`): xpay, askrene and renepay route over channels of any
-  asset.
+- How route finding learns a channel's asset. The channel announcement and the channel update are
+  BOLT 7's messages unchanged, with no asset field: a node learns the asset of an announced
+  channel from its funding output on chain, which it already reads to check the announcement. An
+  asset field in gossip would add nothing a node could trust without that same check, and would
+  make Sequentia's gossip differ from Bitcoin's on the wire. Files:
+  - `gossipd/gossipd.c`, `gossipd/gossmap_manage.{c,h}`, `gossipd/gossipd_wire.csv`,
+    `lightningd/gossip_control.c`: `gossipd_get_txout_reply` carries the funding output's asset,
+    and the asset is written to the gossip store.
+  - `common/gossip_store_wire.csv`: `gossip_store_channel_asset` (4108) records it, immediately
+    after the channel's amount record.
+  - `common/gossmap.{c,h}`: `gossmap_chan_get_asset()` reads it back. For this node's own
+    channels, announced or not, `gossmods_from_listpeerchannels()`
+    (`common/gossmods_listpeerchannels.c`) records each one's asset from `listpeerchannels` in
+    the local modifications (`gossmap_local_setasset()`), so an unannounced first hop carries its
+    asset too.
+  - `listchannels` shows each channel's `asset`.
+- `plugins/topology.c`: `getroute` routes in one asset. It is the one in `asset=`, else the asset
+  of this node's channels when they all hold one; a node with channels in several assets, or a
+  route from another node (`fromid`), must name it.
+- `plugins/pay.c`, `plugins/libplugin-pay.{c,h}`: `pay` routes in the asset the BOLT11 invoice
+  names. `asset=` may repeat it, and a different one is refused ("The invoice is to be paid in
+  asset X, not Y"). A BOLT12 invoice names no asset, so for one of those it is `asset=`, else the
+  asset of this node's channels when they all hold one. A payment in an asset this node has no open
+  channel in (`CHANNELD_NORMAL` or `CHANNELD_AWAITING_SPLICE`) is refused before any HTLC is
+  offered, with `PAY_INSUFFICIENT_FUNDS` and a message naming the asset and every channel looked
+  at (`payment_asset_unsendable()`). A channel in the asset whose peer is offline, or whose
+  balance is still settling, is left to the payment's own attempts, which never use a channel
+  in another asset.
+  - `payment_route_check()`, the single choke point for every routing variant, MPP splits
+    included, skips any channel in another asset.
+  - The direct-channel shortcut (`directpay`) uses only a channel to the payee in the payment's
+    asset.
+  - A routehint through a channel the gossip records in another asset is dropped.
+  - On Sequentia networks xpay does not take over `pay` (`plugins/xpay/xpay.c`): xpay, askrene
+    and renepay route over channels of any asset.
 - `lightningd/peer_htlcs.c` `best_channel()`: a forwarding node may move an HTLC to another
   channel with the same peer, but only one in the same asset.
 - `lightningd/pay.c`: an all-zero first hop ("any channel to this peer") in `sendpay`, and a first
@@ -388,8 +407,8 @@ The Specula design note is not yet published in this repository; the header comm
 | Component | Change |
 | --- | --- |
 | `plugins/bcli.c` | Certified-frontier clamp, fixed feerates on Sequentia, `getfeeexchangerates` passthrough |
-| `plugins/pay.c`, `plugins/libplugin-pay.{c,h}` | `asset` parameter, per-asset route filter |
-| `plugins/topology.c` | `getroute` `asset` parameter |
+| `plugins/pay.c`, `plugins/libplugin-pay.{c,h}` | The invoice's asset, per-asset route filter, refusal of an asset this node cannot send |
+| `plugins/topology.c` | `getroute` in one asset, `listchannels` `asset` |
 | `plugins/spender/*` | `fundchannel`/`multifundchannel` `asset` parameter, single-asset funding txs |
 | `channeld`, `openingd`, `closingd`, `onchaind` | Channel asset threading (section 5) |
 | `gossipd` | On-chain asset learning + gossip store records (section 6) |
@@ -450,7 +469,10 @@ the asset plugins see on an HTLC, with `holdinvoice-seq` holding only the asset 
 registered in, across a restart (`test_hold_asset.py`), and the asset an invoice names in its
 `a` field: under its signature, required on decode, refused at creation without a channel in it,
 and the only asset its route hints are in (`test_invoice_asset.py`; `common/test/run-bolt11.c`
-covers the field's encoding and its meaning on Bitcoin). They need `sequentiad`, `sequentia-cli`
+covers the field's encoding and its meaning on Bitcoin), and route finding in that asset: a payer
+with channels in two assets paying each invoice in its own, to a direct peer as well as over two
+hops, `getroute` in one asset, an unannounced first hop, and an invoice in an asset the payer
+cannot send refused with no HTLC offered anywhere (`test_asset_routing.py`). They need `sequentiad`, `sequentia-cli`
 and a Bitcoin Core `bitcoind` on `PATH`, and the keyless tests need the device signer built
 (`cargo build --release` in `contrib/seqln-signer`, or `SEQLN_SIGNER=/path/to/seqln-signer`).
 The test plugins run under the `python3` on `PATH`, which needs the `pyln` packages, so the
@@ -493,19 +515,16 @@ Each verified present in the code as of 2026-07-08:
    no asset. Use `pay` with `asset=` and invoices that name their asset. A plugin that settles
    HTLCs itself must check the `asset` the `htlc_accepted` hook names, as
    `contrib/holdinvoice-seq` does.
-3. **Local/private channels have no asset record in pathfinding.** The gossmap local
-   modifications (`common/gossmods_listpeerchannels.c`) carry no asset, so unannounced channels
-   are treated as policy-asset channels by the `pay`/`getroute` asset filter.
-4. **Mainnet chainparams are placeholders.** All-zero genesis, NULL fee asset; the `sequentia`
+3. **Mainnet chainparams are placeholders.** All-zero genesis, NULL fee asset; the `sequentia`
    network entry must not be used.
-5. **Committee-stall fail-open.** If the certified frontier is more than 144 blocks behind the tip
+4. **Committee-stall fail-open.** If the certified frontier is more than 144 blocks behind the tip
    (a stalled committee), the bcli clamp fails open with a warning rather than halting; operators
    should monitor for that log message.
-6. **Penalty across an induced anchor reorg is untested.** Open, payment and mutual close of an
+5. **Penalty across an induced anchor reorg is untested.** Open, payment and mutual close of an
    issued-asset channel, and a breach of one answered by `speculad`, run in `tests/sequentia/`,
    and force-close resolution has been exercised on the testnet, but no test covers a penalty
    across a Bitcoin-anchor tail truncation.
-7. **`speculad` pays a justice transaction's fee only in the channel asset.** If the node stops
+6. **`speculad` pays a justice transaction's fee only in the channel asset.** If the node stops
    accepting that asset for fees, the tower cannot fund the justice transaction (it logs the
    asset and broadcasts it unfunded, which the network refuses). Its fee wallet must also hold a
    UTXO in each channel asset it defends.

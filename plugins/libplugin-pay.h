@@ -489,4 +489,16 @@ int libplugin_pay_poll(struct pollfd *fds, nfds_t nfds, int timeout);
 void
 paymod_log(struct payment *p, enum log_level l, const char *fmt, ...);
 
+/* Sequentia: the asset (33-byte tag) of this node's usable channels when
+ * they all hold one.  NULL with *why set when they hold several, or none:
+ * which asset to pay in is then the caller's choice. */
+const u8 *payment_default_asset(const tal_t *ctx, struct command *cmd,
+				const char **why);
+
+/* Sequentia: NULL if this node has an open channel (CHANNELD_NORMAL or
+ * CHANNELD_AWAITING_SPLICE) in @asset; otherwise why it cannot send it,
+ * naming the asset and every channel looked at. */
+const char *payment_asset_unsendable(const tal_t *ctx, struct command *cmd,
+				     const u8 *asset);
+
 #endif /* LIGHTNING_PLUGINS_LIBPLUGIN_PAY_H */
