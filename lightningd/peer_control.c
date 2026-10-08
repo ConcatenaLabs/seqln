@@ -1029,12 +1029,12 @@ static void NON_NULL_ARGS(1, 2, 4, 5) json_add_channel(struct command *cmd,
 		json_add_bool(response, "reestablished", channel->reestablished);
 	}
 	json_add_channel_type(response, "channel_type", channel->type);
-	/* Asset-aware channels: surface the channel asset's display id (32-byte
-	 * hex, natural order) for a non-policy asset; policy-asset channels omit
-	 * it, so amounts are read as the policy asset as before. */
-	if (chainparams->is_elements && chainparams->fee_asset_tag
-	    && memcmp(channel->channel_asset, chainparams->fee_asset_tag,
-		      sizeof(channel->channel_asset)) != 0) {
+	/* Asset-aware channels: name every channel's asset by its display id
+	 * (32-byte hex, natural order), the policy asset included, as listfunds
+	 * does.  Omitting it for the policy asset made that one asset the one
+	 * that does not name itself, and a client reading a missing value as
+	 * "any asset" let it stand in for every other. */
+	if (chainparams->is_elements && chainparams->fee_asset_tag) {
 		u8 id[32];
 		for (size_t i = 0; i < sizeof(id); i++)
 			id[i] = channel->channel_asset[sizeof(id) - i];

@@ -188,7 +188,7 @@ def test_hold_in_the_one_asset_of_the_node(node_factory, bitcoind):
     p = os.urandom(32)
     h = hashlib.sha256(p).hexdigest()
     reg = l2.rpc.call('holdinvoice', {'payment_hash': h, 'amount_msat': 10**9})
-    assert 'asset' not in reg
+    assert reg['asset'] == bitcoind.POLICY_ASSET
     scid = only_one(l1.rpc.listpeerchannels(l2.info['id'])['channels'])['short_channel_id']
     send_over(l1, l2, scid, h, 10**9)
     wait_for(lambda: l2.rpc.call('holdinvoicelookup', {'payment_hash': h})['state'] == 'accepted')

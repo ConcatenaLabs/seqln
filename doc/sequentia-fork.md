@@ -222,7 +222,8 @@ policy asset by default). File-level map of the threading:
 - `lightningd/channel.{c,h}`, `lightningd/channel_control.c`, `lightningd/peer_control.c`,
   `wallet/wallet.{c,h}`, `wallet/migrations.c`: `channel_asset` on the channel state, persisted
   across restarts (DB migration), surfaced in `listpeerchannels` as `channel_asset` (32-byte
-  display hex) for non-policy channels.
+  display hex) for every channel, the policy asset's included, as `listfunds` names each
+  channel's and output's `asset`: no asset is the one a missing value stands for.
 - `wallet/wallet.c`, `wallet/reservation.c`, `wallet/walletrpc.c`: the on-chain wallet records
   UTXOs of any issued asset (the output a peer's commitment pays this node, which onchaind hands
   to the wallet, in the channel's asset), selects coins per-asset, funds single-asset
@@ -541,7 +542,8 @@ keyless node whose device, moved onto an older store, refuses its closing transa
 in each closing state and after `close` times out, and one with an HTLC on chain
 (`test_keyless_start.py`, which runs on Bitcoin regtest too, with `TEST_NETWORK=regtest`), the
 fees of channels in assets of any value and between peers that value an asset differently
-(`test_fee_market.py`),
+(`test_fee_market.py`), a channel in the Sequence token naming its asset in
+`listpeerchannels` like any other, and a hold in it (`test_channel_asset.py`),
 the asset plugins see on an HTLC, with `holdinvoice-seq` holding only the asset it was
 registered in, across a restart, and accepted only once the parts it holds reach its amount,
 a part short of it failed back with `mpp_timeout` at the hold's timeout (`test_hold_asset.py`), and the asset an invoice names in its
