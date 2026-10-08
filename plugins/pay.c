@@ -1,4 +1,5 @@
 #include "config.h"
+#include <ccan/mem/mem.h>
 #include <ccan/array_size/array_size.h>
 #include <ccan/cast/cast.h>
 #include <ccan/str/hex/hex.h>
@@ -889,53 +890,6 @@ static struct command_result *param_asset_tag(struct command *cmd,
 	return NULL;
 }
 
-/* Sequentia: with no `asset=`, the asset of this node's usable channels when
- * they hold one (a 33-byte tag), else NULL.  When they hold several, which
- * one to pay in is the caller's choice: NULL with *why set. */
-static const u8 *pay_default_asset(const tal_t *ctx, struct command *cmd,
-				   const char **why)
-{
-	const char *buf;
-	const jsmntok_t *result, *chans, *t;
-	const u8 *found = NULL;
-	size_t i;
-
-	*why = NULL;
-	result = jsonrpc_request_sync(tmpctx, cmd, "listpeerchannels",
-				      NULL, &buf);
-	chans = json_get_member(buf, result, "channels");
-	json_for_each_arr(i, t, chans) {
-		const jsmntok_t *state = json_get_member(buf, t, "state");
-		const jsmntok_t *atok = json_get_member(buf, t, "channel_asset");
-		u8 *tag;
-
-		if (!state || !json_tok_streq(buf, state, "CHANNELD_NORMAL"))
-			continue;
-		/* listpeerchannels names the asset of a channel that is not
-		 * in the policy asset. */
-		if (atok) {
-			u8 id[32];
-			if (!hex_decode(buf + atok->start, atok->end - atok->start,
-					id, sizeof(id)))
-				continue;
-			tag = tal_arr(tmpctx, u8, 33);
-			tag[0] = 0x01;
-			for (size_t j = 0; j < sizeof(id); j++)
-				tag[1 + j] = id[sizeof(id) - 1 - j];
-		} else
-			tag = tal_dup_arr(tmpctx, u8, chainparams->fee_asset_tag,
-					  33, 0);
-		if (!found)
-			found = tag;
-		else if (memcmp(found, tag, 33) != 0) {
-			*why = "This node holds channels in several assets:"
-				" name the one to pay in with asset=";
-			return NULL;
-		}
-	}
-	return found ? tal_dup_arr(ctx, u8, found, 33, 0) : NULL;
-}
-
 static struct command_result *json_pay(struct command *cmd,
 				       const char *buf,
 				       const jsmntok_t *params)
@@ -1004,17 +958,8 @@ static struct command_result *json_pay(struct command *cmd,
 	p = payment_new(cmd, cmd, NULL /* No parent */, global_hints, paymod_mods);
 	p->invstring = tal_steal(p, b11str);
 	p->description = tal_steal(p, description);
-	/* Sequentia: route this payment only over channels of the given asset. */
-	p->asset = asset ? tal_steal(p, asset) : NULL;
-	/* No asset named: the payment is in the asset of this node's
-	 * channels.  Left unset, routes would mix channels of any asset. */
-	if (!p->asset && chainparams->has_anchor_header && chainparams->fee_asset_tag) {
-		const char *why;
-		p->asset = pay_default_asset(p, cmd, &why);
-		if (why)
-			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "%s", why);
-	}
+	/* Sequentia: the asset is set below, from the invoice. */
+	p->asset = NULL;
 	/* Overridded by bolt12 if present */
 	p->blindedpath = NULL;
 	p->blindedpay = NULL;
@@ -1046,6 +991,18 @@ static struct command_result *json_pay(struct command *cmd,
 		p->routes = notleak_with_children(tal_steal(p, b11->routes));
 		p->min_final_cltv_expiry = b11->min_final_cltv_expiry;
 		p->features = tal_steal(p, b11->features);
+		/* Sequentia: the invoice names the asset it is paid in;
+		 * `asset=` may repeat it, never contradict it. */
+		if (b11->asset) {
+			if (asset && !memeq(asset, tal_bytelen(asset),
+					    b11->asset, 33))
+				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+						    "The invoice is to be paid in"
+						    " asset %s, not %s",
+						    fmt_asset_id(tmpctx, b11->asset),
+						    fmt_asset_id(tmpctx, asset));
+			p->asset = tal_dup_arr(p, u8, b11->asset, 33, 0);
+		}
 		/* Sanity check */
 		if (feature_offered(b11->features, OPT_VAR_ONION) &&
 		    !b11->payment_secret)
@@ -1116,6 +1073,30 @@ static struct command_result *json_pay(struct command *cmd,
 
 	if (clock_time().ts.tv_sec > invexpiry)
 		return command_fail(cmd, PAY_INVOICE_EXPIRED, "Invoice expired");
+
+	/* Sequentia: route only over channels of the payment's asset.  A
+	 * BOLT11 invoice set it above; a BOLT12 one names none, so it is
+	 * `asset=`, else the asset of this node's channels when they all
+	 * hold one.  Left unset, routes would mix channels of any asset. */
+	if (chainparams->has_anchor_header && chainparams->fee_asset_tag) {
+		const char *why;
+
+		if (!p->asset && asset)
+			p->asset = tal_dup_arr(p, u8, asset, 33, 0);
+		if (!p->asset) {
+			p->asset = payment_default_asset(p, cmd, &why);
+			if (!p->asset)
+				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+						    "%s", why);
+		}
+		/* Refuse before any HTLC leaves, rather than offer one the
+		 * payee can only refuse. */
+		why = payment_asset_unsendable(tmpctx, cmd, p->asset);
+		if (why)
+			return command_fail(cmd, PAY_INSUFFICIENT_FUNDS,
+					    "%s", why);
+	} else if (asset)
+		p->asset = tal_steal(p, asset);
 
 	if (invmsat) {
 		if (msat) {

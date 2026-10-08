@@ -89,6 +89,10 @@ struct gossmap {
 	/* local channel_update messages, if any. */
 	u8 *local_updates;
 
+	/* Sequentia: the localmods applied, if any, for the asset of a
+	 * local channel (which has no gossip store record). */
+	struct gossmap_localmods *applied_localmods;
+
 	/* How many live and dead records? */
 	size_t num_live, num_dead;
 
@@ -953,6 +957,7 @@ static bool load_gossip_store(struct gossmap *map,
 	map->map_size = lseek(map->fd, 0, SEEK_END);
 	map->local_announces = NULL;
 	map->local_updates = NULL;
+	map->applied_localmods = NULL;
 
 	/* If this fails, we fall back to read */
 	map->mmap = mmap(NULL, map->map_size, PROT_READ, MAP_SHARED, map->fd, 0);
@@ -1006,6 +1011,10 @@ struct localmod {
 
 	/* Original update offsets */
 	u64 orig_cupdate_off[2];
+
+	/* Sequentia: the channel's asset (33-byte tag), if has_asset. */
+	bool has_asset;
+	u8 asset[33];
 };
 
 static bool localmod_is_local_chan(const struct localmod *mod)
@@ -1079,6 +1088,7 @@ bool gossmap_local_addchan(struct gossmap_localmods *localmods,
 
 	mod.scid = scid;
 	memset(&mod.changes, 0, sizeof(mod.changes));
+	mod.has_asset = false;
 
 	/* We create amount, then fake local channel_announcement */
 	off = insert_local_space(&localmods->local_announces,
@@ -1171,6 +1181,7 @@ bool gossmap_local_updatechan(struct gossmap_localmods *localmods,
 		mod->scid = scidd->scid;
 		memset(&mod->changes, 0, sizeof(mod->changes));
 		mod->local_off = 0xFFFFFFFFFFFFFFFFULL;
+		mod->has_asset = false;
 	}
 
 	lc = &mod->changes[scidd->dir];
@@ -1220,6 +1231,19 @@ bool gossmap_local_setchan(struct gossmap_localmods *localmods,
 					&delay);
 }
 
+bool gossmap_local_setasset(struct gossmap_localmods *localmods,
+			    struct short_channel_id scid,
+			    const u8 asset[33])
+{
+	struct localmod *mod = find_localmod(localmods, scid);
+
+	if (!mod)
+		return false;
+	mod->has_asset = true;
+	memcpy(mod->asset, asset, sizeof(mod->asset));
+	return true;
+}
+
 /* Apply localmods to this map */
 void gossmap_apply_localmods(struct gossmap *map,
 			     struct gossmap_localmods *localmods)
@@ -1228,6 +1252,7 @@ void gossmap_apply_localmods(struct gossmap *map,
 
 	assert(!map->local_announces);
 	map->local_announces = localmods->local_announces;
+	map->applied_localmods = localmods;
 	map->local_updates = tal_arr(map, u8, 0);
 
 	for (size_t i = 0; i < n; i++) {
@@ -1360,6 +1385,7 @@ void gossmap_remove_localmods(struct gossmap *map,
 	}
 	map->local_announces = NULL;
 	map->local_updates = tal_free(map->local_updates);
+	map->applied_localmods = NULL;
 }
 
 bool gossmap_refresh(struct gossmap *map)
@@ -1522,9 +1548,20 @@ bool gossmap_chan_get_asset(const struct gossmap *map,
 	struct gossip_hdr ghdr;
 	u64 off;
 
-	/* Local mods (unannounced/local-only channels) carry no store record. */
-	if (gossmap_chan_is_localmod(map, c))
-		return false;
+	/* Local mods (unannounced/local-only channels) carry no store record:
+	 * their asset, if known, came with the localmods. */
+	if (gossmap_chan_is_localmod(map, c)) {
+		struct localmod *mod;
+
+		if (!map->applied_localmods)
+			return false;
+		mod = find_localmod(map->applied_localmods,
+				    gossmap_chan_scid(map, c));
+		if (!mod || !mod->has_asset)
+			return false;
+		memcpy(asset, mod->asset, 33);
+		return true;
+	}
 
 	/* Skip over the channel_announcement record. */
 	off = c->cann_off - sizeof(ghdr);

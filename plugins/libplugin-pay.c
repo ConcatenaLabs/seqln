@@ -1,5 +1,6 @@
 #include "config.h"
 #include <ccan/mem/mem.h>
+#include <ccan/str/hex/hex.h>
 #include <ccan/tal/str/str.h>
 #include <common/blindedpay.h>
 #include <common/bolt11.h>
@@ -3509,6 +3510,39 @@ static struct command_result *shadow_route_cb(struct shadow_route_data *d,
 REGISTER_PAYMENT_MODIFIER(shadowroute, struct shadow_route_data *,
 			  shadow_route_init, shadow_route_cb);
 
+static bool listpeerchannels_asset(const char *buf, const jsmntok_t *chan,
+				   u8 tag[33]);
+
+/* Sequentia: the listpeerchannels entry of a parsed channel, by its
+ * short_channel_id, else its local alias. */
+static const jsmntok_t *chantok_of(const char *buf, const jsmntok_t *chantoks,
+				   const struct listpeers_channel *chan)
+{
+	const jsmntok_t *t;
+	size_t i;
+
+	if (!chantoks)
+		return NULL;
+	json_for_each_arr(i, t, chantoks) {
+		const jsmntok_t *f;
+		struct short_channel_id scid;
+
+		if (chan->scid) {
+			f = json_get_member(buf, t, "short_channel_id");
+			if (f && json_to_short_channel_id(buf, f, &scid)
+			    && short_channel_id_eq(scid, *chan->scid))
+				return t;
+		} else if (chan->alias[LOCAL]) {
+			f = json_get_member(buf, t, "alias");
+			f = f ? json_get_member(buf, f, "local") : NULL;
+			if (f && json_to_short_channel_id(buf, f, &scid)
+			    && short_channel_id_eq(scid, *chan->alias[LOCAL]))
+				return t;
+		}
+	}
+	return NULL;
+}
+
 static struct command_result *direct_pay_override(struct payment *p)
 {
 	/* The root has performed the search for a direct channel. */
@@ -3567,12 +3601,24 @@ static struct command_result *direct_pay_listpeerchannels(struct command *cmd,
 {
 	struct listpeers_channel **channels = json_to_listpeers_channels(tmpctx, buffer, toks);
 	struct direct_pay_data *d = payment_mod_directpay_get_data(p);
+	const jsmntok_t *chantoks = json_get_member(buffer, toks, "channels");
 
 	for (size_t i=0; i<tal_count(channels); i++) {
 		struct listpeers_channel *chan = channels[i];
 
 		if (!node_id_eq(&chan->id, p->route_destination))
 			continue;
+
+		/* Sequentia: a direct channel in another asset than the
+		 * payment's would carry it out of its asset. */
+		if (payment_root(p)->asset) {
+			u8 tag[33];
+			const jsmntok_t *ct = chantok_of(buffer, chantoks, chan);
+			if (!ct || !listpeerchannels_asset(buffer, ct, tag)
+			    || !memeq(tag, sizeof(tag),
+				      payment_root(p)->asset, 33))
+				continue;
+		}
 
 		if (!chan->connected)
 			continue;
@@ -3972,3 +4018,102 @@ static struct command_result *route_exclusions_step_cb(struct route_exclusions_d
 
 REGISTER_PAYMENT_MODIFIER(route_exclusions, struct route_exclusions_data *,
 	route_exclusions_data_init, route_exclusions_step_cb);
+
+/* Sequentia: the asset of a channel in listpeerchannels, as a 33-byte tag:
+ * it names the asset of a channel that is not in the policy asset. */
+static bool listpeerchannels_asset(const char *buf, const jsmntok_t *chan,
+				   u8 tag[33])
+{
+	const jsmntok_t *atok = json_get_member(buf, chan, "channel_asset");
+	u8 id[32];
+
+	if (!atok) {
+		if (!chainparams->fee_asset_tag)
+			return false;
+		memcpy(tag, chainparams->fee_asset_tag, 33);
+		return true;
+	}
+	if (!hex_decode(buf + atok->start, atok->end - atok->start,
+			id, sizeof(id)))
+		return false;
+	tag[0] = 0x01;
+	for (size_t i = 0; i < sizeof(id); i++)
+		tag[1 + i] = id[sizeof(id) - 1 - i];
+	return true;
+}
+
+const u8 *payment_default_asset(const tal_t *ctx, struct command *cmd,
+				const char **why)
+{
+	const char *buf;
+	const jsmntok_t *result, *chans, *t;
+	u8 found[33];
+	bool have = false;
+	size_t i;
+
+	result = jsonrpc_request_sync(tmpctx, cmd, "listpeerchannels",
+				      NULL, &buf);
+	chans = json_get_member(buf, result, "channels");
+	json_for_each_arr(i, t, chans) {
+		const jsmntok_t *state = json_get_member(buf, t, "state");
+		u8 tag[33];
+
+		if (!state || !json_tok_streq(buf, state, "CHANNELD_NORMAL"))
+			continue;
+		if (!listpeerchannels_asset(buf, t, tag))
+			continue;
+		if (!have) {
+			memcpy(found, tag, sizeof(found));
+			have = true;
+		} else if (!memeq(found, sizeof(found), tag, sizeof(tag))) {
+			*why = "This node holds channels in several assets:"
+				" name the one to pay in with asset=";
+			return NULL;
+		}
+	}
+	if (!have) {
+		*why = "This node has no channel to pay from";
+		return NULL;
+	}
+	*why = NULL;
+	return tal_dup_arr(ctx, u8, found, sizeof(found), 0);
+}
+
+const char *payment_asset_unsendable(const tal_t *ctx, struct command *cmd,
+				     const u8 *asset)
+{
+	const char *buf;
+	const jsmntok_t *result, *chans, *t;
+	char *looked = tal_strdup(tmpctx, "");
+	size_t i;
+
+	result = jsonrpc_request_sync(tmpctx, cmd, "listpeerchannels",
+				      NULL, &buf);
+	chans = json_get_member(buf, result, "channels");
+	json_for_each_arr(i, t, chans) {
+		const jsmntok_t *state = json_get_member(buf, t, "state");
+		const jsmntok_t *scid = json_get_member(buf, t, "short_channel_id");
+		const jsmntok_t *cid = json_get_member(buf, t, "channel_id");
+		u8 tag[33];
+
+		if (!listpeerchannels_asset(buf, t, tag))
+			continue;
+		/* An open channel in the asset can carry the payment, now or
+		 * once its peer reconnects or its balance settles: the
+		 * payment's own attempts handle those. */
+		if (memeq(tag, sizeof(tag), asset, 33)
+		    && state
+		    && (json_tok_streq(buf, state, "CHANNELD_NORMAL")
+			|| json_tok_streq(buf, state, "CHANNELD_AWAITING_SPLICE")))
+			return NULL;
+		tal_append_fmt(&looked, "%s%s in %s (%s)",
+			       looked[0] ? "; " : "",
+			       json_strdup(tmpctx, buf, scid ? scid : cid),
+			       fmt_asset_id(tmpctx, tag),
+			       state ? json_strdup(tmpctx, buf, state) : "?");
+	}
+	return tal_fmt(ctx, "This node cannot send asset %s: it has no open"
+		       " channel in it (looked at: %s)",
+		       fmt_asset_id(tmpctx, asset),
+		       looked[0] ? looked : "no channels");
+}

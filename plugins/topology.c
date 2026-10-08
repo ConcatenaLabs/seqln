@@ -1,6 +1,7 @@
 #include "config.h"
 #include <ccan/array_size/array_size.h>
 #include <ccan/json_escape/json_escape.h>
+#include <ccan/mem/mem.h>
 #include <ccan/str/hex/hex.h>
 #include <ccan/tal/str/str.h>
 #include <common/dijkstra.h>
@@ -193,6 +194,53 @@ static struct command_result *try_route(struct command *cmd,
 	return command_finished(cmd, js);
 }
 
+/* Sequentia: the asset (33-byte tag) of this node's usable channels in a
+ * listpeerchannels result when they all hold one; else NULL and *why. */
+static const u8 *getroute_default_asset(const tal_t *ctx,
+					const char *buf,
+					const jsmntok_t *result,
+					const char **why)
+{
+	const jsmntok_t *chans = json_get_member(buf, result, "channels"), *t;
+	u8 found[33], tag[33];
+	bool have = false;
+	size_t i;
+
+	json_for_each_arr(i, t, chans) {
+		const jsmntok_t *state = json_get_member(buf, t, "state");
+		const jsmntok_t *atok = json_get_member(buf, t, "channel_asset");
+		u8 id[32];
+
+		if (!state || !json_tok_streq(buf, state, "CHANNELD_NORMAL"))
+			continue;
+		/* listpeerchannels names the asset of a channel that is not
+		 * in the policy asset. */
+		if (atok) {
+			if (!hex_decode(buf + atok->start, atok->end - atok->start,
+					id, sizeof(id)))
+				continue;
+			tag[0] = 0x01;
+			for (size_t j = 0; j < sizeof(id); j++)
+				tag[1 + j] = id[sizeof(id) - 1 - j];
+		} else
+			memcpy(tag, chainparams->fee_asset_tag, sizeof(tag));
+		if (!have) {
+			memcpy(found, tag, sizeof(found));
+			have = true;
+		} else if (!memeq(found, sizeof(found), tag, sizeof(tag))) {
+			*why = "This node holds channels in several assets:"
+				" name the one to route in with asset=";
+			return NULL;
+		}
+	}
+	if (!have) {
+		*why = "This node has no channel to route from: name the"
+			" asset to route in with asset=";
+		return NULL;
+	}
+	return tal_dup_arr(ctx, u8, found, sizeof(found), 0);
+}
+
 static struct command_result *
 listpeerchannels_getroute_done(struct command *cmd,
 			       const char *method,
@@ -203,6 +251,23 @@ listpeerchannels_getroute_done(struct command *cmd,
 	struct gossmap *gossmap;
 	struct gossmap_localmods *mods;
 	struct command_result *res;
+
+	/* Sequentia: a route is in one asset.  With none named, it is the
+	 * asset of this node's channels when they all hold one; otherwise
+	 * the caller names it. */
+	if (chainparams->has_anchor_header && !info->asset) {
+		const char *why = NULL;
+
+		if (!node_id_eq(info->source, &local_id))
+			why = "A route from another node: name the asset to"
+				" route in with asset=";
+		else
+			info->asset = getroute_default_asset(info, buf, result,
+							     &why);
+		if (!info->asset)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "%s", why);
+	}
 
 	/* Get local knowledge */
 	mods = gossmods_from_listpeerchannels(tmpctx, &local_id,
@@ -257,6 +322,8 @@ static void json_add_halfchan(struct json_stream *response,
 	struct node_id node_id[2];
 	const u8 *chanfeatures;
 	struct amount_msat capacity_msat;
+	u8 asset[33];
+	bool has_asset;
 
 	/* These are channel (not per-direction) properties */
 	chanfeatures = gossmap_chan_get_features(tmpctx, gossmap, c);
@@ -266,6 +333,10 @@ static void json_add_halfchan(struct json_stream *response,
 				    &node_id[i]);
 
 	capacity_msat = gossmap_chan_get_capacity(gossmap, c);
+	/* Sequentia: the asset the gossip recorded for the channel, learned
+	 * from its funding output on chain. */
+	has_asset = chainparams->has_anchor_header
+		&& gossmap_chan_get_asset(gossmap, c, asset);
 
 	for (int dir = 0; dir < 2; dir++) {
 		u32 timestamp;
@@ -297,6 +368,9 @@ static void json_add_halfchan(struct json_stream *response,
 						&htlc_maximum_msat);
 
 		json_add_amount_msat(response, "amount_msat", capacity_msat);
+		if (has_asset)
+			json_add_string(response, "asset",
+					fmt_asset_id(tmpctx, asset));
 		json_add_num(response, "message_flags", message_flags);
 		json_add_num(response, "channel_flags", channel_flags);
 

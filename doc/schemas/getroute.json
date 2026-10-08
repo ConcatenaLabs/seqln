@@ -83,7 +83,7 @@
       "asset": {
         "type": "hex",
         "description": [
-          "On an asset-aware chain, the 32-byte display id of an asset: only channels in that asset are used."
+          "On an asset-aware chain, the 32-byte display id of an asset: only channels in that asset are used. On a Sequentia network the default is the asset of this node's channels when they all hold one; a node with channels in several assets, or a route from another node, must name it."
         ]
       }
     }

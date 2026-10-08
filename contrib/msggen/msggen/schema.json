@@ -16328,7 +16328,7 @@
           "asset": {
             "type": "hex",
             "description": [
-              "On an asset-aware chain, the 32-byte display id of an asset: only channels in that asset are used."
+              "On an asset-aware chain, the 32-byte display id of an asset: only channels in that asset are used. On a Sequentia network the default is the asset of this node's channels when they all hold one; a node with channels in several assets, or a route from another node, must name it."
             ]
           }
         }
@@ -19129,6 +19129,12 @@
                   "type": "msat",
                   "description": [
                     "The total capacity of this channel (always a whole number of satoshis)."
+                  ]
+                },
+                "asset": {
+                  "type": "hex",
+                  "description": [
+                    "On a Sequentia network, the 32-byte display id of the asset the channel is in, which this node learned from the channel's funding output on chain when it checked the announcement: `amount_msat` and the fee and HTLC amounts are in thousandths of its atoms, and a route uses only channels in one asset."
                   ]
                 },
                 "message_flags": {
@@ -30544,7 +30550,7 @@
           "asset": {
             "type": "hex",
             "description": [
-              "On an asset-aware chain, the 32-byte display id of the asset to pay in: only channels in that asset are used, and the invoice amount is read in its atoms. On a Sequentia network the default is the asset of this node's channels when they all hold one; a node with channels in several assets must name it."
+              "On an asset-aware chain, the 32-byte display id of the asset to pay in: only channels in that asset are used, and the invoice amount is read in its atoms. On a Sequentia network a BOLT11 invoice names its asset (its `a` field) and the payment is in that asset: `asset` may repeat it, and a different one is refused. For a BOLT12 invoice, which names none, the default is the asset of this node's channels when they all hold one; a node with channels in several assets must name it. A payment in an asset this node has no open channel in is refused before any HTLC is offered, naming the asset and the channels looked at."
             ]
           }
         }

@@ -177,9 +177,17 @@ static inline bool gossmap_chan_set(const struct gossmap_chan *chan, int dir)
 struct amount_msat gossmap_chan_get_capacity(const struct gossmap *map,
 					     const struct gossmap_chan *c);
 
+/* Sequentia: record the asset (33-byte tag) of a channel in these
+ * localmods, already added or updated in them, so gossmap_chan_get_asset
+ * answers for it while they are applied.  False if it is not in them. */
+bool gossmap_local_setasset(struct gossmap_localmods *localmods,
+			    struct short_channel_id scid,
+			    const u8 asset[33]);
+
 /* Sequentia: fill in the channel's 33-byte denominating asset (version+tag).
- * Returns false (asset untouched) if the channel has no asset record, i.e. it
- * is the policy asset. */
+ * Returns false (asset untouched) if the channel has no asset record: an
+ * announced channel learned before its asset was recorded, or a local channel
+ * whose asset the applied localmods do not name. */
 bool gossmap_chan_get_asset(const struct gossmap *map,
 			    const struct gossmap_chan *c,
 			    u8 asset[33]);
