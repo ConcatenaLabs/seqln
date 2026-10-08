@@ -17647,14 +17647,10 @@
     "keysend.json": {
       "$schema": "../rpc-schema-draft.json",
       "type": "object",
-      "deprecated": [
-        "v26.06",
-        "v27.03"
-      ],
       "rpc": "keysend",
       "title": "Send funds to a node without an invoice",
       "description": [
-        "WARNING: deprecated: use *xkeysend* which uses askrene for better route calculation (and learns from previous payments).",
+        "Upstream Core Lightning deprecates **keysend** for *xkeysend*. This fork keeps it: *xkeysend* knows nothing of assets, and **keysend** pays in a Sequentia asset.",
         "",
         "The **keysend** RPC command attempts to find a route to the given destination, and send the specified amount to it. Unlike the `pay` RPC command the `keysend` command does not require an invoice, instead it uses the `destination` node ID, and `amount` to find a route to the specified node.",
         "",
@@ -17761,6 +17757,12 @@
             "type": "msat",
             "description": [
               "*maxfee* overrides both *maxfeepercent* and *exemptfee* defaults (and if you specify *maxfee* you cannot specify either of those), and creates an absolute limit on what fee we will pay. This allows you to implement your own heuristics rather than the primitive ones used here."
+            ]
+          },
+          "asset": {
+            "type": "hex",
+            "description": [
+              "On a Sequentia network, the 32-byte display id of the asset to pay in: *amount_msat* is in thousandths of its atoms, and only channels in it are used, so no route mixes assets. The default is the asset of this node's channels when they all hold one; a node with channels in several assets must name it. An asset none of this node's channels can send is refused before any HTLC is offered. The payee records the payment in an invoice that names the asset it arrived in."
             ]
           }
         }
@@ -30430,14 +30432,10 @@
     "pay.json": {
       "$schema": "../rpc-schema-draft.json",
       "type": "object",
-      "deprecated": [
-        "v26.06",
-        "v27.03"
-      ],
       "rpc": "pay",
       "title": "Command for sending a payment to a BOLT11/BOLT12 invoice",
       "description": [
-        "NOTE: As of v26.06, xpay transparantly handles most **pay** invocations, and **pay** is deprecated.",
+        "Upstream Core Lightning deprecates **pay** for *xpay*. This fork keeps it, and on a Sequentia network xpay does not take it over: xpay knows nothing of assets, and **pay** pays in the asset an invoice names.",
         "",
         "The **pay** RPC command attempts to find a route to the given destination, and send the funds it asks for.",
         "",

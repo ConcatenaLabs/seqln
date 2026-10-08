@@ -94,8 +94,8 @@ Experimental / known limitations (details and file pointers in
 
 - Dual-funded (v2) channel opens and splicing are not asset-aware; asset channels must use the
   ordinary single-funder `fundchannel`.
-- `pay` is the payment command that keeps a payment in one asset; xpay, renepay and keysend
-  route over channels of any asset.
+- `pay` and `keysend` are the payment commands that keep a payment in one asset (`pay` the one
+  its invoice names); xpay and renepay route over channels of any asset.
 
 ## Building from source
 

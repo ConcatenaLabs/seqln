@@ -249,6 +249,13 @@ policy asset by default). File-level map of the threading:
   - A routehint through a channel the gossip records in another asset is dropped.
   - On Sequentia networks xpay does not take over `pay` (`plugins/xpay/xpay.c`): xpay, askrene
     and renepay route over channels of any asset.
+- `plugins/keysend.c`: `keysend ... asset=<id>` pays in that asset, else in the asset of this
+  node's channels when they all hold one; a node with channels in several assets must name it.
+  The payment routes only over channels in the asset, so no route mixes assets, and an asset this
+  node cannot send is refused before any HTLC is offered, as for `pay`. The final CLTV delta it
+  asks of the payee is 420 blocks, the margin over Sequentia's 180-block default that upstream's
+  42 keeps over Bitcoin's 18; a Sequentia payee refuses 42 as expiring too soon. Upstream
+  deprecates `keysend` for xpay's `xkeysend`, which knows no asset; here it is not deprecated.
 - `lightningd/peer_htlcs.c` `best_channel()`: a forwarding node may move an HTLC to another
   channel with the same peer, but only one in the same asset.
 - `lightningd/pay.c`: an all-zero first hop ("any channel to this peer") in `sendpay`, and a first
@@ -472,7 +479,11 @@ and the only asset its route hints are in (`test_invoice_asset.py`; `common/test
 covers the field's encoding and its meaning on Bitcoin), and route finding in that asset: a payer
 with channels in two assets paying each invoice in its own, to a direct peer as well as over two
 hops, `getroute` in one asset, an unannounced first hop, and an invoice in an asset the payer
-cannot send refused with no HTLC offered anywhere (`test_asset_routing.py`). They need `sequentiad`, `sequentia-cli`
+cannot send refused with no HTLC offered anywhere (`test_asset_routing.py`), and a multi-part
+payment split over two channels in its asset beside a larger one in another, a payment beyond what
+the payer can spend in the asset failing with every part it offered in that asset, and keysend in
+an asset, one hop and two, refused when the payer must name the asset or no route in it exists
+(`test_asset_mpp_keysend.py`). They need `sequentiad`, `sequentia-cli`
 and a Bitcoin Core `bitcoind` on `PATH`, and the keyless tests need the device signer built
 (`cargo build --release` in `contrib/seqln-signer`, or `SEQLN_SIGNER=/path/to/seqln-signer`).
 The test plugins run under the `python3` on `PATH`, which needs the `pyln` packages, so the
@@ -511,8 +522,8 @@ Each verified present in the code as of 2026-07-08:
    asserts the policy asset (`common/amount.c`), and the interactive-tx path calls it on arbitrary
    PSBT outputs (`common/interactivetx.c`, `openingd/dualopend.c`), so a non-policy output there
    aborts the daemon. Asset channels must use the ordinary single-funder `fundchannel`.
-2. **Payment paths other than `pay` are asset-blind.** xpay, askrene, renepay and keysend know
-   no asset. Use `pay` with `asset=` and invoices that name their asset. A plugin that settles
+2. **Payment paths other than `pay` and `keysend` are asset-blind.** xpay, askrene and renepay
+   know no asset. Use `pay`, which pays in the asset the invoice names, or `keysend asset=`. A plugin that settles
    HTLCs itself must check the `asset` the `htlc_accepted` hook names, as
    `contrib/holdinvoice-seq` does.
 3. **Mainnet chainparams are placeholders.** All-zero genesis, NULL fee asset; the `sequentia`

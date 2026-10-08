@@ -4117,3 +4117,21 @@ const char *payment_asset_unsendable(const tal_t *ctx, struct command *cmd,
 		       fmt_asset_id(tmpctx, asset),
 		       looked[0] ? looked : "no channels");
 }
+
+struct command_result *param_asset_id(struct command *cmd, const char *name,
+				      const char *buffer, const jsmntok_t *tok,
+				      const u8 **asset)
+{
+	u8 id[32], *tag;
+
+	if (!hex_decode(buffer + tok->start, tok->end - tok->start,
+			id, sizeof(id)))
+		return command_fail_badparam(cmd, name, buffer, tok,
+					     "expected a 32-byte hex asset id");
+	tag = tal_arr(cmd, u8, 33);
+	tag[0] = 0x01;
+	for (size_t i = 0; i < sizeof(id); i++)
+		tag[1 + i] = id[sizeof(id) - 1 - i];
+	*asset = tag;
+	return NULL;
+}
