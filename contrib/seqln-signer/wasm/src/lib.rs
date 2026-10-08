@@ -330,6 +330,8 @@ impl Signer {
             validated: Vec::new(),
             pay: Default::default(),
             predates_validation: false,
+            limits: None,
+            peer_reached_reserve: false,
         };
         self.inner
             .arm_channel(arr33(node_id, "node_id")?, dbid, st)

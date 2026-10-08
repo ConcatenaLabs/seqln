@@ -157,8 +157,9 @@ explicit rate-locked boundaries. SeqLN adopts all of it, simplified by native El
 - The funding output is an Elements output of `asset_id`. Commitment transactions, HTLC outputs, and
   to_local/to_remote outputs are all outputs of `asset_id`; the fee output is separate and explicit
   (section 4). No overlay, no custom records, no sat-anchoring: the asset is a first-class output value.
-- Reject mixing: all channel value is one asset. Dust/trim thresholds are computed in the channel asset;
-  Elements keeps the 546-unit dust floor.
+- Reject mixing: all channel value is one asset. Dust/trim thresholds are computed in the channel asset,
+  and the dust limit is the 546-unit reference floor converted at the node's exchange rate for the asset,
+  so a dust threshold is worth the same in every asset.
 
 ### 5.2 Commitments and HTLCs
 

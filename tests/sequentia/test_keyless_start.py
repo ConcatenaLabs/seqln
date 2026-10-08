@@ -157,7 +157,7 @@ def store_as_version(device, version):
     blob = open(path, 'rb').read()
     payload, mac = blob[:-32], blob[-32:]
     assert hmac.compare_digest(store_mac(payload), mac)
-    assert payload[:4] == b'SQCH' and payload[4] in (6, 7, 8), payload[:5]
+    assert payload[:4] == b'SQCH' and payload[4] in (6, 7, 8, 9), payload[:5]
     v = payload[4]
     count = struct.unpack('<I', payload[5:9])[0]
     o, entries = 9, []
@@ -205,6 +205,10 @@ def store_as_version(device, version):
             skip(4)
         if v >= 8:                     # predates validation (8)
             skip(1)
+        if v >= 9:                     # dust limits and reserves (9)
+            if u8():
+                skip(32)
+            skip(1)                    # the peer reached its reserve
         entries.append(entry)
     old = b'SQCH' + bytes([version]) + struct.pack('<I', count) + b''.join(entries)
     with open(path + '.tmp', 'wb') as f:

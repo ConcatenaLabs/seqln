@@ -748,6 +748,28 @@ u32 feerate_in_asset(u32 feerate_per_kw, u64 rate)
 	return (u32)v;
 }
 
+static u64 u64_in_asset(u64 ref, u64 rate)
+{
+	__uint128_t v;
+
+	if (rate == 0 || rate == EXCHANGE_RATE_SCALE)
+		return ref;
+	v = ((__uint128_t)ref * EXCHANGE_RATE_SCALE + rate - 1) / rate;
+	if (v > UINT64_MAX)
+		return UINT64_MAX;
+	return (u64)v;
+}
+
+struct amount_sat amount_sat_in_asset(struct amount_sat ref, u64 rate)
+{
+	return amount_sat(u64_in_asset(ref.satoshis, rate));
+}
+
+struct amount_msat amount_msat_in_asset(struct amount_msat ref, u64 rate)
+{
+	return amount_msat(u64_in_asset(ref.millisatoshis, rate));
+}
+
 bool amount_feerate(u32 *feerate, struct amount_sat fee, size_t weight)
 {
 	assert(weight);

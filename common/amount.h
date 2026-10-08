@@ -249,6 +249,13 @@ struct amount_sat amount_tx_fee_rounded_down(u32 fee_per_kw, size_t weight);
  * UINT32_MAX.  A rate of 0 (an asset with no rate) is returned unchanged. */
 u32 feerate_in_asset(u32 feerate_per_kw, u64 rate);
 
+/* A reference amount (a dust limit, a minimum capacity) expressed in atoms of
+ * an asset at rate `rate`: worth at least as much, rounded up as the node
+ * rounds its own dust threshold, saturating.  A rate of 0 (an asset with no
+ * rate) returns the amount unchanged. */
+struct amount_sat amount_sat_in_asset(struct amount_sat ref, u64 rate);
+struct amount_msat amount_msat_in_asset(struct amount_msat ref, u64 rate);
+
 /* The display id (32-byte hex, as the node shows it) of a 33-byte elements
  * asset tag (0x01 || id in internal byte order). */
 char *fmt_asset_id(const tal_t *ctx, const u8 *asset_tag);

@@ -166,6 +166,26 @@ bool check_config_bounds(const tal_t *ctx,
 	return true;
 }
 
+struct tlv_hsmd_setup_channel_tlvs *
+hsm_setup_channel_limits(const tal_t *ctx,
+			 const struct channel_config *localconf,
+			 const struct channel_config *remoteconf)
+{
+	struct tlv_hsmd_setup_channel_tlvs *tlvs
+		= tlv_hsmd_setup_channel_tlvs_new(ctx);
+
+	tlvs->our_dust_limit = tal_dup(tlvs, struct amount_sat,
+				       &localconf->dust_limit);
+	tlvs->peer_dust_limit = tal_dup(tlvs, struct amount_sat,
+					&remoteconf->dust_limit);
+	/* Each side's channel_reserve is what it requires of the other. */
+	tlvs->our_reserve = tal_dup(tlvs, struct amount_sat,
+				    &remoteconf->channel_reserve);
+	tlvs->peer_reserve = tal_dup(tlvs, struct amount_sat,
+				     &localconf->channel_reserve);
+	return tlvs;
+}
+
 u8 *no_upfront_shutdown_script(const tal_t *ctx,
 			       bool developer,
 			       struct feature_set *our_features,

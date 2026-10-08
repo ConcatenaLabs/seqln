@@ -106,6 +106,18 @@ msgdata,hsmd_setup_channel,remote_to_self_delay,u16,
 msgdata,hsmd_setup_channel,remote_shutdown_script_len,u16,
 msgdata,hsmd_setup_channel,remote_shutdown_script,u8,remote_shutdown_script_len
 msgdata,hsmd_setup_channel,channel_type,channel_type,
+msgdata,hsmd_setup_channel,tlvs,hsmd_setup_channel_tlvs,
+# The channel's dust limits and reserves, fixed at funding: a validating
+# signer holds a close's dust and the peer's reserve to them.  The peer's
+# reserve is the one this side requires it to keep (our channel_reserve).
+tlvtype,hsmd_setup_channel_tlvs,our_dust_limit,1
+tlvdata,hsmd_setup_channel_tlvs,our_dust_limit,our_dust_limit,amount_sat,
+tlvtype,hsmd_setup_channel_tlvs,peer_dust_limit,3
+tlvdata,hsmd_setup_channel_tlvs,peer_dust_limit,peer_dust_limit,amount_sat,
+tlvtype,hsmd_setup_channel_tlvs,our_reserve,5
+tlvdata,hsmd_setup_channel_tlvs,our_reserve,our_reserve,amount_sat,
+tlvtype,hsmd_setup_channel_tlvs,peer_reserve,7
+tlvdata,hsmd_setup_channel_tlvs,peer_reserve,peer_reserve,amount_sat,
 
 # No value returned.,
 msgtype,hsmd_setup_channel_reply,131

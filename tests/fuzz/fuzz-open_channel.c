@@ -139,6 +139,7 @@ static bool test_sync_write(int fd, const void *msg TAKES)
 			struct basepoints remote_basepoints;
 			struct pubkey remote_funding_pubkey;
 			struct channel_type *channel_type;
+			struct tlv_hsmd_setup_channel_tlvs *tlvs;
 
 			assert(fromwire_hsmd_setup_channel(tmpctx, msg,
 						&is_outbound,
@@ -153,7 +154,8 @@ static bool test_sync_write(int fd, const void *msg TAKES)
 						&remote_funding_pubkey,
 						&remote_to_self_delay,
 						&remote_shutdown_script,
-						&channel_type));
+						&channel_type,
+						&tlvs));
 		} else if (hsmd_writes == 2) {
 			struct bitcoin_tx *tx;
 			struct hsm_htlc *htlcs;

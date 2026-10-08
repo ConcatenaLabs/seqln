@@ -1090,7 +1090,10 @@ static void report_channel_hsmd(const struct state *state,
 					&state->their_funding_pubkey,
 					tx_state->remoteconf.to_self_delay,
 					state->upfront_shutdown_script[REMOTE],
-					state->channel_type);
+					state->channel_type,
+					hsm_setup_channel_limits(tmpctx,
+								 &tx_state->localconf,
+								 &tx_state->remoteconf));
 	wire_sync_write(HSM_FD, take(msg));
 	msg = wire_sync_read(tmpctx, HSM_FD);
 	if (!fromwire_hsmd_setup_channel_reply(msg))

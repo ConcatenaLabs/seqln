@@ -8,6 +8,7 @@ struct amount_sat;
 struct bitcoin_tx;
 struct bitcoin_signature;
 struct channel_config;
+struct tlv_hsmd_setup_channel_tlvs;
 
 
 bool check_config_bounds(const tal_t *ctx,
@@ -37,4 +38,11 @@ char *validate_remote_upfront_shutdown(const tal_t *ctx,
 				       const u8 *their_features,
 				       u8 *shutdown_scriptpubkey STEALS,
 				       u8 **state_script);
+/* The channel's dust limits and reserves, as `hsmd_setup_channel` carries
+ * them to a validating signer. */
+struct tlv_hsmd_setup_channel_tlvs *
+hsm_setup_channel_limits(const tal_t *ctx,
+			 const struct channel_config *localconf,
+			 const struct channel_config *remoteconf);
+
 #endif /* LIGHTNING_OPENINGD_COMMON_H */
