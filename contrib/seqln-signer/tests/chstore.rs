@@ -56,6 +56,8 @@ fn chan(seed: u8) -> ChannelState {
         validated: vec![(seed as u64 * 7 + 1, [seed.wrapping_add(9); 32])],
         pay: Default::default(),
         predates_validation: false,
+        limits: None,
+        peer_reached_reserve: false,
     }
 }
 

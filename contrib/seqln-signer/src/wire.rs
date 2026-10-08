@@ -200,6 +200,26 @@ impl<'a> Reader<'a> {
         self.pos = self.data.len();
         s
     }
+    /// A BOLT-1 `bigsize` integer (the type and length of a TLV record),
+    /// minimally encoded.
+    pub fn bigsize(&mut self) -> Option<u64> {
+        let v = match self.u8()? {
+            0xfd => {
+                let v = self.u16()? as u64;
+                (v >= 0xfd).then_some(v)?
+            }
+            0xfe => {
+                let v = self.u32()? as u64;
+                (v >= 0x1_0000).then_some(v)?
+            }
+            0xff => {
+                let v = self.u64()?;
+                (v >= 0x1_0000_0000).then_some(v)?
+            }
+            b => b as u64,
+        };
+        Some(v)
+    }
     /// Read an `?field`: 1 presence byte, then the value only if present.
     /// Returns Some(true) if we skipped a present value of `value_len`.
     fn optional(&mut self, value_len: usize) -> Option<bool> {

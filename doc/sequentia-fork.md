@@ -166,6 +166,23 @@ privileged fee asset), so a node returns no `estimatesmartfee`-style feerate:
   that commitment but commits what is pending, as BOLT 2 allows, and sends it with a later one
   once the dust has cleared, instead of disconnecting at every reestablish
   (`channeld/channeld.c` `send_commit()`). Bitcoin channels keep upstream's behaviour.
+- A channel's dust limit and the node's minimum channel capacity (`--min-capacity-sat`) are
+  reference amounts too: a count of atoms would be dust in a cheap asset and a large sum in a dear
+  one. openingd sets the channel's `dust_limit_satoshis` at what the reference dust limit (546) is
+  worth in the channel asset at the node's rate, rounded up as the node rounds its own relay dust
+  threshold, and judges the capacity the same way (`value_limits_in_asset()` in
+  `openingd/openingd.c`; lightningd stores the dust limit openingd negotiated). HTLCs are therefore
+  trimmed at the same value in every asset, and the channel reserve, 1% of the funding and at least
+  the dust limit, is worth the same in every asset too. Both are fixed at funding, as BOLT 2 fixes
+  the dust limit: a later change of rate leaves an open channel's dust limit and reserve where they
+  were, and a node without a rate for the asset opens no channel in it. A fundee whose dust limit is
+  above the reserve the opener asks of it (BOLT 2 forbids that) lowers it to that reserve when the
+  reserve is worth at least four fifths of it, the margin by which the reference dust limit stands
+  above the node's relay dust threshold for a channel output, and refuses the channel otherwise.
+- `hsmd_setup_channel` carries the channel's dust limits and reserves to a validating signer in a
+  TLV stream (`hsmd/hsmd_wire.csv`; a signer that predates it ignores it, and a node that predates
+  it sends none). The device signer holds a mutual close's dust and the peer's reserve to them
+  (`contrib/seqln-signer/README.md`).
 
 ## 5. Asset-aware channels
 

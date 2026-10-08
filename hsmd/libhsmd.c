@@ -385,6 +385,7 @@ static u8 *handle_setup_channel(struct hsmd_client *c, const u8 *msg_in)
 	u16 remote_to_self_delay;
 	u8 *remote_shutdown_script;
 	struct channel_type *channel_type;
+	struct tlv_hsmd_setup_channel_tlvs *tlvs;
 
 	if (!fromwire_hsmd_setup_channel(tmpctx, msg_in, &is_outbound,
 					&channel_value, &push_value, &funding_txid,
@@ -395,7 +396,8 @@ static u8 *handle_setup_channel(struct hsmd_client *c, const u8 *msg_in)
 					&remote_funding_pubkey,
 					&remote_to_self_delay,
 					&remote_shutdown_script,
-					&channel_type))
+					&channel_type,
+					&tlvs))
 		return hsmd_status_malformed_request(c, msg_in);
 
 	/* Stub implementation */

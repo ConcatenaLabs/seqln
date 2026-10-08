@@ -127,6 +127,8 @@ fn channel(k: &Kernel) -> ChannelState {
         validated: Vec::new(),
         pay: Default::default(),
         predates_validation: false,
+        limits: None,
+        peer_reached_reserve: false,
     }
 }
 

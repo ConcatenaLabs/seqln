@@ -8,6 +8,7 @@
  * commit to the database once openingd succeeds.
  */
 #include "config.h"
+#include <inttypes.h>
 #include <bitcoin/script.h>
 #include <ccan/array_size/array_size.h>
 #include <ccan/breakpoint/breakpoint.h>
@@ -184,6 +185,56 @@ static void set_reserve(struct state *state, const struct amount_sat dust_limit)
 			     amount_sat_div(state->funding_sats, 100));
 }
 
+/* Whether this channel's fee limits, dust limit and minimum capacity are
+ * valued through the node's exchange rate for the channel asset: on a
+ * Sequentia network for every asset (the Sequence token is priced like any
+ * other), on Liquid for every asset but the policy asset (the fee asset, at
+ * par). */
+static bool limits_valued_in_asset(const struct state *state)
+{
+	return chainparams->is_elements && chainparams->fee_asset_tag
+		&& (chainparams->has_anchor_header
+		    || !memeq(state->channel_asset, sizeof(state->channel_asset),
+			      chainparams->fee_asset_tag,
+			      sizeof(state->channel_asset)));
+}
+
+/* The rate lightningd gave us for the channel asset, or 0 if it has none. */
+static u64 channel_asset_rate(const struct state *state)
+{
+	for (size_t i = 0; i < tal_count(state->asset_rate_values); i++) {
+		if (memeq(state->asset_rate_tags + i * sizeof(state->channel_asset),
+			  sizeof(state->channel_asset),
+			  state->channel_asset,
+			  sizeof(state->channel_asset)))
+			return state->asset_rate_values[i];
+	}
+	return 0;
+}
+
+/* The node's dust limit (`chainparams->dust_limit`) and minimum channel
+ * capacity (`--min-capacity-sat`) are reference amounts, like its fee
+ * settings: a count of atoms would be dust in a cheap asset and a fortune in
+ * a dear one.  A channel in an asset holds them at what they are worth in it,
+ * by this node's rate, rounded up as the node rounds its own dust threshold.
+ * The reserve follows: it is at least the dust limit (set_reserve). They are
+ * fixed at funding, as BOLT 2 fixes `dust_limit_satoshis`. */
+static void value_limits_in_asset(struct state *state, u64 rate)
+{
+	struct amount_sat ref_dust = state->localconf.dust_limit;
+
+	state->localconf.dust_limit
+		= amount_sat_in_asset(state->localconf.dust_limit, rate);
+	state->min_effective_htlc_capacity
+		= amount_msat_in_asset(state->min_effective_htlc_capacity, rate);
+	status_debug("Channel asset at rate %"PRIu64": dust limit %s"
+		     " (%s of the reference unit), minimum capacity %s",
+		     rate,
+		     fmt_amount_sat(tmpctx, state->localconf.dust_limit),
+		     fmt_amount_sat(tmpctx, ref_dust),
+		     fmt_amount_msat(tmpctx, state->min_effective_htlc_capacity));
+}
+
 /*~ Handle random messages we might get during opening negotiation, (eg. gossip)
  * returning the first non-handled one, or NULL if we aborted negotiation. */
 static u8 *opening_negotiate_msg(const tal_t *ctx, struct state *state,
@@ -293,6 +344,19 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags,
 	status_debug("funder_channel_start");
 	if (!setup_channel_funder(state))
 		return NULL;
+
+	/* lightningd refuses to open in an asset it has no rate for. */
+	if (limits_valued_in_asset(state)) {
+		u64 rate = channel_asset_rate(state);
+		if (!rate) {
+			negotiation_aborted(state,
+					    tal_fmt(tmpctx, "channel asset %s has no fee exchange rate here",
+						    tal_hexstr(tmpctx, state->channel_asset,
+							       sizeof(state->channel_asset))));
+			return NULL;
+		}
+		value_limits_in_asset(state, rate);
+	}
 
 	/* If we have a reserve override we use that, otherwise we'll
 	 * use our default of 1% of the funding value. */
@@ -592,7 +656,10 @@ static bool funder_finalize_channel_setup(struct state *state,
 				       &state->their_funding_pubkey,
 				       state->remoteconf.to_self_delay,
 				       state->upfront_shutdown_script[REMOTE],
-				       state->channel_type);
+				       state->channel_type,
+				       hsm_setup_channel_limits(tmpctx,
+								&state->localconf,
+								&state->remoteconf));
 	wire_sync_write(HSM_FD, take(msg));
 	msg = wire_sync_read(tmpctx, HSM_FD);
 	if (!fromwire_hsmd_setup_channel_reply(msg))
@@ -850,6 +917,7 @@ static u8 *funder_channel_complete(struct state *state)
 					   &state->funding,
 					   state->feerate_per_kw,
 					   state->localconf.channel_reserve,
+					   state->localconf.dust_limit,
 					   state->upfront_shutdown_script[REMOTE],
 					   state->channel_type,
 					   state->channel_asset);
@@ -925,19 +993,8 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	 * fee of the channel is paid in that asset), so judge it against our
 	 * limits converted at our own rate for the asset.  An asset we hold no
 	 * rate for cannot pay a fee we would relay. */
-	if (chainparams->is_elements && chainparams->fee_asset_tag
-	    && (chainparams->has_anchor_header
-		|| !memeq(state->channel_asset, sizeof(state->channel_asset),
-			  chainparams->fee_asset_tag,
-			  sizeof(state->channel_asset)))) {
-		u64 rate = 0;
-		for (size_t i = 0; i < tal_count(state->asset_rate_values); i++) {
-			if (memeq(state->asset_rate_tags + i * sizeof(state->channel_asset),
-				  sizeof(state->channel_asset),
-				  state->channel_asset,
-				  sizeof(state->channel_asset)))
-				rate = state->asset_rate_values[i];
-		}
+	if (limits_valued_in_asset(state)) {
+		u64 rate = channel_asset_rate(state);
 		if (!rate) {
 			negotiation_failed(state,
 					   "channel asset %s has no fee exchange rate here",
@@ -947,6 +1004,38 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 		}
 		state->min_feerate = feerate_in_asset(state->min_feerate, rate);
 		state->max_feerate = feerate_in_asset(state->max_feerate, rate);
+		value_limits_in_asset(state, rate);
+
+		/* BOLT #2:
+		 * The receiver:
+		 * ...
+		 * - MUST set `dust_limit_satoshis` less than or equal to
+		 *   `channel_reserve_satoshis` from the `open_channel` message.
+		 *
+		 * The opener values the asset at its own rate, so its reserve,
+		 * when it is no more than its dust limit, can be a little below
+		 * ours.  Meet it while it is worth at least four fifths of our
+		 * dust limit: the reference dust limit stands that far above
+		 * the node's relay dust threshold for a channel output. */
+		if (!state->allowdustreserve
+		    && amount_sat_greater(state->localconf.dust_limit,
+					  state->remoteconf.channel_reserve)) {
+			struct amount_sat floor
+				= amount_sat_div(state->localconf.dust_limit, 5);
+			if (!amount_sat_mul(&floor, floor, 4)
+			    || amount_sat_less(state->remoteconf.channel_reserve, floor)) {
+				negotiation_failed(state,
+						   "channel_reserve_satoshis %s is below"
+						   " our dust limit %s for this asset",
+						   fmt_amount_sat(tmpctx, state->remoteconf.channel_reserve),
+						   fmt_amount_sat(tmpctx, state->localconf.dust_limit));
+				return NULL;
+			}
+			status_debug("Lowering our dust limit %s to their reserve %s",
+				     fmt_amount_sat(tmpctx, state->localconf.dust_limit),
+				     fmt_amount_sat(tmpctx, state->remoteconf.channel_reserve));
+			state->localconf.dust_limit = state->remoteconf.channel_reserve;
+		}
 	}
 
 	/* BOLT #2:
@@ -1216,7 +1305,10 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 				       &their_funding_pubkey,
 				       state->remoteconf.to_self_delay,
 				       state->upfront_shutdown_script[REMOTE],
-				       state->channel_type);
+				       state->channel_type,
+				       hsm_setup_channel_limits(tmpctx,
+								&state->localconf,
+								&state->remoteconf));
 	wire_sync_write(HSM_FD, take(msg));
 	msg = wire_sync_read(tmpctx, HSM_FD);
 	if (!fromwire_hsmd_setup_channel_reply(msg))
@@ -1376,6 +1468,7 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 				     state->feerate_per_kw,
 				     msg,
 				     state->localconf.channel_reserve,
+				     state->localconf.dust_limit,
 				     state->upfront_shutdown_script[LOCAL],
 				     state->upfront_shutdown_script[REMOTE],
 				     state->channel_type,

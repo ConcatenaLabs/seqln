@@ -4268,6 +4268,26 @@ static struct inflight *inflights_new(struct peer *peer)
 	return inf;
 }
 
+/* The channel's dust limits and reserves, as `hsmd_setup_channel` carries
+ * them to a validating signer (each side's channel_reserve is what it
+ * requires of the other). */
+static struct tlv_hsmd_setup_channel_tlvs *
+hsm_setup_channel_limits(const tal_t *ctx, const struct channel *channel)
+{
+	struct tlv_hsmd_setup_channel_tlvs *tlvs
+		= tlv_hsmd_setup_channel_tlvs_new(ctx);
+
+	tlvs->our_dust_limit = tal_dup(tlvs, struct amount_sat,
+				       &channel->config[LOCAL].dust_limit);
+	tlvs->peer_dust_limit = tal_dup(tlvs, struct amount_sat,
+					&channel->config[REMOTE].dust_limit);
+	tlvs->our_reserve = tal_dup(tlvs, struct amount_sat,
+				    &channel->config[REMOTE].channel_reserve);
+	tlvs->peer_reserve = tal_dup(tlvs, struct amount_sat,
+				     &channel->config[LOCAL].channel_reserve);
+	return tlvs;
+}
+
 static void update_hsmd_with_splice(struct peer *peer, struct inflight *inflight,
 				    const enum tx_role our_role,
 				    const struct amount_msat push_val)
@@ -4291,7 +4311,8 @@ static void update_hsmd_with_splice(struct peer *peer, struct inflight *inflight
 		&peer->channel->funding_pubkey[REMOTE],
 		peer->channel->config[REMOTE].to_self_delay,
 		/*remote_upfront_shutdown_script*/ NULL,
-		peer->channel->type);
+		peer->channel->type,
+		hsm_setup_channel_limits(tmpctx, peer->channel));
 
 	wire_sync_write(HSM_FD, take(msg));
 	msg = wire_sync_read(tmpctx, HSM_FD);
@@ -7148,7 +7169,8 @@ static void init_channel(struct peer *peer)
 			&peer->channel->funding_pubkey[REMOTE],
 			peer->channel->config[REMOTE].to_self_delay,
 			peer->remote_upfront_shutdown_script,
-			peer->channel->type);
+			peer->channel->type,
+			hsm_setup_channel_limits(tmpctx, peer->channel));
 		u8 *reply;
 		wire_sync_write(HSM_FD, take(setup));
 		reply = wire_sync_read(tmpctx, HSM_FD);

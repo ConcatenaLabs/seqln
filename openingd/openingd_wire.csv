@@ -80,6 +80,7 @@ msgdata,openingd_funder_reply,remote_fundingkey,pubkey,
 msgdata,openingd_funder_reply,funding,bitcoin_outpoint,
 msgdata,openingd_funder_reply,feerate_per_kw,u32,
 msgdata,openingd_funder_reply,our_channel_reserve_satoshis,amount_sat,
+msgdata,openingd_funder_reply,our_dust_limit,amount_sat,
 msgdata,openingd_funder_reply,shutdown_len,u16,
 msgdata,openingd_funder_reply,shutdown_scriptpubkey,u8,shutdown_len
 msgdata,openingd_funder_reply,channel_type,channel_type,
@@ -144,6 +145,7 @@ msgdata,openingd_fundee,feerate_per_kw,u32,
 msgdata,openingd_fundee,msglen,u16,
 msgdata,openingd_fundee,funding_signed_msg,u8,msglen
 msgdata,openingd_fundee,our_channel_reserve_satoshis,amount_sat,
+msgdata,openingd_fundee,our_dust_limit,amount_sat,
 msgdata,openingd_fundee,local_shutdown_len,u16,
 msgdata,openingd_fundee,local_shutdown_scriptpubkey,u8,local_shutdown_len
 msgdata,openingd_fundee,remote_shutdown_len,u16,

@@ -190,6 +190,32 @@ pub struct ChannelState {
     /// device signs only the spends of what that close pays it. Never
     /// cleared.
     pub predates_validation: bool,
+    /// The channel's dust limits and reserves as `setup_channel` named them
+    /// (fixed at funding; recorded once and never replaced). `None` from a
+    /// node that does not send them, or a store from before they were
+    /// recorded.
+    pub limits: Option<ChannelLimits>,
+    /// Whether a commitment this device validated or signed has paid the
+    /// peer at least the reserve it must keep ([`check_peer_reserve`]).
+    /// Never cleared.
+    pub peer_reached_reserve: bool,
+}
+
+/// A channel's dust limits and reserves, in the channel asset's atoms. A node
+/// values its dust limit at its exchange rate for the asset, so these differ
+/// by asset; the reserve is at least the dust limit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ChannelLimits {
+    /// Outputs under it are left out of our commitment and our closing
+    /// transaction.
+    pub our_dust: u64,
+    /// The same for the peer's.
+    pub peer_dust: u64,
+    /// What the peer requires this side to keep.
+    pub our_reserve: u64,
+    /// What this side requires the peer to keep: its main output may not fall
+    /// below it once it has reached it.
+    pub peer_reserve: u64,
 }
 
 /// How many unrevoked validated commitments a channel record keeps.
@@ -261,6 +287,10 @@ impl ChannelState {
             self.is_outbound = old.is_outbound;
         }
         self.predates_validation |= old.predates_validation;
+        if old.limits.is_some() {
+            self.limits = old.limits;
+        }
+        self.peer_reached_reserve |= old.peer_reached_reserve;
     }
 }
 
@@ -439,11 +469,14 @@ pub const CHSTORE_MAGIC: [u8; 4] = *b"SQCH";
 /// local shutdown script's wallet index (flag(1), then index(4)). Version 7
 /// adds, after the ledger, the txids of the mutual closes the device signed
 /// (count(2), then txid(32) each). Version 8 adds, after each entry's wallet
-/// index, whether the channel predates validation (1 byte). Versions 1 to 7
+/// index, whether the channel predates validation (1 byte). Version 9 adds,
+/// after that, the channel's dust limits and reserves (flag(1), then our
+/// dust, the peer's dust, our reserve and the peer's reserve, 8 bytes each)
+/// and whether the peer has reached its reserve (1 byte). Versions 1 to 8
 /// still import (the fields they lack unknown); each channel of a store older
 /// than version 6, written by a device that validated nothing, predates
 /// validation.
-pub const CHSTORE_VERSION: u8 = 8;
+pub const CHSTORE_VERSION: u8 = 9;
 
 /// The first store version a validating device wrote.
 pub const CHSTORE_FIRST_VALIDATING: u8 = 6;
@@ -579,6 +612,16 @@ pub fn encode_channel_store(store: &ChannelStore) -> Vec<u8> {
             }
         }
         out.push(st.predates_validation as u8);
+        match st.limits {
+            None => out.push(0),
+            Some(l) => {
+                out.push(1);
+                for x in [l.our_dust, l.peer_dust, l.our_reserve, l.peer_reserve] {
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+        }
+        out.push(st.peer_reached_reserve as u8);
     }
     push_ledger(&mut out, &store.ledger);
     out.extend_from_slice(&(store.close_txids.len() as u16).to_le_bytes());
@@ -703,7 +746,7 @@ impl<'a> StoreReader<'a> {
 pub type DecodedStore = (Vec<(([u8; 33], u64), ChannelState)>, Ledger, Vec<[u8; 32]>);
 
 /// Decode a channel-store payload (the MAC must already have been verified
-/// and stripped by the caller). Takes versions 1 to 8.
+/// and stripped by the caller). Takes versions 1 to 9.
 pub fn decode_channel_store(bytes: &[u8]) -> Result<DecodedStore, String> {
     if bytes.len() < 9 || bytes[..4] != CHSTORE_MAGIC {
         return Err("not a channel-store blob (bad magic)".to_string());
@@ -747,6 +790,8 @@ pub fn decode_channel_store(bytes: &[u8]) -> Result<DecodedStore, String> {
             validated: Vec::new(),
             pay: PayTrack::default(),
             predates_validation: version < CHSTORE_FIRST_VALIDATING,
+            limits: None,
+            peer_reached_reserve: false,
         };
         if version >= 2 {
             st.is_outbound = r.opt_bool()?;
@@ -786,6 +831,23 @@ pub fn decode_channel_store(bytes: &[u8]) -> Result<DecodedStore, String> {
                 0 => false,
                 1 => true,
                 v => return Err(format!("bad predates-validation flag {v} in channel-store blob")),
+            };
+        }
+        if version >= 9 {
+            st.limits = match r.u8()? {
+                0 => None,
+                1 => Some(ChannelLimits {
+                    our_dust: r.u64()?,
+                    peer_dust: r.u64()?,
+                    our_reserve: r.u64()?,
+                    peer_reserve: r.u64()?,
+                }),
+                v => return Err(format!("bad limits flag {v} in channel-store blob")),
+            };
+            st.peer_reached_reserve = match r.u8()? {
+                0 => false,
+                1 => true,
+                v => return Err(format!("bad reserve flag {v} in channel-store blob")),
             };
         }
         out.push(((node_id, dbid), st));
@@ -1215,8 +1277,9 @@ fn expected_scripts(ks: &Keyset, st: &ChannelState, side: Side, htlcs: &[Htlc]) 
 
 /// FULL commitment validation (used for the peer's commitment and — since it
 /// also carries the HTLC set — our own local commitment). Returns what the
-/// commitment pays this side if the tx is a legitimate commitment for the
-/// tracked channel, else Err(reason).
+/// commitment pays this side, and the peer's main output (0 when trimmed),
+/// if the tx is a legitimate commitment for the tracked channel, else
+/// Err(reason).
 #[allow(clippy::too_many_arguments)]
 pub fn validate_commitment(
     kernel: &Kernel,
@@ -1227,7 +1290,7 @@ pub fn validate_commitment(
     point: &[u8; 33],
     htlcs: &[Htlc],
     tx: &ElementsTx,
-) -> Result<Split, String> {
+) -> Result<(Split, u64), String> {
     let static_remotekey = st.option_static_remotekey || st.option_anchors;
     let our_bp = kernel.channel_basepoints(node_id, dbid);
     let ks = build_keyset(kernel, st, &our_bp, side, point, static_remotekey)?;
@@ -1248,10 +1311,11 @@ pub fn validate_commitment(
     // This side's main output: to_local on our commitment, to_remote (the
     // OTHER side's payment script) on the peer's. expected_scripts puts
     // to_local first, to_remote second, then the two anchors.
-    let ours_script = match side {
-        Side::Local => &whitelist[0],
-        Side::Remote => &whitelist[1],
+    let (ours_script, theirs_script) = match side {
+        Side::Local => (&whitelist[0], &whitelist[1]),
+        Side::Remote => (&whitelist[1], &whitelist[0]),
     };
+    let mut theirs = 0u64;
     let anchor_scripts: &[Vec<u8>] = if st.option_anchors { &whitelist[2..4] } else { &[] };
 
     // Every output pays to an expected script; total value is conserved.
@@ -1275,6 +1339,8 @@ pub fn validate_commitment(
         not_fee += v as u128;
         if o.script == *ours_script {
             split.ours = split.ours.saturating_add(v);
+        } else if o.script == *theirs_script {
+            theirs = theirs.saturating_add(v);
         } else if anchor_scripts.iter().any(|s| *s == o.script) {
             split.anchors = split.anchors.saturating_add(v);
         }
@@ -1286,7 +1352,39 @@ pub fn validate_commitment(
         ));
     }
     split.fee = (st.funding_sats as u128 - not_fee) as u64;
-    Ok(split)
+    Ok((split, theirs))
+}
+
+/// Hold the peer to the reserve this side requires of it (BOLT 2: a side's
+/// balance may start below it, but once there it does not go below it
+/// again). The reserve is what keeps a peer that broadcasts a revoked
+/// commitment from losing nothing by it. channeld refuses an update that
+/// breaks it; the device refuses a commitment that does, ours or the peer's,
+/// so a host that also runs the peer cannot drain the peer's side below it
+/// either. `theirs` is the peer's main output on the commitment: on the
+/// opener's side the commitment fee is already out of it, and BOLT 2 asks
+/// the opener to keep the reserve after the fee. A channel whose limits the
+/// node did not send is not checked.
+pub fn check_peer_reserve(st: &ChannelState, theirs: u64) -> Result<(), String> {
+    match st.limits {
+        Some(l) if st.peer_reached_reserve && theirs < l.peer_reserve => Err(format!(
+            "it leaves the peer {theirs}, below the reserve of {} it must keep",
+            l.peer_reserve
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Note that a commitment paid the peer `theirs`, for [`check_peer_reserve`].
+/// Returns whether the record changed.
+pub fn note_peer_balance(st: &mut ChannelState, theirs: u64) -> bool {
+    match st.limits {
+        Some(l) if !st.peer_reached_reserve && theirs >= l.peer_reserve => {
+            st.peer_reached_reserve = true;
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Whether a transaction spending the funding output has the shape BOLT 3
@@ -1332,10 +1430,25 @@ pub fn commitment_number(
     Some(obscured ^ obscurer)
 }
 
-/// The dust limit Core Lightning gives its own side of every channel
-/// (`chainparams->dust_limit`, 546 on every network it knows): an honest close
-/// leaves this side's output out only when it is worth less than that.
+/// The dust limit a node that does not send the channel's limits gives its
+/// own side (`chainparams->dust_limit`): with no limits recorded, an honest
+/// close leaves this side's output out only when what is due is under it.
 pub const CLOSE_DUST_TOLERANCE: u64 = 546;
+
+/// How much of this side's share a close may leave out as dust: the larger
+/// of the channel's two dust limits (a close leaves out an output under the
+/// dust limit of the side that builds it), which a node sets in the channel
+/// asset at its exchange rate, so a count of atoms means nothing across
+/// assets. The node names them, so they are held to one percent of the
+/// funding (at least one atom), the share a reserve keeps: a host that
+/// named a larger one could otherwise have a close burn this side's share as
+/// fee. With no limits recorded, [`CLOSE_DUST_TOLERANCE`].
+pub fn close_dust_tolerance(st: &ChannelState) -> u64 {
+    match st.limits {
+        Some(l) => l.our_dust.max(l.peer_dust).min((st.funding_sats / 100).max(1)),
+        None => CLOSE_DUST_TOLERANCE,
+    }
+}
 
 /// The ceiling on a close fee the device lets the opener's balance pay, as a
 /// multiple of the latest validated commitment's fee plus anchors. A close is
@@ -1420,8 +1533,8 @@ pub fn validate_mutual_close(
 ///    anchors; the fundee pays none of it. With the opener unknown the fee
 ///    is deducted (the permissive reading).
 ///  * The output to this wallet must be at least that share less the fee;
-///    it may be absent only when what is due is under
-///    [`CLOSE_DUST_TOLERANCE`].
+///    it may be absent only when what is due is under the channel's dust
+///    limit ([`close_dust_tolerance`]).
 ///  * The peer's output may not exceed the funding less our share: dust
 ///    trimmed from us goes to the fee, never to the peer.
 ///  * With no balance known yet (a store from before balances were
@@ -1464,7 +1577,7 @@ pub fn check_close_balance(
                  {fee_share} of close fee"
             ))
         }
-        None if due > CLOSE_DUST_TOLERANCE => {
+        None if due > close_dust_tolerance(st) => {
             return Err(format!(
                 "the close pays this wallet nothing, but its balance is {share} \
                  ({due} after {fee_share} of close fee)"

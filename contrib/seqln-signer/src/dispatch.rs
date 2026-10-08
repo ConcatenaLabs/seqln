@@ -768,7 +768,8 @@ impl Signer {
         if let Some(reason) = self.predating(&req.node_id, req.dbid) {
             return Outcome::Reject(format!("SIGN_REMOTE_COMMITMENT_TX refused: {reason}"));
         }
-        let split = self.check_remote_commitment(req);
+        let checked = self.check_remote_commitment(req);
+        let split = checked.clone().map(|(n, sp, _)| (n, sp));
         let plan = match (&split, parse_remote_commitment(&req.hsmd_msg)) {
             (Ok((n, sp)), Some((bt, _, _, htlcs, _))) => {
                 Some(self.payment_plan(&req.node_id, req.dbid, false, *n, &bt, &htlcs, sp))
@@ -778,6 +779,11 @@ impl Signer {
         if self.policy.is_enforce() {
             if let Err(reason) = &split {
                 return Outcome::Reject(format!("SIGN_REMOTE_COMMITMENT_TX refused: {reason}"));
+            }
+            if let (Ok((_, _, theirs)), Some(st)) = (&checked, self.store.get(&req.node_id, req.dbid)) {
+                if let Err(reason) = policy::check_peer_reserve(st, *theirs) {
+                    return Outcome::Reject(format!("SIGN_REMOTE_COMMITMENT_TX refused: {reason}"));
+                }
             }
             if let (Ok((_, sp)), Some((bt, ..)), Some(st)) = (
                 &split,
@@ -805,6 +811,11 @@ impl Signer {
                     st.remote_split = Some((n, sp));
                     self.store_dirty = true;
                 }
+                if let Ok((_, _, theirs)) = checked {
+                    if policy::note_peer_balance(st, theirs) {
+                        self.store_dirty = true;
+                    }
+                }
             }
             if let Some(Ok(p)) = plan {
                 self.apply_plan(&req.node_id, req.dbid, p);
@@ -821,7 +832,8 @@ impl Signer {
         if let Some(reason) = self.predating(&req.node_id, req.dbid) {
             return Outcome::Reject(format!("VALIDATE_COMMITMENT_TX refused: {reason}"));
         }
-        let split = self.check_local_commitment(req);
+        let checked = self.check_local_commitment(req);
+        let split = checked.clone().map(|(n, sp, _)| (n, sp));
         let plan = match (&split, parse_local_commitment(&req.hsmd_msg)) {
             (Ok((n, sp)), Some((bt, htlcs, _))) => {
                 Some(self.payment_plan(&req.node_id, req.dbid, true, *n, &bt, &htlcs, sp))
@@ -831,6 +843,11 @@ impl Signer {
         if self.policy.is_enforce() {
             if let Err(reason) = &split {
                 return Outcome::Reject(format!("VALIDATE_COMMITMENT_TX refused: {reason}"));
+            }
+            if let (Ok((_, _, theirs)), Some(st)) = (&checked, self.store.get(&req.node_id, req.dbid)) {
+                if let Err(reason) = policy::check_peer_reserve(st, *theirs) {
+                    return Outcome::Reject(format!("VALIDATE_COMMITMENT_TX refused: {reason}"));
+                }
             }
             if let (Ok((_, sp)), Some((bt, ..)), Some(st)) = (
                 &split,
@@ -865,6 +882,11 @@ impl Signer {
                     if st.local_split.map_or(true, |(m, _)| n >= m) {
                         st.local_split = Some((n, sp));
                         self.store_dirty = true;
+                    }
+                    if let Ok((_, _, theirs)) = checked {
+                        if policy::note_peer_balance(st, theirs) {
+                            self.store_dirty = true;
+                        }
                     }
                     if st.record_validated(n, bt.txid) {
                         self.store_dirty = true;
@@ -1023,9 +1045,9 @@ impl Signer {
         }
     }
 
-    /// Full validation of a peer commitment (`side = REMOTE`): its number and
-    /// what it pays this side.
-    fn check_remote_commitment(&self, req: &Request) -> Result<(u64, Split), String> {
+    /// Full validation of a peer commitment (`side = REMOTE`): its number,
+    /// what it pays this side and the peer's main output.
+    fn check_remote_commitment(&self, req: &Request) -> Result<(u64, Split, u64), String> {
         let st = self
             .store
             .get(&req.node_id, req.dbid)
@@ -1046,7 +1068,7 @@ impl Signer {
             &htlcs,
             &bt.tx,
         )
-        .map(|sp| (commit_num, sp))
+        .map(|(sp, theirs)| (commit_num, sp, theirs))
     }
 
     /// Full validation of our local commitment (`side = LOCAL`); the point is
@@ -1055,7 +1077,7 @@ impl Signer {
     /// funding key: a commitment counts as validated, for the revocation
     /// counters and for the balance a close is held to, only when the peer
     /// has committed to it, never on the host's word alone.
-    fn check_local_commitment(&self, req: &Request) -> Result<(u64, Split), String> {
+    fn check_local_commitment(&self, req: &Request) -> Result<(u64, Split, u64), String> {
         let st = self
             .store
             .get(&req.node_id, req.dbid)
@@ -1081,7 +1103,7 @@ impl Signer {
             &htlcs,
             &bt.tx,
         )
-        .map(|sp| (commit_num, sp))
+        .map(|(sp, theirs)| (commit_num, sp, theirs))
     }
 
     /// Whether `sig` is the peer's signature, by the channel's remote funding
@@ -2620,6 +2642,7 @@ fn parse_setup_channel(m: &[u8]) -> Option<ChannelState> {
     let ctlen = r.u16()? as usize;
     let features = r.take_bytes(ctlen)?;
     let (option_static_remotekey, option_anchors) = policy::parse_channel_type(&features);
+    let limits = parse_setup_channel_limits(&mut r)?;
     Some(ChannelState {
         funding_sats,
         funding_txid,
@@ -2644,6 +2667,39 @@ fn parse_setup_channel(m: &[u8]) -> Option<ChannelState> {
         validated: Vec::new(),
         pay: Default::default(),
         predates_validation: false,
+        limits,
+        peer_reached_reserve: false,
+    })
+}
+
+/// The `hsmd_setup_channel_tlvs` stream after `channel_type`: the channel's
+/// dust limits and reserves, records 1, 3, 5 and 7 (8-byte big-endian
+/// amounts). `Some(None)` when they are absent (a node that does not send
+/// them) or incomplete; `None` when the stream is malformed. Unknown records
+/// are skipped.
+fn parse_setup_channel_limits(r: &mut wire::Reader) -> Option<Option<policy::ChannelLimits>> {
+    let mut v: [Option<u64>; 4] = [None; 4];
+    while r.remaining() > 0 {
+        let typ = r.bigsize()?;
+        let len = r.bigsize()? as usize;
+        let value = r.take_slice(len)?;
+        let slot = match typ {
+            1 => 0,
+            3 => 1,
+            5 => 2,
+            7 => 3,
+            _ => continue,
+        };
+        if len != 8 {
+            return None;
+        }
+        v[slot] = Some(u64::from_be_bytes(value.try_into().ok()?));
+    }
+    Some(match v {
+        [Some(our_dust), Some(peer_dust), Some(our_reserve), Some(peer_reserve)] => {
+            Some(policy::ChannelLimits { our_dust, peer_dust, our_reserve, peer_reserve })
+        }
+        _ => None,
     })
 }
 
@@ -3695,8 +3751,16 @@ mod close_and_revocation_tests {
         assert!(matches!(revoke(&mut s, 0), Outcome::Reply(_)));
         assert!(s.store.record_close([0x99; 32]));
         assert!(!s.store.record_close([0x99; 32]));
-        let v8 = policy::encode_channel_store(&s.store);
-        assert_eq!(v8[4], 8);
+        let v9 = policy::encode_channel_store(&s.store);
+        assert_eq!(v9[4], 9);
+        // A version-8 payload: the same, without the entry's limits flag and
+        // reserve flag (the two bytes before the ledger and the close record;
+        // `track` sends no limits).
+        let l = &s.store.ledger;
+        let at9 = v9.len() - (2 + 32) - (2 + 40 * l.approvals.len() + 2 + 49 * l.spends.len()) - 2;
+        assert_eq!(&v9[at9..at9 + 2], &[0, 0]);
+        let mut v8 = [&v9[..at9], &v9[at9 + 2..]].concat();
+        v8[4] = 8;
         let (back, ledger, closes) = policy::decode_channel_store(&v8).unwrap();
         assert_eq!(closes, vec![[0x99; 32]]);
         assert_eq!(back[0].1.validated, st(&s).validated);
@@ -4058,6 +4122,124 @@ mod close_and_revocation_tests {
         // The dust may go to the fee, never to the peer.
         let err = sign_close(&mut s, &close(FUNDING_TXID, &[(peer, 999_001), (Vec::new(), 999)])).unwrap_err();
         assert!(err.contains("pays the peer 999001, above its share 999000"), "{err}");
+    }
+
+    /// `setup_channel` with the channel's limits in its TLV stream: our dust
+    /// limit, the peer's, the reserve the peer requires of us and the one we
+    /// require of it.
+    fn track_with_limits(s: &mut Signer, outbound: bool, limits: [u64; 4]) {
+        let mut m = setup_msg(s, outbound, &[]);
+        let mut w = Writer::new(0);
+        for (typ, v) in [1u64, 3, 5, 7].into_iter().zip(limits) {
+            w.tlv_record(typ, &v.to_be_bytes());
+        }
+        m.extend_from_slice(&w.into_vec()[2..]);
+        assert!(matches!(s.handle(&req(m)), Outcome::Reply(_)));
+    }
+
+    /// The limits arrive in `setup_channel`'s TLV stream, are kept across the
+    /// re-sends channeld makes at every start (which a host could vary), and
+    /// survive a store round trip; a frame without them leaves none.
+    #[test]
+    fn setup_channel_limits_are_read_and_kept() {
+        let mut s = signer(Policy::Enforce);
+        track(&mut s, false, &[]);
+        assert_eq!(st(&s).limits, None);
+        assert_eq!(policy::close_dust_tolerance(st(&s)), policy::CLOSE_DUST_TOLERANCE);
+
+        let mut s = signer(Policy::Enforce);
+        track_with_limits(&mut s, false, [5_460, 5_461, 10_000, 10_001]);
+        let want = policy::ChannelLimits { our_dust: 5_460, peer_dust: 5_461, our_reserve: 10_000, peer_reserve: 10_001 };
+        assert_eq!(st(&s).limits, Some(want));
+        track(&mut s, false, &[]);
+        assert_eq!(st(&s).limits, Some(want));
+        track_with_limits(&mut s, false, [999_999, 999_999, 0, 0]);
+        assert_eq!(st(&s).limits, Some(want));
+        let (back, _, _) = policy::decode_channel_store(&policy::encode_channel_store(&s.store)).unwrap();
+        assert_eq!(back[0].1.limits, Some(want));
+        // A malformed record leaves the channel untracked.
+        let mut m = setup_msg(&s, false, &[]);
+        m.extend_from_slice(&[0x01, 0x07, 0, 0, 0, 0, 0, 0, 0]);
+        let mut fresh = signer(Policy::Enforce);
+        assert!(matches!(fresh.handle(&req(m)), Outcome::Reply(_)));
+        assert!(fresh.store.get(&PEER, DBID).is_none());
+    }
+
+    /// A close may leave our share out only under the channel's dust limit,
+    /// which the node sets in the channel asset: thousands of atoms of a
+    /// cheap asset, a handful of a dear one. A host that names a larger one
+    /// is held to one percent of the funding.
+    #[test]
+    fn close_dust_follows_the_channel_dust_limit() {
+        let peer = peer_script();
+        let only_peer = |p: u64, f: u64| close(FUNDING_TXID, &[(peer.clone(), p), (Vec::new(), f)]);
+
+        // A cheap asset: a dust limit of 5,460 atoms. A share of 3,000 is
+        // dust there, and an honest close leaves it out.
+        let mut s = signer(Policy::Enforce);
+        track_with_limits(&mut s, false, [5_460, 5_460, 10_000, 10_000]);
+        assert!(matches!(validate(&mut s, 0, 3_000, 996_000, 1_000), Outcome::Reply(_)));
+        assert_eq!(sign_close(&mut s, &only_peer(996_000, 4_000)), Ok(()));
+        // ...which the fixed 546-atom tolerance refused.
+        let mut s = signer(Policy::Enforce);
+        track(&mut s, false, &[]);
+        assert!(matches!(validate(&mut s, 0, 3_000, 996_000, 1_000), Outcome::Reply(_)));
+        let err = sign_close(&mut s, &only_peer(996_000, 4_000)).unwrap_err();
+        println!("no limits, share 3000 left out: {err}");
+        assert!(err.contains("pays this wallet nothing, but its balance is 3000"), "{err}");
+
+        // A dear asset: a dust limit of 55 atoms. A share of 300 is not dust
+        // there, and a close may not leave it out.
+        let mut s = signer(Policy::Enforce);
+        track_with_limits(&mut s, false, [55, 55, 10_000, 10_000]);
+        assert!(matches!(validate(&mut s, 0, 300, 998_700, 1_000), Outcome::Reply(_)));
+        let err = sign_close(&mut s, &only_peer(998_700, 1_300)).unwrap_err();
+        println!("dust limit 55, share 300 left out: {err}");
+        assert!(err.contains("pays this wallet nothing, but its balance is 300"), "{err}");
+        let ours = s.wallet_sweep_script(4, false);
+        assert_eq!(sign_close(&mut s, &close(FUNDING_TXID, &[(ours, 300), (peer.clone(), 998_700), (Vec::new(), 1_000)])), Ok(()));
+
+        // A host naming a dust limit of 900,000: held to 1% of the
+        // 1,000,000 funding.
+        let mut s = signer(Policy::Enforce);
+        track_with_limits(&mut s, false, [900_000, 900_000, 900_000, 900_000]);
+        assert_eq!(policy::close_dust_tolerance(st(&s)), 10_000);
+        assert!(matches!(validate(&mut s, 0, 20_000, 979_000, 1_000), Outcome::Reply(_)));
+        let err = sign_close(&mut s, &only_peer(979_000, 21_000)).unwrap_err();
+        println!("dust limit 900000 named, share 20000 left out: {err}");
+        assert!(err.contains("pays this wallet nothing, but its balance is 20000"), "{err}");
+    }
+
+    /// The peer keeps the reserve this side requires of it once it has
+    /// reached it, on our commitments and on its own.
+    #[test]
+    fn peer_reserve_is_held_once_reached() {
+        let mut s = signer(Policy::Enforce);
+        track_with_limits(&mut s, true, [5_460, 5_460, 10_000, 10_000]);
+        // The fundee starts with nothing: below its reserve, as BOLT 2 allows.
+        assert!(matches!(validate(&mut s, 0, 999_000, 0, 1_000), Outcome::Reply(_)));
+        assert!(matches!(validate(&mut s, 1, 994_000, 5_000, 1_000), Outcome::Reply(_)));
+        assert!(!st(&s).peer_reached_reserve);
+        assert!(matches!(validate(&mut s, 2, 979_000, 20_000, 1_000), Outcome::Reply(_)));
+        assert!(st(&s).peer_reached_reserve);
+        // Paying it out below the reserve, by our commitment or by its own.
+        let o = validate(&mut s, 3, 989_001, 9_999, 1_000);
+        println!("our commitment leaving the peer 9999: {}", outcome(&o));
+        assert!(outcome(&o).contains("VALIDATE_COMMITMENT_TX refused: it leaves the peer 9999, below the reserve of 10000 it must keep"), "{}", outcome(&o));
+        let o = sign_remote(&mut s, 3, 9_999, 989_001, 1_000);
+        println!("the peer's commitment leaving it 9999: {}", outcome(&o));
+        assert!(outcome(&o).contains("SIGN_REMOTE_COMMITMENT_TX refused: it leaves the peer 9999, below the reserve of 10000 it must keep"), "{}", outcome(&o));
+        // Down to the reserve itself is fine.
+        assert!(matches!(validate(&mut s, 3, 989_000, 10_000, 1_000), Outcome::Reply(_)));
+        assert!(matches!(sign_remote(&mut s, 3, 10_000, 989_000, 1_000), Outcome::Reply(_)));
+        // The mark survives the store.
+        let (back, _, _) = policy::decode_channel_store(&policy::encode_channel_store(&s.store)).unwrap();
+        assert!(back[0].1.peer_reached_reserve);
+        // Without limits from the node, nothing is held.
+        let mut s = signer(Policy::Enforce);
+        track(&mut s, true, &[]);
+        assert!(matches!(validate(&mut s, 0, 979_000, 20_000, 1_000), Outcome::Reply(_)));
+        assert!(matches!(validate(&mut s, 1, 999_000, 0, 1_000), Outcome::Reply(_)));
     }
 
     /// The peer's commitment the device signs sets the balance too, and the
@@ -5037,8 +5219,8 @@ mod close_and_revocation_tests {
             assert!(matches!(validate(&mut s, n, 300_000, 699_000, 1_000), Outcome::Reply(_)));
         }
         let full = policy::encode_channel_store(&s.store);
-        // Version 8 less the entry's flag and the close record: version 6.
-        let mut payload = [&full[..full.len() - 2 - 4 - 1], &full[full.len() - 2 - 4..full.len() - 2]].concat();
+        // Version 9 less the entry's three flags and the close record: version 6.
+        let mut payload = [&full[..full.len() - 2 - 4 - 3], &full[full.len() - 2 - 4..full.len() - 2]].concat();
         payload[4] = 6;
         let mac = s.chstore_mac(&payload);
         payload.extend_from_slice(&mac);
@@ -5928,6 +6110,8 @@ mod close_output_spend_tests {
             validated: Vec::new(),
             pay: crate::payments::PayTrack { asset: Some(asset), ..Default::default() },
             predates_validation: false,
+            limits: None,
+            peer_reached_reserve: false,
         }
     }
 }

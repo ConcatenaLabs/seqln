@@ -89,10 +89,19 @@ What enforce mode checks:
   counted only up to four times the commitment's fee and anchors: a close paying more (`close`
   with a `feerange` far above the channel's feerate, say) is refused, lightningd keeps running,
   and `close` falls back to a unilateral close after its `unilateraltimeout`. Our output may be
-  left out only when what is due is under the 546-atom dust limit, and the peer's output may not
-  exceed the funding less our balance. While no balance is recorded, every close is refused,
+  left out only when what is due is under the channel's dust limit, and the peer's output may not
+  exceed the funding less our balance. The node sets a channel's dust limit in its asset, at what
+  546 reference atoms are worth there, and names both sides' limits in `setup_channel`; the device
+  takes the larger, held to one percent of the funding (a host naming a larger one could otherwise
+  have a close burn our share as fee). From a node that names none, the limit is 546 atoms. While no balance is recorded, every close is refused,
   however much it pays this wallet: the device cannot tell an honest close from one paying it a
   single atom.
+- **Reserve**: once a commitment the device validated or signed has paid the peer at least the
+  reserve this side requires of it (`setup_channel` names it), the device refuses any commitment,
+  ours or the peer's, whose output to the peer is below it: the reserve is what a peer that
+  broadcasts a revoked commitment loses at least, and a host that also runs the peer could otherwise
+  drain it, as channeld would not. The peer's output is net of the commitment fee when the peer
+  opened the channel, as BOLT 2 asks.
 - **Revocations**: a commitment's secret leaves the device only through its revocation. The
   device speaks hsmd version 6 alone and refuses an INIT whose highest version is below it, the
   first INIT and any later one (lightningd offers 5 to 6): below version 6 a commitment point
@@ -177,18 +186,19 @@ channel can hold more than. What withdrawals let leave (their fees) counts again
 `setPaymentLimit(asset, atoms)` and `setPaymentPeriod(seconds)`, or the SDK's `paymentLimits`
 option. An HTLC is charged when it is first committed, so an attempt that then fails still counts
 until the period has passed; one whose amount lies between the two commitments' dust thresholds
-(listed on one, trimmed on the other: a few hundred atoms wide at floor feerates) is charged twice. A channel the device tracked before it kept payment records takes
+(listed on one, trimmed on the other: a band worth a few hundred reference atoms at floor feerates) is charged twice. A channel the device tracked before it kept payment records takes
 its first commitment as the baseline, whatever HTLCs it carries.
 
 Not checked: how a commitment splits the channel between the two sides beyond what the payment
-accounting sees. So the device does not protect a user from a host that also runs the channel's
+accounting and the peer's reserve see. So the device does not protect a user from a host that also runs the channel's
 peer. Such a host can broadcast a commitment the device signed for the watchtower's preempt slot
 before the device revoked it, which the peer then takes whole with the revocation secret; and the
 peer can sign commitments that move the balance without any HTLC, which the device charges to the
 limit but cannot tell from a payment.
 
-The channel store (each channel's parameters, revocation counters, recorded balance, the
-unrevoked commitments it validated, its payment tracking and whether it predates validation, the
+The channel store (each channel's parameters, dust limits and reserves, revocation counters,
+recorded balance, whether the peer has reached its reserve, the unrevoked commitments it validated,
+its payment tracking and whether it predates validation, the
 approvals and charges against the payment limits, and the txids of the mutual closes the device
 signed) carries no secret and is authenticated by a MAC keyed from the seed. The native signer keeps it in
 `seqln-signer-channels` in its working directory (or the path in `SEQLN_SIGNER_STORE`): it
@@ -226,7 +236,7 @@ any channel.
 | `src/bin/ecdh_latency.rs` | ECDH hot-path latency probe (in-process vs transport round-trip). |
 | `src/bin/emit_elements_vector.rs` | Emits an Elements v2 PSET `sign_withdrawal` vector for the conformance harness's `SEQLN_WITHDRAWAL_VECTOR` mode. |
 | `tests/tamper.rs` | Enforce-mode theft-rejection test (skips without a captured corpus). |
-| `tests/chstore.rs` | Channel-store persistence contract (`export_channels`/`import_channels` round-trip, MAC refusal, merge semantics). The store carries each channel's opener, upfront shutdown scripts (and the local one's wallet index), revocation counters, recorded balance and unrevoked validated commitments, and imports an older store without them. |
+| `tests/chstore.rs` | Channel-store persistence contract (`export_channels`/`import_channels` round-trip, MAC refusal, merge semantics). The store carries each channel's opener, upfront shutdown scripts (and the local one's wallet index), dust limits and reserves, revocation counters, recorded balance and unrevoked validated commitments, and imports an older store without them. |
 | `tests/native_store.rs` | The native binary keeps its store across a restart: a new process refuses a revoked commitment and a close below the recorded balance, which a signer with an empty store signs (the commitment once it has validated it itself). With the store unwritable it refuses every request, a re-sent revocation included, until a write succeeds. |
 | `wasm/` | `wasm-bindgen` build of the same library for browsers/Node, plus SDK, relay, tests, demo page. |
 | `wasm/test/version_floor.mjs` | The WASM build refuses an INIT below version 6, first or later, and returns no secret with a commitment point. |
