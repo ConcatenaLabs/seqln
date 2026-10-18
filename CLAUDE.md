@@ -120,6 +120,11 @@ strings puts a node in a re-exec loop.
   causes — the split signer not being re-primed with a channel on restart, and a stored
   `penalty_base` crashing channeld deterministically on any channel that has seen a payment. When
   a channel goes dead after a restart, check `owner` first.
+- **`fundchannel_complete` does not check the funding amount on Sequentia.** The PSBT gives it
+  nothing to check an Elements output's value against, so it accepts a 2-of-2 output worth less
+  than the channel, and the commitments it secures cannot spend it. Whoever passes it a
+  transaction built outside the node checks the output's amount and asset first
+  (`tests/sequentia/test_external_funding.py`).
 - **Wire bytes are the compatibility contract.** The penalty-base fix was made specifically so the
   wire encoding was unchanged and old and new daemons interoperate. Keep that discipline.
 - **The testnet was re-genesised on 2026-07-05.** Older chain state is invalid.
