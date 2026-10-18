@@ -569,7 +569,12 @@ same route without the plugin, and a payment locked for 5,000 blocks paid under
 `crossassetpay`'s default `maxdelay` (`test_crossasset_forward.py`), and a payer's default
 `maxdelay`, the network's own cap: an invoice with a final lock time of 5,000 blocks paid by
 a default `pay`, and returned by `getroute` and askrene's `getroutes`, on Sequentia and
-refused on Bitcoin regtest (`test_pay_maxdelay.py`, on Bitcoin regtest too). They need `sequentiad`, `sequentia-cli`
+refused on Bitcoin regtest (`test_pay_maxdelay.py`, on Bitcoin regtest too), and a channel in the
+Sequence token or in an issued asset funded by one transaction from a wallet outside the node:
+`fundchannel_complete` given it blinded and unsigned, its txid unchanged by the signatures the
+wallet adds after the peer has signed the first commitment, and the channel paid over and closed
+to the node, which held nothing; with `fundchannel_complete` accepting a funding output worth less
+than the channel, which the funder must therefore check itself (`test_external_funding.py`). They need `sequentiad`, `sequentia-cli`
 and a Bitcoin Core `bitcoind` on `PATH`, and the keyless tests need the device signer built
 (`cargo build --release` in `contrib/seqln-signer`, or `SEQLN_SIGNER=/path/to/seqln-signer`).
 The test plugins run under the `python3` on `PATH`, which needs the `pyln` packages, so the
