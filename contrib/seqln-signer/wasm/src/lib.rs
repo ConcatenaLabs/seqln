@@ -154,6 +154,15 @@ impl Signer {
         Ok(())
     }
 
+    /// Name a scriptPubKey of the wallet that holds this device's seed: a
+    /// cooperative close may then pay this side's balance to it, held to the
+    /// same balance as a close to the node's wallet. Only the page can name
+    /// one, never the node; named again after every start.
+    #[wasm_bindgen(js_name = approveCloseDestination)]
+    pub fn approve_close_destination(&mut self, script: &[u8]) {
+        self.inner.approve_close_destination(script.to_vec());
+    }
+
     #[wasm_bindgen(js_name = processFrame)]
     pub fn process_frame(&mut self, frame_bytes: &[u8]) -> Result<Vec<u8>, JsError> {
         self.inner.set_now((date_now() / 1000.0) as u64);

@@ -111,6 +111,10 @@ pub struct Signer {
     /// again charges it once. Not persisted: after a restart a transaction
     /// signed again is charged again, which can only overstate.
     charged_withdrawals: std::collections::HashSet<[u8; 32]>,
+    /// Scripts the host named as this wallet's own for a cooperative close
+    /// (`approve_close_destination`): a close may pay this side's balance to
+    /// one of them as to the node's own wallet. Not persisted.
+    close_destinations: std::collections::HashSet<Vec<u8>>,
 }
 
 /// What one transaction lets leave this device, in atoms per asset.
@@ -152,6 +156,20 @@ impl Signer {
             now: 0,
             refusal: std::cell::RefCell::new(None),
             charged_withdrawals: std::collections::HashSet::new(),
+            close_destinations: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Name `script` as one of this wallet's own: a cooperative close may pay
+    /// this side's balance to it, held to the same balance and fee as a close
+    /// to the node's wallet. The host is the wallet that derived this device
+    /// from its own seed (the browser); it names its own on-chain address
+    /// before asking the node to close there. Nothing in a frame can add one,
+    /// so the node cannot steer a close to a script of its choosing. Not
+    /// persisted: the host names its scripts again after a restart.
+    pub fn approve_close_destination(&mut self, script: Vec<u8>) {
+        if !script.is_empty() {
+            self.close_destinations.insert(script);
         }
     }
 
@@ -680,7 +698,8 @@ impl Signer {
                 r.u16().ok_or("malformed request")?;
                 let bt = wire::read_bitcoin_tx(&mut r).ok_or("malformed request")?;
                 let own_close = self.own_close_script(st);
-                policy::validate_mutual_close(st, self.own_sweep_script_set(), own_close.as_deref(), &bt.tx)?;
+                policy::validate_mutual_close(st, self.own_sweep_script_set(), own_close.as_deref(),
+                    &self.close_destinations, &bt.tx)?;
                 self.paid_fee_within_limit(st, &bt.tx, Self::close_fee(st, &bt.tx), "the close's fee")
             })();
             if let Err(reason) = check {
@@ -1191,7 +1210,7 @@ impl Signer {
         if !policy::is_commitment_shaped(&bt.tx) {
             let own_close = self.own_close_script(st);
             policy::validate_mutual_close(
-                st, self.own_sweep_script_set(), own_close.as_deref(), &bt.tx)?;
+                st, self.own_sweep_script_set(), own_close.as_deref(), &self.close_destinations, &bt.tx)?;
             return self.paid_fee_within_limit(st, &bt.tx, Self::close_fee(st, &bt.tx), "the close's fee");
         }
         let n = policy::commitment_number(self.kernel(), &peer_id, dbid, st, &bt.tx)
@@ -4031,6 +4050,32 @@ mod close_and_revocation_tests {
 
     fn host_script() -> Vec<u8> {
         [0x00u8, 0x14].iter().copied().chain([0xAA; 20]).collect()
+    }
+
+    /// A close may pay this side's balance to a script the host named as this
+    /// wallet's own (the browser wallet's address), held to the same balance;
+    /// naming one opens no other.
+    #[test]
+    fn close_to_an_approved_destination_is_signed() {
+        let mut s = signer(Policy::Enforce);
+        track(&mut s, true, &[]);
+        assert!(matches!(validate(&mut s, 0, 600_000, 399_000, 1_000), Outcome::Reply(_)));
+        let wallet: Vec<u8> = [0x00u8, 0x14].iter().copied().chain([0xBB; 20]).collect();
+        let to_wallet = close(FUNDING_TXID, &[(wallet.clone(), 600_500), (peer_script(), 399_000), (Vec::new(), 500)]);
+        let err = sign_close(&mut s, &to_wallet).unwrap_err();
+        println!("close to the wallet's address before it is named: {err}");
+        s.approve_close_destination(wallet.clone());
+        assert_eq!(sign_close(&mut s, &to_wallet), Ok(()));
+        // Another script is still refused...
+        let elsewhere = close(FUNDING_TXID, &[(host_script(), 600_500), (peer_script(), 399_000), (Vec::new(), 500)]);
+        assert!(sign_close(&mut s, &elsewhere).is_err());
+        // ...and so is a close paying the named script less than the balance.
+        let short = close(FUNDING_TXID, &[(wallet, 1), (peer_script(), FUNDING - 1_001), (Vec::new(), 1_000)]);
+        let err = sign_close(&mut s, &short).unwrap_err();
+        assert!(err.contains("pays this wallet 1, below its balance 601000"), "{err}");
+        // An empty script is never named.
+        s.approve_close_destination(Vec::new());
+        assert!(!s.close_destinations.contains(&Vec::new()));
     }
 
     /// R2 F1: a "mutual close" that pays the whole channel to a script of the
