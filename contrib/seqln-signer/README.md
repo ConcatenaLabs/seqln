@@ -310,7 +310,9 @@ out-of-band first (`seqln-signer --genkey` prints a keypair):
 
 Other environment knobs: `SEQLN_SIGNER_POLICY=enforce|permissive` (default enforce), the payment
 limits `SEQLN_SIGNER_PAY_LIMIT`, `SEQLN_SIGNER_PAY_LIMITS` and `SEQLN_SIGNER_PAY_PERIOD` (see
-"Scope"),
+"Scope"), `SEQLN_SIGNER_CLOSE_TO` (hex scriptPubKeys of the operator's own wallet, comma-separated,
+that a cooperative close may pay this side's balance to: the native form of
+`approveCloseDestination`),
 `SEQLN_SIGNER_TRACE` (per-request trace logging), `SEQLN_SIGNER_STORE` (the channel store's path,
 default `seqln-signer-channels` in the working directory), `SEQLN_SIGNER_CONNECT` (the env form of
 `--connect`), and `SEQLN_SIGNER_NETWORK=bitcoin|elements`, which selects the sighash family when one

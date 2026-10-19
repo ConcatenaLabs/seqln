@@ -119,6 +119,19 @@ fn main() {
     let limits = seqln_signer::payments::Limits::from_env()
         .unwrap_or_else(|e| fatal(&format!("bad payment limit: {e}")));
     signer.set_limits(limits);
+    // Scripts of the operator's own wallet a cooperative close may pay this
+    // side's balance to (`SEQLN_SIGNER_CLOSE_TO`: hex scriptPubKeys,
+    // comma-separated); the browser build names them with
+    // `approveCloseDestination`.
+    for item in std::env::var("SEQLN_SIGNER_CLOSE_TO").unwrap_or_default().split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let script = unhex(item)
+            .unwrap_or_else(|e| fatal(&format!("bad SEQLN_SIGNER_CLOSE_TO script {item:?}: {e}")));
+        signer.approve_close_destination(script);
+    }
 
     // A per-process log next to the running dir; best effort, never fatal.
     let mut log = std::fs::OpenOptions::new()

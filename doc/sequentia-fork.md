@@ -531,7 +531,8 @@ opened afterwards (`test_predating_store.py`), a breach of an asset channel with
 answered by `speculad` while the victim is offline, also once the node has delisted the channel's
 asset, with the fee paid from another asset the tower holds, and one the cheater races with its
 HTLC-success or HTLC-timeout transaction, whose output the tower takes (`test_watchtower.py`), a keyless node, as
-either side of a channel, closing it and restarting with it closing (`test_keyless_close.py`), a
+either side of a channel, closing it and restarting with it closing, and closing cooperatively to an address
+of its wallet outside the node that the device was given (`test_keyless_close.py`), a
 keyless node whose device approves an invoice against the limit of the asset it names, paying
 in one asset while another's limit is spent (`test_keyless_invoice_asset.py`), a
 keyless node paying and receiving payments trimmed as dust with nothing refused, and one whose
