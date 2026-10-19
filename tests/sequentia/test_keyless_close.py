@@ -114,10 +114,13 @@ class Device(object):
 
 
 def keyless_node(node_factory, directory, trace=False, pay_limit=TEST_PAY_LIMIT, pay_limits=None,
-                 close_to=None, **node_opts):
+                 close_to=None, dev_fail=True, **node_opts):
     """A node whose hsmd is the proxy, served by a device in enforce mode.
     `pay_limits` is SEQLN_SIGNER_PAY_LIMITS (`<asset>=<atoms>,...`);
-    `close_to` the scripts (hex) its wallet names for a close to pay."""
+    `close_to` the scripts (hex) its wallet names for a close to pay.
+    `dev_fail=False` runs lightningd without the harness's
+    dev-fail-on-subdaemon-fail, which exits it on any subdaemon failure, so a
+    refusal by the device plays out as it does in production."""
     port = free_port()
     host_priv, host_pub = genkey()
     dev_priv, dev_pub = genkey()
@@ -125,6 +128,8 @@ def keyless_node(node_factory, directory, trace=False, pay_limit=TEST_PAY_LIMIT,
     device.start()
     node = node_factory.get_node(start=False, may_fail=True,
                                  options={'subdaemon': 'hsmd:' + PROXY}, **node_opts)
+    if not dev_fail:
+        node.daemon.opts.pop('dev-fail-on-subdaemon-fail', None)
     node.daemon.env.update({'SEQLN_SIGNER_LISTEN': '127.0.0.1:{}'.format(port),
                             'SEQLN_HOST_PRIVKEY': host_priv,
                             'SEQLN_SIGNER_PEER_PUBKEY': dev_pub,
@@ -372,6 +377,56 @@ def test_keyless_node_closes_to_its_wallets_address(node_factory, bitcoind, dire
         # The balance less the close fee, which the keyless node (the fundee) does not pay.
         assert float(to_wallet[0]['value']) == 10**7 / PAR
         assert 'POLICY REJECT' not in device.output()
+    finally:
+        if answers(l1, timeout=2):
+            l1.stop()
+        device.stop()
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "lightningd takes the peer's signed closing transaction as the channel's last_tx while "
+    "negotiating, so once the device refuses to sign it nothing broadcastable is left: close "
+    "answers 'The signing device refused to sign the closing transaction' and the channel "
+    "stays in AWAITING_UNILATERAL instead of falling back to its commitment"))
+def test_keyless_node_refused_close_falls_back_to_unilateral(node_factory, bitcoind, directory):
+    """A cooperative close to an address the device was not given is refused:
+    closingd fails, lightningd keeps running, and `close` should fall back to a
+    unilateral close after its timeout, which pays this node. Run without the
+    harness's dev-fail-on-subdaemon-fail, which would exit lightningd on the
+    refusal and is not how a node runs."""
+    asset = bitcoind.issue_asset(1000)
+    bitcoind.set_fee_rates({bitcoind.POLICY_ASSET: PAR, asset: PAR})
+    elsewhere = bitcoind.rpc.getnewaddress()
+    device, l1 = keyless_node(node_factory, directory, dev_fail=False,
+                              broken_log='rejected request WIRE_HSMD_SIGN_MUTUAL_CLOSE_TX'
+                                         '|STATUS_FAIL_HSM_IO: Bad hsm_sign_mutual_close_tx reply'
+                                         '|device REJECTED|device REFUSED|refused to sign our')
+    try:
+        l2 = node_factory.get_node()
+        addr = l2.rpc.newaddr('bech32')['bech32']
+        txid = bitcoind.send_and_mine_block(addr, 2 * 10**8, asset)
+        wait_for(lambda: any(o['txid'] == txid for o in l2.rpc.listfunds()['outputs']))
+        l2.rpc.connect(l1.info['id'], 'localhost', l1.port)
+        res = l2.rpc.call('fundchannel', {'id': l1.info['id'], 'amount': 10**8,
+                                          'asset': asset, 'announce': True})
+        bitcoind.generate_block(1, wait_for_mempool=res['txid'])
+        for a, b in ((l1, l2), (l2, l1)):
+            wait_for(lambda: channel(a, b)['state'] == 'CHANNELD_NORMAL')
+        inv = l1.rpc.call('invoice', {'amount_msat': 10**7 * 1000, 'label': 'in',
+                                      'description': 'to the keyless node', 'asset': asset})
+        l2.rpc.call('pay', {'bolt11': inv['bolt11'], 'asset': asset})
+        wait_for(lambda: channel(l1, l2)['htlcs'] == [] and channel(l1, l2)['to_us_msat'] == 10**10)
+
+        closed = l1.rpc.close(l2.info['id'], 10, elsewhere)
+        print('close to an address the device was not given:', {k: closed.get(k) for k in ('type', 'txids')})
+        assert closed['type'] == 'unilateral'
+        assert 'SIGN_MUTUAL_CLOSE_TX refused' in device.output()
+        assert answers(l1)
+        # The unilateral close pays nothing to the address the device refused.
+        close_txid = only_one(closed['txids'])
+        tx = bitcoind.rpc.getrawtransaction(close_txid, True)
+        want = bitcoind.rpc.getaddressinfo(elsewhere)['scriptPubKey']
+        assert all(o['scriptPubKey'].get('hex') != want for o in tx['vout'])
     finally:
         if answers(l1, timeout=2):
             l1.stop()
