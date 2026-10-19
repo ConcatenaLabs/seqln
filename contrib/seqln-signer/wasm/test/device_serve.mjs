@@ -77,6 +77,10 @@ for (const item of (process.env.SEQLN_SIGNER_PAY_LIMITS || '').split(',').filter
 if (process.env.SEQLN_SIGNER_PAY_PERIOD !== undefined) {
   signer.setPaymentPeriod(Number(process.env.SEQLN_SIGNER_PAY_PERIOD));
 }
+for (const h of (process.env.SEQLN_SIGNER_CLOSE_TO || '').split(',').map((x) => x.trim()).filter(Boolean)) {
+  if (!/^([0-9a-f]{2})+$/i.test(h)) fatal(`bad SEQLN_SIGNER_CLOSE_TO script ${JSON.stringify(h)}`);
+  signer.approveCloseDestination(Buffer.from(h, 'hex'));
+}
 
 // The channel store: restored at start; a bad blob is logged and left out.
 if (existsSync(STORE)) {

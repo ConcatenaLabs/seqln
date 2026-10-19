@@ -62,7 +62,7 @@ class Device(object):
     """The device signer, reconnecting whenever its session ends, as a
     browser does."""
     def __init__(self, directory, port, priv, host_pub, trace=False, pay_limit=TEST_PAY_LIMIT,
-                 pay_limits=None):
+                 pay_limits=None, close_to=None):
         self.dir = os.path.join(directory, 'device')
         os.makedirs(self.dir, exist_ok=True)
         with open(os.path.join(self.dir, 'hsm_secret'), 'wb') as f:
@@ -74,6 +74,8 @@ class Device(object):
                         SEQLN_SIGNER_PAY_LIMIT=pay_limit)
         if pay_limits:
             self.env['SEQLN_SIGNER_PAY_LIMITS'] = pay_limits
+        if close_to:
+            self.env['SEQLN_SIGNER_CLOSE_TO'] = ','.join(close_to)
         if trace:
             self.env['SEQLN_SIGNER_TRACE'] = '1'
         if DEVICE == 'wasm':
@@ -112,13 +114,14 @@ class Device(object):
 
 
 def keyless_node(node_factory, directory, trace=False, pay_limit=TEST_PAY_LIMIT, pay_limits=None,
-                 **node_opts):
+                 close_to=None, **node_opts):
     """A node whose hsmd is the proxy, served by a device in enforce mode.
-    `pay_limits` is SEQLN_SIGNER_PAY_LIMITS (`<asset>=<atoms>,...`)."""
+    `pay_limits` is SEQLN_SIGNER_PAY_LIMITS (`<asset>=<atoms>,...`);
+    `close_to` the scripts (hex) its wallet names for a close to pay."""
     port = free_port()
     host_priv, host_pub = genkey()
     dev_priv, dev_pub = genkey()
-    device = Device(directory, port, dev_priv, host_pub, trace, pay_limit, pay_limits)
+    device = Device(directory, port, dev_priv, host_pub, trace, pay_limit, pay_limits, close_to)
     device.start()
     node = node_factory.get_node(start=False, may_fail=True,
                                  options={'subdaemon': 'hsmd:' + PROXY}, **node_opts)
@@ -323,6 +326,52 @@ def test_keyless_node_broadcasts_its_validated_commitment(node_factory, bitcoind
         wait_for(lambda: channel(l1, l2)['state'] in ('FUNDING_SPEND_SEEN', 'ONCHAIN'))
         spent = bitcoind.rpc.getrawtransaction(commitment, True)
         assert {o['asset'] for o in spent['vout']} == {asset}
+    finally:
+        if answers(l1, timeout=2):
+            l1.stop()
+        device.stop()
+
+
+def test_keyless_node_closes_to_its_wallets_address(node_factory, bitcoind, directory):
+    """A keyless node closes its channel cooperatively, paying its balance to
+    an address of the wallet that holds its device's seed, outside the node:
+    the device signs that close because the wallet named the address to it
+    (SEQLN_SIGNER_CLOSE_TO here, approveCloseDestination in a browser). A
+    close to an address not named is refused (the signer's unit test
+    close_to_an_approved_destination_is_signed)."""
+    asset = bitcoind.issue_asset(1000)
+    bitcoind.set_fee_rates({bitcoind.POLICY_ASSET: PAR, asset: PAR})
+    wallet_addr = bitcoind.rpc.getnewaddress()
+    script = bitcoind.rpc.getaddressinfo(wallet_addr)['scriptPubKey']
+    device, l1 = keyless_node(node_factory, directory, close_to=[script])
+    try:
+        l2 = node_factory.get_node()
+        addr = l2.rpc.newaddr('bech32')['bech32']
+        txid = bitcoind.send_and_mine_block(addr, 2 * 10**8, asset)
+        wait_for(lambda: any(o['txid'] == txid for o in l2.rpc.listfunds()['outputs']))
+        l2.rpc.connect(l1.info['id'], 'localhost', l1.port)
+        res = l2.rpc.call('fundchannel', {'id': l1.info['id'], 'amount': 10**8,
+                                          'asset': asset, 'announce': True})
+        bitcoind.generate_block(1, wait_for_mempool=res['txid'])
+        for a, b in ((l1, l2), (l2, l1)):
+            wait_for(lambda: channel(a, b)['state'] == 'CHANNELD_NORMAL')
+        inv = l1.rpc.call('invoice', {'amount_msat': 10**7 * 1000, 'label': 'in',
+                                      'description': 'to the keyless node', 'asset': asset})
+        l2.rpc.call('pay', {'bolt11': inv['bolt11'], 'asset': asset})
+        wait_for(lambda: channel(l1, l2)['htlcs'] == [] and channel(l1, l2)['to_us_msat'] == 10**10)
+
+        closed = l1.rpc.close(l2.info['id'], 30, wallet_addr)
+        print('close to the wallet:', {k: closed.get(k) for k in ('type', 'txids')})
+        assert closed['type'] == 'mutual'
+        close_txid = only_one(closed['txids'])
+        bitcoind.generate_block(1, wait_for_mempool=close_txid)
+        tx = bitcoind.rpc.getrawtransaction(close_txid, True)
+        to_wallet = [o for o in tx['vout'] if o['scriptPubKey'].get('hex') == script]
+        assert len(to_wallet) == 1
+        assert to_wallet[0]['asset'] == asset
+        # The balance less the close fee, which the keyless node (the fundee) does not pay.
+        assert float(to_wallet[0]['value']) == 10**7 / PAR
+        assert 'POLICY REJECT' not in device.output()
     finally:
         if answers(l1, timeout=2):
             l1.stop()
