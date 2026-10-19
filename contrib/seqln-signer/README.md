@@ -98,7 +98,10 @@ What enforce mode checks:
   this device's wallet addresses at the key index `setup_channel` gives for it, because the host
   supplies that script: a channel opened with `close_to` an address outside this wallet cannot be
   closed mutually, and closes unilaterally instead (the device sweeps its delayed output to its
-  own wallet). The output to our wallet must be at least the recorded balance (the larger of the
+  own wallet). The page that holds the device's seed can name a script of its own on-chain wallet
+  (`approveCloseDestination` in the WASM build and the SDK; never from a frame, and not
+  persisted), and a close paying our share there counts as paying our wallet: that is how a
+  wallet closes a channel straight to its own address. The output to our wallet must be at least the recorded balance (the larger of the
   two commitments' figures), less the close fee when this side opened the channel. That fee is
   counted only up to four times the commitment's fee and anchors: a close paying more (`close`
   with a `feerange` far above the channel's feerate, say) is refused, lightningd keeps running,

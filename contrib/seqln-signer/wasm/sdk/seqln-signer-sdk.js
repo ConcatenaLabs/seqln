@@ -167,6 +167,15 @@ export class SeqlnSigner {
     return this;
   }
 
+  // Name a scriptPubKey (bytes or hex) of the wallet that holds this device's
+  // seed: a cooperative close may then pay this side's balance to it, held to
+  // the same balance as a close to the node's wallet. Only the page names one,
+  // never the node. Not persisted: name it again after each start.
+  approveCloseDestination(script) {
+    this._inner.approveCloseDestination(typeof script === 'string' ? hexToBytes(script) : script);
+    return this;
+  }
+
   // Build from a BIP-39 mnemonic (no passphrase). `opts.wasm` overrides the wasm
   // source (Node: pass the .wasm bytes; browser: omit).
   static async fromMnemonic(mnemonic, opts = {}) {

@@ -1554,6 +1554,7 @@ pub fn validate_mutual_close(
     st: &ChannelState,
     own: &std::collections::HashSet<Vec<u8>>,
     own_close: Option<&[u8]>,
+    approved: &std::collections::HashSet<Vec<u8>>,
     tx: &ElementsTx,
 ) -> Result<(), String> {
     if tx.inputs.len() != 1 {
@@ -1573,7 +1574,7 @@ pub fn validate_mutual_close(
         if o.script.is_empty() {
             continue; // fee
         }
-        if own.contains(&o.script) || own_close == Some(o.script.as_slice()) {
+        if own.contains(&o.script) || own_close == Some(o.script.as_slice()) || approved.contains(&o.script) {
             ours += 1;
             ours_value = v;
         } else if st.remote_shutdown_script.is_empty()
