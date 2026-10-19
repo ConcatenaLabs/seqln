@@ -383,15 +383,12 @@ def test_keyless_node_closes_to_its_wallets_address(node_factory, bitcoind, dire
         device.stop()
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "lightningd takes the peer's signed closing transaction as the channel's last_tx while "
-    "negotiating, so once the device refuses to sign it nothing broadcastable is left: close "
-    "answers 'The signing device refused to sign the closing transaction' and the channel "
-    "stays in AWAITING_UNILATERAL instead of falling back to its commitment"))
 def test_keyless_node_refused_close_falls_back_to_unilateral(node_factory, bitcoind, directory):
     """A cooperative close to an address the device was not given is refused:
-    closingd fails, lightningd keeps running, and `close` should fall back to a
-    unilateral close after its timeout, which pays this node. Run without the
+    closingd fails, lightningd keeps running, and `close` falls back to a
+    unilateral close after its timeout, which pays this node: lightningd took
+    the peer's signed close as the transaction to broadcast only if the device
+    would sign it, so the commitment is still there to broadcast. Run without the
     harness's dev-fail-on-subdaemon-fail, which would exit lightningd on the
     refusal and is not how a node runs."""
     asset = bitcoind.issue_asset(1000)
@@ -422,9 +419,11 @@ def test_keyless_node_refused_close_falls_back_to_unilateral(node_factory, bitco
         assert closed['type'] == 'unilateral'
         assert 'SIGN_MUTUAL_CLOSE_TX refused' in device.output()
         assert answers(l1)
-        # The unilateral close pays nothing to the address the device refused.
+        # The commitment reaches the chain, and pays nothing to the refused address.
         close_txid = only_one(closed['txids'])
+        bitcoind.generate_block(1, wait_for_mempool=close_txid)
         tx = bitcoind.rpc.getrawtransaction(close_txid, True)
+        assert tx.get('confirmations', 0) >= 1
         want = bitcoind.rpc.getaddressinfo(elsewhere)['scriptPubKey']
         assert all(o['scriptPubKey'].get('hex') != want for o in tx['vout'])
     finally:

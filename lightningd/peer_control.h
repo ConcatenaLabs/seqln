@@ -197,6 +197,13 @@ struct bitcoin_tx *sign_last_tx(const tal_t *ctx,
 				const struct bitcoin_tx *last_tx,
 				const struct bitcoin_signature *last_sig);
 
+/* Whether the signing device signs @tx, a closing transaction the peer
+ * signed (@sig): true without asking unless hsmd is a keyless node's signer
+ * proxy, the only hsmd that refuses. */
+bool device_signs_close(const struct channel *channel,
+			const struct bitcoin_tx *tx,
+			const struct bitcoin_signature *sig);
+
 static const struct node_id *peer_node_id(const struct peer *peer)
 {
 	return &peer->id;

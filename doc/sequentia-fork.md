@@ -396,6 +396,15 @@ a user device while a host runs the node:
   onchaind resolves it from the chain. A `close` waiting on that transaction fails with the
   refusal (`lightningd/closing_control.c`). A node with its own keys is never refused, and signs
   and sends the transaction as before.
+- For the same reason a keyless node takes the peer's signed closing transaction as the one to
+  broadcast only once its device agrees to sign it (`device_signs_close` in
+  `lightningd/peer_control.c`, called from `peer_received_closing_signature` in
+  `lightningd/closing_control.c`): lightningd asks the device for that signature as each proposal
+  arrives. A device refuses a close that pays this side's balance anywhere but its own scripts or
+  one its wallet named, or at a fee over its limit; the commitment then stays the transaction to
+  broadcast, and `close` falls back to it after its `unilateraltimeout` instead of leaving the
+  channel in `AWAITING_UNILATERAL` with nothing it can broadcast. A node with its own keys is not
+  asked.
 - The device speaks hsmd version 6 only and refuses an INIT whose highest version is below
   it, at any time (lightningd offers 5 to 6). Below version 6 a commitment point comes with the
   secret of the commitment two before it, so a host that lowered the version could read the
@@ -531,8 +540,9 @@ opened afterwards (`test_predating_store.py`), a breach of an asset channel with
 answered by `speculad` while the victim is offline, also once the node has delisted the channel's
 asset, with the fee paid from another asset the tower holds, and one the cheater races with its
 HTLC-success or HTLC-timeout transaction, whose output the tower takes (`test_watchtower.py`), a keyless node, as
-either side of a channel, closing it and restarting with it closing, and closing cooperatively to an address
-of its wallet outside the node that the device was given (`test_keyless_close.py`), a
+either side of a channel, closing it and restarting with it closing, closing cooperatively to an address
+of its wallet outside the node that the device was given, and falling back to a unilateral close
+when the device refuses the address (`test_keyless_close.py`), a
 keyless node whose device approves an invoice against the limit of the asset it names, paying
 in one asset while another's limit is spent (`test_keyless_invoice_asset.py`), a
 keyless node paying and receiving payments trimmed as dust with nothing refused, and one whose

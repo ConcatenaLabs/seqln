@@ -285,9 +285,27 @@ static void peer_received_closing_signature(struct channel *channel,
 		return;
 	}
 
+	/* The peer's signed close replaces our commitment as the transaction
+	 * to broadcast, so a keyless node takes it only once its signing
+	 * device agrees to sign it.  A device signs a close only when it pays
+	 * this side's balance to its own scripts (or one its wallet named), at
+	 * a fee within its limit; had we taken a close it refuses, the
+	 * unilateral fallback would broadcast that close, be refused again, and
+	 * leave the channel in AWAITING_UNILATERAL with the commitment it
+	 * replaced gone. */
 	if (closing_fee_is_acceptable(ld, channel, tx)) {
-		channel_set_last_tx(channel, tx, &sig);
-		wallet_channel_save(ld->wallet, channel);
+		if (device_signs_close(channel, tx, &sig)) {
+			channel_set_last_tx(channel, tx, &sig);
+			wallet_channel_save(ld->wallet, channel);
+		} else {
+			struct bitcoin_txid refused;
+			bitcoin_txid(tx, &refused);
+			log_unusual(channel->log,
+				    "The signing device refuses the peer's closing"
+				    " transaction %s: keeping our commitment as the"
+				    " transaction to broadcast",
+				    fmt_bitcoin_txid(tmpctx, &refused));
+		}
 	}
 
 

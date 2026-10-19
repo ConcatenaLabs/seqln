@@ -277,6 +277,19 @@ static struct bitcoin_tx *sign_last_tx_unless_refused(const tal_t *ctx,
 	return tx;
 }
 
+bool device_signs_close(const struct channel *channel,
+			const struct bitcoin_tx *tx,
+			const struct bitcoin_signature *sig)
+{
+	struct lightningd *ld = channel->peer->ld;
+
+	/* An alternative hsmd is the keyless signer proxy (as for
+	 * --watchtower-store auto): no other hsmd refuses. */
+	if (!strmap_get(&ld->alt_subdaemons, "hsmd"))
+		return true;
+	return sign_last_tx_unless_refused(tmpctx, channel, tx, sig) != NULL;
+}
+
 struct bitcoin_tx *sign_last_tx(const tal_t *ctx,
 				const struct channel *channel,
 				const struct bitcoin_tx *last_tx,
