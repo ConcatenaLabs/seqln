@@ -103,12 +103,11 @@ What enforce mode checks:
   wallet closes a channel straight to its own address. The output to our wallet must be at least the recorded balance (the larger of the
   two commitments' figures), less the close fee when this side opened the channel. That fee is
   counted only up to four times the commitment's fee and anchors: a close paying more (`close`
-  with a `feerange` far above the channel's feerate, say) is refused, and lightningd keeps
-  running. When the peer's signature on a closing transaction arrived before the refusal,
-  lightningd has already taken that transaction as the one to broadcast, so `close` does not fall
-  back to a unilateral close: the channel stays in AWAITING_UNILATERAL until either side spends
-  the funding (`test_keyless_node_refused_close_falls_back_to_unilateral`, marked as failing until
-  lightningd falls back to the commitment). Our output may be
+  with a `feerange` far above the channel's feerate, say) is refused, lightningd keeps running,
+  and `close` falls back to a unilateral close after its `unilateraltimeout`: lightningd takes the
+  peer's signed close as the transaction to broadcast only once the device agrees to sign it, so
+  the commitment is still there (`test_keyless_node_refused_close_falls_back_to_unilateral`). Our
+  output may be
   left out only when what is due is under the channel's dust limit, and the peer's output may not
   exceed the funding less our balance. The node sets a channel's dust limit in its asset, at what
   546 reference atoms are worth there, and names both sides' limits in `setup_channel`; the device
