@@ -29,7 +29,10 @@ channeld/test/run-full_channel:			\
 	common/pseudorand.o			\
 	common/randbytes.o			\
 	common/setup.o				\
-	common/utils.o
+	common/tcov_commit_tx.o			\
+	common/tcov_scripts.o			\
+	common/utils.o				\
+	channeld/tcov_channel.o
 
 $(CHANNELD_TEST_OBJS): $(CHANNELD_HEADERS) $(CHANNELD_SRC) channeld/test/Makefile
 

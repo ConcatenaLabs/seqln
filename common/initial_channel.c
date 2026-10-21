@@ -8,6 +8,7 @@
 #include <common/initial_channel.h>
 #include <common/initial_commit_tx.h>
 #include <common/keyset.h>
+#include <common/tcov_commit_tx.h>
 
 struct channel *new_initial_channel(const tal_t *ctx,
 				    const struct channel_id *cid,
@@ -118,6 +119,38 @@ struct bitcoin_tx *initial_channel_tx(const tal_t *ctx,
 		return NULL;
 	}
 
+	/* SEQUENTIA: the taproot-covenant type (common/tcov_commit_tx.h)
+	 * has no leases and no anchors. */
+	if (channel_has(channel, OPT_SEQ_TAPROOT_COVENANT)) {
+		struct amount_sat reserve = channel->config[!side].channel_reserve;
+
+		/* As initial_commit_tx: one side must have more than the
+		 * reserve. */
+		if (!amount_msat_greater_sat(channel->view[side].owed[side], reserve)
+		    && !amount_msat_greater_sat(channel->view[side].owed[!side], reserve)) {
+			*err_reason = "Neither self amount nor other amount exceed reserve on "
+				"initial commitment transaction";
+			return NULL;
+		}
+		init_tx = tcov_commit_tx(ctx, &channel->funding,
+					 channel->funding_sats,
+					 channel->channel_asset,
+					 &channel->funding_pubkey[side],
+					 &channel->funding_pubkey[!side],
+					 channel->opener,
+					 /* They specify our to_self_delay and v.v. */
+					 channel->config[!side].to_self_delay,
+					 &keyset, per_commitment_point,
+					 channel_feerate(channel, side),
+					 channel->config[side].dust_limit,
+					 channel->view[side].owed[side],
+					 channel->view[side].owed[!side],
+					 NULL, NULL, direct_outputs,
+					 0 ^ channel->commitment_number_obscurer,
+					 side, err_reason);
+		goto add_pubkeys;
+	}
+
 	/* Figure out the csv_lock (if there's a lease) */
 	if (channel->lease_expiry == 0)
 		csv_lock = 1;
@@ -148,6 +181,7 @@ struct bitcoin_tx *initial_channel_tx(const tal_t *ctx,
 				    channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX),
 				    err_reason);
 
+add_pubkeys:
 	if (init_tx) {
 		psbt_input_add_pubkey(init_tx->psbt, 0,
 				      &channel->funding_pubkey[side], false /* is_taproot */);
@@ -218,6 +252,11 @@ struct channel_type *channel_desired_type(const tal_t *ctx,
 	/* We don't actually want to downgrade anchors! */
 	if (channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX))
 		return channel_type_anchors_zero_fee_htlc(ctx);
+
+	/* SEQUENTIA: nor the taproot-covenant type, whose outputs no other
+	 * type can read. */
+	if (channel_has(channel, OPT_SEQ_TAPROOT_COVENANT))
+		return channel_type_seq_taproot_covenant(ctx);
 
 	/* We don't actually want to downgrade anchors! */
 	if (channel_has(channel, OPT_ANCHOR_OUTPUTS_DEPRECATED))

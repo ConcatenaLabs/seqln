@@ -1,6 +1,7 @@
 #include "config.h"
 #include <bitcoin/privkey.h>
 #include <bitcoin/script.h>
+#include <bitcoin/tapscript.h>
 #include <ccan/array_size/array_size.h>
 #include <ccan/crypto/hkdf_sha256/hkdf_sha256.h>
 #include <ccan/mem/mem.h>
@@ -166,6 +167,10 @@ bool hsmd_check_client_capabilities(struct hsmd_client *client,
 	case WIRE_HSMD_SIGN_ANCHORSPEND:
 	case WIRE_HSMD_SIGN_HTLC_TX_MINGLE:
 	case WIRE_HSMD_SIGN_ANY_CANNOUNCEMENT_REQ:
+	case WIRE_HSMD_SIGN_TCOV_DELAYED_TO_US:
+	case WIRE_HSMD_SIGN_TCOV_LOCAL_HTLC:
+	case WIRE_HSMD_SIGN_TCOV_REMOTE_HTLC_TO_US:
+	case WIRE_HSMD_SIGN_TCOV_PENALTY:
 		return (client->capabilities & HSM_PERM_MASTER) != 0;
 
 	/*~ These are messages sent by the HSM so we should never receive them. */
@@ -211,6 +216,7 @@ bool hsmd_check_client_capabilities(struct hsmd_client *client,
 	case WIRE_HSMD_CHECK_BIP86_PUBKEY_REPLY:
 	case WIRE_HSMD_SIGN_ANCHORSPEND_REPLY:
 	case WIRE_HSMD_SIGN_HTLC_TX_MINGLE_REPLY:
+	case WIRE_HSMD_SIGN_TCOV_REPLY:
 	case WIRE_HSMD_SIGN_ANY_CANNOUNCEMENT_REPLY:
 		break;
 	}
@@ -2199,6 +2205,173 @@ static u8 *handle_sign_any_delayed_payment_to_us(struct hsmd_client *c,
 					     commit_num, tx, wscript);
 }
 
+/*~ SEQUENTIA: the taproot-covenant channel type (common/tcov_scripts.h).
+ * lightningd hands us the whole spend, every input's previous output in its
+ * PSBT, because a taproot signature (SIGHASH_DEFAULT) commits to all of
+ * them: the fee input, in whatever asset it is, included.  The covenant in
+ * an HTLC leaf fixes where the HTLC's value goes; a key-path or DELAY
+ * signature lets it go anywhere, so a signer that holds a wallet's balance
+ * (the Rust device) checks the outputs before it signs these. */
+static u8 *tcov_sign(struct hsmd_client *c, const u8 *msg_in,
+		     struct bitcoin_tx *tx, u32 input_num,
+		     const u8 *leaf, const struct sha256 *merkle_root,
+		     const struct privkey *privkey)
+{
+	struct sha256 sighash;
+	struct bip340sig sig;
+
+	if (input_num >= tx->wtx->num_inputs)
+		return hsmd_status_bad_request_fmt(c, msg_in,
+						   "bad input %u of %zu",
+						   input_num, tx->wtx->num_inputs);
+	if (!merkle_root && tal_bytelen(leaf) == 0)
+		return hsmd_status_bad_request_fmt(c, msg_in, "empty leaf");
+
+	/* The daemon's chainparams: hsmd_client_new_main()/_peer() leave
+	 * c->chainparams unset, and the taproot signature hash reads the
+	 * genesis hash from it. */
+	tx->chainparams = chainparams;
+	if (!tap_sighash(tx, input_num, merkle_root ? NULL : leaf,
+			 TAP_SIGHASH_DEFAULT, &sighash))
+		return hsmd_status_bad_request_fmt(c, msg_in,
+						   "no taproot signature hash for input %u:"
+						   " an input lacks its previous output,"
+						   " or this one is not taproot",
+						   input_num);
+	if (merkle_root)
+		tap_sign_keypath(&sighash, privkey, merkle_root, &sig);
+	else
+		tap_sign(&sighash, privkey, &sig);
+	return towire_hsmd_sign_tcov_reply(NULL, &sig);
+}
+
+/* Our key from @basepoint_fn's basepoint for our commitment @commit_num. */
+static bool tcov_local_privkey(const struct node_id *peer_id, u64 dbid,
+			       u64 commit_num, bool htlc,
+			       struct privkey *privkey)
+{
+	struct secret channel_seed, base_secret;
+	struct sha256 shaseed;
+	struct pubkey point, basepoint;
+
+	get_channel_seed(peer_id, dbid, &channel_seed);
+	if (!derive_shaseed(&channel_seed, &shaseed)
+	    || !per_commit_point(&shaseed, &point, commit_num))
+		return false;
+	if (htlc) {
+		if (!derive_htlc_basepoint(&channel_seed, &basepoint,
+					   &base_secret))
+			return false;
+	} else {
+		if (!derive_delayed_payment_basepoint(&channel_seed,
+						      &basepoint,
+						      &base_secret))
+			return false;
+	}
+	return derive_simple_privkey(&base_secret, &basepoint, &point, privkey);
+}
+
+static u8 *handle_sign_tcov_delayed_to_us(struct hsmd_client *c,
+					  const u8 *msg_in)
+{
+	u64 commit_num, dbid;
+	struct bitcoin_tx *tx;
+	u8 *leaf;
+	u32 input_num;
+	struct node_id peer_id;
+	struct privkey privkey;
+
+	if (!fromwire_hsmd_sign_tcov_delayed_to_us(tmpctx, msg_in, &commit_num,
+						   &tx, &input_num, &leaf,
+						   &peer_id, &dbid))
+		return hsmd_status_malformed_request(c, msg_in);
+	if (!tcov_local_privkey(&peer_id, dbid, commit_num, false, &privkey))
+		return hsmd_status_bad_request_fmt(c, msg_in,
+						   "cannot derive the delayed key");
+	return tcov_sign(c, msg_in, tx, input_num, leaf, NULL, &privkey);
+}
+
+static u8 *handle_sign_tcov_local_htlc(struct hsmd_client *c,
+				       const u8 *msg_in)
+{
+	u64 commit_num, dbid;
+	struct bitcoin_tx *tx;
+	u8 *leaf;
+	u32 input_num;
+	struct node_id peer_id;
+	struct privkey privkey;
+
+	if (!fromwire_hsmd_sign_tcov_local_htlc(tmpctx, msg_in, &commit_num,
+						&tx, &input_num, &leaf,
+						&peer_id, &dbid))
+		return hsmd_status_malformed_request(c, msg_in);
+	if (!tcov_local_privkey(&peer_id, dbid, commit_num, true, &privkey))
+		return hsmd_status_bad_request_fmt(c, msg_in,
+						   "cannot derive the HTLC key");
+	return tcov_sign(c, msg_in, tx, input_num, leaf, NULL, &privkey);
+}
+
+static u8 *handle_sign_tcov_remote_htlc_to_us(struct hsmd_client *c,
+					      const u8 *msg_in)
+{
+	u64 dbid;
+	struct bitcoin_tx *tx;
+	u8 *leaf;
+	u32 input_num;
+	struct node_id peer_id;
+	struct pubkey remote_point;
+	struct secret channel_seed;
+	struct secrets secrets;
+	struct basepoints basepoints;
+	struct privkey privkey;
+
+	if (!fromwire_hsmd_sign_tcov_remote_htlc_to_us(tmpctx, msg_in,
+						       &remote_point, &tx,
+						       &input_num, &leaf,
+						       &peer_id, &dbid))
+		return hsmd_status_malformed_request(c, msg_in);
+	get_channel_seed(&peer_id, dbid, &channel_seed);
+	if (!derive_basepoints(&channel_seed, NULL, &basepoints, &secrets,
+			       NULL)
+	    || !derive_simple_privkey(&secrets.htlc_basepoint_secret,
+				      &basepoints.htlc, &remote_point,
+				      &privkey))
+		return hsmd_status_bad_request_fmt(c, msg_in,
+						   "cannot derive the HTLC key");
+	return tcov_sign(c, msg_in, tx, input_num, leaf, NULL, &privkey);
+}
+
+static u8 *handle_sign_tcov_penalty(struct hsmd_client *c, const u8 *msg_in)
+{
+	u64 dbid;
+	struct bitcoin_tx *tx;
+	u32 input_num;
+	struct node_id peer_id;
+	struct secret revocation_secret, channel_seed, revocation_base_secret;
+	struct sha256 merkle_root;
+	struct pubkey point, revocation_basepoint;
+	struct privkey privkey;
+
+	if (!fromwire_hsmd_sign_tcov_penalty(tmpctx, msg_in, &revocation_secret,
+					     &tx, &input_num, &merkle_root,
+					     &peer_id, &dbid))
+		return hsmd_status_malformed_request(c, msg_in);
+	if (!pubkey_from_secret(&revocation_secret, &point))
+		return hsmd_status_bad_request_fmt(c, msg_in,
+						   "bad revocation secret");
+	get_channel_seed(&peer_id, dbid, &channel_seed);
+	if (!derive_revocation_basepoint(&channel_seed, &revocation_basepoint,
+					 &revocation_base_secret)
+	    || !derive_revocation_privkey(&revocation_base_secret,
+					  &revocation_secret,
+					  &revocation_basepoint, &point,
+					  &privkey))
+		return hsmd_status_bad_request_fmt(c, msg_in,
+						   "cannot derive the revocation key");
+	return tcov_sign(c, msg_in, tx, input_num, NULL, &merkle_root,
+			 &privkey);
+}
+
 u8 *hsmd_handle_client_message(const tal_t *ctx, struct hsmd_client *client,
 			       const u8 *msg)
 {
@@ -2326,6 +2499,14 @@ u8 *hsmd_handle_client_message(const tal_t *ctx, struct hsmd_client *client,
 		return handle_sign_anchorspend(client, msg);
 	case WIRE_HSMD_SIGN_HTLC_TX_MINGLE:
 		return handle_sign_htlc_tx_mingle(client, msg);
+	case WIRE_HSMD_SIGN_TCOV_DELAYED_TO_US:
+		return handle_sign_tcov_delayed_to_us(client, msg);
+	case WIRE_HSMD_SIGN_TCOV_LOCAL_HTLC:
+		return handle_sign_tcov_local_htlc(client, msg);
+	case WIRE_HSMD_SIGN_TCOV_REMOTE_HTLC_TO_US:
+		return handle_sign_tcov_remote_htlc_to_us(client, msg);
+	case WIRE_HSMD_SIGN_TCOV_PENALTY:
+		return handle_sign_tcov_penalty(client, msg);
 
 	case WIRE_HSMD_DEV_MEMLEAK:
 	case WIRE_HSMD_ECDH_RESP:
@@ -2368,6 +2549,7 @@ u8 *hsmd_handle_client_message(const tal_t *ctx, struct hsmd_client *client,
 	case WIRE_HSMD_CHECK_BIP86_PUBKEY_REPLY:
 	case WIRE_HSMD_SIGN_ANCHORSPEND_REPLY:
 	case WIRE_HSMD_SIGN_HTLC_TX_MINGLE_REPLY:
+	case WIRE_HSMD_SIGN_TCOV_REPLY:
 	case WIRE_HSMD_SIGN_ANY_CANNOUNCEMENT_REPLY:
 		break;
 	}
@@ -2459,6 +2641,10 @@ u8 *hsmd_init(const u8 *secret_data, size_t secret_len, const u64 hsmd_version,
 		WIRE_HSMD_REVOKE_COMMITMENT_TX,
 		WIRE_HSMD_SIGN_BOLT12_2,
 		WIRE_HSMD_BIP137_SIGN_MESSAGE,
+		WIRE_HSMD_SIGN_TCOV_DELAYED_TO_US,
+		WIRE_HSMD_SIGN_TCOV_LOCAL_HTLC,
+		WIRE_HSMD_SIGN_TCOV_REMOTE_HTLC_TO_US,
+		WIRE_HSMD_SIGN_TCOV_PENALTY,
 	};
 	u32 *caps;
 

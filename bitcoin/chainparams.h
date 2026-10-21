@@ -56,6 +56,13 @@ struct chainparams {
 	 * 32-byte hash) inserted after block_height, committed under
 	 * SER_GETHASH.  The block parser must pull+hash those 36 bytes. */
 	const bool has_anchor_header;
+	/* SEQUENTIA: the chain's tapscript has the Elements introspection
+	 * opcodes (OP_INSPECTOUTPUT*, OP_PUSHCURRENTINPUTINDEX, the 64-bit
+	 * arithmetic and OP_ECMULSCALARVERIFY), and this fork's channel types
+	 * built on them are offered here.  Set on the Sequentia networks.  It
+	 * is not implied by is_elements: the Liquid entries leave it unset, as
+	 * this fork does not develop against Liquid. */
+	const bool has_tapscript_introspection;
 };
 
 /**

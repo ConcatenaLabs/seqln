@@ -4,6 +4,7 @@
 #include <ccan/array_size/array_size.h>
 #include <channeld/commit_tx.h>
 #include <channeld/full_channel.h>
+#include <channeld/tcov_channel.h>
 #include <common/blockheight_states.h>
 #include <common/features.h>
 #include <common/fee_states.h>
@@ -396,6 +397,28 @@ struct bitcoin_tx **channel_txs(const tal_t *ctx,
 	}
 
 	txs = tal_arr(ctx, struct bitcoin_tx *, 1);
+	/* SEQUENTIA: the taproot-covenant type (common/tcov_commit_tx.h). */
+	if (channel_has(channel, OPT_SEQ_TAPROOT_COVENANT)) {
+		txs[0] = tcov_channel_commit_tx(txs, funding, funding_sats,
+						&funding_pubkeys[side],
+						&funding_pubkeys[!side],
+						channel, &keyset,
+						per_commitment_point,
+						side_pay, other_side_pay,
+						committed, htlcmap,
+						direct_outputs,
+						commitment_number, side);
+		*other_anchor_outnum = -1;
+		psbt_input_add_pubkey(txs[0]->psbt, 0,
+				      &funding_pubkeys[side], false);
+		psbt_input_add_pubkey(txs[0]->psbt, 0,
+				      &funding_pubkeys[!side], false);
+		/* No second-stage HTLC transactions: the HTLC outputs' own
+		 * covenant leaves pay the claims, so commitment_signed
+		 * carries no HTLC signatures. */
+		tal_free(committed);
+		return txs;
+	}
 	txs[0] = commit_tx(
 	    txs, funding,
 	    funding_sats,

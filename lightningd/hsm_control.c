@@ -189,6 +189,21 @@ struct ext_key *hsm_init(struct lightningd *ld)
 		fatal("splicing needs HSM capable of signing splices!");
 	}
 
+	/* SEQUENTIA: a signing device that cannot sign the taproot-covenant
+	 * channel type's spends keeps the node on the other types. */
+	if (feature_offered(ld->our_features->bits[INIT_FEATURE],
+			    OPT_SEQ_TAPROOT_COVENANT)
+	    && !(hsm_capable(ld, WIRE_HSMD_SIGN_TCOV_DELAYED_TO_US)
+		 && hsm_capable(ld, WIRE_HSMD_SIGN_TCOV_LOCAL_HTLC)
+		 && hsm_capable(ld, WIRE_HSMD_SIGN_TCOV_REMOTE_HTLC_TO_US)
+		 && hsm_capable(ld, WIRE_HSMD_SIGN_TCOV_PENALTY))) {
+		log_unusual(ld->log, "The signer cannot sign taproot-covenant"
+			    " channel spends: not offering that channel type");
+		feature_set_sub(ld->our_features,
+				feature_set_for_feature(tmpctx,
+							OPTIONAL_FEATURE(OPT_SEQ_TAPROOT_COVENANT)));
+	}
+
 	/* Check if we have a mnemonic-based HSM secret from TLV */
 	if (tlvs->bip86_base) {
 		ld->bip86_base = tal_steal(ld, tlvs->bip86_base);

@@ -13,14 +13,19 @@ Everything here is testnet software.
 
 ## 1. Networks (`bitcoin/chainparams.c`, `bitcoin/chainparams.h`)
 
-Three Elements-family network entries are added, plus a `has_anchor_header` field on
-`struct chainparams` that gates every Sequentia-specific code path:
+Three Elements-family network entries are added, plus two fields on `struct chainparams`:
+`has_anchor_header`, which gates every Sequentia-specific code path, and
+`has_tapscript_introspection`, which marks a chain whose tapscript has Elements' introspection
+opcodes as one this fork's covenant channel types are offered on, and gates the
+taproot-covenant channel type (section 5b). Such a feature keys on that flag and never on
+`is_elements`, which the Liquid entries share; they leave the flag unset, since this fork does
+not develop against Liquid:
 
-| network_name | onchain HRP | lightning HRP | bip70 (chain) | is_elements | has_anchor_header |
-| --- | --- | --- | --- | --- | --- |
-| `sequentia-testnet` (live) | `tb` | `tsqt` | `test` | yes | yes |
-| `sequentia-regtest` (local tests) | `bcrt` | `sqrt` | `sequentia-regtest` | yes | yes |
-| `sequentia` (placeholder) | `bc` | `sqt` | `sequentia` | yes | yes |
+| network_name | onchain HRP | lightning HRP | bip70 (chain) | is_elements | has_anchor_header | has_tapscript_introspection |
+| --- | --- | --- | --- | --- | --- | --- |
+| `sequentia-testnet` (live) | `tb` | `tsqt` | `test` | yes | yes | yes |
+| `sequentia-regtest` (local tests) | `bcrt` | `sqrt` | `sequentia-regtest` | yes | yes | yes |
+| `sequentia` (placeholder) | `bc` | `sqt` | `sequentia` | yes | yes | yes |
 
 - The on-chain HRP is shared with Bitcoin (`tb`/`bc`) by design: Sequentia is transparent by
   default and its unblinded addresses are byte-identical to Bitcoin's bech32 format, so a
@@ -242,6 +247,103 @@ policy asset by default). File-level map of the threading:
 - `onchaind/onchaind.c` + `onchaind/onchaind_wire.csv`, `lightningd/onchain_control.c`,
   `lightningd/anchorspend.c`: force-close resolution and anchor CPFP in the channel asset
   (single-asset CPFP; no privileged coin is assumed for fee-bumping).
+
+## 5b. Taproot-covenant channels (`option_seq_taproot_covenant`)
+
+A channel type for chains whose tapscript has Elements' introspection opcodes
+(`has_tapscript_introspection`, section 1). Its commitments spend the same 2-of-2 P2WSH funding
+output as every other type, so opening and funding are unchanged, and pay taproot outputs. Each
+HTLC output claims itself: the leaf that lets its holder take it requires the claim's output at
+the same index to carry the HTLC's whole value, in the channel's asset, to the holder's own
+delayed output. The holder needs no signature from the peer for that, so `commitment_signed`
+carries no HTLC signatures, there are no second-stage HTLC transactions, and every claim
+attaches its fee from another input when it is made, in any asset the node accepts for fees.
+
+**Enabling it.** Start both peers with `--taproot-covenant-channels` (lightningd-config(5)). The
+node then offers feature bit 172/173 and prefers the channel type `[12, 172]`
+(`option_static_remotekey` with this type) whenever its peer offers it too; `fundchannel
+channel_type=[12,172]` asks for it explicitly, and a peer that does not offer it gets an
+ordinary channel. `listpeerchannels` names it `seq_taproot_covenant/even`. The option offers
+nothing on a chain without the flag (the Liquid entries included) and nothing when the signer cannot sign the
+type's spends: lightningd withdraws the feature unless hsmd lists the four messages below among
+its capabilities.
+
+**Scripts** (`common/tcov_scripts.{c,h}`, `bitcoin/tapscript.{c,h}`). On the commitment held by
+one side ("self", the peer "other"), every taproot output has self's revocation key as its
+internal key and two leaves, and every key in a leaf is in the script, x-only:
+
+| Output | Leaf 0 | Leaf 1 |
+| --- | --- | --- |
+| `to_local`, and D | DELAY: `<self delayed key> CHECKSIGVERIFY <to_self_delay> CSV` | REVOKE: `<per-commitment point> <G> ROT ECMULSCALARVERIFY KEEP(S)` |
+| HTLC self offered | TIMEOUT: `<self htlc key> CHECKSIGVERIFY <cltv_expiry> CLTV DROP COV(A,X,D)` | SUCCESS: `SIZE 32 EQUALVERIFY HASH160 <RIPEMD160(payment_hash)> EQUALVERIFY <other htlc key> CHECKSIG` |
+| HTLC self received | SUCCESS: the same hash lock, then `<self htlc key> CHECKSIGVERIFY COV(A,X,D)` | TIMEOUT: `<other htlc key> CHECKSIGVERIFY <cltv_expiry> CLTV` |
+
+- `to_remote` is the P2WPKH of other's payment basepoint, as under `option_static_remotekey`.
+- `COV(A,X,D)`: the output at this input's index carries the explicit asset A (the channel's), an
+  explicit value of at least X (the HTLC output's own value) and pays the witness v1 program D,
+  the `to_local` of the same commitment. The output a claim creates is therefore spendable
+  only as `to_local` is: by self after the delay, or by other once self has revoked the
+  commitment.
+- `KEEP(S)`: the output at this input's index carries this input's explicit asset, at least its
+  explicit value, and pays S, other's `to_remote` script. REVOKE needs no signature, only the
+  per-commitment secret that other learns when self revokes the commitment, so anyone holding
+  that secret can return a revoked `to_local`, and every D of that commitment, whole to other.
+- Leaves use the Elements leaf version 0xc4 and the `TapLeaf/elements`, `TapBranch/elements` and
+  `TapTweak/elements` tags; signatures use the Elements taproot signature hash, which commits to
+  the chain's genesis hash and to every input's asset and value (section 9).
+- Locks are block heights and block counts, as BOLT 2 and 4 give them. Fees, trimming and output
+  order are those of an `option_static_remotekey` channel without anchors: a P2TR output weighs
+  what a P2WSH one does, so both sides compute the same commitment fee.
+
+**A force-close on the chain.** The commitment has the funding output as its one input and pays,
+in the channel's asset, a taproot `to_local`, a P2WPKH `to_remote`, one taproot output per HTLC
+above the dust limit, and the explicit fee output. onchaind (`onchaind/onchaind.c`) resolves each
+output by asking lightningd for a spend (`onchaind_spend_tcov`), and lightningd
+(`lightningd/onchain_control.c`) builds it, has hsmd sign it, and rebuilds it at each block at the
+feerate its deadline needs, replacing the one in the mempool when the new fee is higher:
+
+- An HTLC the closing side offered, once its CLTV has passed, and one it received, once it has
+  the preimage: a claim whose input 0 is the HTLC output, spent by its covenant leaf (witness:
+  the preimage for a success, the signature, the leaf, the control block), whose output 0 is D
+  with the HTLC's whole value, and whose fee comes from the node's wallet coins: in the
+  channel's asset if the node accepts it for fees and holds enough of it, otherwise in the
+  accepted asset whose coins are worth most to it, with change back to the wallet. With one fee
+  coin such a claim is about 380 vB. After the closing side's delay it sweeps D to its wallet
+  with the DELAY leaf.
+- `to_local`: swept to the wallet by the DELAY leaf after the delay.
+- The other side takes an HTLC on that commitment with the SUCCESS leaf of one the closer
+  offered (with the preimage) or the TIMEOUT leaf of one the closer received (after its CLTV),
+  paying its own wallet; that claim takes its fee from the output when the node accepts the
+  channel's asset for fees, and from a wallet coin otherwise.
+- A revoked commitment: the victim's onchaind spends its `to_local` and HTLC outputs, and any
+  D the cheater's claims create, by the key path, signed with the revocation key. When a tower got there first
+  with REVOKE, onchaind adds the output it paid the victim to the wallet.
+- No coin in an accepted asset covers a claim's fee: lightningd logs it and tries again.
+
+**Signers.** hsmd signs the spends with four messages (`hsmd/hsmd_wire.csv`):
+`hsmd_sign_tcov_delayed_to_us` (DELAY), `hsmd_sign_tcov_local_htlc` (a covenant leaf),
+`hsmd_sign_tcov_remote_htlc_to_us` (the other side's HTLC leaf) and `hsmd_sign_tcov_penalty`
+(the key path), each answered by `hsmd_sign_tcov_reply` with a BIP340 signature. lightningd sends
+the whole transaction and every input's previous output, since the signature commits to all of
+them, and signs the fee coins with `hsmd_sign_htlc_tx_mingle`.
+
+**Watchtower** (section 7b). At each revocation channeld stores, instead of a signed justice
+transaction, a template of kind `WT_TMPL_TCOV_REVOKE` (`common/presign_templates.h`): the
+REVOKE leaf's witness (the revoked secret, the leaf, its control block) and the output S it
+pays. It needs no signature, so the device signs nothing for the tower on this type. `speculad`
+finds the revoked commitment's `to_local` and every D (the same script) with `scantxoutset`
+once the commitment confirms, and spends each to S with its fee input, as it does for the other
+templates.
+
+Files: `bitcoin/chainparams.{c,h}`, `bitcoin/tapscript.{c,h}`, `common/tcov_scripts.{c,h}`,
+`common/tcov_commit_tx.{c,h}`, `common/features.{c,h}`, `common/channel_type.{c,h}`,
+`common/initial_channel.c`, `channeld/tcov_channel.{c,h}`, `channeld/full_channel.c`,
+`channeld/channeld.c`, `hsmd/hsmd_wire.csv`, `hsmd/libhsmd.c`, `lightningd/options.c`,
+`lightningd/hsm_control.c`, `lightningd/channel.c`, `lightningd/onchain_control.c`,
+`lightningd/onchain_presign.c`, `onchaind/onchaind.c`, `onchaind/onchaind_wire.csv`,
+`speculad/speculad.c`. Tests: `common/test/run-tcov_scripts.c` (the trees, control blocks,
+signature hashes and signatures against vectors from the Sequentia node's test framework) and
+`tests/sequentia/test_taproot_covenant.py` (section 10).
 
 ## 6. Asset-aware gossip, routing, payments
 
@@ -477,6 +579,10 @@ host can defend the channel while the device is offline, without ever holding a 
   per channel; the stored revoked commitments are polled only once a channel's funding output is
   spent. It needs the node to run with `txindex=1`.
 
+On a taproot-covenant channel (section 5b) the tower's template for a revoked commitment is the
+REVOKE leaf's witness, which needs no signature; `speculad` finds that commitment's `to_local`
+and every claim output of it by their script and returns each to the victim.
+
 The Specula design note is not yet published in this repository; the header comment of
 `speculad/speculad.c` is the fullest description of the model.
 
@@ -496,6 +602,7 @@ The Specula design note is not yet published in this repository; the header comm
 | `contrib/holdinvoice-seq/` | New plugin: hold-invoice primitive for pure-Lightning swaps |
 | `contrib/crossasset-seq/` | New plugin: quoted cross-asset forwarding (signed quotes, one forward per quote, settle or fail both HTLCs together) |
 | `contrib/seqln-signer/` | New crate: Rust device signer (native + WASM) |
+| `channeld`, `onchaind`, `lightningd/onchain_control.c`, `hsmd`, `speculad` | Taproot-covenant channel type: taproot commitments, covenant HTLC claims with the fee attached at claim time, keyless tower template (section 5b) |
 
 ## 9. libwally dependency
 
@@ -597,7 +704,12 @@ Sequence token or in an issued asset funded by one transaction from a wallet out
 `fundchannel_complete` given it blinded and unsigned, its txid unchanged by the signatures the
 wallet adds after the peer has signed the first commitment, and the channel paid over and closed
 to the node, which held nothing; with `fundchannel_complete` accepting a funding output worth less
-than the channel, which the funder must therefore check itself (`test_external_funding.py`). They need `sequentiad`, `sequentia-cli`
+than the channel, which the funder must therefore check itself (`test_external_funding.py`), and
+the taproot-covenant channel type (section 5b): chosen only when both peers offer it, paid over
+both ways, an HTLC in flight at a force-close claimed by its covenant past its CLTV with the fee
+from a coin in another asset and claimed with its preimage, the peer's claims on the closer's
+commitment by either leaf, a revoked commitment punished by the victim and, while the victim is
+offline, by `speculad` (`test_taproot_covenant.py`). They need `sequentiad`, `sequentia-cli`
 and a Bitcoin Core `bitcoind` on `PATH`, and the keyless tests need the device signer built
 (`cargo build --release` in `contrib/seqln-signer`, or `SEQLN_SIGNER=/path/to/seqln-signer`).
 The test plugins run under the `python3` on `PATH`, which needs the `pyln` packages, so the

@@ -19,6 +19,7 @@ tests/plugins/channeld_fakenet:			\
 	channeld/commit_tx.o			\
 	channeld/full_channel.o			\
 	channeld/inflight.o			\
+	channeld/tcov_channel.o			\
 	libcommon.a
 
 # Make sure these depend on everything.

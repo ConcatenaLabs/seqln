@@ -456,6 +456,17 @@ use the RPC call lightning-setchannel(7).
 we tell our peer that this is how long they'll have to wait if they
 perform a unilateral close.
 
+* **taproot-covenant-channels**
+
+  Offer, and prefer when the peer offers it too, the taproot-covenant
+channel type (feature bit 172/173): commitments that pay taproot
+outputs, whose HTLC outputs a side claims by covenant, without a
+signature from its peer, attaching the claim's fee at claim time in
+any asset the node accepts for fees. Only on the Sequentia networks,
+whose scripts have Elements' introspection opcodes, and only when
+*hsmd* can sign the type's spends; elsewhere the option offers
+nothing and logs why.
+
 * (deprecated in v23.05) **max-locktime-blocks**=*BLOCKS*
 
   The longest our funds can be delayed (ie. the longest

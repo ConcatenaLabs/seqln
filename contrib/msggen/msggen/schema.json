@@ -14342,7 +14342,8 @@
                     "anchors_zero_fee_htlc_tx/even",
                     "anchors/even",
                     "scid_alias/even",
-                    "zeroconf/even"
+                    "zeroconf/even",
+                    "seq_taproot_covenant/even"
                   ],
                   "description": [
                     "Name of feature bit."
@@ -14818,7 +14819,8 @@
                     "anchors_zero_fee_htlc_tx/even",
                     "anchors/even",
                     "scid_alias/even",
-                    "zeroconf/even"
+                    "zeroconf/even",
+                    "seq_taproot_covenant/even"
                   ],
                   "description": [
                     "Name of feature bit."
@@ -19583,7 +19585,8 @@
                           "anchors/even",
                           "anchors_zero_fee_htlc_tx/even",
                           "scid_alias/even",
-                          "zeroconf/even"
+                          "zeroconf/even",
+                          "seq_taproot_covenant/even"
                         ],
                         "description": [
                           "Name of feature bit."
@@ -25132,7 +25135,8 @@
                           "anchors/even",
                           "anchors_zero_fee_htlc_tx/even",
                           "scid_alias/even",
-                          "zeroconf/even"
+                          "zeroconf/even",
+                          "seq_taproot_covenant/even"
                         ],
                         "description": [
                           "Name of feature bit."
@@ -28528,7 +28532,8 @@
                           "anchors_zero_fee_htlc_tx/even",
                           "anchors/even",
                           "scid_alias/even",
-                          "zeroconf/even"
+                          "zeroconf/even",
+                          "seq_taproot_covenant/even"
                         ],
                         "description": [
                           "Name of feature bit."
@@ -29562,7 +29567,8 @@
                     "anchors_zero_fee_htlc_tx/even",
                     "anchors/even",
                     "scid_alias/even",
-                    "zeroconf/even"
+                    "zeroconf/even",
+                    "seq_taproot_covenant/even"
                   ],
                   "description": [
                     "Name of feature bit."
@@ -29871,7 +29877,8 @@
                     "anchors_zero_fee_htlc_tx/even",
                     "anchors/even",
                     "scid_alias/even",
-                    "zeroconf/even"
+                    "zeroconf/even",
+                    "seq_taproot_covenant/even"
                   ],
                   "description": [
                     "Name of feature bit."
@@ -30210,7 +30217,8 @@
                     "anchors_zero_fee_htlc_tx/even",
                     "anchors/even",
                     "scid_alias/even",
-                    "zeroconf/even"
+                    "zeroconf/even",
+                    "seq_taproot_covenant/even"
                   ],
                   "description": [
                     "Name of feature bit."

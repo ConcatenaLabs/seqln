@@ -1672,6 +1672,11 @@ static void register_opts(struct lightningd *ld)
 		       "and sweep sets for speculad): auto = only when hsmd is "
 		       "a signer proxy, on, or off.");
 
+	opt_register_noarg("--taproot-covenant-channels",
+			   opt_set_bool, &ld->config.taproot_covenant_channels,
+			   "Offer channels whose commitment outputs are taproot trees, "
+			   "with HTLCs claimed by covenant and fees attached at "
+			   "claim time (Sequentia networks only)");
 	opt_register_noarg("--invoices-onchain-fallback",
 			   opt_set_bool, &ld->unified_invoices,
 			   "Include an onchain address in invoices and mark them as paid if payment is received on-chain");
@@ -1990,6 +1995,22 @@ void handle_opts(struct lightningd *ld)
 				 " you won't be able to make connections out");
 	}
 	check_config(ld);
+
+	/* SEQUENTIA: the taproot-covenant channel type is offered only on a
+	 * chain that sets has_tapscript_introspection (the Sequentia networks),
+	 * never on the strength of is_elements.  hsm_control.c withdraws it
+	 * again if the signer cannot sign its spends. */
+	if (ld->config.taproot_covenant_channels) {
+		if (chainparams->has_tapscript_introspection)
+			feature_set_or(ld->our_features,
+				       take(feature_set_for_feature(NULL,
+								    OPTIONAL_FEATURE(OPT_SEQ_TAPROOT_COVENANT))));
+		else
+			log_unusual(ld->log, "--taproot-covenant-channels:"
+				    " not offered on %s, only on the"
+				    " Sequentia networks",
+				    chainparams->network_name);
+	}
 }
 
 /* Canonicalize value they've given */

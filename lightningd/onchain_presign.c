@@ -346,6 +346,11 @@ struct watchtower_blob **onchain_presign_current_sweeps(const tal_t *ctx,
 	struct lightningd *ld = channel->peer->ld;
 	struct watchtower_blob **blobs;
 
+	/* SEQUENTIA: these sweeps spend P2WSH outputs and pre-signed HTLC
+	 * transactions, which a taproot-covenant channel does not have. */
+	if (channel_has(channel, OPT_SEQ_TAPROOT_COVENANT))
+		return NULL;
+
 	/* Stash the keyset ingredients for the fulfill-time (kind-5) rebuild:
 	 * the preimage is only known then, so onchain_presign_htlc_success()
 	 * re-derives the LOCAL keyset from these. */
@@ -544,6 +549,10 @@ void onchain_presign_remote_htlc_sweeps(struct channel *channel,
 	const bool static_remotekey
 		= pbase->commitment_num >= channel->static_remotekey_start[REMOTE];
 
+	/* SEQUENTIA: see onchain_presign_current_sweeps. */
+	if (channel_has(channel, OPT_SEQ_TAPROOT_COVENANT))
+		return;
+
 	/* Stash the REMOTE commitment ingredients for the fulfill-time
 	 * received-by-us (kind-6, preimage) rebuild. */
 	channel->presign_remote_commit_num = pbase->commitment_num;
@@ -607,6 +616,11 @@ bool onchain_presign_htlc_success(struct channel *channel, struct htlc_in *hin)
 	const u64 commit_num = channel->presign_commit_num;
 	bool static_remotekey, opt_anchor_outputs, opt_anchors_zero_fee, hsm_anchors;
 	u32 htlc_feerate, our_to_self_delay;
+
+	/* SEQUENTIA: see onchain_presign_current_sweeps.  Nothing to store
+	 * first, so the preimage may go. */
+	if (channel_has(channel, OPT_SEQ_TAPROOT_COVENANT))
+		return true;
 
 	/* Best-effort on testnet: if the keyset stash is absent (e.g. right
 	 * after a restart, before the next commitment advance) we cannot build

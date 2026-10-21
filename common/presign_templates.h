@@ -42,6 +42,17 @@ enum wt_tmpl_kind {
 	WT_TMPL_HTLC_TIMEOUT = 4,	    /* TIER-2 (peer-cosigned); master-fd seam */
 	WT_TMPL_HTLC_SUCCESS = 5,	    /* TIER-2, needs preimage; master-fd seam */
 	WT_TMPL_REMOTE_HTLC_TO_US = 6,	    /* sweep of an HTLC offered to us */
+
+	/* SEQUENTIA: justice on a revoked commitment of a taproot-covenant
+	 * channel (common/tcov_scripts.h), made with no signature: tx spends
+	 * the revoked to_local (output_index, or (u32)-1 when it has none) by
+	 * its REVOKE leaf, witness <revoked per-commitment secret> <leaf>
+	 * <control block>, and pays the victim's static payment script the
+	 * whole amount; wscript is to_local's scriptPubKey.  Every claim the
+	 * cheater makes from that commitment pays an output with that same
+	 * script, which the same witness spends: speculad sweeps each output
+	 * paying it, whatever transaction made it. */
+	WT_TMPL_TCOV_REVOKE = 7,
 };
 
 /* An unsigned defensive template: the tx-to-be-signed + the metadata the
