@@ -33,6 +33,7 @@
 #include <common/peer_failed.h>
 #include <common/peer_io.h>
 #include <common/per_peer_state.h>
+#include <common/point_lock.h>
 #include <common/psbt_internal.h>
 #include <common/psbt_open.h>
 #include <common/read_peer_msg.h>
@@ -659,6 +660,25 @@ static void handle_peer_add_htlc(struct peer *peer, const u8 *msg)
 				 "Bad peer_add_htlc %s", tal_hex(msg, msg));
 	}
 
+	/* SEQUENTIA: a point-locked HTLC (common/point_lock.h) needs a channel
+	 * whose scripts can lock to a point, a node that offered to take one,
+	 * and a payment_hash that is the point's x coordinate. */
+	if (tlvs->seq_point_lock) {
+		struct sha256 x;
+
+		if (!channel_has(peer->channel, OPT_SEQ_TAPROOT_COVENANT)
+		    || !feature_offered(peer->our_features->bits[INIT_FEATURE],
+					OPT_SEQ_POINT_LOCKS))
+			peer_failed_warn(peer->pps, &peer->channel_id,
+					 "Bad peer_add_htlc: a point lock on a"
+					 " channel that takes none");
+		point_lock_payment_hash(tlvs->seq_point_lock, &x);
+		if (!sha256_eq(&x, &payment_hash))
+			peer_failed_warn(peer->pps, &peer->channel_id,
+					 "Bad peer_add_htlc: payment_hash is"
+					 " not its lock point's x coordinate");
+	}
+
 	/* BOLT #2:
 	 *  - if the sender did not previously acknowledge the commitment of that HTLC:
 	 *     - MUST ignore a repeated `id` value after a reconnection.
@@ -689,6 +709,9 @@ static void handle_peer_add_htlc(struct peer *peer, const u8 *msg)
 		peer_failed_warn(peer->pps, &peer->channel_id,
 				 "Bad peer_add_htlc: %s",
 				 channel_add_err_name(add_err));
+	if (tlvs->seq_point_lock)
+		htlc->lock_point = tal_dup(htlc, struct pubkey,
+					   tlvs->seq_point_lock);
 }
 
 /* We don't get upset if they're outside the range, as long as they're
@@ -1005,6 +1028,33 @@ static struct hsm_htlc *collect_htlcs(const tal_t *ctx,
 	return htlcs;
 }
 
+/* SEQUENTIA: before the signer validates or signs a commitment of @side,
+ * tell it which of its HTLCs are point-locked, and to what point
+ * (hsmd_tcov_htlc_locks; common/point_lock.h). */
+static void tell_hsm_point_locks(const struct channel *channel, enum side side)
+{
+	const struct htlc **committed
+		= channel_committed_htlcs(tmpctx, channel, side);
+	struct sha256 *hashes = tal_arr(tmpctx, struct sha256, 0);
+	struct pubkey *points = tal_arr(tmpctx, struct pubkey, 0);
+	const u8 *msg;
+
+	for (size_t i = 0; i < tal_count(committed); i++) {
+		if (!committed[i]->lock_point)
+			continue;
+		tal_arr_expand(&hashes, committed[i]->rhash);
+		tal_arr_expand(&points, *committed[i]->lock_point);
+	}
+	if (tal_count(hashes) == 0)
+		return;
+	msg = hsm_req(tmpctx, take(towire_hsmd_tcov_htlc_locks(NULL, hashes,
+								 points)));
+	if (!fromwire_hsmd_tcov_htlc_locks_reply(msg))
+		status_failed(STATUS_FAIL_HSM_IO,
+			      "Reading tcov_htlc_locks reply: %s",
+			      tal_hex(tmpctx, msg));
+}
+
 /* Returns HTLC sigs, sets commit_sig. Also used for making commitsigs for each
  * splice awaiting on-chain confirmation. */
 static struct bitcoin_signature *calc_commitsigs(const tal_t *ctx,
@@ -1028,6 +1078,7 @@ static struct bitcoin_signature *calc_commitsigs(const tal_t *ctx,
 		     (int)commit_index, remote_per_commit, commit_sig);
 
 	htlcs = collect_htlcs(tmpctx, peer->channel, REMOTE);
+	tell_hsm_point_locks(peer->channel, REMOTE);
 	msg = towire_hsmd_sign_remote_commitment_tx(NULL, txs[0],
 						    &remote_funding_pubkey,
 						    remote_per_commit,
@@ -1751,6 +1802,7 @@ static void marshall_htlc_info(const tal_t *ctx,
 			a->path_key = htlc->path_key;
 			a->extra_tlvs = htlc->extra_tlvs;
 			a->fail_immediate = htlc->fail_immediate;
+			a->lock_point = htlc->lock_point;
 			tal_arr_expand(added, a);
 		} else if (htlc->state == RCVD_REMOVE_COMMIT) {
 			if (htlc->r) {
@@ -2360,6 +2412,7 @@ static struct commitsig_info *handle_peer_commit_sig(struct peer *peer,
 
 	/* As of HSM_VERSION 5 returned old_secret is always NULL (revoke returns it instead) */
 	htlcs = collect_htlcs(NULL, peer->channel, LOCAL);
+	tell_hsm_point_locks(peer->channel, LOCAL);
 	msg2 = towire_hsmd_validate_commitment_tx(NULL,
 						  txs[0],
 						  htlcs,
@@ -5559,9 +5612,13 @@ static void resend_commitment(struct peer *peer, struct changed_htlc *last)
 
 		if (h->state == SENT_ADD_COMMIT) {
 			struct tlv_update_add_htlc_tlvs *tlvs = NULL;
-			if (h->extra_tlvs || h->path_key) {
+			if (h->extra_tlvs || h->path_key || h->lock_point) {
 				tlvs = tlv_update_add_htlc_tlvs_new(tmpctx);
 			}
+			if (h->lock_point)
+				tlvs->seq_point_lock
+					= tal_dup(tlvs, struct pubkey,
+						  h->lock_point);
 			if (h->extra_tlvs) {
 				tlvs->fields = tal_dup_talarr(tmpctx,
 							      struct tlv_field,
@@ -6541,6 +6598,8 @@ static void handle_offer_htlc(struct peer *peer, const u8 *inmsg)
 	struct tlv_field *extra_tlvs;
 	struct tlv_update_add_htlc_tlvs *tlvs;
 	u8 *extra_tlvs_raw;
+	struct pubkey *lock_point;
+	struct htlc *htlc;
 
 	if (!peer->channel_ready[LOCAL] || !peer->channel_ready[REMOTE])
 		status_failed(STATUS_FAIL_MASTER_IO,
@@ -6548,11 +6607,21 @@ static void handle_offer_htlc(struct peer *peer, const u8 *inmsg)
 
 	if (!fromwire_channeld_offer_htlc(tmpctx, inmsg, &amount,
 					 &cltv_expiry, &payment_hash,
-					 onion_routing_packet, &path_key, &extra_tlvs_raw))
+					 onion_routing_packet, &path_key, &extra_tlvs_raw,
+					 &lock_point))
 		master_badmsg(WIRE_CHANNELD_OFFER_HTLC, inmsg);
 
+	/* SEQUENTIA: lightningd offers a point-locked HTLC only on a channel
+	 * that takes one (offer_point_lock_ok in lightningd/peer_htlcs.c). */
+	if (lock_point
+	    && (!channel_has(peer->channel, OPT_SEQ_TAPROOT_COVENANT)
+		|| !feature_negotiated(peer->our_features, peer->their_features,
+				       OPT_SEQ_POINT_LOCKS)))
+		status_failed(STATUS_FAIL_MASTER_IO,
+			      "offer_htlc: a point lock on a channel that"
+			      " takes none");
 
-	if (extra_tlvs_raw || path_key) {
+	if (extra_tlvs_raw || path_key || lock_point) {
 		tlvs = tlv_update_add_htlc_tlvs_new(tmpctx);
 	} else {
 		tlvs = NULL;
@@ -6576,11 +6645,15 @@ static void handle_offer_htlc(struct peer *peer, const u8 *inmsg)
 	if (path_key) {
 		tlvs->blinded_path = tal_dup(tlvs, struct pubkey, path_key);
 	}
+	if (lock_point)
+		tlvs->seq_point_lock = tal_dup(tlvs, struct pubkey, lock_point);
 
 	e = channel_add_htlc(peer->channel, LOCAL, peer->htlc_id,
 			     amount, cltv_expiry, &payment_hash,
-			     onion_routing_packet, take(path_key), NULL,
+			     onion_routing_packet, take(path_key), &htlc,
 			     &htlc_fee, extra_tlvs, true);
+	if (e == CHANNEL_ERR_ADD_OK && lock_point)
+		htlc->lock_point = tal_dup(htlc, struct pubkey, lock_point);
 	status_debug("Adding HTLC %"PRIu64" amount=%s cltv=%u gave %s",
 		     peer->htlc_id,
 		     fmt_amount_msat(tmpctx, amount),

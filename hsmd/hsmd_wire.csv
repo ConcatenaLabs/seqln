@@ -584,3 +584,17 @@ msgdata,hsmd_sign_tcov_penalty,channel_dbid,u64,
 # Reply for the four above.
 msgtype,hsmd_sign_tcov_reply,161
 msgdata,hsmd_sign_tcov_reply,sig,bip340sig,
+
+# SEQUENTIA: the point locks of a taproot-covenant commitment's HTLCs
+# (common/point_lock.h).  channeld sends it before hsmd_validate_commitment_tx
+# and hsmd_sign_remote_commitment_tx whenever an HTLC of that commitment is
+# point-locked: payment_hashes[i] is that HTLC's payment_hash, the x
+# coordinate of lock_points[i].  A signer that rebuilds the commitment's
+# outputs builds those HTLCs' SUCCESS leaves with these points.  lightningd
+# offers option_seq_point_locks only when the signer lists this message.
+msgtype,hsmd_tcov_htlc_locks,65
+msgdata,hsmd_tcov_htlc_locks,num_locks,u16,
+msgdata,hsmd_tcov_htlc_locks,payment_hashes,sha256,num_locks
+msgdata,hsmd_tcov_htlc_locks,lock_points,pubkey,num_locks
+
+msgtype,hsmd_tcov_htlc_locks_reply,165

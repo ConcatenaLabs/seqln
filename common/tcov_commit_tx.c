@@ -100,6 +100,7 @@ struct bitcoin_tx *tcov_commit_tx(const tal_t *ctx,
 						       to_self_delay,
 						       channel_asset,
 						       &h->payment_ripemd,
+						       h->lock_point,
 						       h->cltv_expiry, amt,
 						       &tree);
 			else
@@ -108,6 +109,7 @@ struct bitcoin_tx *tcov_commit_tx(const tal_t *ctx,
 							to_self_delay,
 							channel_asset,
 							&h->payment_ripemd,
+							h->lock_point,
 							h->cltv_expiry, amt,
 							&tree);
 			bitcoin_tx_add_output(tx,

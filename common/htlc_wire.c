@@ -52,7 +52,8 @@ struct existing_htlc *new_existing_htlc(const tal_t *ctx,
 					const struct pubkey *path_key TAKES,
 					const struct preimage *preimage TAKES,
 					const struct failed_htlc *failed TAKES,
-					const struct tlv_field *extra_tlvs TAKES)
+					const struct tlv_field *extra_tlvs TAKES,
+					const struct pubkey *lock_point TAKES)
 {
 	struct existing_htlc *existing = tal(ctx, struct existing_htlc);
 
@@ -74,6 +75,8 @@ struct existing_htlc *new_existing_htlc(const tal_t *ctx,
 		existing->extra_tlvs = tlv_field_arr_dup(existing, extra_tlvs);
 	else
 		existing->extra_tlvs = NULL;
+	existing->lock_point = tal_dup_or_null(existing, struct pubkey,
+					       lock_point);
 
 	return existing;
 }
@@ -111,6 +114,11 @@ void towire_added_htlc(u8 **pptr, const struct added_htlc *added)
 	} else
 		towire_bool(pptr, false);
 	towire_bool(pptr, added->fail_immediate);
+	if (added->lock_point) {
+		towire_bool(pptr, true);
+		towire_pubkey(pptr, added->lock_point);
+	} else
+		towire_bool(pptr, false);
 }
 
 void towire_existing_htlc(u8 **pptr, const struct existing_htlc *existing)
@@ -140,6 +148,11 @@ void towire_existing_htlc(u8 **pptr, const struct existing_htlc *existing)
 	if (existing->extra_tlvs) {
 		towire_bool(pptr, true);
 		towire_len_and_tlvstream(pptr, existing->extra_tlvs);
+	} else
+		towire_bool(pptr, false);
+	if (existing->lock_point) {
+		towire_bool(pptr, true);
+		towire_pubkey(pptr, existing->lock_point);
 	} else
 		towire_bool(pptr, false);
 }
@@ -236,6 +249,11 @@ struct added_htlc *fromwire_added_htlc(const tal_t *ctx, const u8 **cursor,
 	} else
 		added->extra_tlvs = NULL;
 	added->fail_immediate = fromwire_bool(cursor, max);
+	if (fromwire_bool(cursor, max)) {
+		added->lock_point = tal(added, struct pubkey);
+		fromwire_pubkey(cursor, max, added->lock_point);
+	} else
+		added->lock_point = NULL;
 	return added;
 }
 
@@ -269,6 +287,11 @@ struct existing_htlc *fromwire_existing_htlc(const tal_t *ctx,
 		existing->extra_tlvs = fromwire_len_and_tlvstream(existing, cursor, max);
 	} else
 		existing->extra_tlvs = NULL;
+	if (fromwire_bool(cursor, max)) {
+		existing->lock_point = tal(existing, struct pubkey);
+		fromwire_pubkey(cursor, max, existing->lock_point);
+	} else
+		existing->lock_point = NULL;
 	return existing;
 }
 

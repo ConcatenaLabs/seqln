@@ -13,6 +13,7 @@
 #include <common/htlc_wire.h>
 #include <common/keyset.h>
 #include <common/memleak.h>
+#include <common/point_lock.h>
 #include <common/status.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -681,6 +682,7 @@ static enum channel_add_err add_htlc(struct channel *channel,
 	htlc->path_key = tal_dup_or_null(htlc, struct pubkey, path_key);
 	htlc->failed = NULL;
 	htlc->r = NULL;
+	htlc->lock_point = NULL;
 	htlc->routing = tal_dup_arr(htlc, u8, routing, TOTAL_PACKET_SIZE(ROUTING_INFO_SIZE), 0);
 	if (extra_tlvs && tal_count(extra_tlvs) > 0) {
 		htlc->extra_tlvs = tal_dup_talarr(htlc, struct tlv_field, extra_tlvs);
@@ -1026,16 +1028,23 @@ enum channel_remove_err channel_fulfill_htlc(struct channel *channel,
 	if (htlc->r)
 		return CHANNEL_ERR_ALREADY_FULFILLED;
 
-	sha256(&hash, preimage, sizeof(*preimage));
-	/* BOLT #2:
-	 *
-	 *  - if the `payment_preimage` value in `update_fulfill_htlc`
-	 *  doesn't SHA256 hash to the corresponding HTLC `payment_hash`:
-	 *     - MUST send a `warning` and close the connection, or send an
-	 *       `error` and fail the channel.
-	 */
-	if (!sha256_eq(&hash, &htlc->rhash))
-		return CHANNEL_ERR_BAD_PREIMAGE;
+	/* SEQUENTIA: a point-locked HTLC opens with the scalar of its lock
+	 * point, as its SUCCESS leaf does (common/point_lock.h). */
+	if (htlc->lock_point) {
+		if (!point_lock_opens(htlc->lock_point, preimage))
+			return CHANNEL_ERR_BAD_PREIMAGE;
+	} else {
+		sha256(&hash, preimage, sizeof(*preimage));
+		/* BOLT #2:
+		 *
+		 *  - if the `payment_preimage` value in `update_fulfill_htlc`
+		 *  doesn't SHA256 hash to the corresponding HTLC `payment_hash`:
+		 *     - MUST send a `warning` and close the connection, or send an
+		 *       `error` and fail the channel.
+		 */
+		if (!sha256_eq(&hash, &htlc->rhash))
+			return CHANNEL_ERR_BAD_PREIMAGE;
+	}
 
 	htlc->r = tal_dup(htlc, struct preimage, preimage);
 
@@ -1702,6 +1711,8 @@ bool channel_force_htlcs(struct channel *channel,
 				     ? "out" : "in", htlcs[i]->id, e);
 			return false;
 		}
+		htlc->lock_point = tal_dup_or_null(htlc, struct pubkey,
+						   htlcs[i]->lock_point);
 		if (htlcs[i]->payment_preimage)
 			htlc->r = tal_dup(htlc, struct preimage,
 					  htlcs[i]->payment_preimage);

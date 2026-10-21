@@ -63,6 +63,9 @@ void json_add_bolt11(struct json_stream *response,
 	if (b11->asset)
 		json_add_string(response, "asset",
 				fmt_asset_id(tmpctx, b11->asset));
+	/* SEQUENTIA: the payment point a point-locked payment uses. */
+	if (b11->payment_point)
+		json_add_pubkey(response, "payment_point", b11->payment_point);
         if (tal_count(b11->fallbacks)) {
 		json_array_start(response, "fallbacks");
 		for (size_t i = 0; i < tal_count(b11->fallbacks); i++)

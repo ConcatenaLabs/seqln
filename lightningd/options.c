@@ -1677,6 +1677,11 @@ static void register_opts(struct lightningd *ld)
 			   "Offer channels whose commitment outputs are taproot trees, "
 			   "with HTLCs claimed by covenant and fees attached at "
 			   "claim time (Sequentia networks only)");
+	opt_register_noarg("--point-locks",
+			   opt_set_bool, &ld->config.point_locks,
+			   "With --taproot-covenant-channels, take and offer HTLCs"
+			   " locked to a point rather than a hash, for payments"
+			   " whose every hop takes them (Sequentia networks only)");
 	opt_register_noarg("--invoices-onchain-fallback",
 			   opt_set_bool, &ld->unified_invoices,
 			   "Include an onchain address in invoices and mark them as paid if payment is received on-chain");
@@ -2010,6 +2015,19 @@ void handle_opts(struct lightningd *ld)
 				    " not offered on %s, only on the"
 				    " Sequentia networks",
 				    chainparams->network_name);
+	}
+	/* SEQUENTIA: point locks ride on that channel type; hsm_control.c
+	 * withdraws them if the signer cannot take them. */
+	if (ld->config.point_locks) {
+		if (ld->config.taproot_covenant_channels
+		    && chainparams->has_tapscript_introspection)
+			feature_set_or(ld->our_features,
+				       take(feature_set_for_feature(NULL,
+								    OPTIONAL_FEATURE(OPT_SEQ_POINT_LOCKS))));
+		else
+			log_unusual(ld->log, "--point-locks: needs"
+				    " --taproot-covenant-channels on a"
+				    " Sequentia network");
 	}
 }
 

@@ -12,6 +12,8 @@
 #include <common/gossmods_listpeerchannels.h>
 #include <common/json_stream.h>
 #include <common/memleak.h>
+#include <common/point_lock.h>
+#include <common/randbytes.h>
 #include <common/random_select.h>
 #include <common/route.h>
 #include <common/trace.h>
@@ -111,6 +113,10 @@ struct payment *payment_new(tal_t *ctx, struct command *cmd,
 	/* Sequentia: asset filter; the root payment's value is authoritative
 	 * (payment_route_check reads it via payment_root). */
 	p->asset = parent ? parent->asset : NULL;
+	/* SEQUENTIA: point locks live on the root payment. */
+	p->point_lock = NULL;
+	p->point_lock_sent = false;
+	p->point_lock_routing = false;
 
 	/* Copy over the relevant pieces of information. */
 	if (parent != NULL) {
@@ -671,6 +677,46 @@ static bool dst_is_excluded(const struct gossmap *gossmap,
 	return false;
 }
 
+/* SEQUENTIA: point locks (common/point_lock.h). */
+
+/* Does node @n take point-locked HTLCs: the payee (its invoice said so),
+ * or a node whose announcement offers option_seq_point_locks? */
+static bool payment_point_lock_hop_ok(const struct gossmap *gossmap,
+				      const struct gossmap_node *n,
+				      struct payment *p)
+{
+	struct node_id id;
+
+	gossmap_node_get_id(gossmap, n, &id);
+	if (node_id_eq(&id, payment_root(p)->pay_destination))
+		return true;
+	return gossmap_node_get_feature(gossmap, n, OPT_SEQ_POINT_LOCKS) != -1;
+}
+
+/* The payment falls back to its hash lock, unless an attempt already went
+ * out point-locked. */
+static bool payment_point_lock_fallback(struct payment *p, const char *why)
+{
+	struct payment *root = payment_root(p);
+
+	if (!root->point_lock || root->point_lock_sent)
+		return false;
+	paymod_log(p, LOG_INFORM,
+		   "Paying by hash lock, not point lock: %s", why);
+	root->point_lock = tal_free(root->point_lock);
+	return true;
+}
+
+/* The payment_hash lightningd keys this payment's HTLCs on. */
+static const struct sha256 *payment_lock_hash(struct payment *p)
+{
+	const struct payment *root = payment_root(p);
+
+	if (root->point_lock)
+		return &root->point_hash0;
+	return p->payment_hash;
+}
+
 static bool payment_route_check(const struct gossmap *gossmap,
 				const struct gossmap_chan *c,
 				int dir,
@@ -692,6 +738,14 @@ static bool payment_route_check(const struct gossmap *gossmap,
 	}
 
 	if (dst_is_excluded(gossmap, c, dir, payment_root(p)->excluded_nodes))
+		return false;
+
+	/* SEQUENTIA: a point-locked payment goes only through nodes that
+	 * take point locks (the payee says so in its invoice). */
+	if (payment_root(p)->point_lock && payment_root(p)->point_lock_routing
+	    && !payment_point_lock_hop_ok(gossmap,
+					  gossmap_nth_node(gossmap, c, !dir),
+					  p))
 		return false;
 
 	if (dst_is_excluded(gossmap, c, dir, p->temp_exclusion))
@@ -896,9 +950,20 @@ static struct command_result *payment_getroute(struct payment *p)
 		return payment_fail(p, "We don't have any channels");
 	}
 
+	payment_root(p)->point_lock_routing = true;
 	p->route = route(p, gossmap, src, dst, p->getroute->amount, p->getroute->cltv,
 			 p->getroute->riskfactorppm / 1000000.0, p->getroute->max_hops,
 			 p, &errstr);
+	payment_root(p)->point_lock_routing = false;
+	/* SEQUENTIA: no route whose every node takes point locks: the
+	 * payment goes by its hash lock, if nothing went out yet. */
+	if (!p->route
+	    && payment_point_lock_fallback(p, "no route through nodes that"
+					   " all take point locks"))
+		p->route = route(p, gossmap, src, dst, p->getroute->amount,
+				 p->getroute->cltv,
+				 p->getroute->riskfactorppm / 1000000.0,
+				 p->getroute->max_hops, p, &errstr);
 	put_gossmap(p);
 
 	if (!p->route) {
@@ -1669,6 +1734,34 @@ payment_waitsendpay_finished(struct command *cmd,
 
 	payment_result_infer(p->route, p->result);
 
+	/* SEQUENTIA: a point-locked payment returns the scalar opening L0;
+	 * minus c, it is the invoice's preimage (whose point is T). */
+	if (p->result->state == PAYMENT_COMPLETE
+	    && payment_root(p)->point_lock && p->result->payment_preimage) {
+		struct payment *root = payment_root(p);
+		struct preimage inv;
+		struct sha256 h;
+
+		if (!point_lock_scalar_sub(p->result->payment_preimage,
+					   &root->point_c, &inv)
+		    || !point_lock_opens(root->point_lock, &inv))
+			paymod_log(p, LOG_BROKEN,
+				   "Point-locked payment returned %s, which"
+				   " does not give the invoice's point",
+				   fmt_preimage(tmpctx,
+						p->result->payment_preimage));
+		else {
+			sha256(&h, &inv, sizeof(inv));
+			if (!sha256_eq(&h, p->payment_hash))
+				paymod_log(p, LOG_UNUSUAL,
+					   "Point-locked payment: the payee's"
+					   " scalar opens its invoice point but"
+					   " is not its payment hash's"
+					   " preimage");
+			*p->result->payment_preimage = inv;
+		}
+	}
+
 	if (p->result->state == PAYMENT_COMPLETE) {
 		paymod_log(p, LOG_INFORM,
 			   "HTLC result state=success, sent=%s, deliver=%s",
@@ -1727,7 +1820,7 @@ static struct command_result *payment_sendonion_success(struct command *cmd,
 	req = jsonrpc_request_start(payment_cmd(p), "waitsendpay",
 				    payment_waitsendpay_finished,
 				    payment_waitsendpay_finished, p);
-	json_add_sha256(req->js, "payment_hash", p->payment_hash);
+	json_add_sha256(req->js, "payment_hash", payment_lock_hash(p));
 	json_add_num(req->js, "partid", p->partid);
 	json_add_u64(req->js, "groupid", p->groupid);
 	return send_outreq(req);
@@ -1765,8 +1858,12 @@ static struct command_result *payment_createonion_success(struct command *cmd,
 	json_add_short_channel_id(req->js, "channel", first->scid);
 	json_object_end(req->js);
 
-	json_add_sha256(req->js, "payment_hash", p->payment_hash);
+	json_add_sha256(req->js, "payment_hash", payment_lock_hash(p));
 	json_add_amount_msat(req->js, "amount_msat", p->our_amount);
+	if (root->point_lock) {
+		json_add_pubkey(req->js, "lock_point", &root->point_lock0);
+		root->point_lock_sent = true;
+	}
 
 	json_array_start(req->js, "shared_secrets");
 	secrets = p->createonion_response->shared_secrets;
@@ -1830,6 +1927,7 @@ static void payment_add_hop_onion_payload(struct payment *p,
 	 * `next` are the instructions to include in the payload, which is
 	 * basically the channel going to the next node. */
 	dst->pubkey = node->node_id;
+	dst->assocdata = NULL;
 
 	dst->tlv_payload = tlv_payload_new(cr->hops);
 	fields = &dst->tlv_payload->fields;
@@ -1885,6 +1983,46 @@ static void payment_add_blindedpath(const tal_t *ctx,
 		/* Length is prepended, discard that first! */
 		fromwire_bigsize(&cursor, &max);
 		hops[i].tlv_payload = fromwire_tlv_payload(ctx, &cursor, &max);
+		hops[i].assocdata = NULL;
+	}
+}
+
+/* SEQUENTIA: a point-locked attempt (common/point_lock.h).  The HTLC into
+ * hop i is locked to L(i) = L0 + (d(0) + ... + d(i-1))*G, and that hop's
+ * onion layer commits to L(i)'s x; each hop that forwards is told its d(i),
+ * the payee r = c + sum(d(i)) and the invoice's payment hash. */
+static void payment_point_lock_payloads(struct payment *p,
+					struct createonion_request *cr,
+					size_t hopcount)
+{
+	struct payment *root = payment_root(p);
+	struct pubkey lock = root->point_lock0, next;
+	struct preimage r, rn;
+	struct secret d;
+
+	memcpy(r.r, root->point_c.data, sizeof(r.r));
+	for (size_t i = 0; i < hopcount; i++) {
+		struct tlv_field **fields = &cr->hops[i].tlv_payload->fields;
+
+		cr->hops[i].assocdata = tal(cr->hops, struct sha256);
+		point_lock_payment_hash(&lock, cr->hops[i].assocdata);
+		if (i + 1 < hopcount) {
+			do
+				randbytes(&d, sizeof(d));
+			while (!point_lock_tweak(&lock, &d, &next)
+			       || !point_lock_scalar_add(&r, &d, &rn));
+			tlvstream_set_raw(fields, TLV_PAYLOAD_SEQ_POINT_TWEAK,
+					  d.data, sizeof(d.data));
+			lock = next;
+			r = rn;
+		} else {
+			tlvstream_set_raw(fields, TLV_PAYLOAD_SEQ_POINT_TWEAK,
+					  r.r, sizeof(r.r));
+			tlvstream_set_raw(fields,
+					  TLV_PAYLOAD_SEQ_POINT_PAYMENT_HASH,
+					  p->payment_hash->u.u8,
+					  sizeof(p->payment_hash->u.u8));
+		}
 	}
 }
 
@@ -1911,10 +2049,29 @@ static struct command_result *payment_compute_onion_payloads(struct payment *p)
 		return payment_continue(p);
 	}
 
+	/* SEQUENTIA: a point-locked attempt needs every node on its route
+	 * (route hints included) to take point locks. */
+	if (root->point_lock && !root->blindedpath) {
+		const char *bad = NULL;
+		struct gossmap *gossmap = get_gossmap(p);
+
+		for (size_t i = 0; i + 1 < hopcount && !bad; i++) {
+			const struct gossmap_node *n
+				= gossmap_find_node(gossmap, &p->route[i].node_id);
+			if (!n || !payment_point_lock_hop_ok(gossmap, n, p))
+				bad = tal_fmt(tmpctx, "hop %s takes no point locks",
+					      fmt_node_id(tmpctx,
+							  &p->route[i].node_id));
+		}
+		put_gossmap(p);
+		if (bad && !payment_point_lock_fallback(p, bad))
+			return payment_fail(p, "%s", bad);
+	}
+
 	/* Now compute the payload we're about to pass to `createonion` */
 	cr = p->createonion_request = tal(p, struct createonion_request);
 	cr->assocdata = tal_arr(cr, u8, 0);
-	towire_sha256(&cr->assocdata, p->payment_hash);
+	towire_sha256(&cr->assocdata, payment_lock_hash(p));
 	cr->session_key = NULL;
 	cr->hops = tal_arr(cr, struct createonion_hop,
 			   tal_count(p->route)
@@ -1967,6 +2124,9 @@ static struct command_result *payment_compute_onion_payloads(struct payment *p)
 						    p->route[hopcount - 1].scid));
 	}
 
+	if (root->point_lock && !root->blindedpath)
+		payment_point_lock_payloads(p, cr, hopcount);
+
 	paymod_log(p, LOG_DBG,
 		   "Created outgoing onion for route: %s", routetxt);
 
@@ -1990,6 +2150,9 @@ static struct command_result *payment_sendonion(struct payment *p)
 		json_object_start(req->js, NULL);
 		struct createonion_hop *hop = &p->createonion_request->hops[i];
 		json_add_node_id(req->js, "pubkey", &hop->pubkey);
+		if (hop->assocdata)
+			json_add_hex(req->js, "assocdata", hop->assocdata->u.u8,
+				     sizeof(hop->assocdata->u.u8));
 
 		tlv = tal_arr(tmpctx, u8, 0);
 		towire_tlvstream_raw(&tlv, hop->tlv_payload->fields);

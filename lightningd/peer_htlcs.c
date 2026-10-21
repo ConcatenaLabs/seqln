@@ -5,11 +5,13 @@
 #include <channeld/channeld_wiregen.h>
 #include <common/amount.h>
 #include <common/blinding.h>
+#include <common/channel_type.h>
 #include <common/ecdh.h>
 #include <common/json_command.h>
 #include <common/json_parse.h>
 #include <common/onion_decode.h>
 #include <common/onionreply.h>
+#include <common/point_lock.h>
 #include <common/timeout.h>
 #include <db/exec.h>
 #include <lightningd/channel.h>
@@ -385,16 +387,57 @@ static bool check_cltv(struct htlc_in *hin,
 	return false;
 }
 
+/* SEQUENTIA: point locks (common/point_lock.h). */
+
+/* Can @channel carry a point-locked HTLC we offer on it? */
+bool channel_takes_point_lock(const struct channel *channel)
+{
+	return channel_type_has(channel->type, OPT_SEQ_TAPROOT_COVENANT)
+		&& feature_offered(channel->peer->ld->our_features->bits[INIT_FEATURE],
+				   OPT_SEQ_POINT_LOCKS)
+		&& feature_offered(channel->peer->their_features,
+				   OPT_SEQ_POINT_LOCKS);
+}
+
+/* The scalar that opens point-locked @hin, from the one we learned (the
+ * invoice's preimage, or what opened the HTLC we forwarded it on). */
+static bool point_lock_open_in(const struct htlc_in *hin,
+			       const struct preimage *learned,
+			       struct preimage *opens)
+{
+	if (!hin->point_add
+	    || !point_lock_scalar_add(learned, hin->point_add, opens))
+		return false;
+	return point_lock_opens(hin->lock_point, opens);
+}
+
 void fulfill_htlc(struct htlc_in *hin, const struct preimage *preimage)
 {
 	u8 *msg;
 	struct channel *channel = hin->key.channel;
+	struct preimage opens;
 
 	if (hin->hstate != RCVD_ADD_ACK_REVOCATION) {
 		log_debug(channel->log,
 			  "HTLC fulfilled, but not ready any more (%s).",
 			  htlc_state_name(hin->hstate));
 		return;
+	}
+
+	/* SEQUENTIA: a point-locked HTLC opens with the scalar of its own
+	 * lock point: what we learned, plus what its onion told us. */
+	if (hin->lock_point) {
+		if (!point_lock_open_in(hin, preimage, &opens)) {
+			log_broken(channel->log,
+				   "HTLC %"PRIu64": %s does not open its point"
+				   " lock %s: failing it",
+				   hin->key.id, fmt_preimage(tmpctx, preimage),
+				   fmt_pubkey(tmpctx, hin->lock_point));
+			local_fail_in_htlc(hin,
+					   take(towire_temporary_node_failure(NULL)));
+			return;
+		}
+		preimage = &opens;
 	}
 
 	hin->preimage = tal_dup(hin, struct preimage, preimage);
@@ -454,7 +497,8 @@ static void handle_localpay(struct htlc_in *hin,
 			    struct amount_msat total_msat,
 			    const struct amount_msat *invoice_msat_override,
 			    const struct secret *payment_secret,
-			    const u8 *payment_metadata)
+			    const u8 *payment_metadata,
+			    const struct sha256 *invoice_hash)
 {
 	const u8 *failmsg;
 	struct lightningd *ld = hin->key.channel->peer->ld;
@@ -553,10 +597,12 @@ static void handle_localpay(struct htlc_in *hin,
 		goto fail;
 	}
 
+	/* SEQUENTIA: a point-locked HTLC names its invoice in its onion
+	 * (its own payment_hash is its lock point's x). */
 	htlc_set_add(ld, hin->key.channel->log,
 		     hin->msat, total_msat,
 		     invoice_msat_override,
-		     &hin->payment_hash,
+		     invoice_hash ? invoice_hash : &hin->payment_hash,
 		     payment_secret,
 		     chainparams->is_elements
 		     ? hin->key.channel->channel_asset : NULL,
@@ -728,11 +774,20 @@ const u8 *send_htlc_out(const tal_t *ctx,
 			u64 groupid,
 			const u8 *onion_routing_packet,
 			struct htlc_in *in,
+			const struct pubkey *lock_point,
 			struct htlc_out **houtp)
 {
 	u8 *msg, *raw_tlvs = NULL;
 
 	*houtp = NULL;
+
+	/* SEQUENTIA: a point lock goes only where the scripts and the peer
+	 * take one. */
+	if (lock_point && !channel_takes_point_lock(out)) {
+		log_info(out->log, "Attempt to send a point-locked HTLC on a"
+			 " channel that takes none");
+		return towire_required_channel_feature_missing(ctx);
+	}
 
 	if (!channel_state_can_add_htlc(out->state)) {
 		log_info(out->log, "Attempt to send HTLC but not ready (%s)",
@@ -761,7 +816,7 @@ const u8 *send_htlc_out(const tal_t *ctx,
 			      path_key, extra_tlvs,
 			      in == NULL,
 			      final_msat,
-			      partid, groupid, in);
+			      partid, groupid, in, lock_point);
 	tal_add_destructor(*houtp, destroy_hout_subd_died);
 
 	/* Give channel 30 seconds to commit this htlc. */
@@ -781,7 +836,7 @@ const u8 *send_htlc_out(const tal_t *ctx,
 
 	msg = towire_channeld_offer_htlc(out, amount, cltv, payment_hash,
 					onion_routing_packet, path_key,
-					raw_tlvs);
+					raw_tlvs, lock_point);
 	subd_req(out->peer->ld, out->owner, take(msg), -1, 0, rcvd_htlc_reply,
 		 *houtp);
 
@@ -843,12 +898,14 @@ static void forward_htlc(struct htlc_in *hin,
 			 const struct channel_id *forward_to,
 			 const u8 next_onion[TOTAL_PACKET_SIZE(ROUTING_INFO_SIZE)],
 			 const struct pubkey *next_path_key,
-			 const struct tlv_field *extra_tlvs)
+			 const struct tlv_field *extra_tlvs,
+			 const struct pubkey *next_lock_point)
 {
 	const u8 *failmsg;
 	struct lightningd *ld = hin->key.channel->peer->ld;
 	struct channel *next;
 	struct htlc_out *hout = NULL;
+	struct sha256 next_payment_hash;
 
 	if (forward_to) {
 		next = channel_by_cid(ld, forward_to);
@@ -978,11 +1035,17 @@ static void forward_htlc(struct htlc_in *hin,
 		goto fail;
 	}
 
+	/* SEQUENTIA: a point-locked HTLC goes on locked to the next point,
+	 * whose x is its payment_hash. */
+	if (next_lock_point)
+		point_lock_payment_hash(next_lock_point, &next_payment_hash);
+	else
+		next_payment_hash = hin->payment_hash;
 	failmsg = send_htlc_out(tmpctx, next, amt_to_forward,
 				outgoing_cltv_value, AMOUNT_MSAT(0),
-				&hin->payment_hash,
+				&next_payment_hash,
 				next_path_key, extra_tlvs, 0 /* partid */, 0 /* groupid */,
-				next_onion, hin, &hout);
+				next_onion, hin, next_lock_point, &hout);
 	if (!failmsg)
 		return;
 
@@ -1015,6 +1078,10 @@ struct htlc_accepted_hook_payload {
 	/* Default is NULL, if NOT NULL: used to override the amount of the
 	 * invoice this htlc belongs to in checks! */
 	struct amount_msat *invoice_msat;
+	/* SEQUENTIA: a point-locked HTLC's next lock point (forward), or
+	 * the payment hash of its invoice (final hop). */
+	struct pubkey *next_lock_point;
+	struct sha256 *point_invoice_hash;
 };
 
 static void
@@ -1024,6 +1091,33 @@ htlc_accepted_hook_try_resolve(struct htlc_accepted_hook_payload *request,
 	struct sha256 payment_hash;
 	struct htlc_in *hin = request->hin;
 	u8 *unknown_details;
+	struct preimage opens;
+
+	/* SEQUENTIA: a plugin resolves a point-locked HTLC with the
+	 * invoice's preimage, or with the scalar that opens it. */
+	if (hin->lock_point) {
+		if (point_lock_opens(hin->lock_point, payment_preimage)
+		    && hin->point_add
+		    && point_lock_scalar_sub(payment_preimage, hin->point_add,
+					     &opens))
+			payment_preimage = &opens;
+		if (!point_lock_open_in(hin, payment_preimage, &opens)) {
+			log_broken(request->channel->log,
+				   "Plugin returned %s, which does not open"
+				   " the HTLC's point lock %s.",
+				   fmt_preimage(tmpctx, payment_preimage),
+				   fmt_pubkey(tmpctx, hin->lock_point));
+			unknown_details = tal_arr(NULL, u8, 0);
+			towire_u16(&unknown_details, 0x400f);
+			local_fail_in_htlc(hin, take(unknown_details));
+			return;
+		}
+		hin->we_filled = tal(hin, bool);
+		*hin->we_filled = true;
+		fulfill_htlc(hin, payment_preimage);
+		return;
+	}
+
 	/* Verify that the provided secret hashes to what we need. */
 	sha256(&payment_hash, payment_preimage, sizeof(struct preimage));
 
@@ -1300,6 +1394,12 @@ static void htlc_accepted_hook_serialize(struct htlc_accepted_hook_payload *p,
 	json_add_u32(s, "cltv_expiry", expiry);
 	json_add_s32(s, "cltv_expiry_relative", expiry - blockheight);
 	json_add_sha256(s, "payment_hash", &hin->payment_hash);
+	/* SEQUENTIA: a point-locked HTLC: its payment_hash is this point's
+	 * x, and a plugin resolves it with the invoice's preimage. */
+	if (hin->lock_point)
+		json_add_pubkey(s, "lock_point", hin->lock_point);
+	if (p->point_invoice_hash)
+		json_add_sha256(s, "invoice_payment_hash", p->point_invoice_hash);
 	if (p->extra_tlvs_raw) {
 		json_add_hex_talarr(s, "extra_tlvs", p->extra_tlvs_raw);
 	}
@@ -1356,7 +1456,8 @@ htlc_accepted_hook_final(struct htlc_accepted_hook_payload *request STEALS)
 			     request->payload->forward_channel,
 			     request->fwd_channel_id,
 			     serialize_onionpacket(tmpctx, rs->next),
-			     request->next_path_key, extra_tlvs);
+			     request->next_path_key, extra_tlvs,
+			     request->next_lock_point);
 	} else
 		handle_localpay(hin,
 				request->payload->amt_to_forward,
@@ -1364,7 +1465,8 @@ htlc_accepted_hook_final(struct htlc_accepted_hook_payload *request STEALS)
 				*request->payload->total_msat,
 				request->invoice_msat,
 				request->payload->payment_secret,
-				request->payload->payment_metadata);
+				request->payload->payment_metadata,
+				request->point_invoice_hash);
 
 	tal_free(request);
 }
@@ -1487,6 +1589,65 @@ static struct channel_id *calc_forwarding_channel(struct lightningd *ld,
 		  fmt_node_id(tmpctx, &best->peer->id));
 
 	return tal_dup(hp, struct channel_id, &best->cid);
+}
+
+/* SEQUENTIA: what opens a point-locked HTLC, from its onion: a forwarder
+ * is told d (its next lock is ours + d*G, and it opens ours with what opens
+ * the next minus d), the payee r and the invoice's payment hash (it opens
+ * its HTLC with the invoice's preimage plus r).  A mismatch fails the HTLC
+ * as an invalid onion payload, before any hook sees it. */
+static void point_lock_read_onion(struct lightningd *ld,
+				  struct htlc_in *hin,
+				  bool final,
+				  struct htlc_accepted_hook_payload *hp)
+{
+	const struct tlv_payload *tlv = hp->payload->tlv;
+	const char *why;
+
+	if (!hin->lock_point) {
+		if (!tlv || (!tlv->seq_point_tweak && !tlv->seq_point_payment_hash))
+			return;
+		why = "point lock fields on a hash-locked HTLC";
+		goto bad;
+	}
+	if (hp->payload->path_key || hin->path_key) {
+		why = "a point lock in a blinded path";
+		goto bad;
+	}
+	if (!tlv || !tlv->seq_point_tweak) {
+		why = "a point-locked HTLC without its tweak";
+		goto bad;
+	}
+	hin->point_add = tal(hin, struct secret);
+	if (final) {
+		if (!tlv->seq_point_payment_hash) {
+			why = "a point-locked HTLC that names no invoice";
+			goto bad;
+		}
+		*hin->point_add = *tlv->seq_point_tweak;
+		hp->point_invoice_hash = tal_dup(hp, struct sha256,
+						 tlv->seq_point_payment_hash);
+	} else {
+		hp->next_lock_point = tal(hp, struct pubkey);
+		if (!point_lock_scalar_negate(tlv->seq_point_tweak,
+					      hin->point_add)
+		    || !point_lock_tweak(hin->lock_point, tlv->seq_point_tweak,
+					 hp->next_lock_point)) {
+			why = "a point lock tweak that is not a scalar";
+			goto bad;
+		}
+	}
+	wallet_htlc_set_point_add(ld->wallet, hin);
+	return;
+
+bad:
+	hin->point_add = tal_free(hin->point_add);
+	hp->next_lock_point = tal_free(hp->next_lock_point);
+	hp->point_invoice_hash = tal_free(hp->point_invoice_hash);
+	hp->payload = tal_free(hp->payload);
+	hp->failtlvtype = TLV_PAYLOAD_SEQ_POINT_TWEAK;
+	hp->failtlvpos = 0;
+	hp->failexplanation = why;
 }
 
 /**
@@ -1612,6 +1773,11 @@ static bool peer_accepted_htlc(const tal_t *ctx,
 	hook_payload->hin = hin;
 	hook_payload->channel = channel;
 	hook_payload->next_onion = serialize_onionpacket(hook_payload, rs->next);
+	hook_payload->next_lock_point = NULL;
+	hook_payload->point_invoice_hash = NULL;
+	if (hook_payload->payload)
+		point_lock_read_onion(ld, hin, rs->nextcase == ONION_END,
+				      hook_payload);
 
 	/* We could have blinding from hin or from inside onion. */
 	if (hook_payload->payload && hook_payload->payload->path_key) {
@@ -1740,9 +1906,13 @@ void onchain_fulfilled_htlc(struct channel *channel,
 	struct htlc_out_map_iter outi;
 	struct htlc_out *hout;
 	struct sha256 payment_hash;
+	struct pubkey point;
 	struct lightningd *ld = channel->peer->ld;
+	bool is_point;
 
 	sha256(&payment_hash, preimage, sizeof(*preimage));
+	/* SEQUENTIA: a scalar from a point-locked HTLC's SUCCESS leaf. */
+	is_point = point_lock_point_of(preimage, &point);
 
 	/* FIXME: use db to look this up! */
 	for (hout = htlc_out_map_first(ld->htlcs_out, &outi);
@@ -1756,7 +1926,10 @@ void onchain_fulfilled_htlc(struct channel *channel,
 		if (hout->failmsg || hout->failonion)
 			continue;
 
-		if (!sha256_eq(&hout->payment_hash, &payment_hash))
+		if (hout->lock_point) {
+			if (!is_point || !pubkey_eq(hout->lock_point, &point))
+				continue;
+		} else if (!sha256_eq(&hout->payment_hash, &payment_hash))
 			continue;
 
 		/* We may have already fulfilled before going onchain, or
@@ -2394,6 +2567,7 @@ static bool channel_added_their_htlc(struct channel *channel,
 			  added->onion_routing_packet,
 			  added->extra_tlvs,
 			  added->fail_immediate);
+	hin->lock_point = tal_dup_or_null(hin, struct pubkey, added->lock_point);
 
 	/* Save an incoming htlc to the wallet */
 	wallet_htlc_save_in(ld->wallet, channel, hin);
@@ -2910,7 +3084,8 @@ const struct existing_htlc **peer_htlcs(const tal_t *ctx,
 					     hin->path_key,
 					     hin->preimage,
 					     f,
-					     hin->extra_tlvs);
+					     hin->extra_tlvs,
+					     hin->lock_point);
 		tal_arr_expand(&htlcs, existing);
 	}
 
@@ -2943,7 +3118,8 @@ const struct existing_htlc **peer_htlcs(const tal_t *ctx,
 					     hout->path_key,
 					     hout->preimage,
 					     f,
-					     hout->extra_tlvs);
+					     hout->extra_tlvs,
+					     hout->lock_point);
 		tal_arr_expand(&htlcs, existing);
 	}
 

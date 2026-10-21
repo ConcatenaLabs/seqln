@@ -650,6 +650,7 @@ struct bolt11 *new_bolt11(const tal_t *ctx,
 	b11->payment_secret = NULL;
 	b11->metadata = NULL;
 	b11->asset = NULL;
+	b11->payment_point = NULL;
 
 	if (msat)
 		b11->msat = tal_dup(b11, struct amount_msat, msat);
@@ -692,6 +693,37 @@ static const char *decode_a(struct bolt11 *b11,
 	return NULL;
 }
 
+/* SEQUENTIA: `t` (11): `data_length` 53.  The 33-byte payment point
+ * T = p * G of the payment preimage p (common/point_lock.h).  Read only on a
+ * chain whose tapscript can lock to a point (has_tapscript_introspection):
+ * elsewhere `t` is an unknown field and is skipped. */
+static const char *decode_t(struct bolt11 *b11,
+			    const struct feature_set *our_features,
+			    struct hash_u5 *hu5,
+			    const u5 **data, size_t *field_len,
+			    bool *have_t)
+{
+	u8 der[PUBKEY_CMPR_LEN];
+	const char *err;
+
+	assert(!*have_t);
+	if (!b11->chain->has_tapscript_introspection)
+		return unknown_field(b11, hu5, data, field_len, 't');
+
+	if (*field_len != 53)
+		return tal_fmt(b11, "t: expected 53 characters, got %zu",
+			       *field_len);
+
+	err = pull_bits(hu5, data, field_len, der, sizeof(der) * 8, false);
+	if (err)
+		return err;
+	b11->payment_point = tal(b11, struct pubkey);
+	if (!pubkey_from_der(der, sizeof(der), b11->payment_point))
+		return tal_fmt(b11, "t: invalid point");
+	*have_t = true;
+	return NULL;
+}
+
 struct decoder {
 	/* What BOLT11 letter this is */
 	const char letter;
@@ -731,6 +763,7 @@ static const struct decoder decoders[] = {
 	{ '9', false, decode_9 },
 	{ 'm', false, decode_m },
 	{ 'a', false, decode_a },
+	{ 't', false, decode_t },
 };
 
 static const struct decoder *find_decoder(char c)
@@ -1181,6 +1214,15 @@ static void encode_p(u5 **data, const struct sha256 *hash)
 	push_field(data, 'p', hash, 256);
 }
 
+/* SEQUENTIA: the payment point (see decode_t). */
+static void encode_t(u5 **data, const struct pubkey *point)
+{
+	u8 der[PUBKEY_CMPR_LEN];
+
+	pubkey_to_der(der, point);
+	push_field(data, 't', der, sizeof(der) * 8);
+}
+
 /* Sequentia: the asset id in display order (see decode_a). */
 static void encode_a(u5 **data, const u8 *asset)
 {
@@ -1410,6 +1452,9 @@ char *bolt11_encode_(const tal_t *ctx,
 
 	if (b11->asset)
 		encode_a(&data, b11->asset);
+
+	if (b11->payment_point)
+		encode_t(&data, b11->payment_point);
 
 	if (n_field)
 		encode_n(&data, &b11->receiver_id);

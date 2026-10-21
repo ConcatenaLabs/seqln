@@ -31,6 +31,12 @@
  *                    OP_EQUALVERIFY <self_htlc_key> OP_CHECKSIGVERIFY COV(A, X, D)
  *     leaf 1 TIMEOUT <other_htlc_key> OP_CHECKSIGVERIFY <cltv_expiry> OP_CLTV
  *
+ *   A point-locked HTLC (common/point_lock.h) has the same trees with the
+ *   hash lock of its SUCCESS leaf replaced by a point lock:
+ *     <L> <G> OP_ROT OP_ECMULSCALARVERIFY
+ *   which takes a 32-byte scalar t with t * G == L (L compressed, parity
+ *   included) where the hash lock takes a preimage.
+ *
  *   COV(A, X, D): the output at this input's index carries explicit asset A
  *   (the channel's), an explicit value of at least X (the HTLC output's own
  *   value) and pays the witness v1 program D (to_local's).  So self's claims
@@ -95,24 +101,29 @@ void tcov_to_local_tree(const tal_t *ctx,
 			struct tap_tree2 *tree);
 
 /* An HTLC the commitment's holder offered: leaf 0 TIMEOUT, leaf 1 SUCCESS.
- * @htlc_sats is the HTLC output's value, the X its covenant requires. */
+ * @htlc_sats is the HTLC output's value, the X its covenant requires.
+ * @lock_point: NULL for a hash-locked HTLC (@payment_ripemd), else the
+ * point its SUCCESS leaf is locked to. */
 void tcov_offered_htlc_tree(const tal_t *ctx,
 			    const struct keyset *keyset,
 			    const struct pubkey *per_commitment_point,
 			    u16 to_self_delay,
 			    const u8 *asset_tag,
 			    const struct ripemd160 *payment_ripemd,
+			    const struct pubkey *lock_point,
 			    u32 cltv_expiry,
 			    struct amount_sat htlc_sats,
 			    struct tap_tree2 *tree);
 
-/* An HTLC the commitment's holder received: leaf 0 SUCCESS, leaf 1 TIMEOUT. */
+/* An HTLC the commitment's holder received: leaf 0 SUCCESS, leaf 1 TIMEOUT.
+ * @lock_point as for tcov_offered_htlc_tree. */
 void tcov_received_htlc_tree(const tal_t *ctx,
 			     const struct keyset *keyset,
 			     const struct pubkey *per_commitment_point,
 			     u16 to_self_delay,
 			     const u8 *asset_tag,
 			     const struct ripemd160 *payment_ripemd,
+			     const struct pubkey *lock_point,
 			     u32 cltv_expiry,
 			     struct amount_sat htlc_sats,
 			     struct tap_tree2 *tree);
@@ -138,5 +149,14 @@ u8 *tcov_leaf_received_success(const tal_t *ctx,
 u8 *tcov_leaf_received_timeout(const tal_t *ctx,
 			       const struct pubkey *other_htlc_key,
 			       u32 cltv_expiry);
+u8 *tcov_leaf_offered_success_point(const tal_t *ctx,
+				    const struct pubkey *lock_point,
+				    const struct pubkey *other_htlc_key);
+u8 *tcov_leaf_received_success_point(const tal_t *ctx,
+				     const struct pubkey *lock_point,
+				     const struct pubkey *self_htlc_key,
+				     const u8 *asset_id,
+				     struct amount_sat x,
+				     const u8 d_program[32]);
 
 #endif /* LIGHTNING_COMMON_TCOV_SCRIPTS_H */

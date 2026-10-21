@@ -2019,6 +2019,12 @@
                 "On a Sequentia network, the 32-byte display id of the asset the invoice is to be paid in, from its `a` field: the amounts are in thousandths of that asset's atoms. An invoice on a Sequentia network without it does not decode."
               ]
             },
+            "payment_point": {
+              "type": "pubkey",
+              "description": [
+                "On a Sequentia network, the payment point T = p*G of the payment preimage p, from the invoice's `t` field: a payer whose every hop takes point locks may lock the payment to it."
+              ]
+            },
             "fallbacks": {
               "type": "array",
               "description": [
@@ -2189,6 +2195,7 @@
             "features": {},
             "payment_metadata": {},
             "asset": {},
+            "payment_point": {},
             "fallbacks": {},
             "routes": {},
             "extra": {},

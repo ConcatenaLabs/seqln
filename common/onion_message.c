@@ -122,6 +122,7 @@ struct sphinx_hop **onionmsg_tlvs_to_hops(const tal_t *ctx,
 		u8 *payload;
 		hops[i] = tal(hops, struct sphinx_hop);
 		hops[i]->pubkey = bpath->path[i]->blinded_node_id;
+		hops[i]->assocdata = NULL;
 		/* We use a temporary here since ->raw_payload is const */
 		payload = tal_arr(hops[i], u8, 0);
 		towire_tlv_onionmsg_tlv(&payload, tlvs[i]);

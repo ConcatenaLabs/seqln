@@ -26,6 +26,7 @@ channeld/test/run-full_channel:			\
 	common/key_derive.o			\
 	common/msg_queue.o			\
 	common/permute_tx.o			\
+	common/point_lock.o			\
 	common/pseudorand.o			\
 	common/randbytes.o			\
 	common/setup.o				\

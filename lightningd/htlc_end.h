@@ -61,6 +61,15 @@ struct htlc_in {
 
 	/* Incommimg extra update_add_htlc_tlv tlvs */
 	struct tlv_field *extra_tlvs;
+
+	/* SEQUENTIA: a point-locked HTLC's lock point, else NULL
+	 * (common/point_lock.h). */
+	struct pubkey *lock_point;
+	/* What we add to the scalar we learn (the payee's invoice preimage,
+	 * or the one opening the HTLC we forwarded) to open this one: the
+	 * payee's tweak r, or minus a forwarder's d.  NULL until the onion
+	 * is read. */
+	struct secret *point_add;
 };
 
 struct htlc_out {
@@ -112,6 +121,9 @@ struct htlc_out {
 
 	/* Extra tlvs that are extended to the update_add_htlc_tlvs */
 	struct tlv_field *extra_tlvs;
+
+	/* SEQUENTIA: a point-locked HTLC's lock point, else NULL. */
+	struct pubkey *lock_point;
 };
 
 static inline const struct htlc_key *keyof_htlc_in(const struct htlc_in *in)
@@ -180,7 +192,8 @@ struct htlc_out *new_htlc_out(const tal_t *ctx,
 			      struct amount_msat final_msat,
 			      u64 partid,
 			      u64 groupid,
-			      struct htlc_in *in);
+			      struct htlc_in *in,
+			      const struct pubkey *lock_point);
 
 void connect_htlc_in(struct htlc_in_map *map, struct htlc_in *hin);
 void connect_htlc_out(struct htlc_out_map *map, struct htlc_out *hout);

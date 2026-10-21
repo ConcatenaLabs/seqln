@@ -59,6 +59,9 @@ struct config {
 	 * introspection and the signer can sign its spends. */
 	bool taproot_covenant_channels;
 
+	/* SEQUENTIA: offer point-locked HTLCs (--point-locks). */
+	bool point_locks;
+
 	/* Do we let the opener set any fee rate they want */
 	bool ignore_fee_limits;
 

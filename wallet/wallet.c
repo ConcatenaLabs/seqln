@@ -3472,8 +3472,10 @@ void wallet_htlc_save_in(struct wallet *wallet,
 				 " routing_onion,"
 				 " received_time,"
 				 " min_commit_num, "
-				 " fail_immediate) VALUES "
-				 "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"));
+				 " fail_immediate,"
+				 " lock_point,"
+				 " point_add) VALUES "
+				 "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"));
 
 	in->dbid = htlcs_index_created(wallet->ld,
 				       in->key.id,
@@ -3510,7 +3512,28 @@ void wallet_htlc_save_in(struct wallet *wallet,
 					   chan->next_index[REMOTE]-1));
 
 	db_bind_int(stmt, in->fail_immediate);
+	if (in->lock_point)
+		db_bind_pubkey(stmt, in->lock_point);
+	else
+		db_bind_null(stmt);
+	if (in->point_add)
+		db_bind_secret(stmt, in->point_add);
+	else
+		db_bind_null(stmt);
 
+	db_exec_prepared_v2(take(stmt));
+}
+
+void wallet_htlc_set_point_add(struct wallet *wallet,
+			       const struct htlc_in *in)
+{
+	struct db_stmt *stmt;
+
+	stmt = db_prepare_v2(wallet->db,
+			     SQL("UPDATE channel_htlcs SET point_add = ?"
+				 " WHERE id = ?"));
+	db_bind_secret(stmt, in->point_add);
+	db_bind_u64(stmt, in->dbid);
 	db_exec_prepared_v2(take(stmt));
 }
 
@@ -3542,8 +3565,9 @@ void wallet_htlc_save_out(struct wallet *wallet,
 		" partid,"
 		" groupid,"
 		" fees_msat,"
-		" min_commit_num"
-		") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?);"));
+		" min_commit_num,"
+		" lock_point"
+		") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?);"));
 
 	out->dbid = htlcs_index_created(wallet->ld,
 					out->key.id,
@@ -3586,6 +3610,10 @@ void wallet_htlc_save_out(struct wallet *wallet,
 	db_bind_amount_msat(stmt, out->fees);
 	db_bind_u64(stmt, min_u64(chan->next_index[LOCAL]-1,
 					     chan->next_index[REMOTE]-1));
+	if (out->lock_point)
+		db_bind_pubkey(stmt, out->lock_point);
+	else
+		db_bind_null(stmt);
 
 	db_exec_prepared_v2(take(stmt));
 }
@@ -3746,6 +3774,8 @@ static bool wallet_stmt2htlc_in(struct channel *channel,
 		in->we_filled = NULL;
 
 	in->fail_immediate = db_col_int(stmt, "fail_immediate");
+	in->lock_point = db_col_optional(in, stmt, "lock_point", pubkey);
+	in->point_add = db_col_optional(in, stmt, "point_add", secret);
 
 	return ok;
 }
@@ -3793,6 +3823,7 @@ static bool wallet_stmt2htlc_out(struct wallet *wallet,
 
 	out->in = NULL;
 	out->fees = db_col_amount_msat(stmt, "fees_msat");
+	out->lock_point = db_col_optional(out, stmt, "lock_point", pubkey);
 
 	if (!db_col_is_null(stmt, "origin_htlc")) {
 		u64 in_id = db_col_u64(stmt, "origin_htlc");
@@ -3873,6 +3904,8 @@ bool wallet_htlcs_load_in_for_channel(struct wallet *wallet,
 					     ", received_time"
 					     ", we_filled"
 					     ", fail_immediate"
+					     ", lock_point"
+					     ", point_add"
 					     " FROM channel_htlcs"
 					     " WHERE direction= ?"
 					     " AND channel_id= ?"
@@ -3926,6 +3959,7 @@ bool wallet_htlcs_load_out_for_channel(struct wallet *wallet,
 					     ", localfailmsg"
 					     ", groupid"
 					     ", fees_msat"
+					     ", lock_point"
 					     " FROM channel_htlcs"
 					     " WHERE direction = ?"
 					     " AND channel_id = ?"
@@ -3966,7 +4000,7 @@ struct htlc_stub *wallet_htlc_stubs(const tal_t *ctx, struct wallet *wallet,
 
 	stmt = db_prepare_v2(wallet->db,
 			     SQL("SELECT channel_id, direction, cltv_expiry, "
-				 "channel_htlc_id, payment_hash "
+				 "channel_htlc_id, payment_hash, lock_point "
 				 "FROM channel_htlcs WHERE channel_id = ? AND min_commit_num <= ? AND ((max_commit_num IS NULL) OR max_commit_num >= ?);"));
 
 	db_bind_u64(stmt, chan->dbid);
@@ -3988,6 +4022,11 @@ struct htlc_stub *wallet_htlc_stubs(const tal_t *ctx, struct wallet *wallet,
 
 		db_col_sha256(stmt, "payment_hash", &payment_hash);
 		ripemd160(&stub.ripemd, payment_hash.u.u8, sizeof(payment_hash.u));
+		stub.has_lock_point = !db_col_is_null(stmt, "lock_point");
+		if (stub.has_lock_point)
+			db_col_pubkey(stmt, "lock_point", &stub.lock_point);
+		else
+			memset(&stub.lock_point, 0, sizeof(stub.lock_point));
 		tal_arr_expand(&stubs, stub);
 	}
 	tal_free(stmt);

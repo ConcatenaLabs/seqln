@@ -8,6 +8,7 @@
 #include <common/json_command.h>
 #include <common/onion_decode.h>
 #include <common/onionreply.h>
+#include <common/point_lock.h>
 #include <common/route.h>
 #include <common/timeout.h>
 #include <lightningd/channel.h>
@@ -778,6 +779,7 @@ static const u8 *send_onion(const tal_t *ctx, struct lightningd *ld,
 			    u64 partid,
 			    u64 groupid,
 			    struct channel *channel,
+			    const struct pubkey *lock_point,
 			    struct htlc_out **hout)
 {
 	const u8 *onion;
@@ -789,7 +791,8 @@ static const u8 *send_onion(const tal_t *ctx, struct lightningd *ld,
 	return send_htlc_out(ctx, channel, first_hop->amount,
 			     base_expiry + first_hop->delay,
 			     final_amount, payment_hash,
-			     path_key, NULL, partid, groupid, onion, NULL, hout);
+			     path_key, NULL, partid, groupid, onion, NULL,
+			     lock_point, hout);
 	}
 
 static struct command_result *check_invoice_request_usage(struct command *cmd,
@@ -1094,7 +1097,8 @@ send_payment_core(struct lightningd *ld,
 		  struct node_id *route_nodes TAKES,
 		  struct short_channel_id *route_channels TAKES,
 		  struct secret *path_secrets,
-		  const struct sha256 *local_invreq_id)
+		  const struct sha256 *local_invreq_id,
+		  const struct pubkey *lock_point)
 {
 	struct channel *channel;
 	const u8 *failmsg;
@@ -1153,9 +1157,22 @@ send_payment_core(struct lightningd *ld,
 			 fmt_amount_msat(tmpctx, first_hop->amount),
 			 fmt_amount_msat(tmpctx, msat));
 
+	/* SEQUENTIA: a point-locked payment (common/point_lock.h) needs a
+	 * first channel that takes the lock, and a payment_hash that is the
+	 * lock point's x. */
+	if (lock_point) {
+		struct sha256 x;
+
+		point_lock_payment_hash(lock_point, &x);
+		if (!sha256_eq(&x, rhash))
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "payment_hash is not lock_point's"
+					    " x coordinate");
+	}
+
 	failmsg = send_onion(tmpctx, ld, packet, first_hop, msat,
 			     rhash, NULL, partid,
-			     group, channel, &hout);
+			     group, channel, lock_point, &hout);
 
 	if (failmsg) {
 		fail = immediate_routing_failure(
@@ -1279,7 +1296,7 @@ send_payment(struct lightningd *ld,
 				 msat, total_msat,
 				 label, invstring, description,
 				 packet, &ids[n_hops - 1], ids,
-				 channels, path_secrets, local_invreq_id);
+				 channels, path_secrets, local_invreq_id, NULL);
 }
 
 static struct command_result *
@@ -1354,6 +1371,7 @@ static struct command_result *json_sendonion(struct command *cmd,
 	struct amount_msat *msat, *total_msat;
 	u64 *partid, *group;
 	struct sha256 *local_invreq_id = NULL;
+	struct pubkey *lock_point;
 
 	if (!param_check(cmd, buffer, params,
 			 p_req("onion", param_bin_from_hex, &onion),
@@ -1370,6 +1388,8 @@ static struct command_result *json_sendonion(struct command *cmd,
 			 p_opt("groupid", param_u64, &group),
 			 p_opt("description", param_string, &description),
 			 p_opt_def("total_amount_msat", param_msat, &total_msat, AMOUNT_MSAT(0)),
+			 /* SEQUENTIA: the first HTLC's lock point. */
+			 p_opt("lock_point", param_pubkey, &lock_point),
 			 NULL))
 		return command_param_failed();
 
@@ -1396,7 +1416,7 @@ static struct command_result *json_sendonion(struct command *cmd,
 				 first_hop, *msat, *total_msat,
 				 label, invstring, description,
 				 packet, destination, NULL, NULL,
-				 path_secrets, local_invreq_id);
+				 path_secrets, local_invreq_id, lock_point);
 }
 
 static const struct json_command sendonion_command = {
@@ -2133,7 +2153,7 @@ static struct command_result *json_injectpaymentonion(struct command *cmd,
 				payment_hash,
 				next_path_key, NULL, *partid, *groupid,
 				serialize_onionpacket(tmpctx, rs->next),
-				NULL, &hout);
+				NULL, NULL, &hout);
 	if (failmsg) {
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 				    "Could not send to first peer: %s",
@@ -2455,6 +2475,10 @@ static struct command_result *json_createonion(struct command *cmd,
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 					    "hops[%zi] payload is not prefixed with length!",
 					    i);
+		/* SEQUENTIA: a point-locked payment binds each hop's onion
+		 * to the payment_hash that hop sees. */
+		if (hops[i].assocdata)
+			sphinx_set_hop_assocdata(sp, i, hops[i].assocdata);
 	}
 
 	if (sphinx_path_payloads_size(sp) > *packet_size)

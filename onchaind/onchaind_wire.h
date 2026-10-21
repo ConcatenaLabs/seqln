@@ -1,6 +1,7 @@
 #ifndef LIGHTNING_ONCHAIND_ONCHAIND_WIRE_H
 #define LIGHTNING_ONCHAIND_ONCHAIND_WIRE_H
 #include "config.h"
+#include <bitcoin/pubkey.h>
 #include <ccan/short_types/short_types.h>
 #include <ccan/tal/tal.h>
 #include <common/htlc.h>
@@ -11,6 +12,10 @@ struct htlc_stub {
 	u32 cltv_expiry;
 	u64 id;
 	struct ripemd160 ripemd;
+	/* SEQUENTIA: a point-locked HTLC's lock point (common/point_lock.h):
+	 * valid if has_lock_point. */
+	bool has_lock_point;
+	struct pubkey lock_point;
 };
 
 void towire_htlc_stub(u8 **pptr, const struct htlc_stub *htlc_stub);

@@ -163,4 +163,9 @@ struct feature_set *feature_set_dup(const tal_t *ctx,
  * --sequentia-taproot-covenant-channels. */
 #define OPT_SEQ_TAPROOT_COVENANT		172
 
+/* SEQUENTIA: point-locked HTLCs on taproot-covenant channels
+ * (common/point_lock.h), offered with --point-locks.  In an invoice it says
+ * the payee takes them (with its `t` field, the payment point). */
+#define OPT_SEQ_POINT_LOCKS			174
+
 #endif /* LIGHTNING_COMMON_FEATURES_H */

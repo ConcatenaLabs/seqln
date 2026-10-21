@@ -16,6 +16,9 @@ struct legacy_payload {
 struct createonion_hop {
 	struct node_id pubkey;
 	struct tlv_payload *tlv_payload;
+	/* SEQUENTIA: for a point-locked payment, the payment_hash this hop
+	 * sees (its lock point's x), which its HMAC commits to. */
+	struct sha256 *assocdata;
 };
 
 struct createonion_request {
@@ -151,6 +154,23 @@ struct payment {
 	/* Sequentia: if set (on the root payment), the 33-byte asset this payment
 	 * must be routed in; routing skips channels of any other asset. */
 	const u8 *asset;
+
+	/* SEQUENTIA: point locks (common/point_lock.h), on the root payment.
+	 * point_lock: the invoice's payment point T while the payment is
+	 * point-locked, NULL once it is (or always was) hash-locked.  Every
+	 * attempt locks its first HTLC to L0 = T + c*G (lightningd keys the
+	 * payment on point_hash0, L0's x); the scalar that comes back, minus
+	 * c, is the invoice's preimage.  point_lock_sent: an attempt went out
+	 * point-locked, so the payment can no longer fall back to the hash. */
+	struct pubkey *point_lock;
+	struct secret point_c;
+	struct pubkey point_lock0;
+	struct sha256 point_hash0;
+	bool point_lock_sent;
+	/* Set while payment_getroute routes a point-locked payment: only
+	 * then does routing skip nodes that take no point locks (a modifier
+	 * asking whether a node is reachable at all must not skip them). */
+	bool point_lock_routing;
 
 	/* The current phase we are in. */
 	enum payment_step step;

@@ -17,8 +17,13 @@ struct htlc {
 	struct abs_locktime expiry;
 	/* The hash of the preimage which can redeem this HTLC */
 	struct sha256 rhash;
-	/* The preimage which hashes to rhash (if known) */
+	/* The preimage which hashes to rhash (if known); for a point-locked
+	 * HTLC, the scalar that opens lock_point. */
 	struct preimage *r;
+
+	/* SEQUENTIA: the point a point-locked HTLC is locked to (rhash is its
+	 * x coordinate), or NULL for a hash-locked one (common/point_lock.h). */
+	struct pubkey *lock_point;
 
 	/* If they fail the HTLC, we store why here. */
 	const struct failed_htlc *failed;

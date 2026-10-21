@@ -123,8 +123,16 @@ bool sphinx_add_hop_has_length(struct sphinx_path *path, const struct pubkey *pu
 
 	sp.raw_payload = tal_dup_talarr(path, u8, payload);
 	sp.pubkey = *pubkey;
+	sp.assocdata = NULL;
 	tal_arr_expand(&path->hops, sp);
 	return true;
+}
+
+void sphinx_set_hop_assocdata(struct sphinx_path *path, size_t hopnum,
+			      const u8 *assocdata)
+{
+	assert(hopnum < tal_count(path->hops));
+	path->hops[hopnum].assocdata = tal_dup_talarr(path, u8, assocdata);
 }
 
 static u8 *make_v0_hop(const tal_t *ctx,
@@ -151,6 +159,7 @@ void sphinx_add_v0_hop(struct sphinx_path *path, const struct pubkey *pubkey,
 
 	sp.raw_payload = make_v0_hop(path, scid, forward, outgoing_cltv);
 	sp.pubkey = *pubkey;
+	sp.assocdata = NULL;
 	tal_arr_expand(&path->hops, sp);
 }
 
@@ -623,8 +632,14 @@ struct onionpacket *create_onionpacket(
 		 *  concatenated `hop_payloads` and associated data.
 		 */
 		subkey_from_hmac("mu", &params[i].secret, &mu);
-		compute_packet_hmac(packet, sp->associated_data, tal_bytelen(sp->associated_data), &mu,
-				    &nexthmac);
+		if (sp->hops[i].assocdata)
+			compute_packet_hmac(packet, sp->hops[i].assocdata,
+					    tal_bytelen(sp->hops[i].assocdata),
+					    &mu, &nexthmac);
+		else
+			compute_packet_hmac(packet, sp->associated_data,
+					    tal_bytelen(sp->associated_data),
+					    &mu, &nexthmac);
 	}
 	packet->hmac = nexthmac;
 	packet->ephemeralkey = params[0].ephemeralkey;

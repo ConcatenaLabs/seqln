@@ -842,6 +842,14 @@ void wallet_htlc_save_in(struct wallet *wallet,
  *
  * See comment for wallet_htlc_save_in.
  */
+/**
+ * wallet_htlc_set_point_add - store what opens a point-locked incoming HTLC
+ *
+ * @in->point_add, read from the HTLC's onion (common/point_lock.h).
+ */
+void wallet_htlc_set_point_add(struct wallet *wallet,
+			       const struct htlc_in *in);
+
 void wallet_htlc_save_out(struct wallet *wallet,
 			  const struct channel *chan,
 			  struct htlc_out *out);
