@@ -501,13 +501,25 @@ The Specula design note is not yet published in this repository; the header comm
 
 `.gitmodules` pins `external/libwally-core` to
 https://github.com/ConcatenaLabs/libwally-core, branch
-`sequentia-issuance-denomination`. Sequentia extends the Elements `CAssetIssuance` serialization
-with a 1-byte `nDenomination` (asset decimal precision) after `nInflationKeys`. Stock libwally
-under-reads every issuance input by one byte, so `wally_tx_from_bytes` fails on any issuance
-transaction and a node syncing an issuance block crashes. The fork's patch (libwally
-`src/transaction.c`) consumes and preserves the byte so issuance transactions round-trip
-byte-exact; non-issuance inputs are untouched. Build with `git submodule update --init
---recursive` (or clone with `--recurse-submodules`); no manual patching is needed.
+`sequentia-issuance-denomination`, which carries two patches over upstream libwally:
+
+- **The issuance denomination byte.** Sequentia extends the Elements `CAssetIssuance`
+  serialization with a 1-byte `nDenomination` (asset decimal precision) after `nInflationKeys`.
+  Stock libwally under-reads every issuance input by one byte, so `wally_tx_from_bytes` fails on
+  any issuance transaction and a node syncing an issuance block crashes. The patch (libwally
+  `src/transaction.c`) consumes and preserves the byte so issuance transactions round-trip
+  byte-exact; non-issuance inputs are untouched.
+- **The Elements leaf version in signature hashes.** A script-path signature hash commits to
+  the hash of the leaf being spent, which Elements chains compute with leaf version 0xc4. Stock
+  libwally hashes it with Bitcoin's 0xc0 even for an Elements transaction, so every script-path
+  signature it makes there fails on the chain. The patch (libwally `src/tx_io.c`) uses 0xc4 on
+  Elements. SeqLN's taproot scripts (`common/tcov_scripts.h`) are spent by script path, and
+  `common/test/run-tcov_scripts` fails against an unpatched libwally.
+
+Build with `git submodule update --init --recursive` (or clone with `--recurse-submodules`); no
+manual patching is needed. A build tree from before the submodule moved keeps its old library,
+since `make` rebuilds libwally only when its headers change: run `make external-clean` once
+before `make`.
 
 ## 10. Tests
 

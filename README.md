@@ -24,7 +24,7 @@ Bitcoin testnet4). There is no Sequentia mainnet; the `sequentia` mainnet entry 
 | [seqln](https://github.com/ConcatenaLabs/seqln) | SeqLN: a Core Lightning fork that runs on Sequentia and Bitcoin from the same binary, with asset channels, any-asset payments, pure-Lightning swaps. |
 | [seqdex](https://github.com/ConcatenaLabs/seqdex) | SeqDEX: non-custodial order-book DEX: the SeqOB covenant on-chain order book, same-chain swaps, and cross-chain BTC↔asset and pure-Lightning swaps made safe by Bitcoin anchoring. |
 | [fulmen](https://github.com/ConcatenaLabs/fulmen) | Fulmen: desktop (Electron) wallet for SeqLN with a bundled Lightning node. |
-| [libwally-core](https://github.com/ConcatenaLabs/libwally-core) | libwally fork with the Sequentia transaction-parsing patch (issuance denomination byte) used by SeqLN. |
+| [libwally-core](https://github.com/ConcatenaLabs/libwally-core) | libwally fork with the Sequentia patches used by SeqLN: the issuance denomination byte, and the Elements leaf version in taproot signature hashes. |
 
 Protocol-level documentation (anchoring, proof of stake, fees) lives in the node repo under
 [doc/sequentia/](https://github.com/ConcatenaLabs/Sequentia/tree/HEAD/doc/sequentia).
@@ -112,8 +112,11 @@ lists), with one fork-specific point: the `external/libwally-core` submodule is 
 [Sequentia libwally fork](https://github.com/ConcatenaLabs/libwally-core) (branch
 `sequentia-issuance-denomination`). Stock libwally under-reads Sequentia asset-issuance
 transactions by one byte (Sequentia adds a denomination byte to `CAssetIssuance`), which would
-crash a node syncing any issuance block; the pinned fork parses and round-trips it. Cloning with
-`--recurse-submodules` picks the right commit automatically.
+crash a node syncing any issuance block; the pinned fork parses and round-trips it. It also
+hashes the leaf of an Elements script-path signature with the Elements leaf version, without
+which such a signature fails on the chain. Cloning with
+`--recurse-submodules` picks the right commit automatically; a build tree from before the
+submodule moved needs `make external-clean` once to rebuild it.
 
 ```bash
 git clone --recurse-submodules -b sequentia-stable https://github.com/ConcatenaLabs/seqln.git
