@@ -54,7 +54,8 @@ directory.
 Implements hsmd wire version 6 and the message subset a running SeqLN node exercises:
 derivation (BIP39/32/86, basepoints, per-commitment points, shachain), ECDH, commitment and HTLC
 signing, withdrawal/funding signing for both Elements/Sequentia (explicit, unblinded outputs) and
-Bitcoin (BIP-143 segwit v0 and BIP-86 taproot key-path wallet inputs), and BOLT11 invoice
+Bitcoin (BIP-143 segwit v0 and BIP-86 taproot key-path wallet inputs), the spends of
+taproot-covenant channels (Elements taproot script and key paths), and BOLT11 invoice
 signing. Messages outside the subset return an error sentinel rather than a wrong answer.
 
 What enforce mode checks:
@@ -159,6 +160,18 @@ What enforce mode checks:
   commitment step: a device whose limit is below such a fee refuses it, and the node, or the
   channel at that step, stops until the limit is raised. A limit set for a day's spending is far
   above such a fee at ordinary feerates.
+- **Taproot-covenant channels** (`option_seq_taproot_covenant`; `src/taproot.rs`, the scripts in
+  `common/tcov_scripts.h`): the device rebuilds the type's trees from the channel keys to validate
+  its commitments (a taproot `to_local`, a P2WPKH `to_remote`, and one tree per HTLC whose
+  covenant names the HTLC's value and the channel's asset), and signs its spends (`SIGN_TCOV_*`,
+  messages 61 to 64) with the Elements taproot signature hash, which commits to every input and
+  every output. Such a spend may pay only the device's own wallet scripts, or, through a covenant
+  leaf (`SIGN_TCOV_LOCAL_HTLC`), the D of our commitment that the leaf names, at the input's own
+  index; every output unblinded with no proof, the input in the channel's asset, and each fee
+  output within the payment limit of its asset. A covenant claim's fee coins
+  (`SIGN_HTLC_TX_MINGLE`) are held to the withdrawal rule below, with D allowed only in a claim
+  the device approved since it started; a claim it refuses comes back unsigned and lightningd
+  builds it again.
 - **Withdrawals** (every spend of the node's wallet: `withdraw`, `signpsbt`, a channel funding, an
   anchor fee bump): every output but the fee pays one of the device's own wallet scripts (P2WPKH or
   BIP-86 P2TR of its wallet keys at indices below 5,000), unblinded, or is the funding output of a
@@ -254,6 +267,7 @@ any channel.
 | `src/frame.rs` | Little-endian signer-split transport framing (`hsmd/signer_frame.h`). |
 | `src/noise.rs` | BOLT-8 Noise_XK transport state machine (no sockets). |
 | `src/policy.rs` | Enforce-mode commitment validation. |
+| `src/taproot.rs` | The taproot-covenant channel type's leaves and trees, and the Elements taproot signature hash and BIP340 signing (tested against `common/test/tcov_vectors.h`). |
 | `src/payments.rs` | Payment approval, the per-asset payment limits and their accounting, BOLT 11 decoding. |
 | `src/dispatch.rs` | Request -> reply dispatch; channel-state tracking for the policy. |
 | `src/hsm_secret.rs` | On-disk mnemonic `hsm_secret` parsing. |

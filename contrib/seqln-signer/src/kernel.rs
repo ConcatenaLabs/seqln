@@ -218,6 +218,11 @@ impl Kernel {
         PublicKey::from_secret_key(&self.secp, sk).serialize()
     }
 
+    /// The secp256k1 context, for the taproot builders (`crate::taproot`).
+    pub fn secp(&self) -> &Secp256k1<All> {
+        &self.secp
+    }
+
     /// `node_key()` (`libhsmd.c`): HKDF(salt=&salt(u32)=0, ikm=seed[0..32], "nodeid").
     pub fn node_privkey(&self) -> SecretKey {
         let mut salt: u32 = 0;

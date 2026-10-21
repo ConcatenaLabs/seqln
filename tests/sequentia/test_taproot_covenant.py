@@ -508,3 +508,76 @@ def test_tcov_claim_on_their_commitment(node_factory, bitcoind, executor, leaf):
     wait_for(lambda: any(o['txid'] == claim['txid']
                          for o in claimer.rpc.listfunds()['outputs']))
 
+
+def test_tcov_keyless_device_signs_channel_and_claims(node_factory, bitcoind, executor,
+                                                      directory):
+    """l1 keeps its keys on the device signer (contrib/seqln-signer) in
+    enforce mode.  The device validates the taproot commitments both ways as
+    payments flow, then signs the force-close, the covenant timeout claim of
+    the HTLC l1 offered and the claim's fee coin, in SILV since l1 holds no
+    GOLD outside the channel, and finally the sweeps of to_local and D to l1's
+    wallet.  It refuses nothing along the way."""
+    import test_keyless_close as kc
+    gold = bitcoind.issue_asset(1000)
+    silv = bitcoind.issue_asset(1000)
+    bitcoind.set_fee_rates({bitcoind.POLICY_ASSET: PAR, gold: PAR, silv: 2 * PAR})
+    device, l1 = kc.keyless_node(node_factory, directory, options={**TCOV, **SHORT})
+    l2 = node_factory.get_node(options={**TCOV, **SHORT, 'plugin': HOLD}, may_fail=True)
+    try:
+        # All of l1's GOLD goes into the channel: the claim's fee must come
+        # from another asset.
+        fund_node(bitcoind, l1, gold, PAR + PAR // 10)
+        chan = open_channel(bitcoind, l1, l2, gold, 'all')
+        assert TCOV_BIT in chan['channel_type']['bits']
+        scid = chan['short_channel_id']
+        fund_node(bitcoind, l1, silv, 5 * PAR)
+        assert not [o for o in l1.rpc.listfunds()['outputs']
+                    if o['asset'] == gold and o['status'] == 'confirmed']
+
+        # l2's hold plugin lets these two through, then holds the third.
+        unhold = os.path.join(l2.daemon.lightning_dir, TEST_NETWORK, 'unhold')
+        open(unhold, 'w').close()
+        pay(l1, l2, 4_000_000_000, gold)
+        pay(l2, l1, 1_000_000_000, gold)
+        os.remove(unhold)
+        msat = 3_000_000_000
+        fut, htlc = held_htlc(l1, l2, executor, msat, gold)
+        l2.stop()
+        commitment = only_one(l1.rpc.close(scid, unilateraltimeout=1)['txids'])
+        bitcoind.generate_block(1, wait_for_mempool=commitment)
+        dec = bitcoind.rpc.getrawtransaction(commitment, 1)
+        htlc_out = only_one([o['n'] for o in dec['vout']
+                             if o['scriptPubKey']['type'] == 'witness_v1_taproot'
+                             and int(Decimal(o['value']) * PAR) == msat // 1000])
+
+        mine_to(bitcoind, htlc['expiry'] + 1)
+        wait_spender(bitcoind, commitment, htlc_out)
+        claim, i = confirmed_spender(bitcoind, commitment, htlc_out)
+        print("device-signed timeout claim:",
+              json.dumps({k: claim[k] for k in ('txid', 'vsize', 'weight')}))
+        out0 = claim['vout'][i]
+        assert out0['scriptPubKey']['type'] == 'witness_v1_taproot'
+        assert out0['asset'] == gold and int(Decimal(out0['value']) * PAR) == msat // 1000
+        assert only_one([o for o in claim['vout']
+                         if o['scriptPubKey']['type'] == 'fee'])['asset'] == silv
+
+        # D and to_local, after l1's delay, back to its wallet.
+        to_local = only_one([o['n'] for o in dec['vout']
+                             if o['scriptPubKey']['type'] == 'witness_v1_taproot'
+                             and o['n'] != htlc_out])
+        for txid, n in ((claim['txid'], i), (commitment, to_local)):
+            sweep, _ = wait_spender_after(bitcoind, txid, n, 13)
+            mine_if_pending(bitcoind, sweep['txid'])
+            wait_for(lambda: any(o['txid'] == sweep['txid'] and o['asset'] == gold
+                                 for o in l1.rpc.listfunds()['outputs']))
+        # The claim is mined: lightningd builds it no more, so no longer asks
+        # the device to sign it.
+        assert_claim_settled(bitcoind, l1, commitment, htlc_out)
+        rejects = [ln for ln in device.output().splitlines() if 'POLICY REJECT' in ln]
+        assert rejects == [], rejects
+    finally:
+        # The node first: a node whose device has gone is left waiting for
+        # it to reconnect.
+        if kc.answers(l1, timeout=2):
+            l1.stop()
+        device.stop()

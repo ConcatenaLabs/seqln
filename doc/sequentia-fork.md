@@ -325,7 +325,12 @@ feerate its deadline needs, replacing the one in the mempool when the new fee is
 `hsmd_sign_tcov_remote_htlc_to_us` (the other side's HTLC leaf) and `hsmd_sign_tcov_penalty`
 (the key path), each answered by `hsmd_sign_tcov_reply` with a BIP340 signature. lightningd sends
 the whole transaction and every input's previous output, since the signature commits to all of
-them, and signs the fee coins with `hsmd_sign_htlc_tx_mingle`.
+them, and signs the fee coins with `hsmd_sign_htlc_tx_mingle`. The device signer
+(`contrib/seqln-signer`) computes the same signature hash itself, validates the type's
+commitments against these trees before signing them, and, in enforce mode, signs a spend only
+when every output pays one of its own scripts, or, for a covenant leaf, D at the input's index,
+with the fee within its payment limit; it signs a claim's fee coins once it has approved the
+claim.
 
 **Watchtower** (section 7b). At each revocation channeld stores, instead of a signed justice
 transaction, a template of kind `WT_TMPL_TCOV_REVOKE` (`common/presign_templates.h`): the
@@ -527,6 +532,13 @@ a user device while a host runs the node:
   side pays (a commitment or a close of a channel it opened, a sweep, a penalty, an HTLC claim) is
   at most that limit.
 
+- The device signs the spends of a taproot-covenant channel's outputs (section 5b) with the
+  Elements taproot signature hash, which it computes itself, and validates that type's
+  commitments against its trees. In enforce mode a spend may pay only the device's own scripts,
+  or, through a covenant leaf, the D the covenant names, with its fee within the payment limit;
+  the claim's fee coins (`hsmd_sign_htlc_tx_mingle`) are held to the withdrawal rule, D allowed
+  once the device has approved the claim.
+
 ## 7b. Specula keyless watchtower
 
 Built on the signer split: the device pre-signs the transactions a watchtower would need, so a
@@ -709,7 +721,8 @@ the taproot-covenant channel type (section 5b): chosen only when both peers offe
 both ways, an HTLC in flight at a force-close claimed by its covenant past its CLTV with the fee
 from a coin in another asset and claimed with its preimage, the peer's claims on the closer's
 commitment by either leaf, a revoked commitment punished by the victim and, while the victim is
-offline, by `speculad` (`test_taproot_covenant.py`). They need `sequentiad`, `sequentia-cli`
+offline, by `speculad`, and a keyless node whose device signs the commitments, the claim and its
+fee coin, and the sweeps, refusing nothing (`test_taproot_covenant.py`). They need `sequentiad`, `sequentia-cli`
 and a Bitcoin Core `bitcoind` on `PATH`, and the keyless tests need the device signer built
 (`cargo build --release` in `contrib/seqln-signer`, or `SEQLN_SIGNER=/path/to/seqln-signer`).
 The test plugins run under the `python3` on `PATH`, which needs the `pyln` packages, so the

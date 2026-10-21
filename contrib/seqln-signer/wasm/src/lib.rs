@@ -310,6 +310,7 @@ impl Signer {
         remote_funding: &[u8],
         option_static_remotekey: bool,
         option_anchors: bool,
+        option_tcov: bool,
     ) -> Result<bool, JsError> {
         let mut txid = arr32(funding_txid, "funding_txid")?;
         txid.reverse(); // display -> internal byte order (as setup_channel carries it)
@@ -326,6 +327,7 @@ impl Signer {
             remote_funding: arr33(remote_funding, "remote_funding")?,
             option_static_remotekey,
             option_anchors,
+            option_tcov,
             // Not among the parameters a host reads off the node: learned
             // from the next setup_channel (ChannelState::merge_from).
             is_outbound: None,

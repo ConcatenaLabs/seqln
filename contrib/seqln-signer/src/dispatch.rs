@@ -11,6 +11,7 @@ use crate::hsm_secret::HsmSecret;
 use crate::kernel::{self, Kernel};
 use crate::payments::{self, AssetKey, Limits, Offered, Plan};
 use crate::policy::{self, ChannelState, ChannelStore, Htlc, Policy, Side, Split};
+use crate::taproot;
 use crate::wire::{self, msg, BitcoinTx, Writer};
 use bitcoin::secp256k1::SecretKey;
 
@@ -44,7 +45,7 @@ const SWEEP_KEY_SCAN: u32 = 5000;
 /// The capabilities array from `hsmd_init()`, in the exact order libhsmd emits
 /// it, followed by the two preapprove-check caps (`dev_no_preapprove_check` is
 /// false in a normal, non-dev node).
-const CAPABILITIES: [u32; 13] = [
+const CAPABILITIES: [u32; 17] = [
     28,  // WIRE_HSMD_CHECK_PUBKEY
     56,  // WIRE_HSMD_CHECK_BIP86_PUBKEY
     142, // WIRE_HSMD_SIGN_ANY_DELAYED_PAYMENT_TO_US
@@ -56,6 +57,10 @@ const CAPABILITIES: [u32; 13] = [
     40,  // WIRE_HSMD_REVOKE_COMMITMENT_TX
     41,  // WIRE_HSMD_SIGN_BOLT12_2
     45,  // WIRE_HSMD_BIP137_SIGN_MESSAGE
+    61,  // WIRE_HSMD_SIGN_TCOV_DELAYED_TO_US
+    62,  // WIRE_HSMD_SIGN_TCOV_LOCAL_HTLC
+    63,  // WIRE_HSMD_SIGN_TCOV_REMOTE_HTLC_TO_US
+    64,  // WIRE_HSMD_SIGN_TCOV_PENALTY
     51,  // WIRE_HSMD_PREAPPROVE_INVOICE_CHECK
     52,  // WIRE_HSMD_PREAPPROVE_KEYSEND_CHECK
 ];
@@ -115,7 +120,19 @@ pub struct Signer {
     /// (`approve_close_destination`): a close may pay this side's balance to
     /// one of them as to the node's own wallet. Not persisted.
     close_destinations: std::collections::HashSet<Vec<u8>>,
+    /// The chain's genesis hash, from INIT: an Elements taproot signature
+    /// hash commits to it.
+    genesis: Option<[u8; 32]>,
+    /// The taproot-covenant claims SIGN_TCOV_LOCAL_HTLC approved in this
+    /// session, as (txid, D): SIGN_HTLC_TX_MINGLE may then sign the claim's
+    /// fee coins with D, the covenant's output, among the outputs. At most
+    /// [`TCOV_CLAIMS`], the oldest dropped first. Not persisted: after a
+    /// restart lightningd builds the claim again and asks again.
+    tcov_claims: std::cell::RefCell<std::collections::VecDeque<([u8; 32], Vec<u8>)>>,
 }
+
+/// How many approved taproot-covenant claims the signer remembers.
+const TCOV_CLAIMS: usize = 64;
 
 /// What one transaction lets leave this device, in atoms per asset.
 type Losses = std::collections::BTreeMap<AssetKey, u64>;
@@ -157,6 +174,8 @@ impl Signer {
             refusal: std::cell::RefCell::new(None),
             charged_withdrawals: std::collections::HashSet::new(),
             close_destinations: std::collections::HashSet::new(),
+            genesis: None,
+            tcov_claims: std::cell::RefCell::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -260,6 +279,14 @@ impl Signer {
             // anchor output (funding-key partial sig) plus the node's own wallet
             // fee inputs. Advertised in CAPABILITIES but previously unhandled.
             msg::HSMD_SIGN_ANCHORSPEND => opt(self.h_sign_anchorspend(&req.hsmd_msg)),
+            // SIGN_HTLC_TX_MINGLE (149): the wallet's fee coins of a spend of
+            // a commitment output.
+            msg::HSMD_SIGN_HTLC_TX_MINGLE => opt(self.h_sign_htlc_tx_mingle(&req.hsmd_msg)),
+            // The taproot-covenant channel type's spends (61 to 64).
+            msg::HSMD_SIGN_TCOV_DELAYED_TO_US
+            | msg::HSMD_SIGN_TCOV_LOCAL_HTLC
+            | msg::HSMD_SIGN_TCOV_REMOTE_HTLC_TO_US
+            | msg::HSMD_SIGN_TCOV_PENALTY => opt(self.h_sign_tcov(&req.hsmd_msg, t)),
             msg::HSMD_SIGN_MUTUAL_CLOSE_TX => self.sign_mutual_close_tx_checked(req),
             msg::HSMD_SIGN_REMOTE_HTLC_TX => opt(self.h_sign_remote_htlc_tx(req)),
             msg::HSMD_SIGN_ANY_LOCAL_HTLC_TX => opt(self.h_sign_any_local_htlc_tx(&req.hsmd_msg)),
@@ -368,6 +395,7 @@ impl Signer {
 
         self.kernel = Some(kernel);
         self.hsm_version = hsm_version;
+        self.genesis = Some(f.genesis);
         Outcome::Reply(w.into_vec())
     }
 
@@ -1763,6 +1791,215 @@ impl Signer {
         self.sig_reply(bt, 0, wscript, &privkey, SIGHASH_SINGLE_ACP, msg::HSMD_SIGN_TX_REPLY)
     }
 
+    /// SIGN_TCOV_* (61 to 64): a spend of an output of a taproot-covenant
+    /// channel's commitment (`crate::taproot`). lightningd sends the whole
+    /// transaction and every input's previous output, since the taproot
+    /// signature (SIGHASH_DEFAULT) commits to all of them, fee coins in any
+    /// asset included. The reply is a BIP340 signature of the leaf's script
+    /// path, or of the key path for a penalty:
+    ///  * 61, our delayed key for our commitment `commit_num`: the DELAY leaf
+    ///    of its to_local, or of a claim's output D;
+    ///  * 62, our HTLC key for our commitment `commit_num`: a covenant leaf,
+    ///    which pays the HTLC's value to that commitment's D;
+    ///  * 63, our HTLC key for the peer's commitment at its point: the leaf
+    ///    that pays us;
+    ///  * 64, the revocation key for a revoked commitment of the peer's,
+    ///    tweaked for the output's tree: the key path.
+    fn h_sign_tcov(&self, m: &[u8], t: u16) -> Option<Vec<u8>> {
+        enum Key {
+            Delayed(u64),
+            LocalHtlc(u64),
+            RemoteHtlc([u8; 33]),
+            Penalty([u8; 32]),
+        }
+        let mut r = wire::Reader::new(m);
+        r.u16()?;
+        let key = match t {
+            msg::HSMD_SIGN_TCOV_DELAYED_TO_US => Key::Delayed(r.u64()?),
+            msg::HSMD_SIGN_TCOV_LOCAL_HTLC => Key::LocalHtlc(r.u64()?),
+            msg::HSMD_SIGN_TCOV_REMOTE_HTLC_TO_US => Key::RemoteHtlc(r.arr33()?),
+            msg::HSMD_SIGN_TCOV_PENALTY => Key::Penalty(r.arr32()?),
+            _ => return None,
+        };
+        let (bt, proofs_empty) = wire::read_elements_tx_proofs(&mut r)?;
+        let input = r.u32()? as usize;
+        let (leaf, merkle_root) = match key {
+            Key::Penalty(_) => (None, Some(r.arr32()?)),
+            _ => (Some(r.u16_prefixed()?), None),
+        };
+        let peer_id = r.arr33()?;
+        let dbid = r.u64()?;
+        if input >= bt.tx.inputs.len() || leaf.as_ref().is_some_and(|l| l.is_empty()) {
+            return None;
+        }
+        let genesis = self.genesis?;
+        let prevouts = (0..bt.tx.inputs.len())
+            .map(|i| {
+                wire::psbt_input_elements_prevout(&bt.psbt, i)
+                    .map(|(asset, value, script)| taproot::Prevout { asset, value, script })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        if !is_p2tr(&prevouts[input].script) {
+            return None;
+        }
+
+        let k = self.kernel();
+        let s = k.channel_secrets(&peer_id, dbid);
+        let (label, sk, local_point) = match key {
+            Key::Delayed(n) => {
+                let point = k.per_commit_point_at(&s.shaseed, n);
+                ("SIGN_TCOV_DELAYED_TO_US", k.derive_simple_privkey(&s.delayed, &point), None)
+            }
+            Key::LocalHtlc(n) => {
+                let point = k.per_commit_point_at(&s.shaseed, n);
+                ("SIGN_TCOV_LOCAL_HTLC", k.derive_simple_privkey(&s.htlc, &point), Some(point))
+            }
+            Key::RemoteHtlc(point) => {
+                ("SIGN_TCOV_REMOTE_HTLC_TO_US", k.derive_simple_privkey(&s.htlc, &point), None)
+            }
+            Key::Penalty(secret) => {
+                let rev = SecretKey::from_slice(&secret).ok()?;
+                let point = k.point_from_secret(&secret).ok()?;
+                ("SIGN_TCOV_PENALTY", k.derive_revocation_privkey(&s.revocation, &rev, &point), None)
+            }
+        };
+        self.enforce_tcov(label, &peer_id, dbid, &bt, proofs_empty, input, &prevouts, local_point.as_ref())
+            .ok()?;
+        let sighash = taproot::elements_sighash(
+            &bt.tx,
+            &prevouts,
+            input,
+            leaf.as_deref(),
+            taproot::SIGHASH_DEFAULT,
+            &genesis,
+        )?;
+        let sig = match merkle_root {
+            None => taproot::sign(k.secp(), &sighash, &sk),
+            Some(root) => {
+                let (sig, output_key) = taproot::sign_keypath(k.secp(), &sighash, &sk, &root)?;
+                // A key path for some other output: no use to anyone.
+                if taproot::p2tr(&output_key) != prevouts[input].script {
+                    return None;
+                }
+                sig
+            }
+        };
+        let mut w = Writer::new(msg::HSMD_SIGN_TCOV_REPLY);
+        w.bytes(&sig);
+        Some(w.into_vec())
+    }
+
+    /// The enforce gate for a taproot-covenant spend, whose signature commits
+    /// to every output: each one is unblinded and pays one of the node's own
+    /// scripts, or, for SIGN_TCOV_LOCAL_HTLC (`local_point` given), D, the
+    /// to_local of our commitment at that point, at the input's own index,
+    /// where the covenant sends the HTLC's value; and what leaves, the fee
+    /// outputs, is within the payment limit of each asset. The input it signs
+    /// is in the channel's asset, unblinded, and the transaction has no
+    /// issuance or output proof (its signature hash takes them as empty). An
+    /// approved claim's (txid, D) is kept for SIGN_HTLC_TX_MINGLE.
+    #[allow(clippy::too_many_arguments)]
+    fn enforce_tcov(
+        &self,
+        label: &str,
+        peer_id: &[u8; 33],
+        dbid: u64,
+        bt: &BitcoinTx,
+        proofs_empty: bool,
+        input: usize,
+        prevouts: &[taproot::Prevout],
+        local_point: Option<&[u8; 33]>,
+    ) -> Result<(), ()> {
+        if !self.policy.is_enforce() {
+            return Ok(());
+        }
+        let check = (|| -> Result<Option<Vec<u8>>, String> {
+            if !proofs_empty {
+                return Err("the transaction carries an issuance or output proof".to_string());
+            }
+            let asset = explicit_asset(&prevouts[input].asset)
+                .ok_or("the input's asset is not explicit")?;
+            explicit_amount(&prevouts[input].value).ok_or("the input's value is not explicit")?;
+            let st = self.store.get(peer_id, dbid);
+            if let Some(chan) = st.and_then(|st| st.pay.asset) {
+                if chan != asset {
+                    return Err(format!("the input is not in the channel's asset {}", chan.display()));
+                }
+            }
+            let d = match local_point {
+                None => None,
+                Some(point) => {
+                    let st = st.ok_or_else(|| self.untracked(peer_id, dbid))?;
+                    if !st.option_tcov {
+                        return Err("the channel is not a taproot-covenant channel".to_string());
+                    }
+                    Some(policy::tcov_local_to_local(self.kernel(), peer_id, dbid, st, point)?)
+                }
+            };
+            let own = self.own_sweep_script_set();
+            let mut fees = Losses::new();
+            for (i, o) in bt.tx.outputs.iter().enumerate() {
+                let a = explicit_asset(&o.asset).ok_or_else(|| format!("output {i} has a blinded asset"))?;
+                let v = explicit_amount(&o.value).ok_or_else(|| format!("output {i} has a blinded value"))?;
+                if o.nonce != [0x00] {
+                    return Err(format!("output {i} is blinded"));
+                }
+                if o.script.is_empty() {
+                    let f = fees.entry(a).or_insert(0);
+                    *f = f.saturating_add(v);
+                } else if !own.contains(&o.script) && !(i == input && d.as_ref() == Some(&o.script)) {
+                    return Err(format!(
+                        "output {i} pays {}, which is not one of this device's own scripts",
+                        hexbytes(&o.script)
+                    ));
+                }
+            }
+            for (a, fee) in &fees {
+                self.within_limit(a, *fee, "what it lets leave this device")?;
+            }
+            Ok(d)
+        })();
+        match check {
+            Ok(d) => {
+                if let Some(d) = d {
+                    let mut claims = self.tcov_claims.borrow_mut();
+                    if claims.len() >= TCOV_CLAIMS {
+                        claims.pop_front();
+                    }
+                    claims.push_back((bt.txid, d));
+                }
+                Ok(())
+            }
+            Err(reason) => {
+                self.refuse(format!("{label} refused: {reason}"));
+                Err(())
+            }
+        }
+    }
+
+    /// Whether `script`, paid by the transaction `txid`, is D, the covenant
+    /// output of a taproot-covenant claim SIGN_TCOV_LOCAL_HTLC approved.
+    fn tcov_claim_pays(&self, txid: &[u8; 32], script: &[u8]) -> bool {
+        self.tcov_claims.borrow().iter().any(|(t, d)| t == txid && d.as_slice() == script)
+    }
+
+    /// SIGN_HTLC_TX_MINGLE (149): sign the wallet's fee coins of a spend of a
+    /// commitment output whose own input lightningd has finished: on a
+    /// taproot-covenant channel, a claim's fee coins, in whatever asset pays
+    /// the fee. The coins are held to the withdrawal rule
+    /// ([`Self::check_withdrawal`], each spend on its own against the payment
+    /// limits), which also lets an output pay the D of a claim
+    /// SIGN_TCOV_LOCAL_HTLC approved. A refused request gets its PSBT back
+    /// unsigned, which lightningd cannot finalize, so it tries again later.
+    fn h_sign_htlc_tx_mingle(&self, m: &[u8]) -> Option<Vec<u8>> {
+        let (_peer_id, _dbid, utxos, psbt) = wire::parse_sign_htlc_tx_mingle(m)?;
+        let (out, _) = self.sign_wallet_inputs_into_psbt("SIGN_HTLC_TX_MINGLE", &utxos, psbt, Bound::Each, 0)?;
+        let mut w = Writer::new(msg::HSMD_SIGN_HTLC_TX_MINGLE_REPLY);
+        w.u32(out.len() as u32);
+        w.bytes(&out);
+        Some(w.into_vec())
+    }
+
     /// SIGN_WITHDRAWAL (7): sign the node's OWN wallet inputs of a withdrawal /
     /// channel-funding PSBT and return the PSBT with a `PSBT_IN_PARTIAL_SIG` per
     /// signed input, mirroring `handle_sign_withdrawal_tx` -> `sign_our_inputs`
@@ -2100,7 +2337,7 @@ impl Signer {
                 ),
             };
             paid = paid.saturating_add(amount);
-            if own.contains(&o.script) {
+            if own.contains(&o.script) || self.tcov_claim_pays(txid, &o.script) {
                 continue;
             }
             match self.funding_output(txid, i, o, network) {
@@ -2692,7 +2929,7 @@ fn parse_setup_channel(m: &[u8]) -> Option<ChannelState> {
     let remote_shutdown_script = r.take_bytes(rsl)?;
     let ctlen = r.u16()? as usize;
     let features = r.take_bytes(ctlen)?;
-    let (option_static_remotekey, option_anchors) = policy::parse_channel_type(&features);
+    let (option_static_remotekey, option_anchors, option_tcov) = policy::parse_channel_type(&features);
     let limits = parse_setup_channel_limits(&mut r)?;
     Some(ChannelState {
         funding_sats,
@@ -2707,6 +2944,7 @@ fn parse_setup_channel(m: &[u8]) -> Option<ChannelState> {
         remote_funding,
         option_static_remotekey,
         option_anchors,
+        option_tcov,
         is_outbound: Some(is_outbound),
         local_shutdown_script,
         remote_shutdown_script,
@@ -3802,8 +4040,17 @@ mod close_and_revocation_tests {
         assert!(matches!(revoke(&mut s, 0), Outcome::Reply(_)));
         assert!(s.store.record_close([0x99; 32]));
         assert!(!s.store.record_close([0x99; 32]));
-        let v9 = policy::encode_channel_store(&s.store);
-        assert_eq!(v9[4], 9);
+        let v10 = policy::encode_channel_store(&s.store);
+        assert_eq!(v10[4], 10);
+        // A version-9 payload: the same, without the entry's channel-type
+        // flag (the byte before the ledger and the close record).
+        let l = &s.store.ledger;
+        let at10 = v10.len() - (2 + 32) - (2 + 40 * l.approvals.len() + 2 + 49 * l.spends.len()) - 1;
+        assert_eq!(v10[at10], 0);
+        let mut v9 = [&v10[..at10], &v10[at10 + 1..]].concat();
+        v9[4] = 9;
+        let (back, _, _) = policy::decode_channel_store(&v9).unwrap();
+        assert!(!back[0].1.option_tcov);
         // A version-8 payload: the same, without the entry's limits flag and
         // reserve flag (the two bytes before the ledger and the close record;
         // `track` sends no limits).
@@ -5460,8 +5707,8 @@ mod close_and_revocation_tests {
             assert!(matches!(validate(&mut s, n, 300_000, 699_000, 1_000), Outcome::Reply(_)));
         }
         let full = policy::encode_channel_store(&s.store);
-        // Version 9 less the entry's three flags and the close record: version 6.
-        let mut payload = [&full[..full.len() - 2 - 4 - 3], &full[full.len() - 2 - 4..full.len() - 2]].concat();
+        // Version 10 less the entry's four flags and the close record: version 6.
+        let mut payload = [&full[..full.len() - 2 - 4 - 4], &full[full.len() - 2 - 4..full.len() - 2]].concat();
         payload[4] = 6;
         let mac = s.chstore_mac(&payload);
         payload.extend_from_slice(&mac);
@@ -6340,6 +6587,7 @@ mod close_output_spend_tests {
             remote_funding: [0x02; 33],
             option_static_remotekey: true,
             option_anchors: true,
+            option_tcov: false,
             is_outbound: Some(false),
             local_shutdown_script: Vec::new(),
             remote_shutdown_script: Vec::new(),
@@ -6354,5 +6602,544 @@ mod close_output_spend_tests {
             limits: None,
             peer_reached_reserve: false,
         }
+    }
+}
+
+/// The taproot-covenant channel type (`crate::taproot`): SIGN_TCOV_* signs
+/// what lightningd builds and, in enforce mode, refuses a spend that pays
+/// anywhere but the node's own scripts or the covenant's D; the claim's fee
+/// coins sign once the claim was approved; the commitments validate against
+/// the taproot trees.
+#[cfg(test)]
+mod tcov_tests {
+    use super::*;
+    use crate::hsm_secret::HsmSecret;
+    use crate::kernel::{Kernel, BIP32_VER_TEST_PRIVATE, BIP32_VER_TEST_PUBLIC};
+    use crate::policy::Policy;
+    use crate::taproot::{self, Prevout, TcovKeys};
+    use secp256k1::{Message, XOnlyPublicKey};
+
+    const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    const PEER_MNEMONIC: &str = "legal winner thank year wave sausage worth useful legal winner thank yellow";
+    const PEER: [u8; 33] = [0x02; 33];
+    const DBID: u64 = 7;
+    const GOLD: [u8; 32] = [0x47; 32];
+    const SILV: [u8; 32] = [0x53; 32];
+    const GENESIS: [u8; 32] = [0xa5; 32];
+    const N: u64 = 3;
+    const X: u64 = 50_000;
+    const CLTV: u32 = 700;
+    const PAYMENT_HASH: [u8; 32] = [0x66; 32];
+    const FEE_COIN: u64 = 20_000;
+
+    fn signer(policy: Policy) -> Signer {
+        let seed = crate::kernel::bip39_seed(MNEMONIC, "");
+        let kernel = Kernel::new(seed.to_vec(), BIP32_VER_TEST_PUBLIC, BIP32_VER_TEST_PRIVATE);
+        let secret = HsmSecret { seed, secret_type: 2, mnemonic: String::new() };
+        let mut s = Signer::with_policy(secret, policy);
+        s.kernel = Some(kernel);
+        s.hsm_version = 6;
+        s.genesis = Some(GENESIS);
+        s
+    }
+
+    /// The peer's basepoints: another seed's.
+    fn peer_bp() -> [[u8; 33]; 5] {
+        let seed = crate::kernel::bip39_seed(PEER_MNEMONIC, "");
+        Kernel::new(seed.to_vec(), BIP32_VER_TEST_PUBLIC, BIP32_VER_TEST_PRIVATE).channel_basepoints(&[0x03; 33], 1)
+    }
+
+    fn channel() -> ChannelState {
+        let bp = peer_bp();
+        ChannelState {
+            funding_sats: 1_000_000,
+            funding_txid: [0x44; 32],
+            funding_txout: 0,
+            local_to_self_delay: 144,
+            remote_to_self_delay: 12,
+            remote_revocation: bp[0],
+            remote_payment: bp[1],
+            remote_htlc: bp[2],
+            remote_delayed: bp[3],
+            remote_funding: bp[4],
+            option_static_remotekey: true,
+            option_anchors: false,
+            option_tcov: true,
+            is_outbound: Some(true),
+            local_shutdown_script: Vec::new(),
+            remote_shutdown_script: Vec::new(),
+            local_shutdown_wallet_index: None,
+            revoked_through: None,
+            validated_through: None,
+            local_split: None,
+            remote_split: None,
+            validated: Vec::new(),
+            pay: crate::payments::PayTrack { asset: Some(AssetKey::Asset(GOLD)), ..Default::default() },
+            predates_validation: false,
+            limits: None,
+            peer_reached_reserve: false,
+        }
+    }
+
+    fn tracked(policy: Policy) -> Signer {
+        let mut s = signer(policy);
+        s.store.insert(PEER, DBID, channel());
+        s
+    }
+
+    /// The keys of our commitment `n`, derived here on their own.
+    fn our_keys(s: &Signer, n: u64) -> ([u8; 33], TcovKeys) {
+        let k = s.kernel();
+        let sec = k.channel_secrets(&PEER, DBID);
+        let point = k.per_commit_point_at(&sec.shaseed, n);
+        let ours = k.channel_basepoints(&PEER, DBID);
+        let peer = peer_bp();
+        let keys = TcovKeys {
+            revocation: k.derive_revocation_key_pub(&peer[0], &point).unwrap(),
+            self_delayed: k.derive_simple_key_pub(&ours[3], &point).unwrap(),
+            self_htlc: k.derive_simple_key_pub(&ours[2], &point).unwrap(),
+            other_htlc: k.derive_simple_key_pub(&peer[2], &point).unwrap(),
+            other_payment: peer[1],
+        };
+        (point, keys)
+    }
+
+    fn explicit(asset: &[u8; 32], v: u64) -> (Vec<u8>, Vec<u8>) {
+        let mut a = vec![0x01];
+        a.extend_from_slice(asset);
+        let mut b = vec![0x01];
+        b.extend_from_slice(&v.to_be_bytes());
+        (a, b)
+    }
+
+    struct Spend {
+        /// (txid, vout, asset, amount, script, sequence)
+        ins: Vec<([u8; 32], u32, [u8; 32], u64, Vec<u8>, u32)>,
+        /// (asset, amount, script); an empty script is a fee output.
+        outs: Vec<([u8; 32], u64, Vec<u8>)>,
+        locktime: u32,
+    }
+
+    impl Spend {
+        fn tx(&self) -> Vec<u8> {
+            let mut t = 2u32.to_le_bytes().to_vec();
+            t.push(0x00);
+            t.extend(compact_size(self.ins.len()));
+            for (txid, vout, _, _, _, seq) in &self.ins {
+                t.extend_from_slice(txid);
+                t.extend_from_slice(&vout.to_le_bytes());
+                t.push(0x00);
+                t.extend_from_slice(&seq.to_le_bytes());
+            }
+            t.extend(compact_size(self.outs.len()));
+            for (asset, v, spk) in &self.outs {
+                let (a, b) = explicit(asset, *v);
+                t.extend(a);
+                t.extend(b);
+                t.push(0x00);
+                t.extend(compact_size(spk.len()));
+                t.extend_from_slice(spk);
+            }
+            t.extend_from_slice(&self.locktime.to_le_bytes());
+            t
+        }
+
+        fn pset(&self) -> Vec<u8> {
+            let rec = |key: &[u8], val: &[u8]| {
+                let mut r = compact_size(key.len());
+                r.extend_from_slice(key);
+                r.extend(compact_size(val.len()));
+                r.extend_from_slice(val);
+                r
+            };
+            let mut p = b"pset\xff".to_vec();
+            p.extend(rec(&[0x02], &2u32.to_le_bytes()));
+            p.extend(rec(&[0x03], &self.locktime.to_le_bytes()));
+            p.extend(rec(&[0x04], &[self.ins.len() as u8]));
+            p.extend(rec(&[0x05], &[self.outs.len() as u8]));
+            p.push(0x00);
+            for (txid, vout, asset, v, spk, seq) in &self.ins {
+                let (a, b) = explicit(asset, *v);
+                let mut wu = a;
+                wu.extend(b);
+                wu.push(0x00);
+                wu.extend(compact_size(spk.len()));
+                wu.extend_from_slice(spk);
+                p.extend(rec(&[0x01], &wu));
+                p.extend(rec(&[0x0e], txid));
+                p.extend(rec(&[0x0f], &vout.to_le_bytes()));
+                p.extend(rec(&[0x10], &seq.to_le_bytes()));
+                p.push(0x00);
+            }
+            for (asset, v, spk) in &self.outs {
+                p.extend(rec(&[0xfc, 0x04, 0x70, 0x73, 0x65, 0x74, 0x02], asset));
+                p.extend(rec(&[0x03], &v.to_le_bytes()));
+                p.extend(rec(&[0x04], spk));
+                p.push(0x00);
+            }
+            p
+        }
+
+        fn prevouts(&self) -> Vec<Prevout> {
+            self.ins
+                .iter()
+                .map(|(_, _, asset, v, spk, _)| {
+                    let (a, b) = explicit(asset, *v);
+                    Prevout { asset: a, value: b, script: spk.clone() }
+                })
+                .collect()
+        }
+    }
+
+    fn wallet(s: &Signer) -> Vec<u8> {
+        s.wallet_sweep_script(0, false)
+    }
+
+    /// Our offered HTLC on our commitment N, its tree, and D.
+    fn offered(s: &Signer) -> (taproot::Tree2, Vec<u8>) {
+        let (point, keys) = our_keys(s, N);
+        let secp = s.kernel().secp();
+        let tree = taproot::offered_tree(secp, &keys, &point, 12, &GOLD, &PAYMENT_HASH, CLTV, X).unwrap();
+        let d = taproot::to_local_tree(secp, &keys, &point, 12).unwrap().script_pubkey();
+        (tree, d)
+    }
+
+    /// The covenant claim: the HTLC to D, a SILV fee coin, its change to the
+    /// wallet and the fee.
+    fn claim(s: &Signer, out0: Vec<u8>, fee: u64) -> Spend {
+        let (tree, _) = offered(s);
+        Spend {
+            ins: vec![
+                ([0xaa; 32], 2, GOLD, X, tree.script_pubkey(), 0xffff_fffe),
+                ([0xbb; 32], 1, SILV, FEE_COIN, wallet(s), 0xffff_fffd),
+            ],
+            outs: vec![(GOLD, X, out0), (SILV, FEE_COIN - fee, wallet(s)), (SILV, fee, Vec::new())],
+            locktime: CLTV,
+        }
+    }
+
+    fn tcov_msg(t: u16, head: &[u8], sp: &Spend, input: u32, tail: &[u8]) -> Request {
+        let tx = sp.tx();
+        let p = sp.pset();
+        let mut w = Writer::new(t);
+        w.bytes(head);
+        w.u32(tx.len() as u32);
+        w.bytes(&tx);
+        w.u32(p.len() as u32);
+        w.bytes(&p);
+        w.u32(input);
+        w.bytes(tail);
+        w.bytes(&PEER);
+        w.u64(DBID);
+        Request { is_main: true, node_id: [0x09; 33], dbid: 0, capabilities: 0, hsmd_msg: w.into_vec() }
+    }
+
+    fn leaf_tail(leaf: &[u8]) -> Vec<u8> {
+        let mut t = (leaf.len() as u16).to_be_bytes().to_vec();
+        t.extend_from_slice(leaf);
+        t
+    }
+
+    fn local_htlc(s: &Signer, sp: &Spend) -> Request {
+        let (tree, _) = offered(s);
+        tcov_msg(msg::HSMD_SIGN_TCOV_LOCAL_HTLC, &N.to_be_bytes(), sp, 0, &leaf_tail(&tree.leaves[0]))
+    }
+
+    fn sig_of(o: &Outcome) -> [u8; 64] {
+        match o {
+            Outcome::Reply(r) => {
+                assert_eq!(u16::from_be_bytes([r[0], r[1]]), msg::HSMD_SIGN_TCOV_REPLY);
+                r[2..66].try_into().unwrap()
+            }
+            Outcome::Reject(r) => panic!("refused: {r}"),
+            _ => panic!("no signature"),
+        }
+    }
+
+    fn verifies(s: &Signer, sp: &Spend, input: usize, leaf: Option<&[u8]>, sig: &[u8; 64], key_x: &[u8]) -> bool {
+        let sh = taproot::elements_sighash(&sp.tx_parsed(), &sp.prevouts(), input, leaf, 0, &GENESIS).unwrap();
+        let sig = secp256k1::schnorr::Signature::from_slice(sig).unwrap();
+        let key = XOnlyPublicKey::from_slice(key_x).unwrap();
+        s.kernel().secp().verify_schnorr(&sig, &Message::from_digest(sh), &key).is_ok()
+    }
+
+    impl Spend {
+        fn tx_parsed(&self) -> kernel::ElementsTx {
+            wire::parse_elements_tx(&self.tx()).unwrap()
+        }
+    }
+
+    fn refused(o: &Outcome) -> String {
+        match o {
+            Outcome::Reject(r) => r.clone(),
+            Outcome::Reply(_) => panic!("signed"),
+            _ => panic!("sentinel without a reason"),
+        }
+    }
+
+    #[test]
+    fn the_policy_d_is_the_one_the_trees_name() {
+        let s = tracked(Policy::Enforce);
+        let (point, _) = our_keys(&s, N);
+        let (_, d) = offered(&s);
+        let st = s.store.get(&PEER, DBID).unwrap();
+        assert_eq!(policy::tcov_local_to_local(s.kernel(), &PEER, DBID, st, &point).unwrap(), d);
+    }
+
+    #[test]
+    fn covenant_claim_signs_and_its_fee_coins_follow() {
+        let mut s = tracked(Policy::Enforce);
+        let (tree, d) = offered(&s);
+        let sp = claim(&s, d, 1_000);
+        let o = s.handle(&local_htlc(&s, &sp));
+        let sig = sig_of(&o);
+        let (_, keys) = our_keys(&s, N);
+        assert!(verifies(&s, &sp, 0, Some(&tree.leaves[0]), &sig, &keys.self_htlc[1..]));
+
+        // The fee coin: SIGN_HTLC_TX_MINGLE adds its partial signature.
+        let psbt = sp.pset();
+        let m = mingle_msg(&s, &sp, &psbt);
+        match s.handle(&req(m)) {
+            Outcome::Reply(r) => {
+                let out = &r[6..];
+                assert!(out.len() > psbt.len(), "no signature added");
+                assert_eq!(s.refusal.borrow().as_ref(), None);
+            }
+            _ => panic!("mingle failed"),
+        }
+    }
+
+    fn req(m: Vec<u8>) -> Request {
+        Request { is_main: true, node_id: [0x09; 33], dbid: 0, capabilities: 0, hsmd_msg: m }
+    }
+
+    fn mingle_msg(s: &Signer, sp: &Spend, psbt: &[u8]) -> Vec<u8> {
+        let mut w = Writer::new(msg::HSMD_SIGN_HTLC_TX_MINGLE);
+        w.bytes(&PEER);
+        w.u64(DBID);
+        w.u16(1);
+        let (txid, vout, _, v, spk, _) = &sp.ins[1];
+        w.bytes(txid);
+        w.u32(*vout);
+        w.u64(*v);
+        w.u32(0); // keyindex
+        w.bool(false);
+        w.u16(spk.len() as u16);
+        w.bytes(spk);
+        w.bool(false); // not a unilateral close
+        w.bool(false); // not coinbase
+        w.u32(psbt.len() as u32);
+        w.bytes(psbt);
+        let _ = s;
+        w.into_vec()
+    }
+
+    #[test]
+    fn fee_coins_of_an_unapproved_claim_stay_unsigned() {
+        let mut s = tracked(Policy::Enforce);
+        let (_, d) = offered(&s);
+        let sp = claim(&s, d, 1_000);
+        let psbt = sp.pset();
+        match s.handle(&req(mingle_msg(&s, &sp, &psbt))) {
+            Outcome::Reply(r) => assert_eq!(&r[6..], &psbt[..], "signed coins of a claim it never saw"),
+            _ => panic!("no reply"),
+        }
+        let why = s.refusal.borrow().clone().unwrap();
+        assert!(why.contains("SIGN_HTLC_TX_MINGLE refused") && why.contains("not one of this device's own scripts"), "{why}");
+    }
+
+    #[test]
+    fn covenant_claim_paying_elsewhere_is_refused() {
+        let mut s = tracked(Policy::Enforce);
+        let (_, d) = offered(&s);
+        // Output 0 to a script the host chose.
+        let host: Vec<u8> = [0x00u8, 0x14].iter().copied().chain([0xee; 20]).collect();
+        let r = refused(&s.handle(&local_htlc(&s, &claim(&s, host, 1_000))));
+        assert!(r.contains("SIGN_TCOV_LOCAL_HTLC refused: output 0 pays"), "{r}");
+        // D of another commitment.
+        let (point, keys) = our_keys(&s, N + 1);
+        let other_d = taproot::to_local_tree(s.kernel().secp(), &keys, &point, 12).unwrap().script_pubkey();
+        let r = refused(&s.handle(&local_htlc(&s, &claim(&s, other_d, 1_000))));
+        assert!(r.contains("output 0 pays"), "{r}");
+        // D, but at another index than the input's.
+        let mut sp = claim(&s, wallet(&s), 1_000);
+        sp.outs[1].2 = d.clone();
+        let r = refused(&s.handle(&local_htlc(&s, &sp)));
+        assert!(r.contains("output 1 pays"), "{r}");
+        // A fee over the payment limit.
+        let mut t = tracked(Policy::Enforce);
+        let mut l = payments::Limits::default();
+        l.default_atoms = Some(500);
+        t.set_limits(l);
+        let r = refused(&t.handle(&local_htlc(&t, &claim(&t, d.clone(), 1_000))));
+        assert!(r.contains("over this device's payment limit"), "{r}");
+        // An untracked channel: D cannot be checked.
+        let mut u = signer(Policy::Enforce);
+        let r = refused(&u.handle(&local_htlc(&u, &claim(&u, d.clone(), 1_000))));
+        assert!(r.contains("no tracked channel"), "{r}");
+        // Permissive mode (the kill-switch) signs as asked.
+        let mut p = tracked(Policy::Permissive);
+        let host: Vec<u8> = [0x00u8, 0x14].iter().copied().chain([0xee; 20]).collect();
+        sig_of(&p.handle(&local_htlc(&p, &claim(&p, host, 1_000))));
+    }
+
+    #[test]
+    fn a_blinded_or_proof_carrying_claim_is_refused() {
+        let mut s = tracked(Policy::Enforce);
+        let (tree, d) = offered(&s);
+        let sp = claim(&s, d, 1_000);
+        // The same transaction with a witness section whose output 0 carries
+        // a range proof.
+        let mut tx = sp.tx();
+        tx[4] = 0x01;
+        for _ in 0..sp.ins.len() {
+            tx.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        }
+        tx.extend_from_slice(&[0x00, 0x01, 0xaa]);
+        for _ in 1..sp.outs.len() {
+            tx.extend_from_slice(&[0x00, 0x00]);
+        }
+        let p = sp.pset();
+        let mut w = Writer::new(msg::HSMD_SIGN_TCOV_LOCAL_HTLC);
+        w.u64(N);
+        w.u32(tx.len() as u32);
+        w.bytes(&tx);
+        w.u32(p.len() as u32);
+        w.bytes(&p);
+        w.u32(0);
+        w.bytes(&leaf_tail(&tree.leaves[0]));
+        w.bytes(&PEER);
+        w.u64(DBID);
+        let r = refused(&s.handle(&req(w.into_vec())));
+        assert!(r.contains("issuance or output proof"), "{r}");
+    }
+
+    #[test]
+    fn sweeps_to_the_wallet_sign_and_a_foreign_one_does_not() {
+        let mut s = tracked(Policy::Enforce);
+        let (point, keys) = our_keys(&s, N);
+        let tl = taproot::to_local_tree(s.kernel().secp(), &keys, &point, 12).unwrap();
+        // The DELAY leaf of to_local, fee out of the output itself.
+        let sweep = |out: Vec<u8>| Spend {
+            ins: vec![([0xcc; 32], 0, GOLD, 300_000, tl.script_pubkey(), 12)],
+            outs: vec![(GOLD, 299_000, out), (GOLD, 1_000, Vec::new())],
+            locktime: 0,
+        };
+        let sp = sweep(wallet(&s));
+        let m = tcov_msg(msg::HSMD_SIGN_TCOV_DELAYED_TO_US, &N.to_be_bytes(), &sp, 0, &leaf_tail(&tl.leaves[0]));
+        let sig = sig_of(&s.handle(&m));
+        assert!(verifies(&s, &sp, 0, Some(&tl.leaves[0]), &sig, &keys.self_delayed[1..]));
+        let host: Vec<u8> = [0x00u8, 0x14].iter().copied().chain([0xee; 20]).collect();
+        let sp = sweep(host);
+        let m = tcov_msg(msg::HSMD_SIGN_TCOV_DELAYED_TO_US, &N.to_be_bytes(), &sp, 0, &leaf_tail(&tl.leaves[0]));
+        assert!(refused(&s.handle(&m)).contains("SIGN_TCOV_DELAYED_TO_US refused: output 0 pays"));
+        // In another asset than the channel's.
+        let mut sp = sweep(wallet(&s));
+        sp.ins[0].2 = SILV;
+        let m = tcov_msg(msg::HSMD_SIGN_TCOV_DELAYED_TO_US, &N.to_be_bytes(), &sp, 0, &leaf_tail(&tl.leaves[0]));
+        assert!(refused(&s.handle(&m)).contains("not in the channel's asset"));
+    }
+
+    #[test]
+    fn penalty_signs_the_key_path_of_the_output_it_names() {
+        let mut s = tracked(Policy::Enforce);
+        // A revoked commitment of the peer's: its per-commitment secret, and
+        // its to_local keyed by our revocation basepoint.
+        let secret = [0x31u8; 32];
+        let k = s.kernel();
+        let point = k.point_from_secret(&secret).unwrap();
+        let ours = k.channel_basepoints(&PEER, DBID);
+        let peer = peer_bp();
+        let keys = TcovKeys {
+            revocation: k.derive_revocation_key_pub(&ours[0], &point).unwrap(),
+            self_delayed: k.derive_simple_key_pub(&peer[3], &point).unwrap(),
+            self_htlc: k.derive_simple_key_pub(&peer[2], &point).unwrap(),
+            other_htlc: k.derive_simple_key_pub(&ours[2], &point).unwrap(),
+            other_payment: ours[1],
+        };
+        let tl = taproot::to_local_tree(k.secp(), &keys, &point, 144).unwrap();
+        let sp = Spend {
+            ins: vec![([0xdd; 32], 0, GOLD, 300_000, tl.script_pubkey(), 0xffff_fffd)],
+            outs: vec![(GOLD, 299_000, wallet(&s)), (GOLD, 1_000, Vec::new())],
+            locktime: 0,
+        };
+        let m = tcov_msg(msg::HSMD_SIGN_TCOV_PENALTY, &secret, &sp, 0, &tl.merkle_root);
+        let sig = sig_of(&s.handle(&m));
+        assert!(verifies(&s, &sp, 0, None, &sig, &tl.program));
+        // The merkle root of another tree: no signature.
+        let m = tcov_msg(msg::HSMD_SIGN_TCOV_PENALTY, &secret, &sp, 0, &[0x77; 32]);
+        assert!(matches!(s.handle(&m), Outcome::Sentinel));
+    }
+
+    /// A taproot-covenant commitment validates against the trees; one with an
+    /// HTLC output whose covenant names another value, or a BOLT 3 to_local,
+    /// does not.
+    #[test]
+    fn tcov_commitments_validate_against_the_trees() {
+        let s = tracked(Policy::Enforce);
+        let st = s.store.get(&PEER, DBID).unwrap().clone();
+        let (point, keys) = our_keys(&s, N);
+        let secp = s.kernel().secp();
+        let to_local = taproot::to_local_tree(secp, &keys, &point, 12).unwrap().script_pubkey();
+        let to_remote = taproot::p2wpkh(&peer_bp()[1]);
+        let off = taproot::offered_tree(secp, &keys, &point, 12, &GOLD, &PAYMENT_HASH, CLTV, X).unwrap();
+        let htlcs = [Htlc { side: 0, amount_msat: X * 1000 + 999, payment_hash: PAYMENT_HASH, cltv_expiry: CLTV }];
+        let commitment = |outs: Vec<(Vec<u8>, u64)>| {
+            let mut t = 2u32.to_le_bytes().to_vec();
+            t.push(0x00);
+            t.push(0x01);
+            t.extend_from_slice(&[0x44; 32]);
+            t.extend_from_slice(&0u32.to_le_bytes());
+            t.push(0x00);
+            t.extend_from_slice(&0x8000_0000u32.to_le_bytes());
+            t.extend(compact_size(outs.len()));
+            for (spk, v) in &outs {
+                let (a, b) = explicit(&GOLD, *v);
+                t.extend(a);
+                t.extend(b);
+                t.push(0x00);
+                t.extend(compact_size(spk.len()));
+                t.extend_from_slice(spk);
+            }
+            t.extend_from_slice(&0x2000_0000u32.to_le_bytes());
+            wire::parse_elements_tx(&t).unwrap()
+        };
+        let good = commitment(vec![
+            (to_local.clone(), 600_000),
+            (to_remote.clone(), 349_000),
+            (off.script_pubkey(), X),
+            (Vec::new(), 1_000),
+        ]);
+        let v = policy::validate_commitment(s.kernel(), &PEER, DBID, &st, Side::Local, &point, &htlcs, &good).unwrap();
+        assert_eq!((v.split.ours, v.theirs, v.trimmed), (600_000, 349_000, 0));
+        // The HTLC's covenant naming one atom less.
+        let short = taproot::offered_tree(secp, &keys, &point, 12, &GOLD, &PAYMENT_HASH, CLTV, X - 1).unwrap();
+        let bad = commitment(vec![
+            (to_local.clone(), 600_000),
+            (to_remote.clone(), 349_000),
+            (short.script_pubkey(), X),
+            (Vec::new(), 1_000),
+        ]);
+        let e = policy::validate_commitment(s.kernel(), &PEER, DBID, &st, Side::Local, &point, &htlcs, &bad).unwrap_err();
+        assert!(e.contains("output 2 pays to a script not derivable"), "{e}");
+        // A BOLT 3 to_local on this channel type.
+        let bolt3 = policy::expected_htlc_tx_to_local(s.kernel(), &PEER, DBID, &st, Side::Local, &point).unwrap();
+        let bad = commitment(vec![(bolt3, 600_000), (to_remote, 349_000), (off.script_pubkey(), X), (Vec::new(), 1_000)]);
+        let e = policy::validate_commitment(s.kernel(), &PEER, DBID, &st, Side::Local, &point, &htlcs, &bad).unwrap_err();
+        assert!(e.contains("output 0 pays to a script not derivable"), "{e}");
+    }
+
+    #[test]
+    fn channel_type_and_store_carry_the_flag() {
+        // channel_type [12, 172]: bit 172 is byte 21 from the end.
+        let mut f = vec![0u8; 22];
+        f[22 - 1 - 172 / 8] |= 1 << (172 % 8);
+        f[22 - 1 - 12 / 8] |= 1 << (12 % 8);
+        assert_eq!(policy::parse_channel_type(&f), (true, false, true));
+        let s = tracked(Policy::Enforce);
+        let blob = s.export_channels();
+        let mut t = signer(Policy::Enforce);
+        assert_eq!(t.import_channels(&blob), Ok(1));
+        assert!(t.store.get(&PEER, DBID).unwrap().option_tcov);
     }
 }

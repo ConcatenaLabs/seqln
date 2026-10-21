@@ -27,4 +27,5 @@ pub mod kernel;
 pub mod noise;
 pub mod payments;
 pub mod policy;
+pub mod taproot;
 pub mod wire;

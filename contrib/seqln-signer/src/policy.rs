@@ -62,6 +62,7 @@
 
 use crate::kernel::{ElementsTx, Kernel, Network, TxOutput};
 use crate::payments::{AssetKey, Ledger, Offered, PayTrack, SideTrack};
+use crate::taproot;
 use bitcoin::hashes::{hash160, ripemd160, sha256, Hash};
 
 /// Signing policy. DEFAULT is now `Enforce` (the watchtower custody guard: the
@@ -140,6 +141,9 @@ pub struct ChannelState {
     pub remote_funding: [u8; 33],
     pub option_static_remotekey: bool,
     pub option_anchors: bool,
+    /// `option_seq_taproot_covenant`: the commitments pay taproot outputs
+    /// (`crate::taproot`) and carry no second-stage HTLC transactions.
+    pub option_tcov: bool,
     /// Whether WE opened the channel (`setup_channel.is_outbound`): it orders
     /// the two payment basepoints in the commitment-number obscuring factor.
     /// `None` for a channel restored from a version-1 store, which did not
@@ -472,11 +476,12 @@ pub const CHSTORE_MAGIC: [u8; 4] = *b"SQCH";
 /// index, whether the channel predates validation (1 byte). Version 9 adds,
 /// after that, the channel's dust limits and reserves (flag(1), then our
 /// dust, the peer's dust, our reserve and the peer's reserve, 8 bytes each)
-/// and whether the peer has reached its reserve (1 byte). Versions 1 to 8
-/// still import (the fields they lack unknown); each channel of a store older
+/// and whether the peer has reached its reserve (1 byte). Version 10 adds,
+/// after that, whether the channel is `option_seq_taproot_covenant` (1 byte).
+/// Versions 1 to 9 still import (the fields they lack unknown); each channel of a store older
 /// than version 6, written by a device that validated nothing, predates
 /// validation.
-pub const CHSTORE_VERSION: u8 = 9;
+pub const CHSTORE_VERSION: u8 = 10;
 
 /// The first store version a validating device wrote.
 pub const CHSTORE_FIRST_VALIDATING: u8 = 6;
@@ -622,6 +627,7 @@ pub fn encode_channel_store(store: &ChannelStore) -> Vec<u8> {
             }
         }
         out.push(st.peer_reached_reserve as u8);
+        out.push(st.option_tcov as u8);
     }
     push_ledger(&mut out, &store.ledger);
     out.extend_from_slice(&(store.close_txids.len() as u16).to_le_bytes());
@@ -746,7 +752,7 @@ impl<'a> StoreReader<'a> {
 pub type DecodedStore = (Vec<(([u8; 33], u64), ChannelState)>, Ledger, Vec<[u8; 32]>);
 
 /// Decode a channel-store payload (the MAC must already have been verified
-/// and stripped by the caller). Takes versions 1 to 9.
+/// and stripped by the caller). Takes versions 1 to 10.
 pub fn decode_channel_store(bytes: &[u8]) -> Result<DecodedStore, String> {
     if bytes.len() < 9 || bytes[..4] != CHSTORE_MAGIC {
         return Err("not a channel-store blob (bad magic)".to_string());
@@ -779,6 +785,7 @@ pub fn decode_channel_store(bytes: &[u8]) -> Result<DecodedStore, String> {
             remote_funding: arr33(&e[219..252]),
             option_static_remotekey: e[252] != 0,
             option_anchors: e[253] != 0,
+            option_tcov: false,
             is_outbound: None,
             local_shutdown_script: Vec::new(),
             remote_shutdown_script: Vec::new(),
@@ -850,6 +857,13 @@ pub fn decode_channel_store(bytes: &[u8]) -> Result<DecodedStore, String> {
                 v => return Err(format!("bad reserve flag {v} in channel-store blob")),
             };
         }
+        if version >= 10 {
+            st.option_tcov = match r.u8()? {
+                0 => false,
+                1 => true,
+                v => return Err(format!("bad channel-type flag {v} in channel-store blob")),
+            };
+        }
         out.push(((node_id, dbid), st));
     }
     let ledger = if version >= 5 { r.ledger()? } else { Ledger::default() };
@@ -870,10 +884,12 @@ pub fn decode_channel_store(bytes: &[u8]) -> Result<DecodedStore, String> {
 }
 
 /// Decode a BOLT/BOLT channel_type feature bitfield (BOLT-1 big-endian: the
-/// last byte holds bits 0..7) into the two flags the commitment scripts need.
+/// last byte holds bits 0..7) into the flags the commitment scripts need:
+/// (static_remotekey, anchors, taproot covenant).
 /// `option_static_remotekey` = bit 12/13, `option_anchor_outputs` (deprecated) =
-/// 20/21, `option_anchors_zero_fee_htlc_tx` = 22/23. Anchors imply static.
-pub fn parse_channel_type(features: &[u8]) -> (bool, bool) {
+/// 20/21, `option_anchors_zero_fee_htlc_tx` = 22/23, Sequentia's
+/// `option_seq_taproot_covenant` = 172/173. Anchors imply static.
+pub fn parse_channel_type(features: &[u8]) -> (bool, bool, bool) {
     let bit = |n: usize| -> bool {
         if features.is_empty() {
             return false;
@@ -887,7 +903,7 @@ pub fn parse_channel_type(features: &[u8]) -> (bool, bool) {
     };
     let anchors = bit(20) || bit(21) || bit(22) || bit(23);
     let static_remotekey = bit(12) || bit(13) || anchors;
-    (static_remotekey, anchors)
+    (static_remotekey, anchors, bit(172) || bit(173))
 }
 
 // ---------------------------------------------------------------------------
@@ -1352,7 +1368,12 @@ pub fn validate_commitment(
     let static_remotekey = st.option_static_remotekey || st.option_anchors;
     let our_bp = kernel.channel_basepoints(node_id, dbid);
     let ks = build_keyset(kernel, st, &our_bp, side, point, static_remotekey)?;
-    let whitelist = expected_scripts(&ks, st, side, htlcs);
+    let whitelist = if st.option_tcov {
+        let asset = tcov_channel_asset(st, tx)?;
+        tcov_expected_scripts(kernel, &ks, side, point, htlcs, &asset)?
+    } else {
+        expected_scripts(&ks, st, side, htlcs)
+    };
 
     // The commitment spends exactly the funding outpoint, once.
     if tx.inputs.len() != 1 {
@@ -1725,7 +1746,92 @@ pub fn htlc_output_script(
     let static_remotekey = st.option_static_remotekey || st.option_anchors;
     let our_bp = kernel.channel_basepoints(node_id, dbid);
     let ks = build_keyset(kernel, st, &our_bp, side, point, static_remotekey)?;
+    if st.option_tcov {
+        let asset = match st.pay.asset {
+            Some(AssetKey::Asset(id)) => id,
+            _ => return Err("the channel's asset is not recorded yet".to_string()),
+        };
+        let set = tcov_expected_scripts(kernel, &ks, side, point, std::slice::from_ref(htlc), &asset)?;
+        return Ok(set.last().expect("one HTLC").clone());
+    }
     Ok(expected_scripts(&ks, st, side, std::slice::from_ref(htlc)).pop().expect("one HTLC"))
+}
+
+/// The keys of a taproot-covenant commitment, from its keyset.
+fn tcov_keys(ks: &Keyset) -> taproot::TcovKeys {
+    taproot::TcovKeys {
+        revocation: ks.self_revocation_key,
+        self_delayed: ks.self_delayed_key,
+        self_htlc: ks.self_htlc_key,
+        other_htlc: ks.other_htlc_key,
+        other_payment: ks.other_payment_key,
+    }
+}
+
+/// The asset of a taproot-covenant channel, which its HTLC outputs' covenants
+/// name: the one the device recorded from its commitments, else the asset of
+/// this commitment's first output ([`check_single_asset`] then holds every
+/// other output to it, and consensus holds it to the funding output's).
+fn tcov_channel_asset(st: &ChannelState, tx: &ElementsTx) -> Result<[u8; 32], String> {
+    if tx.network != Network::Elements {
+        return Err("a taproot-covenant channel exists only on a Sequentia chain".to_string());
+    }
+    if let Some(AssetKey::Asset(id)) = st.pay.asset {
+        return Ok(id);
+    }
+    match tx.outputs.first().map(|o| &o.asset) {
+        Some(a) if a.len() == 33 && a[0] == 0x01 => Ok(a[1..].try_into().unwrap()),
+        Some(_) => Err("the commitment's output 0 has a non-explicit asset".to_string()),
+        None => Err("the commitment has no output".to_string()),
+    }
+}
+
+/// [`expected_scripts`] for an `option_seq_taproot_covenant` channel, in the
+/// same order (to_local, to_remote, then one per HTLC): to_local and the
+/// HTLCs are the taproot trees of `crate::taproot`, to_remote the other
+/// side's static P2WPKH. An HTLC's covenant names the channel's `asset` and
+/// its own output's value, the HTLC's amount in whole atoms.
+fn tcov_expected_scripts(
+    kernel: &Kernel,
+    ks: &Keyset,
+    side: Side,
+    point: &[u8; 33],
+    htlcs: &[Htlc],
+    asset: &[u8; 32],
+) -> Result<Vec<Vec<u8>>, String> {
+    let secp = kernel.secp();
+    let k = tcov_keys(ks);
+    let bad = || "a taproot output cannot be built from the channel keys".to_string();
+    let mut set = Vec::with_capacity(2 + htlcs.len());
+    set.push(taproot::to_local_tree(secp, &k, point, ks.to_self_delay).ok_or_else(bad)?.script_pubkey());
+    set.push(p2wpkh(&ks.other_payment_key));
+    let side_int = side as u8;
+    for h in htlcs {
+        let x = h.amount_msat / 1000;
+        let tree = if h.side == side_int {
+            taproot::offered_tree(secp, &k, point, ks.to_self_delay, asset, &h.payment_hash, h.cltv_expiry, x)
+        } else {
+            taproot::received_tree(secp, &k, point, ks.to_self_delay, asset, &h.payment_hash, h.cltv_expiry, x)
+        };
+        set.push(tree.ok_or_else(bad)?.script_pubkey());
+    }
+    Ok(set)
+}
+
+/// D on a taproot-covenant channel: the to_local script of OUR commitment at
+/// per-commitment `point`, which our HTLC outputs' covenants pay.
+pub fn tcov_local_to_local(
+    kernel: &Kernel,
+    node_id: &[u8; 33],
+    dbid: u64,
+    st: &ChannelState,
+    point: &[u8; 33],
+) -> Result<Vec<u8>, String> {
+    let our_bp = kernel.channel_basepoints(node_id, dbid);
+    let ks = build_keyset(kernel, st, &our_bp, Side::Local, point, true)?;
+    taproot::to_local_tree(kernel.secp(), &tcov_keys(&ks), point, ks.to_self_delay)
+        .map(|t| t.script_pubkey())
+        .ok_or_else(|| "a taproot output cannot be built from the channel keys".to_string())
 }
 
 fn hexstr(b: &[u8]) -> String {
