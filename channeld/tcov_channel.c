@@ -5,6 +5,7 @@
 #include <channeld/channeld_wiregen.h>
 #include <channeld/full_channel.h>
 #include <channeld/tcov_channel.h>
+#include <common/credit_scripts.h>
 #include <common/keyset.h>
 #include <common/penalty_base.h>
 #include <common/presign_templates.h>
@@ -58,7 +59,7 @@ struct bitcoin_tx *tcov_channel_commit_tx(const tal_t *ctx,
 			    self_pay, other_pay,
 			    outs, &map, direct_outputs,
 			    commitment_number ^ channel->commitment_number_obscurer,
-			    side, NULL);
+			    side, channel_tcov_credit(tmpctx, channel), NULL);
 	*htlcmap = (const struct htlc **)map;
 	return tx;
 }
@@ -81,9 +82,23 @@ struct watchtower_blob *tcov_justice_blob(const tal_t *ctx,
 			      &channel->basepoints[LOCAL], true, &ks))
 		return tal_free(b);
 
-	/* Their to_local, delayed by what we asked of them. */
-	tcov_to_local_tree(tmpctx, &ks, &point,
-			   channel->config[LOCAL].to_self_delay, &tree);
+	/* Their to_local, delayed by what we asked of them: a credit
+	 * provider's carries CLAIM too (common/credit_scripts.h).  What their
+	 * HTLC claims pay (D) keeps the two-leaf tree, which this template,
+	 * keyed on to_local's script, does not cover. */
+	{
+		const struct tcov_credit *credit
+			= channel_tcov_credit(tmpctx, channel);
+		if (credit && credit->provider == REMOTE)
+			credit_to_local_tree(tmpctx, &ks, &point,
+					     channel->config[LOCAL].to_self_delay,
+					     &credit->params, pbase->amount,
+					     &tree);
+		else
+			tcov_to_local_tree(tmpctx, &ks, &point,
+					   channel->config[LOCAL].to_self_delay,
+					   &tree);
+	}
 	spk = tap_tree2_scriptpubkey(tmpctx, &tree);
 
 	b->kind = WT_TMPL_TCOV_REVOKE;

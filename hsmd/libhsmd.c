@@ -8,6 +8,7 @@
 #include <ccan/tal/str/str.h>
 #include <common/bolt12_id.h>
 #include <common/bolt12_merkle.h>
+#include <common/credit_scripts.h>
 #include <common/hash_u5.h>
 #include <common/hsm_secret.h>
 #include <common/key_derive.h>
@@ -19,6 +20,7 @@
 #include <hsmd/permissions.h>
 #include <inttypes.h>
 #include <secp256k1_ecdh.h>
+#include <secp256k1_extrakeys.h>
 #include <secp256k1_schnorrsig.h>
 #include <sodium/utils.h>
 #include <stddef.h>
@@ -124,6 +126,7 @@ bool hsmd_check_client_capabilities(struct hsmd_client *client,
 	case WIRE_HSMD_REVOKE_COMMITMENT_TX:
 	case WIRE_HSMD_VALIDATE_REVOCATION:
 	case WIRE_HSMD_TCOV_HTLC_LOCKS:
+	case WIRE_HSMD_CREDIT_NOTE:
 		return (client->capabilities & HSM_PERM_SIGN_REMOTE_TX) != 0;
 
 	case WIRE_HSMD_SIGN_MUTUAL_CLOSE_TX:
@@ -172,6 +175,8 @@ bool hsmd_check_client_capabilities(struct hsmd_client *client,
 	case WIRE_HSMD_SIGN_TCOV_LOCAL_HTLC:
 	case WIRE_HSMD_SIGN_TCOV_REMOTE_HTLC_TO_US:
 	case WIRE_HSMD_SIGN_TCOV_PENALTY:
+	case WIRE_HSMD_SIGN_TCOV_PAYMENT_TO_US:
+	case WIRE_HSMD_SIGN_CREDIT_NOTE:
 		return (client->capabilities & HSM_PERM_MASTER) != 0;
 
 	/*~ These are messages sent by the HSM so we should never receive them. */
@@ -219,6 +224,8 @@ bool hsmd_check_client_capabilities(struct hsmd_client *client,
 	case WIRE_HSMD_SIGN_HTLC_TX_MINGLE_REPLY:
 	case WIRE_HSMD_SIGN_TCOV_REPLY:
 	case WIRE_HSMD_TCOV_HTLC_LOCKS_REPLY:
+	case WIRE_HSMD_SIGN_CREDIT_NOTE_REPLY:
+	case WIRE_HSMD_CREDIT_NOTE_REPLY:
 	case WIRE_HSMD_SIGN_ANY_CANNOUNCEMENT_REPLY:
 		break;
 	}
@@ -2357,6 +2364,86 @@ static u8 *handle_tcov_htlc_locks(struct hsmd_client *c, const u8 *msg_in)
 	return towire_hsmd_tcov_htlc_locks_reply(NULL);
 }
 
+/* SEQUENTIA: the provider-signed credit (common/credit_scripts.h).  A
+ * note, signed by the channel's funding key tweaked into the credit key. */
+static u8 *handle_sign_credit_note(struct hsmd_client *c, const u8 *msg_in)
+{
+	struct node_id peer_id;
+	u64 dbid, credit;
+	struct channel_id cid;
+	struct sha256 payment_hash, dtag, tweak;
+	struct secret channel_seed;
+	struct pubkey funding_pubkey;
+	struct privkey funding_privkey;
+	secp256k1_keypair keypair;
+	struct bip340sig sig;
+	u8 msg[72];
+
+	if (!fromwire_hsmd_sign_credit_note(msg_in, &peer_id, &dbid, &cid,
+					    &credit, &payment_hash))
+		return hsmd_status_malformed_request(c, msg_in);
+	get_channel_seed(&peer_id, dbid, &channel_seed);
+	if (!derive_funding_key(&channel_seed, &funding_pubkey,
+				&funding_privkey))
+		return hsmd_status_bad_request_fmt(c, msg_in,
+						   "cannot derive the funding key");
+	credit_key_tweak(&funding_pubkey, &tweak);
+	if (secp256k1_ec_seckey_tweak_add(secp256k1_ctx,
+					  funding_privkey.secret.data,
+					  tweak.u.u8) != 1
+	    || secp256k1_keypair_create(secp256k1_ctx, &keypair,
+					funding_privkey.secret.data) != 1)
+		return hsmd_status_bad_request_fmt(c, msg_in,
+						   "cannot derive the credit key");
+	credit_tag(&cid, &dtag);
+	credit_note_msg(&dtag, credit, &payment_hash, msg);
+	if (secp256k1_schnorrsig_sign_custom(secp256k1_ctx, sig.u8, msg,
+					     sizeof(msg), &keypair, NULL) != 1)
+		return hsmd_status_bad_request_fmt(c, msg_in, "cannot sign");
+	return towire_hsmd_sign_credit_note_reply(NULL, &sig);
+}
+
+/* A note the holder holds.  This signer keeps no channel state and checks
+ * no commitment, so it needs nothing from it; listing the message says it
+ * can hold credit. */
+static u8 *handle_credit_note(struct hsmd_client *c, const u8 *msg_in)
+{
+	u64 credit;
+	struct channel_id cid;
+	struct sha256 payment_hash;
+	struct bip340sig sig;
+	struct preimage *preimage;
+
+	if (!fromwire_hsmd_credit_note(tmpctx, msg_in, &cid, &credit,
+				       &payment_hash, &sig, &preimage))
+		return hsmd_status_malformed_request(c, msg_in);
+	return towire_hsmd_credit_note_reply(NULL);
+}
+
+/* The provider's output on the holder's commitment, by its PROVIDER leaf:
+ * the static payment key, our payment basepoint's secret. */
+static u8 *handle_sign_tcov_payment_to_us(struct hsmd_client *c,
+					  const u8 *msg_in)
+{
+	u64 dbid;
+	struct bitcoin_tx *tx;
+	u8 *leaf;
+	u32 input_num;
+	struct node_id peer_id;
+	struct secret channel_seed;
+	struct privkey privkey;
+
+	if (!fromwire_hsmd_sign_tcov_payment_to_us(tmpctx, msg_in, &tx,
+						   &input_num, &leaf,
+						   &peer_id, &dbid))
+		return hsmd_status_malformed_request(c, msg_in);
+	get_channel_seed(&peer_id, dbid, &channel_seed);
+	if (!derive_payment_basepoint(&channel_seed, NULL, &privkey.secret))
+		return hsmd_status_bad_request_fmt(c, msg_in,
+						   "cannot derive the payment key");
+	return tcov_sign(c, msg_in, tx, input_num, leaf, NULL, &privkey);
+}
+
 static u8 *handle_sign_tcov_penalty(struct hsmd_client *c, const u8 *msg_in)
 {
 	u64 dbid;
@@ -2525,6 +2612,12 @@ u8 *hsmd_handle_client_message(const tal_t *ctx, struct hsmd_client *client,
 		return handle_sign_tcov_penalty(client, msg);
 	case WIRE_HSMD_TCOV_HTLC_LOCKS:
 		return handle_tcov_htlc_locks(client, msg);
+	case WIRE_HSMD_SIGN_CREDIT_NOTE:
+		return handle_sign_credit_note(client, msg);
+	case WIRE_HSMD_CREDIT_NOTE:
+		return handle_credit_note(client, msg);
+	case WIRE_HSMD_SIGN_TCOV_PAYMENT_TO_US:
+		return handle_sign_tcov_payment_to_us(client, msg);
 
 	case WIRE_HSMD_DEV_MEMLEAK:
 	case WIRE_HSMD_ECDH_RESP:
@@ -2569,6 +2662,8 @@ u8 *hsmd_handle_client_message(const tal_t *ctx, struct hsmd_client *client,
 	case WIRE_HSMD_SIGN_HTLC_TX_MINGLE_REPLY:
 	case WIRE_HSMD_TCOV_HTLC_LOCKS_REPLY:
 	case WIRE_HSMD_SIGN_TCOV_REPLY:
+	case WIRE_HSMD_SIGN_CREDIT_NOTE_REPLY:
+	case WIRE_HSMD_CREDIT_NOTE_REPLY:
 	case WIRE_HSMD_SIGN_ANY_CANNOUNCEMENT_REPLY:
 		break;
 	}
@@ -2665,6 +2760,9 @@ u8 *hsmd_init(const u8 *secret_data, size_t secret_len, const u64 hsmd_version,
 		WIRE_HSMD_SIGN_TCOV_REMOTE_HTLC_TO_US,
 		WIRE_HSMD_SIGN_TCOV_PENALTY,
 		WIRE_HSMD_TCOV_HTLC_LOCKS,
+		WIRE_HSMD_SIGN_CREDIT_NOTE,
+		WIRE_HSMD_CREDIT_NOTE,
+		WIRE_HSMD_SIGN_TCOV_PAYMENT_TO_US,
 	};
 	u32 *caps;
 

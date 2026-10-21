@@ -1677,6 +1677,11 @@ static void register_opts(struct lightningd *ld)
 			   "Offer channels whose commitment outputs are taproot trees, "
 			   "with HTLCs claimed by covenant and fees attached at "
 			   "claim time (Sequentia networks only)");
+	opt_register_noarg("--credit-channels",
+			   opt_set_bool, &ld->config.credit_channels,
+			   "With --taproot-covenant-channels, take and offer credit"
+			   " channels: a provider can credit the holder while the"
+			   " holder cannot sign an update (Sequentia networks only)");
 	opt_register_noarg("--point-locks",
 			   opt_set_bool, &ld->config.point_locks,
 			   "With --taproot-covenant-channels, take and offer HTLCs"
@@ -2016,6 +2021,20 @@ void handle_opts(struct lightningd *ld)
 				    " Sequentia networks",
 				    chainparams->network_name);
 	}
+	/* SEQUENTIA: so does the credit; hsm_control.c withdraws it if the
+	 * signer cannot hold credit notes. */
+	if (ld->config.credit_channels) {
+		if (ld->config.taproot_covenant_channels
+		    && chainparams->has_tapscript_introspection)
+			feature_set_or(ld->our_features,
+				       take(feature_set_for_feature(NULL,
+								    OPTIONAL_FEATURE(OPT_SEQ_CREDIT))));
+		else
+			log_unusual(ld->log, "--credit-channels: needs"
+				    " --taproot-covenant-channels on a"
+				    " Sequentia network");
+	}
+
 	/* SEQUENTIA: point locks ride on that channel type; hsm_control.c
 	 * withdraws them if the signer cannot take them. */
 	if (ld->config.point_locks) {

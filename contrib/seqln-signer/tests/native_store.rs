@@ -147,6 +147,8 @@ fn channel(k: &Kernel) -> ChannelState {
         predates_validation: false,
         limits: None,
         peer_reached_reserve: false,
+        option_credit: false,
+        credit: None,
     }
 }
 

@@ -168,4 +168,10 @@ struct feature_set *feature_set_dup(const tal_t *ctx,
  * the payee takes them (with its `t` field, the payment point). */
 #define OPT_SEQ_POINT_LOCKS			174
 
+/* SEQUENTIA: the provider-signed credit (common/credit_scripts.h), a variant
+ * of the taproot-covenant channel type offered with --credit-channels.  In a
+ * channel_type, [12, 172, 176]: the side that opened the channel issues
+ * credit notes, the other holds them. */
+#define OPT_SEQ_CREDIT				176
+
 #endif /* LIGHTNING_COMMON_FEATURES_H */

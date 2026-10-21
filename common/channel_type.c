@@ -86,6 +86,16 @@ struct channel_type *channel_type_seq_taproot_covenant(const tal_t *ctx)
 	return type;
 }
 
+/* SEQUENTIA: the taproot-covenant type with the provider-signed credit;
+ * the opener issues the credit (common/credit_scripts.h). */
+struct channel_type *channel_type_seq_credit(const tal_t *ctx)
+{
+	struct channel_type *type = channel_type_seq_taproot_covenant(ctx);
+	set_feature_bit(&type->features,
+			COMPULSORY_FEATURE(OPT_SEQ_CREDIT));
+	return type;
+}
+
 bool channel_type_has(const struct channel_type *type, int feature)
 {
 	return feature_offered(type->features, feature);
@@ -133,6 +143,7 @@ struct channel_type *channel_type_accept(const tal_t *ctx,
 		OPT_SCID_ALIAS,
 		OPT_ZEROCONF,
 		OPT_SEQ_TAPROOT_COVENANT,
+		OPT_SEQ_CREDIT,
 	};
 
 	/* BOLT #2:
@@ -171,7 +182,9 @@ struct channel_type *channel_type_accept(const tal_t *ctx,
 	    channel_type_eq(&proposed,
 			    channel_type_anchors_zero_fee_htlc(tmpctx)) ||
 	    channel_type_eq(&proposed,
-			    channel_type_seq_taproot_covenant(tmpctx))) {
+			    channel_type_seq_taproot_covenant(tmpctx)) ||
+	    channel_type_eq(&proposed,
+			    channel_type_seq_credit(tmpctx))) {
 		/* At this point we know it matches, and maybe has
 		 * a couple of extra options. So let's just reply
 		 * with their proposal. */

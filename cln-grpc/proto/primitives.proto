@@ -130,6 +130,7 @@ enum ChannelTypeName {
   zeroconf_even = 4;
   anchors_even = 5;
   seq_taproot_covenant_even = 6;
+  seq_credit_even = 7;
 }
 
 enum AutocleanSubsystem {

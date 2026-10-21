@@ -204,6 +204,27 @@ struct ext_key *hsm_init(struct lightningd *ld)
 							OPTIONAL_FEATURE(OPT_SEQ_TAPROOT_COVENANT)));
 	}
 
+	/* SEQUENTIA: credit channels need that channel type, and a signer
+	 * that learns the notes it holds (hsmd_credit_note): a device that
+	 * did not could sign away a credit it was owed.  Issuing them as a
+	 * provider also needs one that signs notes and its credit outputs. */
+	if (feature_offered(ld->our_features->bits[INIT_FEATURE],
+			    OPT_SEQ_CREDIT)
+	    && (!feature_offered(ld->our_features->bits[INIT_FEATURE],
+				 OPT_SEQ_TAPROOT_COVENANT)
+		|| !hsm_capable(ld, WIRE_HSMD_CREDIT_NOTE))) {
+		log_unusual(ld->log, "The signer cannot hold credit notes:"
+			    " not offering credit channels");
+		feature_set_sub(ld->our_features,
+				feature_set_for_feature(tmpctx,
+							OPTIONAL_FEATURE(OPT_SEQ_CREDIT)));
+	}
+	ld->credit_issuer
+		= feature_offered(ld->our_features->bits[INIT_FEATURE],
+				  OPT_SEQ_CREDIT)
+		&& hsm_capable(ld, WIRE_HSMD_SIGN_CREDIT_NOTE)
+		&& hsm_capable(ld, WIRE_HSMD_SIGN_TCOV_PAYMENT_TO_US);
+
 	/* SEQUENTIA: point locks need that channel type, and a signer that
 	 * says it can sign for channels carrying them (a device signer that
 	 * rebuilds each commitment must build their SUCCESS leaves). */

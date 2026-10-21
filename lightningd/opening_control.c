@@ -1518,9 +1518,22 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 		return command_check_done(cmd);
 
 	/* Now we know the peer, we can derive the channel type to ask for */
-	if (!fc->channel_type)
+	if (!fc->channel_type) {
 		fc->channel_type = desired_channel_type(fc, cmd->ld->our_features,
 							peer->their_features);
+		/* SEQUENTIA: a node that can issue credit notes opens a
+		 * credit channel (it, the opener, is the provider) with a
+		 * peer that holds them (common/credit_scripts.h). */
+		if (cmd->ld->credit_issuer
+		    && channel_type_has(fc->channel_type, OPT_SEQ_TAPROOT_COVENANT)
+		    && feature_negotiated(cmd->ld->our_features,
+					  peer->their_features, OPT_SEQ_CREDIT))
+			fc->channel_type = channel_type_seq_credit(fc);
+	} else if (channel_type_has(fc->channel_type, OPT_SEQ_CREDIT)
+		   && !cmd->ld->credit_issuer)
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "This node's signer cannot issue credit"
+				    " notes, so it cannot open a credit channel");
 
 	fc->push = push_msat ? *push_msat : AMOUNT_MSAT(0);
 	fc->channel_flags = OUR_CHANNEL_FLAGS;

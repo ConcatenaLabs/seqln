@@ -143,6 +143,25 @@ What enforce mode checks:
   kept in the store and never cleared. The native signer logs each such channel when it loads its
   store; the WASM build reports them (`predatingChannels()`, and the SDK's `predatingChannels()`
   and `onPredating`) so the wallet can tell the user the channel is not carried over.
+- **Credit** (`option_seq_credit`, the SeqLN fork doc's section 5d): on a credit channel the
+  peer opened, the peer is the provider and this side holds credit. The device never provides:
+  on a credit channel it opened it signs no commitment. When the node tells it of a note
+  (`HSMD_CREDIT_NOTE`), it checks the note names this channel (BOLT 2's id from the funding
+  outpoint), carries the signature of the channel's credit key (the provider's funding key,
+  tweaked), and, when a preimage comes with it, that the preimage opens the note's payment hash;
+  in enforce mode it refuses one that fails. It keeps the latest (the highest credit, its
+  preimage once known) in its store. It validates the channel's commitments against the credit
+  trees: the provider's output on our commitment is the tree of CLAIM and PROVIDER under no key
+  path, its `to_local` on its own commitment has CLAIM beside DELAY and REVOKE, and each CLAIM
+  names its own output's value. It refuses a commitment, ours or the peer's, whose provider output
+  cannot pay the note it holds (a host that also ran the provider could otherwise move the
+  provider's balance below the credit and take it back by dropping that commitment), and a mutual
+  close that does not pay this side its balance and the note. A claim of the note needs no
+  signature of the device's; it signs the claim's fee coins when the claim keeps the rest under
+  the provider's script, at most the value it came with, and pays the credit to this side's
+  payment script. The WASM build gives the wallet the notes it holds (`creditNotes()`, and the
+  SDK's `creditNotes()` and `onCredit`), with the preimage, so the wallet keeps what a claim
+  needs.
 - **Sweeps, penalties and HTLC transactions**: they pay only the node's own outputs, and a sweep
   of a channel's commitment output pays it in the channel's asset (the one the device recorded
   from the channel's commitments; for a channel it never validated a commitment of, the one the
@@ -241,7 +260,7 @@ before the device revoked it, which the peer then takes whole with the revocatio
 
 The channel store (each channel's parameters, dust limits and reserves, revocation counters,
 recorded balance, whether the peer has reached its reserve, the unrevoked commitments it validated,
-its payment tracking and whether it predates validation, the
+its payment tracking, whether it predates validation and the latest credit note it holds, the
 approvals and charges against the payment limits, and the txids of the mutual closes the device
 signed) carries no secret and is authenticated by a MAC keyed from the seed. The native signer keeps it in
 `seqln-signer-channels` in its working directory (or the path in `SEQLN_SIGNER_STORE`): it
@@ -277,7 +296,7 @@ any channel.
 | `src/frame.rs` | Little-endian signer-split transport framing (`hsmd/signer_frame.h`). |
 | `src/noise.rs` | BOLT-8 Noise_XK transport state machine (no sockets). |
 | `src/policy.rs` | Enforce-mode commitment validation. |
-| `src/taproot.rs` | The taproot-covenant channel type's leaves and trees, and the Elements taproot signature hash and BIP340 signing (tested against `common/test/tcov_vectors.h`). |
+| `src/taproot.rs` | The taproot-covenant channel type's leaves and trees, the credit channel's CLAIM leaf, trees and note check, and the Elements taproot signature hash and BIP340 signing (tested against `common/test/tcov_vectors.h` and `common/test/credit_vectors.h`). |
 | `src/payments.rs` | Payment approval, the per-asset payment limits and their accounting, BOLT 11 decoding. |
 | `src/dispatch.rs` | Request -> reply dispatch; channel-state tracking for the policy. |
 | `src/hsm_secret.rs` | On-disk mnemonic `hsm_secret` parsing. |

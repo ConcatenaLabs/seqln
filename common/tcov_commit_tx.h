@@ -14,9 +14,11 @@
 #include <bitcoin/pubkey.h>
 #include <bitcoin/tx.h>
 #include <ccan/crypto/ripemd160/ripemd160.h>
+#include <common/credit_scripts.h>
 #include <common/htlc.h>
 
 struct bitcoin_outpoint;
+struct channel_id;
 struct keyset;
 struct wally_tx_output;
 
@@ -35,6 +37,27 @@ struct tcov_htlc_out {
 	const void *handle;
 };
 
+/* SEQUENTIA: a credit channel (common/credit_scripts.h): who provides, and
+ * what the provider's credit outputs are built from. */
+struct tcov_credit {
+	enum side provider;
+	/* The provider's wait on its output on the holder's commitment: the
+	 * delay the holder asked of it (its to_self_delay). */
+	u16 window;
+	struct credit_params params;
+};
+
+/* Fill @credit for a channel whose @provider has funding key
+ * @provider_funding_key and whose holder has payment basepoint
+ * @holder_payment_basepoint. */
+bool tcov_credit_init(const tal_t *ctx,
+		      const struct channel_id *cid,
+		      enum side provider,
+		      const struct pubkey *provider_funding_key,
+		      const struct pubkey *holder_payment_basepoint,
+		      u16 window,
+		      struct tcov_credit *credit);
+
 /**
  * tcov_commit_tx: the commitment transaction held by @side.
  * @keyset: derived from @per_commitment_point, @side's own.
@@ -42,6 +65,8 @@ struct tcov_htlc_out {
  * @htlcs: every committed HTLC (trimmed ones included), or NULL.
  * @htlcmap: (out) per output, the handle of its HTLC, or NULL.
  * @direct_outputs: (out, may be NULL) to_local [LOCAL] and to_remote [REMOTE].
+ * @credit: a credit channel's (the provider's balance output carries CLAIM),
+ * or NULL.
  *
  * @err_reason: non-NULL for the initial commitment, which fails (NULL, with
  * @err_reason set) if the opener cannot pay the fee; later commitments take
@@ -66,6 +91,7 @@ struct bitcoin_tx *tcov_commit_tx(const tal_t *ctx,
 				  struct wally_tx_output *direct_outputs[NUM_SIDES],
 				  u64 obscured_commitment_number,
 				  enum side side,
+				  const struct tcov_credit *credit,
 				  char **err_reason);
 
 #endif /* LIGHTNING_COMMON_TCOV_COMMIT_TX_H */

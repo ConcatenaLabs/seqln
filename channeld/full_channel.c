@@ -459,8 +459,9 @@ static bool get_room_above_reserve(const struct channel *channel,
 				   enum side side,
 				   struct amount_msat *remainder)
 {
-	/* Reserve is set by the *other* side */
-	struct amount_sat reserve = channel->config[!side].channel_reserve;
+	/* Reserve is set by the *other* side (and a credit provider keeps
+	 * its latest note's credit on top). */
+	struct amount_sat reserve = channel_reserve_of(channel, side);
 	struct balance balance;
 	struct amount_msat owed = view->owed[side];
 
@@ -1346,7 +1347,7 @@ u32 approx_max_feerate(const struct channel *channel)
 	} else {
 		/* We should never go below reserve. */
 		if (!amount_msat_deduct_sat(&avail,
-					    channel->config[!channel->opener].channel_reserve))
+					    channel_reserve_of(channel, channel->opener)))
 		avail = AMOUNT_MSAT(0);
 	}
 
@@ -1441,12 +1442,12 @@ bool can_opener_afford_feerate(const struct channel *channel, u32 feerate_per_kw
 
 	/* How much does it think it has?  Must be >= reserve + fee */
 	if (!amount_sat_add(&needed, fee,
-			    channel->config[!channel->opener].channel_reserve))
+			    channel_reserve_of(channel, channel->opener)))
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "Cannot add fee %s and reserve %s",
 			      fmt_amount_sat(tmpctx, fee),
 			      fmt_amount_sat(tmpctx,
-					     channel->config[!channel->opener].channel_reserve));
+					     channel_reserve_of(channel, channel->opener)));
 
 	/* The amount we have needs to take into account that we're
 	 * adding and removing htlcs */

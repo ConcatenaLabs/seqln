@@ -17,6 +17,7 @@ channeld/test/run-full_channel:			\
 	common/amount.o				\
 	common/autodata.o			\
 	common/channel_type.o			\
+	common/credit_scripts.o			\
 	common/daemon_conn.o			\
 	common/features.o			\
 	common/htlc_state.o			\

@@ -22,6 +22,7 @@
 #include <lightningd/channel.h>
 #include <lightningd/channel_control.h>
 #include <lightningd/coin_mvts.h>
+#include <lightningd/credit.h>
 #include <lightningd/hsm_control.h>
 #include <lightningd/onchain_control.h>
 #include <lightningd/peer_htlcs.h>
@@ -172,6 +173,8 @@ static void handle_onchain_init_reply(struct channel *channel, const u8 *msg)
 
 	/* Tell it about any preimages we know. */
 	onchaind_tell_fulfill(channel);
+	/* SEQUENTIA: and a credit channel's latest note. */
+	credit_onchaind_started(channel);
 }
 
 /**
@@ -1747,6 +1750,15 @@ struct tcov_spend {
 	struct bitcoin_outpoint *coins;
 	/* The output is spent on chain, by this spend or by the peer. */
 	bool spent;
+
+	/* SEQUENTIA: a credit claim (common/credit_scripts.h): no signature
+	 * of ours on input 0, which takes the note; output 0 returns what
+	 * remains to spent_spk, output 1 pays the holder. */
+	bool credit_claim;
+	struct amount_sat credit_b;
+	u64 credit;
+	struct bip340sig note_sig;
+	u8 *holder_spk;
 };
 
 /* The spends in progress.  Once the output one spends is spent on chain it
@@ -1817,6 +1829,10 @@ static bool tcov_sign_input0(const struct tcov_spend *ts,
 						    tx, 0, &ts->merkle_root,
 						    id, dbid);
 		break;
+	case TCOV_SIGN_PAYMENT:
+		msg = towire_hsmd_sign_tcov_payment_to_us(NULL, tx, 0,
+							  ts->leaf, id, dbid);
+		break;
 	default:
 		return false;
 	}
@@ -1824,11 +1840,46 @@ static bool tcov_sign_input0(const struct tcov_spend *ts,
 	return fromwire_hsmd_sign_tcov_reply(msg, sig);
 }
 
+/* SEQUENTIA: a credit claim's: <note sig> <credit, 8 LE> <preimage>
+ * <leaf> <control block>. */
+static u8 **credit_claim_witness(const tal_t *ctx, const struct tcov_spend *ts)
+{
+	u8 **w = tal_arr(ctx, u8 *, 0);
+	le64 c = cpu_to_le64(ts->credit);
+
+	tal_arr_expand(&w, tal_dup_arr(w, u8, ts->note_sig.u8,
+				       sizeof(ts->note_sig.u8), 0));
+	tal_arr_expand(&w, tal_dup_arr(w, u8, (const u8 *)&c, sizeof(c), 0));
+	tal_arr_expand(&w, tal_dup_arr(w, u8, ts->preimage->r,
+				       sizeof(ts->preimage->r), 0));
+	tal_arr_expand(&w, tal_dup_talarr(w, u8, ts->leaf));
+	tal_arr_expand(&w, tal_dup_talarr(w, u8, ts->cb));
+	return w;
+}
+
+/* SEQUENTIA: what a credit claim pays the holder (output 1) and leaves
+ * (output 0): the note's credit less what was paid, b less the input. */
+static bool credit_claim_split(const struct tcov_spend *ts,
+			       struct amount_sat *delta,
+			       struct amount_sat *rem)
+{
+	struct amount_sat paid;
+
+	if (!amount_sat_sub(&paid, ts->credit_b, ts->out_sats)
+	    || ts->credit <= paid.satoshis) /* Raw: credit atoms */
+		return false;
+	*delta = amount_sat(ts->credit - paid.satoshis); /* Raw: credit atoms */
+	return amount_sat_sub(rem, ts->out_sats, *delta);
+}
+
 /* Input 0's witness: <sig> [<preimage>] <leaf> <control block>, or <sig>. */
 static u8 **tcov_witness(const tal_t *ctx, const struct tcov_spend *ts,
 			 const struct bip340sig *sig)
 {
 	u8 **w = tal_arr(ctx, u8 *, 0);
+
+	if (ts->credit_claim)
+		return credit_claim_witness(ctx, ts);
 
 	tal_arr_expand(&w, tap_sig_to_witness(w, sig, TAP_SIGHASH_DEFAULT));
 	if (tal_bytelen(ts->leaf) == 0)
@@ -1845,6 +1896,13 @@ static size_t tcov_input0_witness_weight(const struct tcov_spend *ts)
 {
 	/* count, the 64-byte signature, then the optional elements. */
 	size_t w = 1 + 1 + 64;
+
+	/* SEQUENTIA: a credit claim: the note's signature, its credit and
+	 * its preimage. */
+	if (ts->credit_claim)
+		return 1 + (1 + 64) + (1 + 8) + (1 + 32)
+			+ varint_size(tal_bytelen(ts->leaf)) + tal_bytelen(ts->leaf)
+			+ 1 + tal_bytelen(ts->cb);
 
 	if (tal_bytelen(ts->leaf)) {
 		if (ts->preimage)
@@ -1940,6 +1998,8 @@ static size_t tcov_weight(const struct tcov_spend *ts, const u8 *dest_spk,
 	memset(dummy, 1, sizeof(dummy));
 	psbt_append_input(psbt, &ts->out, ts->sequence, NULL, NULL, NULL);
 	psbt_append_output_asset(psbt, dest_spk, ts->out_sats, dummy);
+	if (ts->credit_claim)
+		psbt_append_output_asset(psbt, ts->holder_spk, ts->out_sats, dummy);
 	for (size_t i = 0; i < tal_count(coins); i++)
 		psbt_append_input(psbt, &coins[i]->outpoint, 0, NULL, NULL, NULL);
 	if (change)
@@ -1989,7 +2049,10 @@ static struct bitcoin_tx *tcov_build(const tal_t *ctx,
 		log_broken(channel->log, "tcov spend: no wallet key");
 		return NULL;
 	}
-	if (ts->cov_program) {
+	if (ts->credit_claim) {
+		/* Output 0 returns the remainder to the same script. */
+		dest_spk = ts->spent_spk;
+	} else if (ts->cov_program) {
 		dest_spk = tal_arr(tmpctx, u8, 2 + 32);
 		dest_spk[0] = 0x51;
 		dest_spk[1] = 32;
@@ -1999,7 +2062,7 @@ static struct bitcoin_tx *tcov_build(const tal_t *ctx,
 
 	/* Not a covenant, and the channel's asset pays fees here: out of
 	 * the output itself, as for any other channel type. */
-	if (!ts->cov_program && chan_rate) {
+	if (!ts->cov_program && !ts->credit_claim && chan_rate) {
 		size_t weight = tcov_weight(ts, dest_spk, NULL, false);
 		struct amount_sat left;
 
@@ -2105,8 +2168,20 @@ static struct bitcoin_tx *tcov_build(const tal_t *ctx,
 	psbt_append_input(psbt, &ts->out, ts->sequence, NULL, NULL, NULL);
 	psbt_input_set_wit_utxo_asset(psbt, 0, ts->spent_spk, ts->out_sats,
 				      chan_asset);
-	psbt_append_output_asset(psbt, dest_spk, ts->out_sats, chan_asset);
-	if (!ts->cov_program)
+	if (ts->credit_claim) {
+		struct amount_sat delta, rem;
+
+		if (!credit_claim_split(ts, &delta, &rem)) {
+			log_broken(channel->log, "credit claim of %s: the note"
+				   " owes nothing more", fmt_bitcoin_outpoint(tmpctx,
+									    &ts->out));
+			return NULL;
+		}
+		psbt_append_output_asset(psbt, ts->spent_spk, rem, chan_asset);
+		psbt_append_output_asset(psbt, ts->holder_spk, delta, chan_asset);
+	} else
+		psbt_append_output_asset(psbt, dest_spk, ts->out_sats, chan_asset);
+	if (!ts->cov_program && !ts->credit_claim)
 		tcov_set_keypath(psbt, 0, channel, &ext);
 	psbt = psbt_using_utxos(tmpctx, ld->wallet, coins, ts->locktime,
 				BITCOIN_TX_RBF_SEQUENCE, psbt);
@@ -2119,7 +2194,10 @@ static struct bitcoin_tx *tcov_build(const tal_t *ctx,
 
 sign:
 	tx = bitcoin_tx_with_psbt(tmpctx, psbt);
-	if (!tcov_sign_input0(ts, tx, &sig)) {
+	/* A credit claim's input 0 takes the note, no signature of ours. */
+	if (ts->credit_claim)
+		memset(&sig, 0, sizeof(sig));
+	else if (!tcov_sign_input0(ts, tx, &sig)) {
 		log_broken(channel->log, "tcov spend: hsmd did not sign %s",
 			   fmt_bitcoin_outpoint(tmpctx, &ts->out));
 		return NULL;
@@ -2175,7 +2253,8 @@ sign:
 	log_debug(channel->log, "tcov spend of %s (%s): fee %s of asset %s at"
 		  " %u/kw, %zu fee coin(s)",
 		  fmt_bitcoin_outpoint(tmpctx, &ts->out),
-		  ts->cov_program ? "by covenant" : "to our wallet",
+		  ts->credit_claim ? "credit claim"
+		  : ts->cov_program ? "by covenant" : "to our wallet",
 		  fmt_amount_sat(tmpctx, fee), fmt_asset_id(tmpctx, ts->fee_asset),
 		  feerate, tal_count(coins));
 	return tx;
@@ -2267,6 +2346,8 @@ static void handle_onchaind_spend_tcov(struct channel *channel,
 
 	ts->coins = NULL;
 	ts->channel = channel;
+	ts->credit_claim = false;
+	ts->holder_spk = NULL;
 	tcov_spend_track(ts);
 	if (!fromwire_onchaind_spend_tcov(ts, msg, &ts->out, &ts->out_sats,
 					  &ts->spent_spk, &signer,
@@ -2348,6 +2429,74 @@ static void handle_onchaind_spend_tcov(struct channel *channel,
 		     ts->minblock, NULL, tcov_rebroadcast, take(ts));
 }
 
+/* SEQUENTIA: claim a credit output with the note we hold
+ * (common/credit_scripts.h). */
+static void handle_onchaind_spend_credit_claim(struct channel *channel,
+					       const u8 *msg)
+{
+	struct lightningd *ld = channel->peer->ld;
+	struct tcov_spend *ts = tal(channel, struct tcov_spend);
+	struct bitcoin_tx *tx;
+	struct onchain_witness_element **welements;
+	u8 **wit;
+
+	ts->coins = NULL;
+	ts->channel = channel;
+	ts->credit_claim = true;
+	ts->cov_program = NULL;
+	ts->remote_point = NULL;
+	ts->revocation_secret = NULL;
+	ts->signer = TCOV_SIGN_DELAYED;
+	ts->commit_num = 0;
+	ts->locktime = 0;
+	ts->sequence = 0xFFFFFFFF;
+	memset(&ts->merkle_root, 0, sizeof(ts->merkle_root));
+	ts->preimage = tal(ts, struct preimage);
+	tcov_spend_track(ts);
+	if (!fromwire_onchaind_spend_credit_claim(ts, msg, &ts->out,
+						  &ts->out_sats,
+						  &ts->spent_spk,
+						  &ts->credit_b,
+						  &ts->leaf, &ts->cb,
+						  &ts->credit, &ts->note_sig,
+						  ts->preimage,
+						  &ts->holder_spk)) {
+		channel_internal_error(channel,
+				       "Invalid onchaind_spend_credit_claim %s",
+				       tal_hex(tmpctx, msg));
+		tal_free(ts);
+		return;
+	}
+	ts->minblock = get_block_height(ld->topology);
+	/* The provider sweeps after its delay: be in well before. */
+	ts->deadline_block = get_block_height(ld->topology) + 2;
+
+	tx = tcov_build(ts, ts, tcov_feerate(ts));
+
+	/* Every element is fixed: none is a signature of ours. */
+	wit = credit_claim_witness(tmpctx, ts);
+	welements = tal_arr(tmpctx, struct onchain_witness_element *,
+			    tal_count(wit));
+	for (size_t i = 0; i < tal_count(wit); i++) {
+		welements[i] = tal(welements, struct onchain_witness_element);
+		welements[i]->is_signature = false;
+		welements[i]->witness = tal_dup_talarr(welements[i], u8, wit[i]);
+	}
+	subd_send_msg(channel->owner,
+		      take(towire_onchaind_spend_created(NULL, true,
+				cast_const2(const struct onchain_witness_element **,
+					    welements))));
+	if (!tx) {
+		notleak(new_reltimer(ld->timers, ts, time_from_sec(10),
+				     tcov_retry, ts));
+		return;
+	}
+	log_info(channel->log, "Claiming credit note %"PRIu64" from %s",
+		 ts->credit, fmt_bitcoin_outpoint(tmpctx, &ts->out));
+	broadcast_tx(channel, ld->topology, channel, take(tx), NULL, false,
+		     ts->minblock, NULL, tcov_rebroadcast, take(ts));
+}
+
 static unsigned int onchain_msg(struct subd *sd, const u8 *msg, const int *fds UNUSED)
 {
 	enum onchaind_wire t = fromwire_peektype(msg);
@@ -2421,6 +2570,10 @@ static unsigned int onchain_msg(struct subd *sd, const u8 *msg, const int *fds U
 		handle_onchaind_spend_tcov(sd->channel, msg);
 		break;
 
+	case WIRE_ONCHAIND_SPEND_CREDIT_CLAIM:
+		handle_onchaind_spend_credit_claim(sd->channel, msg);
+		break;
+
 	/* We send these, not receive them */
 	case WIRE_ONCHAIND_INIT:
 	case WIRE_ONCHAIND_SPENT:
@@ -2428,6 +2581,7 @@ static unsigned int onchain_msg(struct subd *sd, const u8 *msg, const int *fds U
 	case WIRE_ONCHAIND_HTLCS:
 	case WIRE_ONCHAIND_KNOWN_PREIMAGE:
 	case WIRE_ONCHAIND_SPEND_CREATED:
+	case WIRE_ONCHAIND_CREDIT_NOTE:
 	case WIRE_ONCHAIND_DEV_MEMLEAK:
 	case WIRE_ONCHAIND_DEV_MEMLEAK_REPLY:
 	case WIRE_ONCHAIND_SPENT_REPLY:
@@ -2588,6 +2742,7 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 				   channel_has(channel, OPT_ANCHOR_OUTPUTS_DEPRECATED),
 				   channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX),
 				   channel_has(channel, OPT_SEQ_TAPROOT_COVENANT),
+				   channel_has(channel, OPT_SEQ_CREDIT),
 				  feerate_min(ld, NULL));
 	subd_send_msg(channel->owner, take(msg));
 

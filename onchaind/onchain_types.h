@@ -41,6 +41,12 @@ enum tx_type {
 	/* When we use revocation key to take output. */
 	OUR_PENALTY_TX,
 
+	/* SEQUENTIA: a credit note claimed from the provider's balance
+	 * output (common/credit_scripts.h), and the provider's own sweep of
+	 * that output after its delay. */
+	CREDIT_CLAIM,
+	CREDIT_SWEEP_TO_THEM,
+
 	/* Amount too small, we're just spending it to close UTXO */
 	IGNORING_TINY_PAYMENT,
 
@@ -77,6 +83,12 @@ enum output_type {
 	/* Anchor outputs for option_anchor_outputs */
 	ANCHOR_TO_US,
 	ANCHOR_TO_THEM,
+
+	/* SEQUENTIA: a credit channel's provider balance output (or what a
+	 * claim left of it), ours (we provide) or theirs (we hold the
+	 * credit). */
+	CREDIT_OUTPUT_TO_US,
+	CREDIT_OUTPUT_TO_THEM,
 };
 
 

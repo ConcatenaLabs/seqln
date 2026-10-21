@@ -52,6 +52,7 @@ pub mod msg {
     pub const HSMD_SIGN_TCOV_LOCAL_HTLC: u16 = 62;
     pub const HSMD_SIGN_TCOV_REMOTE_HTLC_TO_US: u16 = 63;
     pub const HSMD_SIGN_TCOV_PENALTY: u16 = 64;
+    pub const HSMD_CREDIT_NOTE: u16 = 67;
 
     pub const HSMD_ECDH_RESP: u16 = 100;
     pub const HSMD_CANNOUNCEMENT_SIG_REPLY: u16 = 102;
@@ -84,6 +85,7 @@ pub mod msg {
     pub const HSMD_SIGN_ANCHORSPEND_REPLY: u16 = 148;
     pub const HSMD_SIGN_HTLC_TX_MINGLE_REPLY: u16 = 150;
     pub const HSMD_SIGN_TCOV_REPLY: u16 = 161;
+    pub const HSMD_CREDIT_NOTE_REPLY: u16 = 167;
 }
 
 /// Append-only big-endian wire builder.

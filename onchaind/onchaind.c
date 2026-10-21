@@ -5,6 +5,8 @@
 #include <ccan/cast/cast.h>
 #include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
+#include <common/channel_id.h>
+#include <common/credit_scripts.h>
 #include <common/htlc_tx.h>
 #include <common/initial_commit_tx.h>
 #include <common/keyset.h>
@@ -78,6 +80,19 @@ static bool option_anchors_zero_fee_htlc_tx;
 /* SEQUENTIA: a taproot-covenant channel (common/tcov_scripts.h)? */
 static bool option_seq_taproot_covenant;
 
+/* SEQUENTIA: a credit channel (common/credit_scripts.h): who provides, the
+ * credit leaves' constants, and the latest note we hold, as its holder. */
+static bool option_seq_credit;
+static enum side credit_provider;
+static struct credit_params *credit_params;
+struct credit_note_held {
+	u64 credit;
+	struct sha256 payment_hash;
+	struct bip340sig sig;
+	struct preimage preimage;
+};
+static struct credit_note_held *credit_note;
+
 /* Asset-aware channels: the asset this channel is denominated in (33-byte
  * version+tag); the policy asset for an ordinary channel. All resolution/HTLC
  * txs we build (or the amounts we read off the commitment tx) are in it. */
@@ -131,7 +146,20 @@ struct tracked_output {
 
 	/* SEQUENTIA: a taproot-covenant output's script tree, else NULL. */
 	const struct tap_tree2 *tcov_tree;
+
+	/* SEQUENTIA: a credit output's B, the constant its CLAIM leaf counts
+	 * what was paid from (common/credit_scripts.h). */
+	struct amount_sat credit_b;
 };
+
+/* SEQUENTIA: the provider-signed credit, near the end of this file. */
+static bool credit_output_spent(struct tracked_output ***outs,
+				struct tracked_output *out,
+				const struct tx_parts *tx_parts,
+				u32 input_num, u32 tx_blockheight,
+				bool by_proposal);
+static void handle_onchaind_credit_note(struct tracked_output **outs,
+					const u8 *msg);
 
 /* SEQUENTIA: the taproot-covenant channel type, near the end of this file. */
 static void tcov_resolve_claim(struct tracked_output ***outs,
@@ -665,6 +693,7 @@ new_tracked_output(struct tracked_output ***outs,
 	out->remote_htlc_sig = tal_dup_or_null(out, struct bitcoin_signature,
 					       remote_htlc_sig);
 	out->tcov_tree = NULL;
+	out->credit_b = AMOUNT_SAT(0);
 
 	tal_arr_expand(outs, out);
 
@@ -817,8 +846,10 @@ static bool resolved_by_proposal(struct tracked_output *out,
 {
 	const struct wally_tx_input *input;
 
-	/* If there's no TX associated, it's not us. */
-	if (!out->proposal->welements)
+	/* If there's no TX associated, it's not us.  (SEQUENTIA: a credit
+	 * output we only watch, whose note owes nothing more, has no
+	 * proposal at all.) */
+	if (!out->proposal || !out->proposal->welements)
 		return false;
 
 	input = which_input_spends(tx_parts, &out->outpoint);
@@ -1262,6 +1293,12 @@ static bool output_spent(struct tracked_output ***outs,
 
 		/* Was this our resolution? */
 		if (resolved_by_proposal(out, tx_parts)) {
+			/* SEQUENTIA: our credit claim: what it paid us, and
+			 * what it left for a later note. */
+			if (out->output_type == CREDIT_OUTPUT_TO_THEM)
+				credit_output_spent(outs, out, tx_parts,
+						    input_num, tx_blockheight,
+						    true);
 			/* If it's our htlc tx, we need to resolve that, too. */
 			if (out->resolved->tx_type == OUR_HTLC_SUCCESS_TX
 			    || out->resolved->tx_type == OUR_HTLC_TIMEOUT_TX) {
@@ -1410,6 +1447,12 @@ static bool output_spent(struct tracked_output ***outs,
 
 			record_external_deposit(out, out->tx_blockheight, mk_mvt_tags(MVT_STOLEN));
 			break;
+		case CREDIT_OUTPUT_TO_US:
+		case CREDIT_OUTPUT_TO_THEM:
+			credit_output_spent(outs, out, tx_parts, input_num,
+					    tx_blockheight, false);
+			break;
+
 		/* Um, we don't track these! */
 		case OUTPUT_TO_THEM:
 		case DELAYED_OUTPUT_TO_THEM:
@@ -1778,6 +1821,9 @@ static void wait_for_resolved(struct tracked_output **outs)
 		case WIRE_ONCHAIND_DEV_MEMLEAK:
 			handle_dev_memleak(&outs, msg);
 			goto handled;
+		case WIRE_ONCHAIND_CREDIT_NOTE:
+			handle_onchaind_credit_note(outs, msg);
+			goto handled;
 
 		/* Unexpected messages */
 		case WIRE_ONCHAIND_INIT:
@@ -1804,6 +1850,7 @@ static void wait_for_resolved(struct tracked_output **outs)
 		case WIRE_ONCHAIND_SPEND_FULFILL:
 		case WIRE_ONCHAIND_SPEND_HTLC_EXPIRED:
 		case WIRE_ONCHAIND_SPEND_TCOV:
+		case WIRE_ONCHAIND_SPEND_CREDIT_CLAIM:
 			break;
 		}
 		master_badmsg(-1, msg);
@@ -3525,6 +3572,8 @@ static const struct tap_tree2 *keep_tree(const tal_t *ctx,
 	struct tap_tree2 *t = tal_dup(ctx, struct tap_tree2, tree);
 	t->leaf[0] = tal_dup_talarr(t, u8, tree->leaf[0]);
 	t->leaf[1] = tal_dup_talarr(t, u8, tree->leaf[1]);
+	t->leaf[2] = tree->nleaves == 3
+		? tal_dup_talarr(t, u8, tree->leaf[2]) : NULL;
 	return t;
 }
 
@@ -3784,6 +3833,192 @@ static bool tcov_revoke_leaf_paid_us(const struct tx_parts *tx_parts,
 	return true;
 }
 
+/*~ SEQUENTIA: the provider-signed credit (common/credit_scripts.h).
+ *
+ * On a credit channel the provider's balance output, on either commitment,
+ * carries CLAIM: whoever holds a note (and its payment's preimage) moves what
+ * it owes to the holder's static payment script, the rest staying under the
+ * same script.  As provider we sweep that output (or what a claim left of it)
+ * to our wallet after our delay: by DELAY from our own commitment, by
+ * PROVIDER from the holder's.  As holder we claim it with our latest note,
+ * which lightningd hands us (onchaind_credit_note), and claim again whenever
+ * a higher one arrives while some of it remains. */
+
+/* Is @o the provider's credit output of the commitment @holder holds? */
+static bool credit_match(const struct wally_tx_output *o,
+			 struct amount_sat amt,
+			 const struct pubkey *holder_point,
+			 enum side holder,
+			 struct tap_tree2 *tree)
+{
+	if (holder == credit_provider)
+		credit_to_local_tree(tmpctx, keyset, holder_point,
+				     to_self_delay[holder], credit_params,
+				     amt, tree);
+	else
+		credit_to_remote_tree(tmpctx, &keyset->other_payment_key,
+				      to_self_delay[credit_provider],
+				      credit_params, amt, tree);
+	return wally_tx_output_scripteq(o, tap_tree2_scriptpubkey(tmpctx, tree));
+}
+
+/* Ours: to our wallet after our delay, by DELAY (our own commitment's
+ * to_local, three leaves) or PROVIDER (on the holder's, two). */
+static void credit_propose_own(struct tracked_output *out)
+{
+	bool to_local = (out->tcov_tree->nleaves == 3);
+
+	tcov_propose(out, to_local ? TCOV_SIGN_DELAYED : TCOV_SIGN_PAYMENT,
+		     to_local ? TCOV_LEAF_DELAY : CREDIT_REMOTE_LEAF_PROVIDER,
+		     NULL, NULL, 0, to_self_delay[LOCAL],
+		     rel_blockheight(out, to_self_delay[LOCAL]),
+		     TCOV_DEADLINE_SWEEP, OUR_DELAYED_RETURN_TO_WALLET);
+}
+
+/* Theirs: claimed with our note, if it owes more than was paid from it. */
+static void credit_propose_claim(struct tracked_output *out)
+{
+	struct amount_sat paid;
+	const struct tap_tree2 *tree = out->tcov_tree;
+	int leaf = tree->nleaves == 3 ? CREDIT_LEAF_CLAIM
+		: CREDIT_REMOTE_LEAF_CLAIM;
+	const u8 *msg;
+
+	if (!credit_note)
+		return;
+	if (!amount_sat_sub(&paid, out->credit_b, out->sat))
+		paid = AMOUNT_SAT(0);
+	if (credit_note->credit <= paid.satoshis) { /* Raw: credit atoms */
+		status_debug("Credit note %"PRIu64" owes nothing more from %s"
+			     " (%s already paid)", credit_note->credit,
+			     fmt_bitcoin_outpoint(tmpctx, &out->outpoint),
+			     fmt_amount_sat(tmpctx, paid));
+		return;
+	}
+	out->proposal = tal_free(out->proposal);
+	msg = towire_onchaind_spend_credit_claim(NULL, &out->outpoint,
+						 out->sat,
+						 tap_tree2_scriptpubkey(tmpctx, tree),
+						 out->credit_b,
+						 tree->leaf[leaf],
+						 tap_tree2_control_block(tmpctx, tree, leaf),
+						 credit_note->credit,
+						 &credit_note->sig,
+						 &credit_note->preimage,
+						 credit_params->holder_spk);
+	propose_immediate_resolution(out, take(msg), CREDIT_CLAIM);
+}
+
+static void credit_track(struct tracked_output ***outs,
+			 const struct bitcoin_outpoint *outpoint,
+			 u32 tx_blockheight, enum tx_type tx_type,
+			 struct amount_sat amt, struct amount_sat b,
+			 const struct tap_tree2 *tree)
+{
+	struct tracked_output *out;
+
+	out = new_tracked_output(outs, outpoint, tx_blockheight, tx_type, amt,
+				 credit_provider == LOCAL
+				 ? CREDIT_OUTPUT_TO_US : CREDIT_OUTPUT_TO_THEM,
+				 NULL, NULL, NULL);
+	out->tcov_tree = keep_tree(out, tree);
+	out->credit_b = b;
+	if (credit_provider == LOCAL)
+		credit_propose_own(out);
+	else
+		credit_propose_claim(out);
+}
+
+/* A credit output was spent.  A claim's output 1 pays the holder (us, if we
+ * hold the credit: our wallet learns it) and its output 0 keeps the rest
+ * under the same script, which we track again. */
+static bool credit_output_spent(struct tracked_output ***outs,
+				struct tracked_output *out,
+				const struct tx_parts *tx_parts,
+				u32 input_num, u32 tx_blockheight,
+				bool by_proposal)
+{
+	const u8 *spk = tap_tree2_scriptpubkey(tmpctx, out->tcov_tree);
+	bool claim = input_num + 1 < tal_count(tx_parts->outputs)
+		&& tx_parts->outputs[input_num]
+		&& tx_parts->outputs[input_num + 1]
+		&& wally_tx_output_scripteq(tx_parts->outputs[input_num], spk)
+		&& wally_tx_output_scripteq(tx_parts->outputs[input_num + 1],
+					    credit_params->holder_spk);
+
+	if (!claim) {
+		if (!by_proposal)
+			resolved_by_other(out, &tx_parts->txid,
+					  out->output_type == CREDIT_OUTPUT_TO_US
+					  ? THEIR_DELAYED_CHEAT
+					  : CREDIT_SWEEP_TO_THEM);
+		return false;
+	}
+
+	if (!by_proposal)
+		resolved_by_other(out, &tx_parts->txid, CREDIT_CLAIM);
+
+	/* What it paid the holder. */
+	if (credit_provider == REMOTE) {
+		struct bitcoin_outpoint paid;
+		struct amount_asset a
+			= wally_tx_output_get_amount(tx_parts->outputs[input_num + 1]);
+
+		paid.txid = tx_parts->txid;
+		paid.n = input_num + 1;
+		if (amount_asset_is(&a, channel_asset)) {
+			status_debug("Credit claim paid us %s at %s",
+				     fmt_amount_sat(tmpctx, amount_sat(a.value)),
+				     fmt_bitcoin_outpoint(tmpctx, &paid));
+			wire_sync_write(REQ_FD,
+					take(towire_onchaind_add_utxo(NULL, &paid,
+								     NULL,
+								     amount_sat(a.value),
+								     tx_blockheight,
+								     credit_params->holder_spk,
+								     0)));
+		}
+	}
+
+	/* What it left, under the same script. */
+	{
+		struct bitcoin_outpoint rem;
+		struct amount_asset a
+			= wally_tx_output_get_amount(tx_parts->outputs[input_num]);
+
+		rem.txid = tx_parts->txid;
+		rem.n = input_num;
+		if (amount_asset_is(&a, channel_asset) && a.value > 0)
+			credit_track(outs, &rem, tx_blockheight, CREDIT_CLAIM,
+				     amount_sat(a.value), out->credit_b,
+				     out->tcov_tree);
+	}
+	return true;
+}
+
+static void handle_onchaind_credit_note(struct tracked_output **outs,
+					const u8 *msg)
+{
+	struct credit_note_held n;
+
+	if (!fromwire_onchaind_credit_note(msg, &n.credit, &n.payment_hash,
+					   &n.sig, &n.preimage))
+		master_badmsg(WIRE_ONCHAIND_CREDIT_NOTE, msg);
+	if (!option_seq_credit || credit_provider == LOCAL)
+		return;
+	if (credit_note && credit_note->credit >= n.credit)
+		return;
+	tal_free(credit_note);
+	credit_note = notleak(tal_dup(NULL, struct credit_note_held, &n));
+	status_debug("Credit note %"PRIu64" to claim", n.credit);
+
+	for (size_t i = 0; i < tal_count(outs); i++) {
+		if (outs[i]->output_type == CREDIT_OUTPUT_TO_THEM
+		    && !outs[i]->resolved)
+			credit_propose_claim(outs[i]);
+	}
+}
+
 static void handle_unilateral_tcov(const struct tx_parts *tx,
 				   u32 tx_blockheight,
 				   enum side holder,
@@ -3856,6 +4091,29 @@ static void handle_unilateral_tcov(const struct tx_parts *tx,
 						 tx_type, amt, ELEMENTS_FEE,
 						 NULL, NULL, NULL);
 			ignore_output(out);
+			continue;
+		}
+
+		/* SEQUENTIA: a credit channel's provider balance output. */
+		if (option_seq_credit
+		    && credit_match(tx->outputs[i], amt, &holder_point,
+				    holder, &tree)) {
+			if (revoked && holder == credit_provider) {
+				/* Their revoked commitment: all ours, by the
+				 * key path, as any revoked to_local. */
+				out = new_tracked_output(&outs, &outpoint,
+							 tx_blockheight, tx_type,
+							 amt,
+							 DELAYED_CHEAT_OUTPUT_TO_THEM,
+							 NULL, NULL, NULL);
+				out->tcov_tree = keep_tree(out, &tree);
+				tcov_propose(out, TCOV_SIGN_PENALTY, -1, NULL,
+					     NULL, 0, 0xFFFFFFFF,
+					     tx_blockheight + 1,
+					     TCOV_DEADLINE_NOW, OUR_PENALTY_TX);
+			} else
+				credit_track(&outs, &outpoint, tx_blockheight,
+					     tx_type, amt, amt, &tree);
 			continue;
 		}
 
@@ -4024,6 +4282,7 @@ int main(int argc, char *argv[])
 				   &option_anchor_outputs,
 				   &option_anchors_zero_fee_htlc_tx,
 				   &option_seq_taproot_covenant,
+				   &option_seq_credit,
 				   &min_relay_feerate)) {
 		master_badmsg(WIRE_ONCHAIND_INIT, msg);
 	}
@@ -4034,6 +4293,22 @@ int main(int argc, char *argv[])
 	outs = tal_arr(ctx, struct tracked_output *, 0);
 	wally_tx_input_get_txid(tx->inputs[0], &funding.txid);
 	funding.n = tx->inputs[0]->index;
+
+	/* SEQUENTIA: a credit channel's leaves (common/credit_scripts.h): the
+	 * opener provides. */
+	if (option_seq_credit) {
+		struct channel_id cid;
+
+		credit_provider = opener;
+		derive_channel_id(&cid, &funding);
+		credit_params = notleak(tal(ctx, struct credit_params));
+		if (!credit_params_init(credit_params, &cid,
+					&funding_pubkey[credit_provider],
+					&basepoints[!credit_provider].payment,
+					credit_params))
+			status_failed(STATUS_FAIL_INTERNAL_ERROR,
+				      "No credit key for this channel");
+	}
 	new_tracked_output(&outs, &funding,
 			   0, /* We don't care about funding blockheight */
 			   FUNDING_TRANSACTION,

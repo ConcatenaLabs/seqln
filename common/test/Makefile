@@ -170,3 +170,4 @@ check-units: $(COMMON_TEST_PROGRAMS:%=unittest/%)
 
 common/test/run-tcov_scripts: wire/fromwire.o wire/towire.o
 common/test/run-point_lock: wire/fromwire.o wire/towire.o
+common/test/run-credit_scripts: wire/fromwire.o wire/towire.o

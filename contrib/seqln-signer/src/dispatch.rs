@@ -45,7 +45,7 @@ const SWEEP_KEY_SCAN: u32 = 5000;
 /// The capabilities array from `hsmd_init()`, in the exact order libhsmd emits
 /// it, followed by the two preapprove-check caps (`dev_no_preapprove_check` is
 /// false in a normal, non-dev node).
-const CAPABILITIES: [u32; 17] = [
+const CAPABILITIES: [u32; 18] = [
     28,  // WIRE_HSMD_CHECK_PUBKEY
     56,  // WIRE_HSMD_CHECK_BIP86_PUBKEY
     142, // WIRE_HSMD_SIGN_ANY_DELAYED_PAYMENT_TO_US
@@ -61,6 +61,7 @@ const CAPABILITIES: [u32; 17] = [
     62,  // WIRE_HSMD_SIGN_TCOV_LOCAL_HTLC
     63,  // WIRE_HSMD_SIGN_TCOV_REMOTE_HTLC_TO_US
     64,  // WIRE_HSMD_SIGN_TCOV_PENALTY
+    67,  // WIRE_HSMD_CREDIT_NOTE
     51,  // WIRE_HSMD_PREAPPROVE_INVOICE_CHECK
     52,  // WIRE_HSMD_PREAPPROVE_KEYSEND_CHECK
 ];
@@ -287,6 +288,8 @@ impl Signer {
             | msg::HSMD_SIGN_TCOV_LOCAL_HTLC
             | msg::HSMD_SIGN_TCOV_REMOTE_HTLC_TO_US
             | msg::HSMD_SIGN_TCOV_PENALTY => opt(self.h_sign_tcov(&req.hsmd_msg, t)),
+            // A credit note this device's side holds (option_seq_credit).
+            msg::HSMD_CREDIT_NOTE => self.credit_note(req),
             msg::HSMD_SIGN_MUTUAL_CLOSE_TX => self.sign_mutual_close_tx_checked(req),
             msg::HSMD_SIGN_REMOTE_HTLC_TX => opt(self.h_sign_remote_htlc_tx(req)),
             msg::HSMD_SIGN_ANY_LOCAL_HTLC_TX => opt(self.h_sign_any_local_htlc_tx(&req.hsmd_msg)),
@@ -496,6 +499,89 @@ impl Signer {
 
     /// Record a channel's parameters from `setup_channel` (keyed by the frame's
     /// peer node_id + dbid), so later commitment signs can be validated.
+    /// HSMD_CREDIT_NOTE (67), on a credit channel's client: the latest note
+    /// the provider signed this side, with its payment's preimage once
+    /// known. The note must name this channel (its id from the funding
+    /// outpoint) and carry the credit key's signature (the provider's
+    /// funding key, tweaked); a preimage must open its payment hash. The
+    /// device keeps the latest (`ChannelState::learn_credit`) and from then
+    /// on refuses a commitment whose provider output could not pay it, and
+    /// a close that does not pay it. In enforce mode a note that fails a
+    /// check is refused; otherwise it is acknowledged and not kept.
+    fn credit_note(&mut self, req: &Request) -> Outcome {
+        let checked = (|| -> Result<policy::CreditNote, String> {
+            let mut r = wire::Reader::new(&req.hsmd_msg);
+            let bad = || "malformed CREDIT_NOTE".to_string();
+            r.u16().ok_or_else(bad)?;
+            let cid = r.arr32().ok_or_else(bad)?;
+            let credit = r.u64().ok_or_else(bad)?;
+            let payment_hash = r.arr32().ok_or_else(bad)?;
+            let sig: [u8; 64] = r.take_bytes(64).ok_or_else(bad)?.try_into().map_err(|_| bad())?;
+            let preimage = match r.u8().ok_or_else(bad)? {
+                0 => None,
+                _ => Some(r.arr32().ok_or_else(bad)?),
+            };
+            let st = self
+                .store
+                .get(&req.node_id, req.dbid)
+                .ok_or_else(|| self.untracked(&req.node_id, req.dbid))?;
+            if !st.option_credit || st.is_outbound != Some(false) {
+                return Err("the channel is not a credit channel this device's side holds".to_string());
+            }
+            if cid != taproot::channel_id(&st.funding_txid, st.funding_txout) {
+                return Err("the note names another channel".to_string());
+            }
+            let our_payment = self.kernel().channel_basepoints(&req.node_id, req.dbid)[1];
+            let cp = taproot::CreditParams::new(
+                self.kernel().secp(),
+                &st.funding_txid,
+                st.funding_txout,
+                &st.remote_funding,
+                &our_payment,
+            )
+            .ok_or("the channel has no credit key")?;
+            if !taproot::credit_note_check(self.kernel().secp(), &cp.dtag, &cp.credit_key, credit, &payment_hash, &sig) {
+                return Err(format!("the note of {credit} is not signed by the provider's credit key"));
+            }
+            if let Some(p) = preimage {
+                if taproot::sha256(&p) != payment_hash {
+                    return Err("the preimage does not open the note's payment hash".to_string());
+                }
+            }
+            Ok(policy::CreditNote { credit, payment_hash, sig, preimage })
+        })();
+        match checked {
+            Ok(n) => {
+                if let Some(st) = self.store.get_mut(&req.node_id, req.dbid) {
+                    if st.learn_credit(n) {
+                        self.store_dirty = true;
+                    }
+                }
+                Outcome::Reply(empty_reply(msg::HSMD_CREDIT_NOTE_REPLY))
+            }
+            Err(reason) if self.policy.is_enforce() => Outcome::Reject(format!("CREDIT_NOTE refused: {reason}")),
+            Err(_) => Outcome::Reply(empty_reply(msg::HSMD_CREDIT_NOTE_REPLY)),
+        }
+    }
+
+    /// The credit notes this device holds, one per credit channel: (peer,
+    /// channel dbid, funding txid as lightningd holds it, funding output,
+    /// note), for a wallet to show what its user is owed and keep a copy.
+    #[allow(clippy::type_complexity)]
+    pub fn credit_notes(&self) -> Vec<([u8; 33], u64, [u8; 32], u16, policy::CreditNote)> {
+        let mut v: Vec<_> = self
+            .store
+            .iter()
+            .filter_map(|((peer, dbid), st)| {
+                st.credit
+                    .filter(|_| st.option_credit)
+                    .map(|n| (*peer, *dbid, st.funding_txid, st.funding_txout, n))
+            })
+            .collect();
+        v.sort_by_key(|e| (e.0, e.1));
+        v
+    }
+
     fn record_setup_channel(&mut self, req: &Request) {
         // Best-effort: a parse failure leaves the channel untracked, and in
         // enforce mode its commitment signs are then refused (the safe default).
@@ -1977,6 +2063,48 @@ impl Signer {
         }
     }
 
+    /// A credit claim this device's side makes (`option_seq_credit`): input
+    /// 0 spends the provider's credit output by its CLAIM leaf, which needs
+    /// no signature, so the fee coins are all lightningd asks to be signed.
+    /// Its output 0 keeps the rest under the input's own script, at most the
+    /// input's value in the input's asset, and output 1 pays this side's
+    /// static payment script (the claim leaf's U). Those two outputs are
+    /// recorded as a claim's, like a covenant claim's D, so the withdrawal
+    /// rule lets the fee coins sign: what the coins bring still goes only to
+    /// fees within the limits and to the device's own scripts.
+    fn note_credit_claim(&self, peer_id: &[u8; 33], dbid: u64, psbt: &[u8]) {
+        let Some(st) = self.store.get(peer_id, dbid) else {
+            return;
+        };
+        if !st.option_credit || st.is_outbound != Some(false) {
+            return;
+        }
+        let Some(tx) = wire::reconstruct_elements_tx_from_pset(psbt) else {
+            return;
+        };
+        let (Some((in_asset, in_value, in_spk)), Some(txid)) =
+            (wire::psbt_input_elements_prevout(psbt, 0), wire::unsigned_txid(&tx))
+        else {
+            return;
+        };
+        let (Some(o0), Some(o1)) = (tx.outputs.first(), tx.outputs.get(1)) else {
+            return;
+        };
+        let u = taproot::p2wpkh(&self.kernel().channel_basepoints(peer_id, dbid)[1]);
+        let same_asset = |a: &[u8]| explicit_asset(a).is_some() && a == in_asset.as_slice();
+        let keeps = o0.script == in_spk
+            && same_asset(&o0.asset)
+            && matches!((explicit_amount(&o0.value), explicit_amount(&in_value)), (Some(a), Some(b)) if a <= b);
+        if keeps && o1.script == u && same_asset(&o1.asset) && o0.nonce == [0x00] && o1.nonce == [0x00] {
+            let mut claims = self.tcov_claims.borrow_mut();
+            while claims.len() + 2 > TCOV_CLAIMS {
+                claims.pop_front();
+            }
+            claims.push_back((txid, o0.script.clone()));
+            claims.push_back((txid, u));
+        }
+    }
+
     /// Whether `script`, paid by the transaction `txid`, is D, the covenant
     /// output of a taproot-covenant claim SIGN_TCOV_LOCAL_HTLC approved.
     fn tcov_claim_pays(&self, txid: &[u8; 32], script: &[u8]) -> bool {
@@ -1992,7 +2120,8 @@ impl Signer {
     /// SIGN_TCOV_LOCAL_HTLC approved. A refused request gets its PSBT back
     /// unsigned, which lightningd cannot finalize, so it tries again later.
     fn h_sign_htlc_tx_mingle(&self, m: &[u8]) -> Option<Vec<u8>> {
-        let (_peer_id, _dbid, utxos, psbt) = wire::parse_sign_htlc_tx_mingle(m)?;
+        let (peer_id, dbid, utxos, psbt) = wire::parse_sign_htlc_tx_mingle(m)?;
+        self.note_credit_claim(&peer_id, dbid, &psbt);
         let (out, _) = self.sign_wallet_inputs_into_psbt("SIGN_HTLC_TX_MINGLE", &utxos, psbt, Bound::Each, 0)?;
         let mut w = Writer::new(msg::HSMD_SIGN_HTLC_TX_MINGLE_REPLY);
         w.u32(out.len() as u32);
@@ -2930,6 +3059,7 @@ fn parse_setup_channel(m: &[u8]) -> Option<ChannelState> {
     let ctlen = r.u16()? as usize;
     let features = r.take_bytes(ctlen)?;
     let (option_static_remotekey, option_anchors, option_tcov) = policy::parse_channel_type(&features);
+    let option_credit = option_tcov && policy::channel_type_has_credit(&features);
     let limits = parse_setup_channel_limits(&mut r)?;
     Some(ChannelState {
         funding_sats,
@@ -2958,6 +3088,8 @@ fn parse_setup_channel(m: &[u8]) -> Option<ChannelState> {
         predates_validation: false,
         limits,
         peer_reached_reserve: false,
+        option_credit,
+        credit: None,
     })
 }
 
@@ -4040,8 +4172,18 @@ mod close_and_revocation_tests {
         assert!(matches!(revoke(&mut s, 0), Outcome::Reply(_)));
         assert!(s.store.record_close([0x99; 32]));
         assert!(!s.store.record_close([0x99; 32]));
-        let v10 = policy::encode_channel_store(&s.store);
-        assert_eq!(v10[4], 10);
+        let v11 = policy::encode_channel_store(&s.store);
+        assert_eq!(v11[4], 11);
+        // A version-10 payload: the same, without the entry's credit flag
+        // and credit-note flag (the two bytes before the ledger and the
+        // close record; the channel holds no credit).
+        let l = &s.store.ledger;
+        let at11 = v11.len() - (2 + 32) - (2 + 40 * l.approvals.len() + 2 + 49 * l.spends.len()) - 2;
+        assert_eq!(&v11[at11..at11 + 2], &[0, 0]);
+        let mut v10 = [&v11[..at11], &v11[at11 + 2..]].concat();
+        v10[4] = 10;
+        let (back, _, _) = policy::decode_channel_store(&v10).unwrap();
+        assert!(!back[0].1.option_credit && back[0].1.credit.is_none());
         // A version-9 payload: the same, without the entry's channel-type
         // flag (the byte before the ledger and the close record).
         let l = &s.store.ledger;
@@ -5707,8 +5849,8 @@ mod close_and_revocation_tests {
             assert!(matches!(validate(&mut s, n, 300_000, 699_000, 1_000), Outcome::Reply(_)));
         }
         let full = policy::encode_channel_store(&s.store);
-        // Version 10 less the entry's four flags and the close record: version 6.
-        let mut payload = [&full[..full.len() - 2 - 4 - 4], &full[full.len() - 2 - 4..full.len() - 2]].concat();
+        // Version 11 less the entry's six flags and the close record: version 6.
+        let mut payload = [&full[..full.len() - 2 - 4 - 6], &full[full.len() - 2 - 4..full.len() - 2]].concat();
         payload[4] = 6;
         let mac = s.chstore_mac(&payload);
         payload.extend_from_slice(&mac);
@@ -6601,6 +6743,8 @@ mod close_output_spend_tests {
             predates_validation: false,
             limits: None,
             peer_reached_reserve: false,
+            option_credit: false,
+            credit: None,
         }
     }
 }
@@ -6678,6 +6822,8 @@ mod tcov_tests {
             predates_validation: false,
             limits: None,
             peer_reached_reserve: false,
+            option_credit: false,
+            credit: None,
         }
     }
 
@@ -7127,6 +7273,324 @@ mod tcov_tests {
         let bad = commitment(vec![(bolt3, 600_000), (to_remote, 349_000), (off.script_pubkey(), X), (Vec::new(), 1_000)]);
         let e = policy::validate_commitment(s.kernel(), &PEER, DBID, &st, Side::Local, &point, &htlcs, &bad).unwrap_err();
         assert!(e.contains("output 0 pays to a script not derivable"), "{e}");
+    }
+
+    // ---- option_seq_credit: this device holds credit ----------------------
+
+    /// The provider's channel secrets: the peer's (see `peer_bp`).
+    fn provider_secrets() -> crate::kernel::ChannelSecrets {
+        let seed = crate::kernel::bip39_seed(PEER_MNEMONIC, "");
+        Kernel::new(seed.to_vec(), BIP32_VER_TEST_PUBLIC, BIP32_VER_TEST_PRIVATE).channel_secrets(&[0x03; 33], 1)
+    }
+
+    /// A credit channel the peer opened: it provides, this device holds.
+    fn credit_channel() -> ChannelState {
+        let mut st = channel();
+        st.is_outbound = Some(false);
+        st.option_credit = true;
+        st
+    }
+
+    fn credit_tracked(policy: Policy) -> Signer {
+        let mut s = signer(policy);
+        s.store.insert(PEER, DBID, credit_channel());
+        s
+    }
+
+    fn credit_params(s: &Signer) -> taproot::CreditParams {
+        let st = credit_channel();
+        let ours = s.kernel().channel_basepoints(&PEER, DBID);
+        taproot::CreditParams::new(s.kernel().secp(), &st.funding_txid, st.funding_txout, &st.remote_funding, &ours[1])
+            .unwrap()
+    }
+
+    /// The provider's note of `credit` for `hash`: BIP340 over the 72-byte
+    /// message, with the credit key (its funding key, tweaked).
+    fn sign_note(s: &Signer, credit: u64, hash: &[u8; 32]) -> [u8; 64] {
+        use secp256k1::ffi::CPtr;
+        let secp = s.kernel().secp();
+        let f = provider_secrets().funding;
+        let fpub = secp256k1::PublicKey::from_secret_key(secp, &f).serialize();
+        let t = secp256k1::Scalar::from_be_bytes(taproot::tagged_hash("SeqLN/credit-key", &fpub)).unwrap();
+        let kp = secp256k1::Keypair::from_secret_key(secp, &f.add_tweak(&t).unwrap());
+        let msg = taproot::credit_note_msg(&credit_params(s).dtag, credit, hash);
+        let mut sig = [0u8; 64];
+        // SAFETY: live buffers of the lengths passed; a signing context.
+        let ok = unsafe {
+            secp256k1::ffi::secp256k1_schnorrsig_sign_custom(
+                secp.ctx().as_ptr(),
+                sig.as_mut_ptr(),
+                msg.as_ptr(),
+                msg.len(),
+                kp.as_c_ptr(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(ok, 1);
+        sig
+    }
+
+    fn note_req(cid: [u8; 32], credit: u64, hash: &[u8; 32], sig: &[u8; 64], preimage: Option<[u8; 32]>) -> Request {
+        let mut w = Writer::new(msg::HSMD_CREDIT_NOTE);
+        w.bytes(&cid);
+        w.u64(credit);
+        w.bytes(hash);
+        w.bytes(sig);
+        match preimage {
+            None => w.u8(0),
+            Some(p) => {
+                w.u8(1);
+                w.bytes(&p);
+            }
+        }
+        Request { is_main: false, node_id: PEER, dbid: DBID, capabilities: 0, hsmd_msg: w.into_vec() }
+    }
+
+    fn cid() -> [u8; 32] {
+        let st = credit_channel();
+        taproot::channel_id(&st.funding_txid, st.funding_txout)
+    }
+
+    fn held(s: &Signer) -> Option<policy::CreditNote> {
+        s.store.get(&PEER, DBID).unwrap().credit
+    }
+
+    #[test]
+    fn credit_notes_are_checked_and_the_latest_kept() {
+        let mut s = credit_tracked(Policy::Enforce);
+        let (x1, x2) = ([0x11u8; 32], [0x22u8; 32]);
+        let (h1, h2) = (taproot::sha256(&x1), taproot::sha256(&x2));
+        let (sig1, sig2) = (sign_note(&s, 20_000, &h1), sign_note(&s, 45_000, &h2));
+        let ok = |o: Outcome| match o {
+            Outcome::Reply(r) => assert_eq!(r, empty_reply(msg::HSMD_CREDIT_NOTE_REPLY)),
+            Outcome::Reject(r) => panic!("refused: {r}"),
+            _ => panic!("no reply"),
+        };
+        ok(s.handle(&note_req(cid(), 20_000, &h1, &sig1, Some(x1))));
+        assert_eq!(held(&s).unwrap().credit, 20_000);
+        // The second, cumulative, before its preimage is out; then with it.
+        ok(s.handle(&note_req(cid(), 45_000, &h2, &sig2, None)));
+        assert_eq!(held(&s).map(|n| (n.credit, n.preimage)), Some((45_000, None)));
+        ok(s.handle(&note_req(cid(), 45_000, &h2, &sig2, Some(x2))));
+        assert_eq!(held(&s).map(|n| (n.credit, n.preimage)), Some((45_000, Some(x2))));
+        // A superseded note adds nothing.
+        ok(s.handle(&note_req(cid(), 20_000, &h1, &sig1, Some(x1))));
+        assert_eq!(held(&s).unwrap().credit, 45_000);
+
+        // Refused: an overstated credit, a note for another channel, a
+        // preimage that does not open the hash, a note not the provider's.
+        let r = refused(&s.handle(&note_req(cid(), 99_000, &h2, &sig2, Some(x2))));
+        assert!(r.contains("CREDIT_NOTE refused") && r.contains("not signed by the provider's credit key"), "{r}");
+        let mut other = cid();
+        other[0] ^= 1;
+        let r = refused(&s.handle(&note_req(other, 45_000, &h2, &sig2, None)));
+        assert!(r.contains("names another channel"), "{r}");
+        let r = refused(&s.handle(&note_req(cid(), 45_000, &h2, &sig2, Some(x1))));
+        assert!(r.contains("does not open"), "{r}");
+        let mut forged = sig2;
+        forged[10] ^= 1;
+        let r = refused(&s.handle(&note_req(cid(), 45_000, &h2, &forged, None)));
+        assert!(r.contains("not signed by the provider's credit key"), "{r}");
+        assert_eq!(held(&s).map(|n| (n.credit, n.preimage)), Some((45_000, Some(x2))));
+        // On a channel this device opened it provides nothing to hold.
+        let mut p = credit_tracked(Policy::Enforce);
+        p.store.get_mut(&PEER, DBID).unwrap().is_outbound = Some(true);
+        let r = refused(&p.handle(&note_req(cid(), 45_000, &h2, &sig2, None)));
+        assert!(r.contains("not a credit channel this device's side holds"), "{r}");
+        // Not a credit channel.
+        let mut t = tracked(Policy::Enforce);
+        let r = refused(&t.handle(&note_req(cid(), 45_000, &h2, &sig2, None)));
+        assert!(r.contains("not a credit channel"), "{r}");
+
+        // The store keeps it (version 11), and the wallet reads it.
+        let blob = s.export_channels();
+        let mut u = signer(Policy::Enforce);
+        assert_eq!(u.import_channels(&blob), Ok(1));
+        let st = u.store.get(&PEER, DBID).unwrap();
+        assert!(st.option_credit);
+        assert_eq!(st.credit, held(&s));
+        let notes = u.credit_notes();
+        assert_eq!(notes.len(), 1);
+        assert_eq!((notes[0].0, notes[0].1, notes[0].4.credit), (PEER, DBID, 45_000));
+        // A setup_channel replayed after a reconnect keeps it.
+        let mut again = credit_channel();
+        again.merge_from(st);
+        assert_eq!(again.credit.unwrap().credit, 45_000);
+    }
+
+    fn credit_commitment(outs: Vec<(Vec<u8>, u64)>) -> kernel::ElementsTx {
+        let mut t = 2u32.to_le_bytes().to_vec();
+        t.push(0x00);
+        t.push(0x01);
+        t.extend_from_slice(&[0x44; 32]);
+        t.extend_from_slice(&0u32.to_le_bytes());
+        t.push(0x00);
+        t.extend_from_slice(&0x8000_0000u32.to_le_bytes());
+        t.extend(compact_size(outs.len()));
+        for (spk, v) in &outs {
+            let (a, b) = explicit(&GOLD, *v);
+            t.extend(a);
+            t.extend(b);
+            t.push(0x00);
+            t.extend(compact_size(spk.len()));
+            t.extend_from_slice(spk);
+        }
+        t.extend_from_slice(&0x2000_0000u32.to_le_bytes());
+        wire::parse_elements_tx(&t).unwrap()
+    }
+
+    /// The holder's commitment pays the provider's balance to the NUMS tree
+    /// of CLAIM and PROVIDER, the provider's own to its tree with CLAIM; each
+    /// names its own value. Once the device holds a note, neither may leave
+    /// that output below the note's credit.
+    #[test]
+    fn credit_commitments_validate_against_the_trees_and_keep_the_floor() {
+        // `s` takes the note; `ks`, the same seed, derives the keys.
+        let mut s = credit_tracked(Policy::Enforce);
+        let ks = credit_tracked(Policy::Enforce);
+        let st = ks.store.get(&PEER, DBID).unwrap().clone();
+        let secp = ks.kernel().secp();
+        let cp = credit_params(&ks);
+        let peer = peer_bp();
+
+        // Ours (side Local): to_local as ever, the provider's output CLAIM +
+        // PROVIDER after the delay we ask of it (144).
+        let (point, keys) = our_keys(&ks, N);
+        let to_local = taproot::to_local_tree(secp, &keys, &point, 12).unwrap().script_pubkey();
+        let prov = |v: u64| taproot::credit_to_remote_spk(secp, &peer[1], 144, &cp, v).unwrap();
+        let ours = |pv: u64, pspk: Vec<u8>| {
+            credit_commitment(vec![(to_local.clone(), 300_000), (pspk, pv), (Vec::new(), 1_000)])
+        };
+        let v = policy::validate_commitment(ks.kernel(), &PEER, DBID, &st, Side::Local, &point, &[], &ours(699_000, prov(699_000)))
+            .unwrap();
+        assert_eq!((v.split.ours, v.theirs), (300_000, 699_000));
+        // The plain P2WPKH to_remote is not a credit channel's.
+        let e = policy::validate_commitment(ks.kernel(), &PEER, DBID, &st, Side::Local, &point, &[],
+            &ours(699_000, taproot::p2wpkh(&peer[1]))).unwrap_err();
+        assert!(e.contains("output 1 pays to a script not derivable"), "{e}");
+        // A CLAIM naming another value than its output's: no claim would pay.
+        let e = policy::validate_commitment(ks.kernel(), &PEER, DBID, &st, Side::Local, &point, &[],
+            &ours(699_000, prov(799_000))).unwrap_err();
+        assert!(e.contains("output 1 pays to a script not derivable"), "{e}");
+        // PROVIDER after another delay.
+        let short = taproot::credit_to_remote_spk(secp, &peer[1], 12, &cp, 699_000).unwrap();
+        assert!(policy::validate_commitment(ks.kernel(), &PEER, DBID, &st, Side::Local, &point, &[], &ours(699_000, short))
+            .is_err());
+
+        // The provider's (side Remote): its to_local carries CLAIM.
+        let secret = [0x31u8; 32];
+        let rpoint = ks.kernel().point_from_secret(&secret).unwrap();
+        let k = ks.kernel();
+        let mine = k.channel_basepoints(&PEER, DBID);
+        let rkeys = TcovKeys {
+            revocation: k.derive_revocation_key_pub(&mine[0], &rpoint).unwrap(),
+            self_delayed: k.derive_simple_key_pub(&peer[3], &rpoint).unwrap(),
+            self_htlc: k.derive_simple_key_pub(&peer[2], &rpoint).unwrap(),
+            other_htlc: k.derive_simple_key_pub(&mine[2], &rpoint).unwrap(),
+            other_payment: mine[1],
+        };
+        let ptl = |v: u64| taproot::credit_to_local_spk(secp, &rkeys, &rpoint, 144, &cp, v).unwrap();
+        let theirs = |pv: u64, pspk: Vec<u8>| {
+            credit_commitment(vec![(pspk, pv), (taproot::p2wpkh(&mine[1]), 300_000), (Vec::new(), 1_000)])
+        };
+        let v = policy::validate_commitment(ks.kernel(), &PEER, DBID, &st, Side::Remote, &rpoint, &[], &theirs(699_000, ptl(699_000)))
+            .unwrap();
+        assert_eq!((v.split.ours, v.theirs), (300_000, 699_000));
+        let plain = taproot::to_local_tree(secp, &rkeys, &rpoint, 144).unwrap().script_pubkey();
+        let e = policy::validate_commitment(ks.kernel(), &PEER, DBID, &st, Side::Remote, &rpoint, &[], &theirs(699_000, plain))
+            .unwrap_err();
+        assert!(e.contains("output 0 pays to a script not derivable"), "{e}");
+
+        // Holding a note of 450,000: an output of 449,999 cannot pay it.
+        let x = [0x22u8; 32];
+        let h = taproot::sha256(&x);
+        let sig = sign_note(&ks, 450_000, &h);
+        assert!(matches!(s.handle(&note_req(cid(), 450_000, &h, &sig, Some(x))), Outcome::Reply(_)));
+        let st = s.store.get(&PEER, DBID).unwrap().clone();
+        let low = |side: Side| {
+            let (p, tx) = match side {
+                Side::Local => (point, credit_commitment(vec![(to_local.clone(), 549_001), (prov(449_999), 449_999), (Vec::new(), 1_000)])),
+                Side::Remote => (rpoint, credit_commitment(vec![(ptl(449_999), 449_999), (taproot::p2wpkh(&mine[1]), 549_001), (Vec::new(), 1_000)])),
+            };
+            policy::validate_commitment(ks.kernel(), &PEER, DBID, &st, side, &p, &[], &tx)
+        };
+        for side in [Side::Local, Side::Remote] {
+            let e = low(side).unwrap_err();
+            assert!(e.contains("cannot pay the 450000 atoms of credit this device holds"), "{e}");
+        }
+        assert!(policy::validate_commitment(ks.kernel(), &PEER, DBID, &st, Side::Local, &point, &[],
+            &credit_commitment(vec![(to_local.clone(), 549_000), (prov(450_000), 450_000), (Vec::new(), 1_000)])).is_ok());
+        // Trimmed away entirely: nothing pays the note.
+        let e = policy::validate_commitment(ks.kernel(), &PEER, DBID, &st, Side::Local, &point, &[],
+            &credit_commitment(vec![(to_local.clone(), 999_000), (Vec::new(), 1_000)])).unwrap_err();
+        assert!(e.contains("cannot pay the 450000"), "{e}");
+        // A channel this device opened: it would be the provider.
+        let mut opened = st.clone();
+        opened.is_outbound = Some(true);
+        let e = policy::validate_commitment(ks.kernel(), &PEER, DBID, &opened, Side::Local, &point, &[], &ours(699_000, prov(699_000)))
+            .unwrap_err();
+        assert!(e.contains("holds credit, it does not provide it"), "{e}");
+    }
+
+    /// A mutual close pays the holder its balance and the note.
+    #[test]
+    fn a_close_must_pay_the_credit() {
+        let mut st = credit_channel();
+        st.local_split = Some((N, Split { ours: 300_000, fee: 1_000, anchors: 0 }));
+        st.remote_split = Some((N, Split { ours: 300_000, fee: 1_000, anchors: 0 }));
+        assert!(policy::check_close_balance(&st, Some(300_000), 699_000, 1_000).is_ok());
+        st.credit = Some(policy::CreditNote { credit: 450_000, payment_hash: [1; 32], sig: [2; 64], preimage: None });
+        let e = policy::check_close_balance(&st, Some(300_000), 699_000, 1_000).unwrap_err();
+        assert!(e.contains("below its balance 750000"), "{e}");
+        // The provider's output may not exceed the funding less what this
+        // side is owed.
+        let e = policy::check_close_balance(&st, Some(750_000), 250_001, 1_000).unwrap_err();
+        assert!(e.contains("above its share 250000"), "{e}");
+        assert!(policy::check_close_balance(&st, Some(750_000), 249_000, 1_000).is_ok());
+    }
+
+    /// A credit claim: input 0 the provider's output by CLAIM (no signature
+    /// of the device's), the rest back to its script, the credit to this
+    /// side's payment script, a SILV fee coin. Its fee coin signs; a claim
+    /// whose outputs go elsewhere leaves it unsigned.
+    #[test]
+    fn a_credit_claims_fee_coin_signs_and_a_diverted_one_does_not() {
+        let mut s = credit_tracked(Policy::Enforce);
+        let cp = credit_params(&s);
+        let peer = peer_bp();
+        let prov = taproot::credit_to_remote_spk(&secp256k1::Secp256k1::new(), &peer[1], 144, &cp, 699_000).unwrap();
+        let u = cp.holder_spk.clone();
+        let w = wallet(&s);
+        let claim = |rest: (u64, Vec<u8>), paid: (u64, Vec<u8>)| Spend {
+            ins: vec![
+                ([0xaa; 32], 1, GOLD, 699_000, prov.clone(), 0xffff_fffd),
+                ([0xbb; 32], 1, SILV, FEE_COIN, w.clone(), 0xffff_fffd),
+            ],
+            outs: vec![(GOLD, rest.0, rest.1), (GOLD, paid.0, paid.1), (SILV, FEE_COIN - 1_000, w.clone()), (SILV, 1_000, Vec::new())],
+            locktime: 0,
+        };
+        let signs = |s: &mut Signer, sp: &Spend| {
+            let psbt = sp.pset();
+            match s.handle(&req(mingle_msg(s, sp, &psbt))) {
+                Outcome::Reply(r) => r[6..].len() > psbt.len(),
+                _ => panic!("no reply"),
+            }
+        };
+        assert!(signs(&mut s, &claim((249_000, prov.clone()), (450_000, u.clone()))));
+        // The credit paid to another script.
+        let host: Vec<u8> = [0x00u8, 0x14].iter().copied().chain([0xee; 20]).collect();
+        let mut t = credit_tracked(Policy::Enforce);
+        assert!(!signs(&mut t, &claim((249_000, prov.clone()), (450_000, host.clone()))));
+        // The rest paid to another script.
+        let mut t = credit_tracked(Policy::Enforce);
+        assert!(!signs(&mut t, &claim((249_000, host), (450_000, u.clone()))));
+        // More back to the script than the input held (the fee coin's GOLD
+        // would have to fund it).
+        let mut t = credit_tracked(Policy::Enforce);
+        assert!(!signs(&mut t, &claim((700_000, prov.clone()), (450_000, u.clone()))));
+        // Not a credit channel.
+        let mut t = tracked(Policy::Enforce);
+        assert!(!signs(&mut t, &claim((249_000, prov.clone()), (450_000, u.clone()))));
     }
 
     #[test]

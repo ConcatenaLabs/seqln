@@ -7,6 +7,7 @@
 #include <hsmd/permissions.h>
 #include <lightningd/channel.h>
 #include <lightningd/connect_control.h>
+#include <lightningd/credit.h>
 #include <lightningd/dual_open_control.h>
 #include <lightningd/hsm_control.h>
 #include <lightningd/notification.h>
@@ -407,6 +408,15 @@ static void handle_custommsg_in(struct lightningd *ld, const u8 *msg)
 	if (!fromwire_connectd_custommsg_in(p, msg, &p->peer_id, &p->msg)) {
 		log_broken(ld->log, "Malformed custommsg: %s",
 			   tal_hex(tmpctx, msg));
+		tal_free(p);
+		return;
+	}
+
+	/* SEQUENTIA: a credit note (lightningd/credit.h) is lightningd's. */
+	if (credit_handle_peer_msg(ld, &p->peer_id, p->msg)) {
+		subd_send_msg(ld->connectd,
+			      take(towire_connectd_custommsg_in_complete(NULL,
+									 &p->peer_id)));
 		tal_free(p);
 		return;
 	}

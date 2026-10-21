@@ -28,6 +28,7 @@ COMMON_SRC_NOGEN :=				\
 	common/coin_mvt.c			\
 	common/configdir.c			\
 	common/configvar.c			\
+	common/credit_scripts.c		\
 	common/cryptomsg.c			\
 	common/daemon.c				\
 	common/daemon_conn.c			\

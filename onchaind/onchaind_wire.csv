@@ -51,6 +51,8 @@ msgdata,onchaind_init,option_anchor_outputs,bool,
 msgdata,onchaind_init,option_anchors_zero_fee_htlc_tx,bool,
 # SEQUENTIA: a taproot-covenant channel (common/tcov_scripts.h).
 msgdata,onchaind_init,option_seq_taproot_covenant,bool,
+# SEQUENTIA: a credit channel (common/credit_scripts.h); the opener provides.
+msgdata,onchaind_init,option_seq_credit,bool,
 # We need this for BIP125 rule 4
 msgdata,onchaind_init,min_relay_feerate,u32,
 
@@ -246,3 +248,33 @@ msgtype,onchaind_spend_created,5140
 msgdata,onchaind_spend_created,expect_to_succeed,bool,
 msgdata,onchaind_spend_created,num_witnesses,u32,
 msgdata,onchaind_spend_created,witness,onchain_witness_element,num_witnesses
+
+# SEQUENTIA: a credit channel's latest enforceable note (lightningd/credit.h),
+# which onchaind claims from the provider's balance output.
+msgtype,onchaind_credit_note,5050
+msgdata,onchaind_credit_note,credit,u64,
+msgdata,onchaind_credit_note,payment_hash,sha256,
+msgdata,onchaind_credit_note,sig,bip340sig,
+msgdata,onchaind_credit_note,preimage,preimage,
+
+# SEQUENTIA: claim a credit output (common/credit_scripts.h) with our latest
+# note: input 0 spends it by its CLAIM leaf (witness <sig> <credit> <preimage>
+# <leaf> <control block>, no signature of ours), output 0 returns what
+# remains, b - credit, to the same script, output 1 pays what the note still
+# owes, credit - (b - its value), to the holder's script; the fee comes from
+# a wallet coin.  lightningd answers with onchaind_spend_created.
+msgtype,onchaind_spend_credit_claim,5051
+msgdata,onchaind_spend_credit_claim,outpoint,bitcoin_outpoint,
+msgdata,onchaind_spend_credit_claim,outpoint_amount,amount_sat,
+msgdata,onchaind_spend_credit_claim,spent_scriptpubkey_len,u16,
+msgdata,onchaind_spend_credit_claim,spent_scriptpubkey,u8,spent_scriptpubkey_len
+msgdata,onchaind_spend_credit_claim,b,amount_sat,
+msgdata,onchaind_spend_credit_claim,leaf_len,u16,
+msgdata,onchaind_spend_credit_claim,leaf,u8,leaf_len
+msgdata,onchaind_spend_credit_claim,control_block_len,u16,
+msgdata,onchaind_spend_credit_claim,control_block,u8,control_block_len
+msgdata,onchaind_spend_credit_claim,credit,u64,
+msgdata,onchaind_spend_credit_claim,sig,bip340sig,
+msgdata,onchaind_spend_credit_claim,preimage,preimage,
+msgdata,onchaind_spend_credit_claim,holder_scriptpubkey_len,u16,
+msgdata,onchaind_spend_credit_claim,holder_scriptpubkey,u8,holder_scriptpubkey_len

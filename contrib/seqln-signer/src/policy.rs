@@ -203,6 +203,28 @@ pub struct ChannelState {
     /// peer at least the reserve it must keep ([`check_peer_reserve`]).
     /// Never cleared.
     pub peer_reached_reserve: bool,
+    /// `option_seq_credit`: a credit channel. Its opener, the provider, can
+    /// credit the other side with notes it signs, enforceable from its
+    /// balance output by a CLAIM leaf (`crate::taproot`). This device holds
+    /// credit only: it validates a credit channel only as its holder.
+    pub option_credit: bool,
+    /// The latest note the provider signed this device's side (the highest
+    /// credit), checked against the channel's credit key when it arrived
+    /// (HSMD_CREDIT_NOTE). Every commitment must leave the provider's
+    /// output able to pay it, and a mutual close must pay it.
+    pub credit: Option<CreditNote>,
+}
+
+/// A credit note: the provider owes the holder `credit` atoms of the
+/// channel's asset in all, conditional on the preimage of `payment_hash`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CreditNote {
+    pub credit: u64,
+    pub payment_hash: [u8; 32],
+    pub sig: [u8; 64],
+    /// The payment's preimage, once known: with it the note is enforceable,
+    /// by anyone, from either commitment.
+    pub preimage: Option<[u8; 32]>,
 }
 
 /// A channel's dust limits and reserves, in the channel asset's atoms. A node
@@ -295,6 +317,33 @@ impl ChannelState {
             self.limits = old.limits;
         }
         self.peer_reached_reserve |= old.peer_reached_reserve;
+        self.option_credit |= old.option_credit;
+        if let Some(n) = old.credit {
+            self.learn_credit(n);
+        }
+    }
+}
+
+impl ChannelState {
+    /// Keep `n` if it is the latest note: a higher credit than the one held,
+    /// or the one held with its preimage now known. Notes are cumulative, so
+    /// a lower one adds nothing. Returns whether the record changed.
+    pub fn learn_credit(&mut self, n: CreditNote) -> bool {
+        match &mut self.credit {
+            Some(held) if held.credit > n.credit => false,
+            Some(held) if held.credit == n.credit => {
+                if held.preimage.is_none() && n.preimage.is_some() && held.payment_hash == n.payment_hash {
+                    held.preimage = n.preimage;
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => {
+                self.credit = Some(n);
+                true
+            }
+        }
     }
 }
 
@@ -409,6 +458,10 @@ impl ChannelStore {
     pub fn contains(&self, node_id: &[u8; 33], dbid: u64) -> bool {
         self.map.contains_key(&(*node_id, dbid))
     }
+    /// Every channel, keyed by (peer, dbid).
+    pub fn iter(&self) -> impl Iterator<Item = (&([u8; 33], u64), &ChannelState)> {
+        self.map.iter()
+    }
     /// Remove a channel (FORGET_CHANNEL). Returns whether anything was removed,
     /// so the caller knows to re-persist.
     pub fn remove(&mut self, node_id: &[u8; 33], dbid: u64) -> bool {
@@ -478,10 +531,13 @@ pub const CHSTORE_MAGIC: [u8; 4] = *b"SQCH";
 /// dust, the peer's dust, our reserve and the peer's reserve, 8 bytes each)
 /// and whether the peer has reached its reserve (1 byte). Version 10 adds,
 /// after that, whether the channel is `option_seq_taproot_covenant` (1 byte).
+/// Version 11 adds, after that, whether it is `option_seq_credit` (1 byte)
+/// and the latest credit note (flag(1), then credit(8), payment hash(32),
+/// signature(64) and preimage flag(1), preimage(32) if set).
 /// Versions 1 to 9 still import (the fields they lack unknown); each channel of a store older
 /// than version 6, written by a device that validated nothing, predates
 /// validation.
-pub const CHSTORE_VERSION: u8 = 10;
+pub const CHSTORE_VERSION: u8 = 11;
 
 /// The first store version a validating device wrote.
 pub const CHSTORE_FIRST_VALIDATING: u8 = 6;
@@ -628,6 +684,23 @@ pub fn encode_channel_store(store: &ChannelStore) -> Vec<u8> {
         }
         out.push(st.peer_reached_reserve as u8);
         out.push(st.option_tcov as u8);
+        out.push(st.option_credit as u8);
+        match &st.credit {
+            None => out.push(0),
+            Some(n) => {
+                out.push(1);
+                out.extend_from_slice(&n.credit.to_le_bytes());
+                out.extend_from_slice(&n.payment_hash);
+                out.extend_from_slice(&n.sig);
+                match n.preimage {
+                    None => out.push(0),
+                    Some(p) => {
+                        out.push(1);
+                        out.extend_from_slice(&p);
+                    }
+                }
+            }
+        }
     }
     push_ledger(&mut out, &store.ledger);
     out.extend_from_slice(&(store.close_txids.len() as u16).to_le_bytes());
@@ -799,6 +872,8 @@ pub fn decode_channel_store(bytes: &[u8]) -> Result<DecodedStore, String> {
             predates_validation: version < CHSTORE_FIRST_VALIDATING,
             limits: None,
             peer_reached_reserve: false,
+            option_credit: false,
+            credit: None,
         };
         if version >= 2 {
             st.is_outbound = r.opt_bool()?;
@@ -864,6 +939,28 @@ pub fn decode_channel_store(bytes: &[u8]) -> Result<DecodedStore, String> {
                 v => return Err(format!("bad channel-type flag {v} in channel-store blob")),
             };
         }
+        if version >= 11 {
+            st.option_credit = match r.u8()? {
+                0 => false,
+                1 => true,
+                v => return Err(format!("bad credit flag {v} in channel-store blob")),
+            };
+            st.credit = match r.u8()? {
+                0 => None,
+                1 => {
+                    let credit = u64::from_le_bytes(r.take(8)?.try_into().unwrap());
+                    let payment_hash = r.take(32)?.try_into().unwrap();
+                    let sig = r.take(64)?.try_into().unwrap();
+                    let preimage = match r.u8()? {
+                        0 => None,
+                        1 => Some(r.take(32)?.try_into().unwrap()),
+                        v => return Err(format!("bad preimage flag {v} in channel-store blob")),
+                    };
+                    Some(CreditNote { credit, payment_hash, sig, preimage })
+                }
+                v => return Err(format!("bad credit-note flag {v} in channel-store blob")),
+            };
+        }
         out.push(((node_id, dbid), st));
     }
     let ledger = if version >= 5 { r.ledger()? } else { Ledger::default() };
@@ -904,6 +1001,19 @@ pub fn parse_channel_type(features: &[u8]) -> (bool, bool, bool) {
     let anchors = bit(20) || bit(21) || bit(22) || bit(23);
     let static_remotekey = bit(12) || bit(13) || anchors;
     (static_remotekey, anchors, bit(172) || bit(173))
+}
+
+/// Whether a channel_type names Sequentia's `option_seq_credit` (bit
+/// 176/177), which a taproot-covenant channel may add.
+pub fn channel_type_has_credit(features: &[u8]) -> bool {
+    let bit = |n: usize| -> bool {
+        let byte_from_end = n / 8;
+        if byte_from_end >= features.len() {
+            return false;
+        }
+        (features[features.len() - 1 - byte_from_end] >> (n % 8)) & 1 == 1
+    };
+    bit(176) || bit(177)
 }
 
 // ---------------------------------------------------------------------------
@@ -1370,7 +1480,7 @@ pub fn validate_commitment(
     let ks = build_keyset(kernel, st, &our_bp, side, point, static_remotekey)?;
     let whitelist = if st.option_tcov {
         let asset = tcov_channel_asset(st, tx)?;
-        tcov_expected_scripts(kernel, &ks, side, point, htlcs, &asset)?
+        tcov_expected_scripts(kernel, st, &our_bp[1], &ks, side, point, htlcs, &asset, Some(tx))?
     } else {
         expected_scripts(&ks, st, side, htlcs)
     };
@@ -1449,7 +1559,25 @@ pub fn validate_commitment(
             None => trimmed = trimmed.saturating_add(atoms),
         }
     }
+    check_credit_floor(st, theirs)?;
     Ok(Validated { split, theirs, trimmed })
+}
+
+/// On a credit channel, the provider's balance output (`theirs`: this
+/// device holds the credit) must be able to pay the latest note this device
+/// holds: its CLAIM pays the note out of that output and keeps the rest
+/// there, so an output worth less than the note's credit pays none of it.
+/// A provider that could move its balance below the credit, by an HTLC or a
+/// fee it then lets drop to chain, would take the credit back.
+pub fn check_credit_floor(st: &ChannelState, theirs: u64) -> Result<(), String> {
+    match &st.credit {
+        Some(n) if st.option_credit && theirs < n.credit => Err(format!(
+            "it leaves the provider's balance output {theirs}, which cannot pay the {} atoms \
+             of credit this device holds",
+            n.credit
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Hold the peer to the reserve this side requires of it (BOLT 2: a side's
@@ -1621,6 +1749,15 @@ pub fn validate_mutual_close(
     check_close_balance(st, (ours == 1).then_some(ours_value), theirs_value, fee)
 }
 
+/// The credit a mutual close must pay this side on top of its balance: the
+/// latest note this device holds, on a credit channel.
+pub fn credit_owed(st: &ChannelState) -> u64 {
+    match &st.credit {
+        Some(n) if st.option_credit => n.credit,
+        _ => 0,
+    }
+}
+
 /// Hold a close to this side's balance: the larger of the shares
 /// ([`Split::share`]) that the latest of our commitments the device validated
 /// and the latest of the peer's it signed give us. A close is negotiated only
@@ -1658,7 +1795,9 @@ pub fn check_close_balance(
         });
     }
     let (share, ceiling) = match known {
-        Some(k) => k,
+        // A credit channel's holder is owed its latest note on top of its
+        // balance: the close pays it out of the provider's side.
+        Some((s, c)) => (s.saturating_add(credit_owed(st)), c),
         None => {
             return Err(format!(
                 "no balance is known for the channel yet (the close pays this wallet {}): a \
@@ -1751,7 +1890,17 @@ pub fn htlc_output_script(
             Some(AssetKey::Asset(id)) => id,
             _ => return Err("the channel's asset is not recorded yet".to_string()),
         };
-        let set = tcov_expected_scripts(kernel, &ks, side, point, std::slice::from_ref(htlc), &asset)?;
+        let set = tcov_expected_scripts(
+            kernel,
+            st,
+            &our_bp[1],
+            &ks,
+            side,
+            point,
+            std::slice::from_ref(htlc),
+            &asset,
+            None,
+        )?;
         return Ok(set.last().expect("one HTLC").clone());
     }
     Ok(expected_scripts(&ks, st, side, std::slice::from_ref(htlc)).pop().expect("one HTLC"))
@@ -1791,20 +1940,59 @@ fn tcov_channel_asset(st: &ChannelState, tx: &ElementsTx) -> Result<[u8; 32], St
 /// HTLCs are the taproot trees of `crate::taproot`, to_remote the other
 /// side's static P2WPKH. An HTLC's covenant names the channel's `asset` and
 /// its own output's value, the HTLC's amount in whole atoms.
+///
+/// On a credit channel (`option_seq_credit`, which this device holds and
+/// the peer provides) the provider's balance output carries CLAIM, which
+/// names that output's own value: on our commitment it is to_remote, the
+/// NUMS tree of CLAIM and PROVIDER; on the provider's, its to_local with
+/// CLAIM beside DELAY and REVOKE. It is the output of `tx` whose script is
+/// that tree at its own value; with no such output (or no `tx`) the
+/// provider's script is empty, which no paying output has.
+#[allow(clippy::too_many_arguments)]
 fn tcov_expected_scripts(
     kernel: &Kernel,
+    st: &ChannelState,
+    our_payment: &[u8; 33],
     ks: &Keyset,
     side: Side,
     point: &[u8; 33],
     htlcs: &[Htlc],
     asset: &[u8; 32],
+    tx: Option<&ElementsTx>,
 ) -> Result<Vec<Vec<u8>>, String> {
     let secp = kernel.secp();
     let k = tcov_keys(ks);
     let bad = || "a taproot output cannot be built from the channel keys".to_string();
     let mut set = Vec::with_capacity(2 + htlcs.len());
-    set.push(taproot::to_local_tree(secp, &k, point, ks.to_self_delay).ok_or_else(bad)?.script_pubkey());
-    set.push(p2wpkh(&ks.other_payment_key));
+    let mut to_local = taproot::to_local_tree(secp, &k, point, ks.to_self_delay).ok_or_else(bad)?.script_pubkey();
+    let mut to_remote = p2wpkh(&ks.other_payment_key);
+    if st.option_credit {
+        if st.is_outbound != Some(false) {
+            return Err("a credit channel this device opened: it holds credit, it does not provide it".to_string());
+        }
+        let cp = taproot::CreditParams::new(secp, &st.funding_txid, st.funding_txout, &st.remote_funding, our_payment)
+            .ok_or_else(bad)?;
+        let provider_spk = |value: u64| match side {
+            Side::Local => taproot::credit_to_remote_spk(secp, &ks.other_payment_key, st.local_to_self_delay, &cp, value),
+            Side::Remote => taproot::credit_to_local_spk(secp, &k, point, ks.to_self_delay, &cp, value),
+        };
+        let found = tx.and_then(|tx| {
+            tx.outputs.iter().find_map(|o| {
+                if o.script.is_empty() {
+                    return None;
+                }
+                let v = output_value(o, tx.network)?;
+                (provider_spk(v)? == o.script).then(|| o.script.clone())
+            })
+        });
+        let provider = found.unwrap_or_default();
+        match side {
+            Side::Local => to_remote = provider,
+            Side::Remote => to_local = provider,
+        }
+    }
+    set.push(to_local);
+    set.push(to_remote);
     let side_int = side as u8;
     for h in htlcs {
         let x = h.amount_msat / 1000;

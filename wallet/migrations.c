@@ -1138,6 +1138,19 @@ static const struct db_migration dbmigrations[] = {
      SQL("ALTER TABLE channel_htlcs DROP COLUMN lock_point"), NULL},
     {SQL("ALTER TABLE channel_htlcs ADD point_add BLOB DEFAULT NULL;"), NULL,
      SQL("ALTER TABLE channel_htlcs DROP COLUMN point_add"), NULL},
+    /* The provider-signed credit (lightningd/credit.h): every credit note
+     * of a credit channel, issued (by us, the provider) or held (by us,
+     * the holder), keyed by its cumulative credit. */
+    {SQL("CREATE TABLE credit_notes ("
+	 "  channel_id BIGINT REFERENCES channels(id) ON DELETE CASCADE"
+	 ", issued INTEGER"
+	 ", credit BIGINT"
+	 ", payment_hash BLOB"
+	 ", signature BLOB"
+	 ", preimage BLOB"
+	 ", PRIMARY KEY (channel_id, credit)"
+	 ");"), NULL,
+     SQL("DROP TABLE credit_notes"), NULL},
 };
 
 const struct db_migration *get_db_migrations(size_t *num)

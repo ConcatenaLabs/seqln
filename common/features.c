@@ -154,6 +154,11 @@ static const struct feature_style feature_styles[] = {
 			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
 			  [BOLT11_FEATURE] = FEATURE_REPRESENT,
 			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT } },
+	{ OPT_SEQ_CREDIT,
+	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
+			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
+			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT,
+			  [CHANNEL_TYPE_FEATURE] = FEATURE_REPRESENT } },
 };
 
 struct dependency {
@@ -502,6 +507,7 @@ const char *feature_name(const tal_t *ctx, size_t f)
 		NULL, /* 170/171 */
 		"option_seq_taproot_covenant", /* SEQUENTIA: common/tcov_commit_tx.h */
 		"option_seq_point_locks", /* SEQUENTIA: common/point_lock.h */
+		"option_seq_credit", /* SEQUENTIA: common/credit_scripts.h */
 	};
 
 	if (f / 2 >= ARRAY_SIZE(fnames) || !fnames[f / 2])

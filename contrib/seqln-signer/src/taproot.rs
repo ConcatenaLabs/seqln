@@ -43,6 +43,11 @@ fn sha(data: &[u8]) -> [u8; 32] {
     sha256::Hash::hash(data).to_byte_array()
 }
 
+/// SHA256 of `data`: a payment hash from its preimage.
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    sha(data)
+}
+
 fn compact_size(out: &mut Vec<u8>, n: u64) {
     match n {
         0..=0xfc => out.push(n as u8),
@@ -426,6 +431,203 @@ pub fn received_tree(
 }
 
 // ---------------------------------------------------------------------------
+// The provider-signed credit (`common/credit_scripts.c`).
+// ---------------------------------------------------------------------------
+
+const OP_2DUP: u8 = 0x6e;
+const OP_SWAP: u8 = 0x7c;
+const OP_CAT: u8 = 0x7e;
+const OP_1ADD: u8 = 0x8b;
+const OP_SHA256: u8 = 0xa8;
+const OP_CHECKSIGFROMSTACKVERIFY: u8 = 0xc2;
+const OP_INSPECTINPUTSCRIPTPUBKEY: u8 = 0xca;
+const OP_SUB64: u8 = 0xd8;
+const OP_GREATERTHAN64: u8 = 0xde;
+
+/// BIP341's NUMS point H, with even y: the internal key of the provider's
+/// output on the holder's commitment, which nobody can spend by key.
+pub const NUMS: [u8; 33] = [
+    0x02, 0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9,
+    0x7a, 0x5e, 0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a, 0xce,
+    0x80, 0x3a, 0xc0,
+];
+
+/// Dtag = tagged_hash("SeqLN/credit", channel_id): binds a note to its
+/// channel (BOLT 2's channel id, from the funding outpoint).
+pub fn credit_tag(channel_id: &[u8; 32]) -> [u8; 32] {
+    tagged_hash("SeqLN/credit", channel_id)
+}
+
+/// BOLT 2's channel id: the funding txid (as lightningd holds it) with the
+/// output index XORed into its last two bytes.
+pub fn channel_id(funding_txid: &[u8; 32], funding_txout: u16) -> [u8; 32] {
+    let mut id = *funding_txid;
+    id[30] ^= (funding_txout >> 8) as u8;
+    id[31] ^= funding_txout as u8;
+    id
+}
+
+/// Pc, the credit key: the provider's funding key plus
+/// tagged_hash("SeqLN/credit-key", funding key) * G.  It signs nothing but
+/// notes.
+pub fn credit_key(secp: &Secp256k1<All>, provider_funding: &[u8; 33]) -> Option<[u8; 33]> {
+    let pk = secp256k1::PublicKey::from_slice(provider_funding).ok()?;
+    let t = Scalar::from_be_bytes(tagged_hash("SeqLN/credit-key", provider_funding)).ok()?;
+    Some(pk.add_exp_tweak(secp, &t).ok()?.serialize())
+}
+
+/// What a note signs: Dtag || c (8 bytes, little-endian) || payment hash.
+pub fn credit_note_msg(dtag: &[u8; 32], credit: u64, payment_hash: &[u8; 32]) -> [u8; 72] {
+    let mut m = [0u8; 72];
+    m[..32].copy_from_slice(dtag);
+    m[32..40].copy_from_slice(&credit.to_le_bytes());
+    m[40..].copy_from_slice(payment_hash);
+    m
+}
+
+/// Whether `sig` is the credit key's BIP340 signature of the note (`credit`,
+/// `payment_hash`) on the channel `dtag`: the 72-byte message itself, as
+/// OP_CHECKSIGFROMSTACKVERIFY checks it, not a hash of it.
+pub fn credit_note_check(
+    secp: &Secp256k1<All>,
+    dtag: &[u8; 32],
+    credit_key: &[u8; 33],
+    credit: u64,
+    payment_hash: &[u8; 32],
+    sig: &[u8; 64],
+) -> bool {
+    use secp256k1::ffi::CPtr;
+    let Ok(xonly) = XOnlyPublicKey::from_slice(&credit_key[1..]) else {
+        return false;
+    };
+    let msg = credit_note_msg(dtag, credit, payment_hash);
+    // SAFETY: every pointer is to a live buffer of the length passed, and the
+    // context is the caller's, which verifies.
+    unsafe {
+        secp256k1::ffi::secp256k1_schnorrsig_verify(
+            secp.ctx().as_ptr(),
+            sig.as_ptr(),
+            msg.as_ptr(),
+            msg.len(),
+            xonly.as_c_ptr(),
+        ) == 1
+    }
+}
+
+/// CLAIM: pays the holder's v0 program `holder_spk` (P2WPKH) what a note
+/// signed by `credit_key` on the channel `dtag` still owes it out of an
+/// output worth `b` in its commitment; the rest stays under the same script.
+pub fn leaf_claim(dtag: &[u8; 32], credit_key: &[u8; 33], b: u64, holder_spk: &[u8]) -> Option<Vec<u8>> {
+    if holder_spk.len() != 22 || holder_spk[0] != OP_0 || holder_spk[1] != 20 {
+        return None;
+    }
+    let mut s = Vec::with_capacity(172);
+    s.extend_from_slice(&[OP_SIZE, 0x01, 32, OP_EQUALVERIFY, OP_SHA256, OP_OVER]);
+    push(&mut s, dtag);
+    s.extend_from_slice(&[OP_SWAP, OP_CAT, OP_SWAP, OP_CAT, OP_ROT, OP_SWAP]);
+    push(&mut s, xonly(credit_key));
+    s.push(OP_CHECKSIGFROMSTACKVERIFY);
+    push(&mut s, &b.to_le_bytes());
+    s.extend_from_slice(&[
+        OP_PUSHCURRENTINPUTINDEX, OP_INSPECTINPUTVALUE, OP_1, OP_EQUALVERIFY, OP_SUB64, OP_VERIFY,
+        OP_2DUP, OP_GREATERTHAN64, OP_VERIFY,
+        OP_OVER, OP_SWAP, OP_SUB64, OP_VERIFY,
+        OP_PUSHCURRENTINPUTINDEX, OP_1ADD, OP_DUP, OP_INSPECTOUTPUTVALUE, OP_1, OP_EQUALVERIFY,
+        OP_ROT, OP_EQUALVERIFY,
+        OP_DUP, OP_INSPECTOUTPUTSCRIPTPUBKEY, OP_0, OP_EQUALVERIFY,
+    ]);
+    push(&mut s, &holder_spk[2..]);
+    s.extend_from_slice(&[
+        OP_EQUALVERIFY, OP_INSPECTOUTPUTASSET, OP_PUSHCURRENTINPUTINDEX, OP_INSPECTINPUTASSET,
+        OP_ROT, OP_EQUALVERIFY, OP_EQUALVERIFY,
+    ]);
+    push(&mut s, &b.to_le_bytes());
+    s.extend_from_slice(&[
+        OP_SWAP, OP_SUB64, OP_VERIFY,
+        OP_PUSHCURRENTINPUTINDEX, OP_INSPECTOUTPUTVALUE, OP_1, OP_EQUALVERIFY, OP_EQUALVERIFY,
+        OP_PUSHCURRENTINPUTINDEX, OP_INSPECTOUTPUTSCRIPTPUBKEY,
+        OP_PUSHCURRENTINPUTINDEX, OP_INSPECTINPUTSCRIPTPUBKEY,
+        OP_ROT, OP_EQUALVERIFY, OP_EQUALVERIFY,
+        OP_PUSHCURRENTINPUTINDEX, OP_INSPECTOUTPUTASSET,
+        OP_PUSHCURRENTINPUTINDEX, OP_INSPECTINPUTASSET,
+        OP_ROT, OP_EQUALVERIFY, OP_EQUAL,
+    ]);
+    Some(s)
+}
+
+/// What a channel's credit leaves are built from.
+pub struct CreditParams {
+    pub dtag: [u8; 32],
+    pub credit_key: [u8; 33],
+    /// U: the holder's static payment script, P2WPKH of its payment
+    /// basepoint.
+    pub holder_spk: Vec<u8>,
+}
+
+impl CreditParams {
+    /// For the channel funded at (`funding_txid`, `funding_txout`), whose
+    /// provider's funding key is `provider_funding` and whose holder's
+    /// payment basepoint is `holder_payment`.
+    pub fn new(
+        secp: &Secp256k1<All>,
+        funding_txid: &[u8; 32],
+        funding_txout: u16,
+        provider_funding: &[u8; 33],
+        holder_payment: &[u8; 33],
+    ) -> Option<CreditParams> {
+        Some(CreditParams {
+            dtag: credit_tag(&channel_id(funding_txid, funding_txout)),
+            credit_key: credit_key(secp, provider_funding)?,
+            holder_spk: p2wpkh(holder_payment),
+        })
+    }
+}
+
+/// The scriptPubKey of the provider's to_local on its own commitment,
+/// worth `value`: internal key the revocation key, CLAIM at depth one,
+/// DELAY and REVOKE at depth two.
+pub fn credit_to_local_spk(
+    secp: &Secp256k1<All>,
+    k: &TcovKeys,
+    per_commitment_point: &[u8; 33],
+    to_self_delay: u16,
+    cp: &CreditParams,
+    value: u64,
+) -> Option<Vec<u8>> {
+    let two = to_local_tree(secp, k, per_commitment_point, to_self_delay)?;
+    let claim = leaf_hash(&leaf_claim(&cp.dtag, &cp.credit_key, value, &cp.holder_spk)?);
+    let root = branch_hash(&claim, &two.merkle_root);
+    tweaked_spk(secp, &k.revocation, &root)
+}
+
+/// The scriptPubKey of the provider's output on the holder's commitment,
+/// worth `value`: no key path (NUMS), CLAIM, and PROVIDER, the provider's
+/// own spend after `delay` blocks.
+pub fn credit_to_remote_spk(
+    secp: &Secp256k1<All>,
+    provider_payment: &[u8; 33],
+    delay: u16,
+    cp: &CreditParams,
+    value: u64,
+) -> Option<Vec<u8>> {
+    let t = Tree2::new(
+        secp,
+        &NUMS,
+        leaf_claim(&cp.dtag, &cp.credit_key, value, &cp.holder_spk)?,
+        leaf_delay(provider_payment, delay),
+    )?;
+    Some(t.script_pubkey())
+}
+
+fn tweaked_spk(secp: &Secp256k1<All>, internal_key: &[u8; 33], root: &[u8; 32]) -> Option<Vec<u8>> {
+    let internal: [u8; 32] = internal_key[1..].try_into().ok()?;
+    let xonly = XOnlyPublicKey::from_slice(&internal).ok()?;
+    let tweak = taptweak(&internal, root)?;
+    let (out, _) = xonly.add_tweak(secp, &tweak).ok()?;
+    Some(p2tr(&out.serialize()))
+}
+
+// ---------------------------------------------------------------------------
 // The Elements taproot signature hash.
 // ---------------------------------------------------------------------------
 
@@ -727,6 +929,90 @@ mod tests {
         let (sig, out_x) = sign_keypath(&secp, &sh_key, &rev_sk, &root).unwrap();
         assert_eq!(sig.to_vec(), h(&v("V_SIG_KEY")));
         assert_eq!(p2tr(&out_x), h(&v("V_OFFERED_SPK")));
+    }
+
+    /// One vector of `common/test/credit_vectors.h`.
+    fn cv(name: &str) -> String {
+        let src = include_str!("../../../common/test/credit_vectors.h");
+        for line in src.lines() {
+            if let Some(rest) = line.strip_prefix(&format!("static const char {name}[] = \"")) {
+                return rest.trim_end_matches("\";").to_string();
+            }
+            if let Some(rest) = line.strip_prefix(&format!("#define {name} ")) {
+                return rest.trim().to_string();
+            }
+        }
+        panic!("no vector {name}");
+    }
+
+    #[test]
+    fn credit_scripts_match_the_vectors() {
+        let secp = Secp256k1::new();
+        let k = keys();
+        let pcp = a33(&v("V_PER_COMMITMENT_POINT"));
+        let pub_of = |name: &str| {
+            let sk = SecretKey::from_slice(&a32(&cv(name))).unwrap();
+            PublicKey::from_secret_key(&secp, &sk).serialize()
+        };
+        let provider_funding = pub_of("CV_PROVIDER_FUNDING_SECRET");
+        let provider_payment = pub_of("CV_PROVIDER_PAYMENT_SECRET");
+        let cid = a32(&cv("CV_CHANNEL_ID"));
+        let v0: u64 = cv("CV_V0").parse().unwrap();
+        let delay: u16 = cv("CV_DELAY").parse().unwrap();
+        let window: u16 = cv("CV_WINDOW").parse().unwrap();
+
+        let cp = CreditParams {
+            dtag: credit_tag(&cid),
+            credit_key: credit_key(&secp, &provider_funding).unwrap(),
+            holder_spk: p2wpkh(&k.other_payment),
+        };
+        assert_eq!(cp.dtag.to_vec(), h(&cv("CV_DTAG")));
+        assert_eq!(cp.credit_key.to_vec(), h(&cv("CV_CREDIT_KEY")));
+        assert_eq!(cp.holder_spk, h(&cv("CV_HOLDER_SPK")));
+        let leaf = leaf_claim(&cp.dtag, &cp.credit_key, v0, &cp.holder_spk).unwrap();
+        assert_eq!(leaf, h(&cv("CV_CLAIM_LEAF")));
+        assert_eq!(leaf.len(), 172);
+        assert_eq!(
+            credit_to_local_spk(&secp, &k, &pcp, delay, &cp, v0).unwrap(),
+            h(&cv("CV_TO_LOCAL_SPK"))
+        );
+        assert_eq!(
+            credit_to_remote_spk(&secp, &provider_payment, window, &cp, v0).unwrap(),
+            h(&cv("CV_TO_REMOTE_SPK"))
+        );
+        assert_eq!(leaf_delay(&provider_payment, window), h(&cv("CV_PROVIDER_LEAF")));
+        // B is in the leaf: another value is another script.
+        assert_ne!(
+            credit_to_remote_spk(&secp, &provider_payment, window, &cp, v0 + 1).unwrap(),
+            h(&cv("CV_TO_REMOTE_SPK"))
+        );
+        // A holder script that is not P2WPKH builds no leaf.
+        assert!(leaf_claim(&cp.dtag, &cp.credit_key, v0, &p2tr(&[7; 32])).is_none());
+
+        // The note: good as signed, refused for another credit, hash,
+        // channel or key.
+        let ph = a32(&cv("CV_NOTE_HASH"));
+        let sig: [u8; 64] = h(&cv("CV_NOTE_SIG")).try_into().unwrap();
+        let c: u64 = cv("CV_NOTE_C").parse().unwrap();
+        assert!(credit_note_check(&secp, &cp.dtag, &cp.credit_key, c, &ph, &sig));
+        assert!(!credit_note_check(&secp, &cp.dtag, &cp.credit_key, c + 1, &ph, &sig));
+        assert!(!credit_note_check(&secp, &cp.dtag, &provider_funding, c, &ph, &sig));
+        let mut other = ph;
+        other[0] ^= 1;
+        assert!(!credit_note_check(&secp, &cp.dtag, &cp.credit_key, c, &other, &sig));
+        let mut tag = cp.dtag;
+        tag[31] ^= 1;
+        assert!(!credit_note_check(&secp, &tag, &cp.credit_key, c, &ph, &sig));
+    }
+
+    #[test]
+    fn channel_id_is_bolt2s() {
+        let mut txid = [0u8; 32];
+        txid[30] = 0x12;
+        txid[31] = 0x34;
+        let id = channel_id(&txid, 0x0102);
+        assert_eq!(&id[30..], &[0x13, 0x36]);
+        assert_eq!(&id[..30], &[0u8; 30]);
     }
 
     #[test]

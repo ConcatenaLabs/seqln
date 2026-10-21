@@ -598,3 +598,49 @@ msgdata,hsmd_tcov_htlc_locks,payment_hashes,sha256,num_locks
 msgdata,hsmd_tcov_htlc_locks,lock_points,pubkey,num_locks
 
 msgtype,hsmd_tcov_htlc_locks_reply,165
+
+#include <common/channel_id.h>
+# SEQUENTIA: the provider-signed credit (common/credit_scripts.h).
+# A credit channel's provider signs a credit note: the cumulative credit c
+# (atoms) owed to the holder, conditional on payment_hash's preimage.  The
+# key is the channel's funding key tweaked by
+# tagged_hash("SeqLN/credit-key", funding pubkey), so it signs nothing but
+# notes; the message is tagged_hash("SeqLN/credit", channel_id) || c (8 LE) ||
+# payment_hash.
+msgtype,hsmd_sign_credit_note,66
+msgdata,hsmd_sign_credit_note,peerid,node_id,
+msgdata,hsmd_sign_credit_note,channel_dbid,u64,
+msgdata,hsmd_sign_credit_note,channel_id,channel_id,
+msgdata,hsmd_sign_credit_note,credit,u64,
+msgdata,hsmd_sign_credit_note,payment_hash,sha256,
+
+msgtype,hsmd_sign_credit_note_reply,166
+msgdata,hsmd_sign_credit_note_reply,sig,bip340sig,
+
+# A credit channel's holder tells its signer (channeld's client, for that
+# channel) the latest note it holds, with its payment's preimage once known,
+# before the signer validates or signs anything more on that channel: a
+# signer that rebuilds commitments then refuses one whose provider output
+# could not pay that note, and a close that does not pay it, and a signer
+# that keeps the note and preimage holds all a claim needs.  A signer that
+# lists this message can hold credit; lightningd offers option_seq_credit
+# only then.
+msgtype,hsmd_credit_note,67
+msgdata,hsmd_credit_note,channel_id,channel_id,
+msgdata,hsmd_credit_note,credit,u64,
+msgdata,hsmd_credit_note,payment_hash,sha256,
+msgdata,hsmd_credit_note,sig,bip340sig,
+msgdata,hsmd_credit_note,preimage,?preimage,
+
+msgtype,hsmd_credit_note_reply,167
+
+# The provider's own output on the holder's commitment, by its PROVIDER leaf
+# after the holder's delay: our payment basepoint's key (the static key).
+# Answered by hsmd_sign_tcov_reply.
+msgtype,hsmd_sign_tcov_payment_to_us,68
+msgdata,hsmd_sign_tcov_payment_to_us,tx,bitcoin_tx,
+msgdata,hsmd_sign_tcov_payment_to_us,input,u32,
+msgdata,hsmd_sign_tcov_payment_to_us,leaf_len,u16,
+msgdata,hsmd_sign_tcov_payment_to_us,leaf,u8,leaf_len
+msgdata,hsmd_sign_tcov_payment_to_us,peerid,node_id,
+msgdata,hsmd_sign_tcov_payment_to_us,channel_dbid,u64,

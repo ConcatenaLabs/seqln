@@ -16,6 +16,20 @@
 #define TCOV_ANCHORS false
 #define TCOV_ZERO_FEE_HTLC false
 
+bool tcov_credit_init(const tal_t *ctx,
+		      const struct channel_id *cid,
+		      enum side provider,
+		      const struct pubkey *provider_funding_key,
+		      const struct pubkey *holder_payment_basepoint,
+		      u16 window,
+		      struct tcov_credit *credit)
+{
+	credit->provider = provider;
+	credit->window = window;
+	return credit_params_init(ctx, cid, provider_funding_key,
+				  holder_payment_basepoint, &credit->params);
+}
+
 struct bitcoin_tx *tcov_commit_tx(const tal_t *ctx,
 				  const struct bitcoin_outpoint *funding,
 				  struct amount_sat funding_sats,
@@ -35,6 +49,7 @@ struct bitcoin_tx *tcov_commit_tx(const tal_t *ctx,
 				  struct wally_tx_output *direct_outputs[NUM_SIDES],
 				  u64 obscured_commitment_number,
 				  enum side side,
+				  const struct tcov_credit *credit,
 				  char **err_reason)
 {
 	struct amount_sat base_fee;
@@ -123,22 +138,42 @@ struct bitcoin_tx *tcov_commit_tx(const tal_t *ctx,
 
 	if (amount_msat_greater_eq_sat(self_pay, dust_limit)) {
 		struct tap_tree2 tree;
+		struct amount_sat v = amount_msat_to_sat_round_down(self_pay);
 
-		tcov_to_local_tree(tmpctx, keyset, per_commitment_point,
-				   to_self_delay, &tree);
+		/* SEQUENTIA: the provider's own balance carries CLAIM. */
+		if (credit && side == credit->provider)
+			credit_to_local_tree(tmpctx, keyset,
+					     per_commitment_point,
+					     to_self_delay, &credit->params,
+					     v, &tree);
+		else
+			tcov_to_local_tree(tmpctx, keyset,
+					   per_commitment_point,
+					   to_self_delay, &tree);
 		bitcoin_tx_add_output(tx, tap_tree2_scriptpubkey(tmpctx, &tree),
-				      NULL,
-				      amount_msat_to_sat_round_down(self_pay));
+				      NULL, v);
 		map[n] = &dummy_to_local;
 		n++;
 	}
 
 	if (amount_msat_greater_eq_sat(other_pay, dust_limit)) {
-		bitcoin_tx_add_output(tx,
-				      scriptpubkey_p2wpkh(tmpctx,
-							  &keyset->other_payment_key),
-				      NULL,
-				      amount_msat_to_sat_round_down(other_pay));
+		struct amount_sat v = amount_msat_to_sat_round_down(other_pay);
+		const u8 *spk;
+
+		/* SEQUENTIA: on the holder's commitment the provider's balance
+		 * carries CLAIM, and the provider waits the holder's delay. */
+		if (credit && side != credit->provider) {
+			struct tap_tree2 tree;
+
+			credit_to_remote_tree(tmpctx,
+					      &keyset->other_payment_key,
+					      credit->window, &credit->params,
+					      v, &tree);
+			spk = tap_tree2_scriptpubkey(tmpctx, &tree);
+		} else
+			spk = scriptpubkey_p2wpkh(tmpctx,
+						  &keyset->other_payment_key);
+		bitcoin_tx_add_output(tx, spk, NULL, v);
 		map[n] = &dummy_to_remote;
 		n++;
 	}
