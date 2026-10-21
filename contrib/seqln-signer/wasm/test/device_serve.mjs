@@ -12,7 +12,8 @@
 // log `seqln-signer.log`. From the environment, as the native binary reads
 // them: SEQLN_SIGNER_PRIVKEY and SEQLN_HOST_PEER_PUBKEY (the Noise_XK keys),
 // SEQLN_SIGNER_POLICY (`permissive` turns enforcement off),
-// SEQLN_SIGNER_PAY_LIMIT, SEQLN_SIGNER_PAY_LIMITS, SEQLN_SIGNER_PAY_PERIOD and
+// SEQLN_SIGNER_PAY_LIMIT_REFERENCE, SEQLN_SIGNER_RATES, SEQLN_SIGNER_PAY_LIMIT,
+// SEQLN_SIGNER_PAY_LIMITS, SEQLN_SIGNER_PAY_PERIOD and
 // SEQLN_SIGNER_TRACE. Each refusal is logged as the native binary logs it,
 // `seqln-signer: POLICY REJECT: <reason>`. The process serves one link and
 // exits when it closes; the caller restarts it, as a browser reconnects.
@@ -65,6 +66,14 @@ function atoms(v) {
   if (/^none$/i.test(s)) return undefined;
   if (!/^[0-9]+$/.test(s)) fatal(`bad payment limit: limit ${JSON.stringify(s)} is neither a number of atoms nor \`none\``);
   return Number(s);
+}
+if (process.env.SEQLN_SIGNER_PAY_LIMIT_REFERENCE !== undefined) {
+  signer.setReferencePaymentLimit(atoms(process.env.SEQLN_SIGNER_PAY_LIMIT_REFERENCE));
+}
+for (const item of (process.env.SEQLN_SIGNER_RATES || '').split(',').filter((x) => x.trim())) {
+  const [a, n] = item.split('=');
+  if (n === undefined || !/^[1-9][0-9]*$/.test(n.trim())) fatal(`bad payment limit: SEQLN_SIGNER_RATES item ${JSON.stringify(item)} is not <asset>=<rate>`);
+  signer.setAssetRate(a.trim(), Number(n.trim()));
 }
 if (process.env.SEQLN_SIGNER_PAY_LIMIT !== undefined) {
   signer.setPaymentLimit(undefined, atoms(process.env.SEQLN_SIGNER_PAY_LIMIT));

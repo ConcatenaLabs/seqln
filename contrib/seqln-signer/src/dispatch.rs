@@ -1027,7 +1027,7 @@ impl Signer {
         }
         let assets = self.store.assets();
         if assets.is_empty() {
-            if let Some(l) = self.limits.default_atoms.map(|x| x.saturating_mul(1000)) {
+            if let Some(l) = self.limits.unnamed_limit_atoms().map(|x| x.saturating_mul(1000)) {
                 if need > l {
                     return Err(format!(
                         "a payment of {a} msat (with {} of fee allowance) is over the limit of \
@@ -4944,7 +4944,7 @@ mod close_and_revocation_tests {
         let mut s = signer(Policy::Enforce);
         s.set_now(1_000);
         let mut l = payments::Limits::default();
-        l.default_atoms = Some(atoms);
+        l.default = payments::DefaultLimit::Atoms(atoms);
         s.set_limits(l);
         track(&mut s, outbound, &[]);
         assert!(matches!(validate(&mut s, 0, ours, theirs, 1_000), Outcome::Reply(_)));
@@ -5041,7 +5041,7 @@ mod close_and_revocation_tests {
         assert!(!preapprove_invoice(&mut s, inv, false));
         assert!(!s.store.ledger.is_approved(&hash, 0, payments::DEFAULT_PERIOD_SECS));
         let mut l = payments::Limits::default();
-        l.default_atoms = Some(31_000_000);
+        l.default = payments::DefaultLimit::Atoms(31_000_000);
         s.set_limits(l);
         assert!(preapprove_invoice(&mut s, inv, true));
         assert!(!s.store.ledger.is_approved(&hash, 0, payments::DEFAULT_PERIOD_SECS));
@@ -6969,7 +6969,7 @@ mod tcov_tests {
         // A fee over the payment limit.
         let mut t = tracked(Policy::Enforce);
         let mut l = payments::Limits::default();
-        l.default_atoms = Some(500);
+        l.default = payments::DefaultLimit::Atoms(500);
         t.set_limits(l);
         let r = refused(&t.handle(&local_htlc(&t, &claim(&t, d.clone(), 1_000))));
         assert!(r.contains("over this device's payment limit"), "{r}");

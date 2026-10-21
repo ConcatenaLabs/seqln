@@ -212,13 +212,23 @@ What enforce mode checks:
   the HTLC back, and the channel is idle until the peer reconnects. Call `preapproveinvoice` or
   `preapprovekeysend` first.
 
-The payment limit is an amount of each asset, in its own atoms, over a sliding period: by default
-10,000,000 atoms of each asset (Bitcoin included) a day: a default for a day's spending, which a
-channel can hold more than. What withdrawals let leave (their fees) counts against it too. Native: `SEQLN_SIGNER_PAY_LIMIT` (atoms, or `none`), `SEQLN_SIGNER_PAY_LIMITS`
-(`<asset>=<atoms|none>,...`, each asset `btc` or a display-order asset id) and
-`SEQLN_SIGNER_PAY_PERIOD` (seconds); the signer refuses to start on a malformed value. WASM:
-`setPaymentLimit(asset, atoms)` and `setPaymentPeriod(seconds)`, or the SDK's `paymentLimits`
-option. An HTLC is charged when it is first committed, so an attempt that then fails still counts
+The payment limit is an amount of each asset over a sliding period, a day by default. By default
+it is one value in the reference unit, 1,000 reference units a day, held in each asset at that
+asset's rate: the rate the node's fee exchange rates give it (`getfeeexchangerates`, reference
+atoms per 10^8 atoms of the asset), so the limit is worth the same in every asset and privileges
+none. The reference unit is the price feed's numeraire (the US dollar on the testnet), so a
+thousand a day covers everyday Lightning spending and bounds what a host could have the device
+approve in a day. The wallet gives the device the rates; the host never does. An asset the wallet
+gives no rate for (the device cannot value it) is held to 10,000,000 of its own atoms. A limit
+set for one asset, in its own atoms, comes first, and a default set in atoms replaces the
+reference default for every asset. What withdrawals let leave (their fees) counts against the
+limit too. Native: `SEQLN_SIGNER_PAY_LIMIT_REFERENCE` (reference atoms, or `none`),
+`SEQLN_SIGNER_RATES` (`<asset>=<rate>,...`), `SEQLN_SIGNER_PAY_LIMIT` (atoms of every asset, or
+`none`), `SEQLN_SIGNER_PAY_LIMITS` (`<asset>=<atoms|none>,...`), each asset `btc` or a
+display-order asset id, and `SEQLN_SIGNER_PAY_PERIOD` (seconds); the signer refuses to start on a
+malformed value. WASM: `setReferencePaymentLimit(referenceAtoms)`, `setAssetRate(asset, rate)`,
+`setPaymentLimit(asset, atoms)`, `setPaymentPeriod(seconds)` and `paymentLimit(asset)`, or the
+SDK's `paymentLimits` option (`reference`, `rates`, `default`, `assets`, `period`). option. An HTLC is charged when it is first committed, so an attempt that then fails still counts
 until the period has passed. A channel the device tracked before it kept payment records takes
 its first commitment as the baseline, whatever HTLCs it carries, and so does the first commitment
 the device sees on each side of a channel.
@@ -325,7 +335,8 @@ out-of-band first (`seqln-signer --genkey` prints a keypair):
   host proxy with `SEQLN_SIGNER_LISTEN=<bind:port>` (reconnect-tolerant), same key pinning.
 
 Other environment knobs: `SEQLN_SIGNER_POLICY=enforce|permissive` (default enforce), the payment
-limits `SEQLN_SIGNER_PAY_LIMIT`, `SEQLN_SIGNER_PAY_LIMITS` and `SEQLN_SIGNER_PAY_PERIOD` (see
+limits `SEQLN_SIGNER_PAY_LIMIT_REFERENCE`, `SEQLN_SIGNER_RATES`, `SEQLN_SIGNER_PAY_LIMIT`,
+`SEQLN_SIGNER_PAY_LIMITS` and `SEQLN_SIGNER_PAY_PERIOD` (see
 "Scope"), `SEQLN_SIGNER_CLOSE_TO` (hex scriptPubKeys of the operator's own wallet, comma-separated,
 that a cooperative close may pay this side's balance to: the native form of
 `approveCloseDestination`),

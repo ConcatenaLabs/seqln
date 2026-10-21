@@ -2,7 +2,8 @@
 
 The device signer approves a payment when `pay` or `keysend` asks it to
 (`PREAPPROVE_INVOICE`, `PREAPPROVE_KEYSEND`), if the amount fits in what its
-limit (atoms of each asset per period) leaves; it signs a commitment that adds
+limit (by default a value in the reference unit, held in each asset at the
+rate the wallet gives the device) leaves; it signs a commitment that adds
 an HTLC we offer only for an approved payment hash, and charges the amount to
 the asset.  Run with TEST_NETWORK=sequentia-regtest; the signer binary is
 SEQLN_SIGNER, by default contrib/seqln-signer/target/release/seqln-signer.
@@ -93,6 +94,54 @@ def test_keyless_node_pays_only_approved_payments(node_factory, bitcoind, direct
         inv = l2.rpc.invoice(10**6 * 1000, 'after', 'after')['bolt11']
         assert l1.rpc.pay(inv)['status'] == 'complete'
         assert only_one(l2.rpc.listinvoices('bypass')['invoices'])['status'] == 'unpaid'
+    finally:
+        if kc.answers(l1, timeout=2):
+            l1.stop()
+        device.stop()
+
+
+@pytest.mark.skipif(not os.path.exists(kc.SIGNER), reason='needs the seqln-signer binary')
+@pytest.mark.parametrize('rated', [True, False])
+def test_keyless_default_limit_is_a_reference_value(node_factory, bitcoind, directory, rated):
+    """With the device's default limit, 1,000 reference units a day, and the
+    wallet's rate for the channel's asset (one reference unit per 10^8
+    atoms, a dollar-priced asset), the keyless node opens a channel of 10
+    units and pays 5 of them.  Without a rate the device cannot value the
+    asset and holds it to 10,000,000 atoms, so the same payment is declined
+    before any HTLC is offered."""
+    asset = bitcoind.issue_asset(1000)
+    bitcoind.set_fee_rates({bitcoind.POLICY_ASSET: kc.PAR, asset: kc.PAR})
+    rates = '{}={}'.format(asset, kc.PAR) if rated else None
+    device, l1 = kc.keyless_node(node_factory, directory, pay_limit=None, rates=rates,
+                                 broken_log='.*')
+    try:
+        l2 = node_factory.get_node()
+        addr = l1.rpc.newaddr('bech32')['bech32']
+        txid = bitcoind.send_and_mine_block(addr, 20 * 10**8, asset)
+        wait_for(lambda: any(o['txid'] == txid for o in l1.rpc.listfunds()['outputs']))
+        l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+        res = l1.rpc.call('fundchannel', {'id': l2.info['id'], 'amount': 10 * 10**8,
+                                          'asset': asset, 'announce': True})
+        bitcoind.generate_block(1, wait_for_mempool=res['txid'])
+        for a, b in ((l1, l2), (l2, l1)):
+            wait_for(lambda: kc.channel(a, b)['state'] == 'CHANNELD_NORMAL')
+
+        inv = l2.rpc.invoice(5 * 10**8 * 1000, 'five', 'five units')['bolt11']
+        if rated:
+            assert l1.rpc.pay(inv)['status'] == 'complete'
+            assert only_one(l2.rpc.listinvoices('five')['invoices'])['status'] == 'paid'
+            assert 'declined' not in device.output()
+            assert 'POLICY REJECT' not in device.output()
+        else:
+            with pytest.raises(RpcError, match='declined'):
+                l1.rpc.pay(inv)
+            # The native device logs why; the browser build answers the same
+            # decline without a log line.
+            if kc.DEVICE == 'native':
+                out = [x for x in device.output().splitlines() if 'PREAPPROVE declined' in x]
+                print(out[:1])
+                assert 'a payment of 500000000000 msat' in out[0]
+            assert only_one(l2.rpc.listinvoices('five')['invoices'])['status'] == 'unpaid'
     finally:
         if kc.answers(l1, timeout=2):
             l1.stop()

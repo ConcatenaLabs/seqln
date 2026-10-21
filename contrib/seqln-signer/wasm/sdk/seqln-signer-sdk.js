@@ -150,16 +150,24 @@ export class SeqlnSigner {
     // normally. Used by the reconnect stress harness to exercise the proxy's
     // B6 fail-soft path (a device reject on a master-fd op must not kill the node).
     this._rejectOnce = opts.rejectOnce ? new Set(opts.rejectOnce.map(Number)) : null;
-    // Payment limits (enforce mode): `paymentLimits` = { default: atoms|null,
+    // Payment limits (enforce mode): `paymentLimits` = { reference: reference
+    // atoms|null, rates: { <asset id or 'btc'>: rate }, default: atoms|null,
     // period: seconds, assets: { <asset id or 'btc'>: atoms|null } }. The
     // device approves a payment only within what the limit leaves for the
-    // period, per asset in the asset's own atoms; null means no limit. Unset,
-    // the default is 10,000,000 atoms of each asset per day.
+    // period. The default is a value in the reference unit (`reference`, by
+    // default 1,000 reference units a day), held in each asset at its rate as
+    // the node's fee exchange rates give it (reference atoms per 10^8 atoms);
+    // an asset with no rate is held to 10,000,000 of its own atoms. `default`
+    // replaces it with the same atoms of every asset, `assets` sets an
+    // asset's own limit; null means no limit.
     if (opts.paymentLimits) this.setPaymentLimits(opts.paymentLimits);
   }
 
   // Set the payment limits; see the constructor's `paymentLimits`.
-  setPaymentLimits({ default: dflt, period, assets } = {}) {
+  setPaymentLimits({ reference, rates, default: dflt, period, assets } = {}) {
+    if (reference !== undefined) this._inner.setReferencePaymentLimit(reference === null ? undefined : reference);
+    for (const [asset, rate] of Object.entries(rates || {}))
+      this._inner.setAssetRate(asset, rate === null ? undefined : Number(rate));
     if (dflt !== undefined) this._inner.setPaymentLimit(undefined, dflt === null ? undefined : dflt);
     if (period !== undefined) this._inner.setPaymentPeriod(period);
     for (const [asset, atoms] of Object.entries(assets || {}))
