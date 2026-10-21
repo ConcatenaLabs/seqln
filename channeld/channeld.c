@@ -20,6 +20,7 @@
 #include <channeld/channeld_wiregen.h>
 #include <channeld/full_channel.h>
 #include <channeld/splice.h>
+#include <channeld/tcov_channel.h>
 #include <channeld/watchtower.h>
 #include <common/billboard.h>
 #include <common/ecdh_hsmd.h>
@@ -1260,6 +1261,20 @@ static u8 *send_commit_part(const tal_t *ctx,
 	 * (a peer with no balance of its own) still needs one, or nothing
 	 * defends those HTLCs; its outnum is then (u32)-1. */
 	pbase = NULL;
+	/* SEQUENTIA: the taproot-covenant type has neither P2WSH outputs nor
+	 * second-stage transactions (txs[] holds the commitment alone).  The
+	 * tower needs only the commitment's txid and its to_local
+	 * (tcov_justice_blob): every claim from it pays to_local's script. */
+	if (channel_has(peer->channel, OPT_SEQ_TAPROOT_COVENANT)) {
+		if (direct_outputs[LOCAL] != NULL)
+			pbase = penalty_base_new(tmpctx, remote_index,
+						 txs[0], direct_outputs[LOCAL]);
+		else
+			pbase = penalty_base_new_htlcs_only(tmpctx,
+							    remote_index,
+							    txs[0]);
+		goto save_penalty_base;
+	}
 	if (direct_outputs[LOCAL] != NULL)
 		pbase = penalty_base_new(tmpctx, remote_index,
 					 txs[0], direct_outputs[LOCAL]);
@@ -1309,6 +1324,7 @@ static u8 *send_commit_part(const tal_t *ctx,
 
 	/* Add the penalty_base to our in-memory list as well, so we
 	 * can find it again later. */
+save_penalty_base:
 	if (pbase)
 		tal_arr_expand(&peer->pbases, tal_steal(peer, pbase));
 
@@ -2678,7 +2694,19 @@ static u8 *got_revoke_msg(struct peer *peer, u64 revoke_num,
 
 	pbase = penalty_base_by_commitnum(tmpctx, peer, revoke_num);
 
-	if (pbase) {
+	if (pbase && channel_has(peer->channel, OPT_SEQ_TAPROOT_COVENANT)) {
+		/* SEQUENTIA: no signature to make: the tower spends the
+		 * REVOKE leaf with the secret itself. */
+		wt_blobs = tal_arr(tmpctx, struct watchtower_blob *, 0);
+		{
+			struct watchtower_blob *b
+				= tcov_justice_blob(wt_blobs, peer->channel,
+						    per_commitment_secret,
+						    pbase);
+			if (b)
+				tal_arr_expand(&wt_blobs, b);
+		}
+	} else if (pbase) {
 		/* DTODO we need penalty tx's per splice candidate */
 		ptx = penalty_tx_create(
 		    NULL, peer->channel, peer->feerate_penalty,

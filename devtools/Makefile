@@ -23,7 +23,7 @@ $(DEVTOOLS_TOOL_OBJS): wire/wire.h
 devtools/decodemsg: devtools/print_wire.o
 devtools/decodemsg.o: devtools/print_wire.h
 
-devtools/mkcommit: channeld/full_channel.o channeld/commit_tx.o
+devtools/mkcommit: channeld/full_channel.o channeld/commit_tx.o channeld/tcov_channel.o
 devtools/mkcommit.o: channeld/full_channel.h channeld/commit_tx.h
 
 devtools/route devtools/topology: devtools/clean_topo.o

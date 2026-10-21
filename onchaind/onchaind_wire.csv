@@ -49,6 +49,8 @@ msgdata,onchaind_init,local_static_remotekey_start,u64,
 msgdata,onchaind_init,remote_static_remotekey_start,u64,
 msgdata,onchaind_init,option_anchor_outputs,bool,
 msgdata,onchaind_init,option_anchors_zero_fee_htlc_tx,bool,
+# SEQUENTIA: a taproot-covenant channel (common/tcov_scripts.h).
+msgdata,onchaind_init,option_seq_taproot_covenant,bool,
 # We need this for BIP125 rule 4
 msgdata,onchaind_init,min_relay_feerate,u32,
 
@@ -200,6 +202,38 @@ msgdata,onchaind_spend_htlc_expired,cltv_expiry,u32,
 msgdata,onchaind_spend_htlc_expired,remote_per_commitment_point,pubkey,
 msgdata,onchaind_spend_htlc_expired,wscript_len,u32,
 msgdata,onchaind_spend_htlc_expired,wscript,u8,wscript_len
+
+# SEQUENTIA: create, sign and broadcast a spend of one output of a
+# taproot-covenant channel's commitment, or of what a claim from it paid.
+# Input 0 spends @outpoint (@spent_scriptpubkey, @outpoint_amount in the
+# channel asset) by @leaf, with @control_block, or by the key path when
+# @leaf is empty.  @covenant_program set: the leaf is a covenant, and output
+# 0 pays the whole amount to that witness v1 program; otherwise it pays our
+# wallet.  The fee always comes from another input, in an asset this node
+# accepts (enum tcov_spend_signer and tcov_spend_deadline:
+# common/tcov_scripts.h).
+msgtype,onchaind_spend_tcov,5046
+msgdata,onchaind_spend_tcov,outpoint,bitcoin_outpoint,
+msgdata,onchaind_spend_tcov,outpoint_amount,amount_sat,
+msgdata,onchaind_spend_tcov,spent_scriptpubkey_len,u16,
+msgdata,onchaind_spend_tcov,spent_scriptpubkey,u8,spent_scriptpubkey_len
+msgdata,onchaind_spend_tcov,signer,u8,
+msgdata,onchaind_spend_tcov,commit_num,u64,
+msgdata,onchaind_spend_tcov,remote_per_commitment_point,?pubkey,
+msgdata,onchaind_spend_tcov,revocation_secret,?secret,
+msgdata,onchaind_spend_tcov,leaf_len,u16,
+msgdata,onchaind_spend_tcov,leaf,u8,leaf_len
+msgdata,onchaind_spend_tcov,control_block_len,u16,
+msgdata,onchaind_spend_tcov,control_block,u8,control_block_len
+msgdata,onchaind_spend_tcov,merkle_root,sha256,
+msgdata,onchaind_spend_tcov,preimage,?preimage,
+msgdata,onchaind_spend_tcov,covenant_program_len,u16,
+msgdata,onchaind_spend_tcov,covenant_program,u8,covenant_program_len
+msgdata,onchaind_spend_tcov,locktime,u32,
+msgdata,onchaind_spend_tcov,sequence,u32,
+msgdata,onchaind_spend_tcov,minblock,u32,
+msgdata,onchaind_spend_tcov,deadline,u8,
+msgdata,onchaind_spend_tcov,htlc_id,u64,
 
 subtype,onchain_witness_element
 subtypedata,onchain_witness_element,is_signature,bool,

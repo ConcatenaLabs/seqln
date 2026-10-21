@@ -264,6 +264,11 @@ struct channel_type *desired_channel_type(const tal_t *ctx,
 					  const struct feature_set *our_features,
 					  const u8 *their_features)
 {
+	/* SEQUENTIA: only offered where the chain has tapscript
+	 * introspection (options.c), so negotiated only there. */
+	if (feature_negotiated(our_features, their_features,
+			       OPT_SEQ_TAPROOT_COVENANT))
+		return channel_type_seq_taproot_covenant(ctx);
 	if (feature_negotiated(our_features, their_features,
 			       OPT_ANCHORS_ZERO_FEE_HTLC_TX))
 		return channel_type_anchors_zero_fee_htlc(ctx);

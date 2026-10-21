@@ -129,6 +129,7 @@ enum ChannelTypeName {
   scid_alias_even = 3;
   zeroconf_even = 4;
   anchors_even = 5;
+  seq_taproot_covenant_even = 6;
 }
 
 enum AutocleanSubsystem {

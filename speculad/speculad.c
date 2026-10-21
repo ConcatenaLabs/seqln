@@ -1166,9 +1166,17 @@ static char *attach_fee_and_sign(const tal_t *ctx,
 		const struct wally_tx_output *o = &blobs[k]->tx->wtx->outputs[0];
 
 		bitcoin_tx_input_get_outpoint(blobs[k]->tx, 0, &op);
-		bitcoin_tx_add_input(tx, &op,
-				     blobs[k]->tx->wtx->inputs[0].sequence, NULL,
-				     blobs[k]->amount, NULL, blobs[k]->wscript);
+		if (blobs[k]->kind == WT_TMPL_TCOV_REVOKE)
+			/* Its wscript is the spent output's scriptPubKey. */
+			bitcoin_tx_add_input(tx, &op,
+					     blobs[k]->tx->wtx->inputs[0].sequence,
+					     NULL, blobs[k]->amount,
+					     blobs[k]->wscript, NULL);
+		else
+			bitcoin_tx_add_input(tx, &op,
+					     blobs[k]->tx->wtx->inputs[0].sequence,
+					     NULL, blobs[k]->amount, NULL,
+					     blobs[k]->wscript);
 		bitcoin_tx_input_copy_witness(tx, k, blobs[k]->tx, 0);
 		bitcoin_tx_add_output(tx, tal_dup_arr(tmpctx, u8, o->script,
 						      o->script_len, 0),
@@ -1267,6 +1275,73 @@ static char *trim(char *res)
 	return res;
 }
 
+/* SEQUENTIA: a WT_TMPL_TCOV_REVOKE blob (taproot-covenant channel) holds a
+ * spend of the revoked to_local by its REVOKE leaf, which needs no
+ * signature, and to_local's script.  Every claim the cheater makes from that
+ * commitment pays an output with that script, which the same witness spends;
+ * so the blobs to broadcast are one per unspent output paying it, found in
+ * the UTXO set, each a copy of the template spending that output. */
+static struct spd_blob **tcov_revoke_blobs(const tal_t *ctx,
+					   const struct spd_blob *tmpl)
+{
+	struct spd_blob **out = tal_arr(ctx, struct spd_blob *, 0);
+	const char **extra = tal_arr(tmpctx, const char *, 2);
+	const jsmntok_t *toks, *unspents, *t;
+	char *res;
+	size_t i;
+
+	extra[0] = "start";
+	extra[1] = tal_fmt(extra, "[\"raw(%s)\"]",
+			   tal_hex(tmpctx, tmpl->wscript));
+	res = run_cli(tmpctx, "scantxoutset", extra);
+	if (!res)
+		return out;
+	toks = json_parse_simple(tmpctx, res, strlen(res));
+	if (!toks)
+		return out;
+	unspents = json_get_member(res, toks, "unspents");
+	if (!unspents || unspents->type != JSMN_ARRAY)
+		return out;
+	json_for_each_arr(i, t, unspents) {
+		const jsmntok_t *txid = json_get_member(res, t, "txid");
+		const jsmntok_t *vout = json_get_member(res, t, "vout");
+		const char *obj = json_strdup(tmpctx, res, t);
+		struct spd_blob *b;
+		struct bitcoin_outpoint op;
+		u64 sat;
+		char *hex;
+		u8 *spk;
+		struct amount_asset tmpl_out;
+
+		if (!txid || !vout || !json_to_u32(res, vout, &op.n)
+		    || !json_find_btc_sat(obj, "amount", &sat))
+			continue;
+		hex = json_strdup(tmpctx, res, txid);
+		if (!bitcoin_txid_from_hex(hex, strlen(hex), &op.txid))
+			continue;
+		b = tal(out, struct spd_blob);
+		b->kind = tmpl->kind;
+		b->commit_num = tmpl->commit_num;
+		b->output_index = op.n;
+		b->amount = amount_sat(sat);
+		b->deadline_delta = tmpl->deadline_delta;
+		b->wscript = tal_dup_talarr(b, u8, tmpl->wscript);
+		tmpl_out = bitcoin_tx_output_get_amount(tmpl->tx, 0);
+		spk = tal_dup_arr(tmpctx, u8,
+				  tmpl->tx->wtx->outputs[0].script,
+				  tmpl->tx->wtx->outputs[0].script_len, 0);
+		b->tx = bitcoin_tx(b, chainparams, 1, 1, 0);
+		bitcoin_tx_set_output_asset(b->tx, tmpl_out.asset);
+		bitcoin_tx_add_input(b->tx, &op, 0xFFFFFFFF, NULL, b->amount,
+				     tmpl->wscript, NULL);
+		bitcoin_tx_input_copy_witness(b->tx, 0, tmpl->tx, 0);
+		bitcoin_tx_add_output(b->tx, spk, NULL, b->amount);
+		bitcoin_tx_finalize(b->tx);
+		tal_arr_expand(&out, b);
+	}
+	return out;
+}
+
 /* Defend a confirmed breach: one justice transaction for every output of the
  * revoked commitment that is still unspent in the confirmed UTXO set,
  * re-broadcast each round with a higher fee (RBF) until it confirms. */
@@ -1291,8 +1366,23 @@ static void defend_breach(struct revoked_commit *rc, long breach_confs,
 	 * later reorg that re-exposes the outpoint flips it back to UNSPENT
 	 * and it rejoins the set (principle #1, no finality).  UNKNOWN (RPC
 	 * error) conservatively keeps defending. */
+	struct spd_blob **blobs = tal_arr(tmpctx, struct spd_blob *, 0);
+
 	for (size_t k = 0; k < tal_count(rc->blobs); k++) {
-		struct spd_blob *b = rc->blobs[k];
+		if (rc->blobs[k]->kind == WT_TMPL_TCOV_REVOKE) {
+			struct spd_blob **found
+				= tcov_revoke_blobs(tmpctx, rc->blobs[k]);
+			fprintf(stderr, "speculad: %s: %zu unspent output(s)"
+				" pay the revoked to_local's script\n",
+				rc->locator, tal_count(found));
+			for (size_t f = 0; f < tal_count(found); f++)
+				tal_arr_expand(&blobs, found[f]);
+		} else
+			tal_arr_expand(&blobs, rc->blobs[k]);
+	}
+
+	for (size_t k = 0; k < tal_count(blobs); k++) {
+		struct spd_blob *b = blobs[k];
 		struct bitcoin_outpoint op;
 		const char *op_txid;
 

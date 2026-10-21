@@ -268,6 +268,7 @@ const struct chainparams networks[] = {
      .testnet = true,
      .fee_asset_tag = sequentia_testnet_fee_asset,
      .has_anchor_header = true,
+     .has_tapscript_introspection = true,
      .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_TEST_PUBLIC,
 			   .bip32_privkey_version = BIP32_VER_TEST_PRIVATE},
      .is_elements = true},
@@ -299,6 +300,7 @@ const struct chainparams networks[] = {
      .testnet = true,
      .fee_asset_tag = sequentia_regtest_fee_asset,
      .has_anchor_header = true,
+     .has_tapscript_introspection = true,
      .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_TEST_PUBLIC,
 			   .bip32_privkey_version = BIP32_VER_TEST_PRIVATE},
      .is_elements = true},
@@ -325,6 +327,7 @@ const struct chainparams networks[] = {
      .testnet = false,
      .fee_asset_tag = NULL, /* TODO: mainnet policy asset */
      .has_anchor_header = true,
+     .has_tapscript_introspection = true,
      .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_MAIN_PUBLIC,
 			   .bip32_privkey_version = BIP32_VER_MAIN_PRIVATE},
      .is_elements = true},

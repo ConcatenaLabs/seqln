@@ -73,6 +73,19 @@ struct channel_type *channel_type_anchors_zero_fee_htlc(const tal_t *ctx)
 	return type;
 }
 
+/* SEQUENTIA: the taproot-covenant type is its own basic type: it implies
+ * option_static_remotekey's to_remote and carries no anchors. */
+struct channel_type *channel_type_seq_taproot_covenant(const tal_t *ctx)
+{
+	struct channel_type *type = new_channel_type(ctx);
+
+	set_feature_bit(&type->features,
+			COMPULSORY_FEATURE(OPT_SEQ_TAPROOT_COVENANT));
+	set_feature_bit(&type->features,
+			COMPULSORY_FEATURE(OPT_STATIC_REMOTEKEY));
+	return type;
+}
+
 bool channel_type_has(const struct channel_type *type, int feature)
 {
 	return feature_offered(type->features, feature);
@@ -119,6 +132,7 @@ struct channel_type *channel_type_accept(const tal_t *ctx,
 		OPT_STATIC_REMOTEKEY,
 		OPT_SCID_ALIAS,
 		OPT_ZEROCONF,
+		OPT_SEQ_TAPROOT_COVENANT,
 	};
 
 	/* BOLT #2:
@@ -155,7 +169,9 @@ struct channel_type *channel_type_accept(const tal_t *ctx,
 	if (channel_type_eq(&proposed,
 			    channel_type_static_remotekey(tmpctx)) ||
 	    channel_type_eq(&proposed,
-			    channel_type_anchors_zero_fee_htlc(tmpctx))) {
+			    channel_type_anchors_zero_fee_htlc(tmpctx)) ||
+	    channel_type_eq(&proposed,
+			    channel_type_seq_taproot_covenant(tmpctx))) {
 		/* At this point we know it matches, and maybe has
 		 * a couple of extra options. So let's just reply
 		 * with their proposal. */

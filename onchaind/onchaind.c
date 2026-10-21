@@ -13,6 +13,7 @@
 #include <common/peer_billboard.h>
 #include <common/status.h>
 #include <common/subdaemon.h>
+#include <common/tcov_scripts.h>
 #include <hsmd/hsmd_wiregen.h>
 #include <inttypes.h>
 #include <onchaind/onchain_types.h>
@@ -73,6 +74,9 @@ static bool option_anchor_outputs;
 /* Does option_anchors_zero_fee_htlc_tx apply to this commitment tx? */
 static bool option_anchors_zero_fee_htlc_tx;
 
+/* SEQUENTIA: a taproot-covenant channel (common/tcov_scripts.h)? */
+static bool option_seq_taproot_covenant;
+
 /* Asset-aware channels: the asset this channel is denominated in (33-byte
  * version+tag); the policy asset for an ordinary channel. All resolution/HTLC
  * txs we build (or the amounts we read off the commitment tx) are in it. */
@@ -123,7 +127,30 @@ struct tracked_output {
 
 	/* stashed so we can pass it along to the coin ledger */
 	struct sha256 payment_hash;
+
+	/* SEQUENTIA: a taproot-covenant output's script tree, else NULL. */
+	const struct tap_tree2 *tcov_tree;
 };
+
+/* SEQUENTIA: the taproot-covenant channel type, near the end of this file. */
+static void tcov_resolve_claim(struct tracked_output ***outs,
+			       size_t out_index,
+			       const struct tx_parts *claim,
+			       size_t input_num,
+			       u32 tx_blockheight);
+static void tcov_steal_claim(struct tracked_output *out,
+			     struct tracked_output ***outs,
+			     const struct tx_parts *claim,
+			     u32 tx_blockheight,
+			     enum tx_type claim_type,
+			     const struct bitcoin_outpoint *d_outpoint);
+static void tcov_extract_preimage(struct tracked_output *out,
+				  const struct tx_parts *tx_parts,
+				  const struct bitcoin_outpoint *spend);
+static void tcov_claim_with_preimage(struct tracked_output *out,
+				     const struct preimage *preimage);
+static bool tcov_revoke_leaf_paid_us(const struct tx_parts *tx_parts,
+				     size_t input_num, u32 tx_blockheight);
 
 static const char *tx_type_name(enum tx_type tx_type)
 {
@@ -636,6 +663,7 @@ new_tracked_output(struct tracked_output ***outs,
 	out->wscript = tal_steal(out, wscript);
 	out->remote_htlc_sig = tal_dup_or_null(out, struct bitcoin_signature,
 					       remote_htlc_sig);
+	out->tcov_tree = NULL;
 
 	tal_arr_expand(outs, out);
 
@@ -1235,9 +1263,17 @@ static bool output_spent(struct tracked_output ***outs,
 		if (resolved_by_proposal(out, tx_parts)) {
 			/* If it's our htlc tx, we need to resolve that, too. */
 			if (out->resolved->tx_type == OUR_HTLC_SUCCESS_TX
-			    || out->resolved->tx_type == OUR_HTLC_TIMEOUT_TX)
-				resolve_htlc_tx(outs, i, tx_parts, input_num,
-						tx_blockheight);
+			    || out->resolved->tx_type == OUR_HTLC_TIMEOUT_TX) {
+				/* SEQUENTIA: or our covenant claim's D. */
+				if (option_seq_taproot_covenant)
+					tcov_resolve_claim(outs, i, tx_parts,
+							   input_num,
+							   tx_blockheight);
+				else
+					resolve_htlc_tx(outs, i, tx_parts,
+							input_num,
+							tx_blockheight);
+			}
 
 			record_coin_movements(out, tx_blockheight,
 					      &tx_parts->txid);
@@ -1267,10 +1303,16 @@ static bool output_spent(struct tracked_output ***outs,
 						      tags);
 
 				/* we've actually got a 'new' output here */
-				steal_htlc_tx(out, outs, tx_parts,
-					      tx_blockheight,
-					      THEIR_HTLC_TIMEOUT_TO_THEM,
-					      &htlc_outpoint);
+				if (option_seq_taproot_covenant)
+					tcov_steal_claim(out, outs, tx_parts,
+							 tx_blockheight,
+							 THEIR_HTLC_TIMEOUT_TO_THEM,
+							 &htlc_outpoint);
+				else
+					steal_htlc_tx(out, outs, tx_parts,
+						      tx_blockheight,
+						      THEIR_HTLC_TIMEOUT_TO_THEM,
+						      &htlc_outpoint);
 			} else {
 				/* We ignore this timeout tx, since we should
 				 * resolve by ignoring once we reach depth. */
@@ -1298,8 +1340,12 @@ static bool output_spent(struct tracked_output ***outs,
 			 *     - MUST extract the payment preimage from the HTLC-success transaction input
 			 *     witness.
 			 */
-			handle_htlc_onchain_fulfill(out, tx_parts,
-						    &htlc_outpoint);
+			if (option_seq_taproot_covenant)
+				tcov_extract_preimage(out, tx_parts,
+						      &htlc_outpoint);
+			else
+				handle_htlc_onchain_fulfill(out, tx_parts,
+							    &htlc_outpoint);
 
 			record_to_them_htlc_fulfilled(out, out->tx_blockheight);
 
@@ -1308,10 +1354,16 @@ static bool output_spent(struct tracked_output ***outs,
 						      out,
 						      tx_blockheight,
 						      mk_mvt_tags(MVT_HTLC_FULFILL, MVT_STEALABLE));
-				steal_htlc_tx(out, outs, tx_parts,
-					      tx_blockheight,
-					      OUR_HTLC_FULFILL_TO_THEM,
-					      &htlc_outpoint);
+				if (option_seq_taproot_covenant)
+					tcov_steal_claim(out, outs, tx_parts,
+							 tx_blockheight,
+							 OUR_HTLC_FULFILL_TO_THEM,
+							 &htlc_outpoint);
+				else
+					steal_htlc_tx(out, outs, tx_parts,
+						      tx_blockheight,
+						      OUR_HTLC_FULFILL_TO_THEM,
+						      &htlc_outpoint);
 			} else {
 				record_external_spend(&tx_parts->txid, out,
 						      tx_blockheight,
@@ -1340,6 +1392,17 @@ static bool output_spent(struct tracked_output ***outs,
 				      "Funding output spent again!");
 
 		case DELAYED_CHEAT_OUTPUT_TO_THEM:
+			/* SEQUENTIA: a taproot-covenant output can also be
+			 * taken by its REVOKE leaf, by whoever holds the
+			 * revoked secret (our watchtower), into our static
+			 * payment script: then it is ours. */
+			if (option_seq_taproot_covenant
+			    && tcov_revoke_leaf_paid_us(tx_parts, input_num,
+							tx_blockheight)) {
+				resolved_by_other(out, &tx_parts->txid,
+						  OUR_PENALTY_TX);
+				break;
+			}
 			/* They successfully spent a delayed revoked output */
 			resolved_by_other(out, &tx_parts->txid,
 					  THEIR_DELAYED_CHEAT);
@@ -1520,9 +1583,20 @@ static void handle_preimage(struct tracked_output **outs,
 		/* stash the payment_hash so we can track this coin movement */
 		outs[i]->payment_hash = sha;
 
+		/* SEQUENTIA: a revoked taproot-covenant commitment's HTLC
+		 * is ours by the penalty already proposed. */
+		if (option_seq_taproot_covenant
+		    && outs[i]->tx_type == THEIR_REVOKED_UNILATERAL)
+			continue;
+
 		/* Discard any previous resolution.  Could be a timeout,
 		 * could be due to multiple identical rhashes in tx. */
 		outs[i]->proposal = tal_free(outs[i]->proposal);
+
+		if (option_seq_taproot_covenant) {
+			tcov_claim_with_preimage(outs[i], preimage);
+			continue;
+		}
 
 		/* BOLT #5:
 		 *
@@ -1716,6 +1790,7 @@ static void wait_for_resolved(struct tracked_output **outs)
 		case WIRE_ONCHAIND_SPEND_HTLC_TIMEOUT:
 		case WIRE_ONCHAIND_SPEND_FULFILL:
 		case WIRE_ONCHAIND_SPEND_HTLC_EXPIRED:
+		case WIRE_ONCHAIND_SPEND_TCOV:
 			break;
 		}
 		master_badmsg(-1, msg);
@@ -3420,6 +3495,440 @@ found:
 	wait_for_resolved(outs);
 }
 
+/*~ SEQUENTIA: the taproot-covenant channel type (common/tcov_scripts.h).
+ *
+ * Every output of its commitments is a taproot output (to_remote apart, a
+ * P2WPKH as ever), spent by one leaf or, on a revoked commitment, by the key
+ * path.  An HTLC claim from the holder's own commitment goes by a covenant
+ * leaf to the holder's delayed output D, which has to_local's script, and is
+ * swept from there after the delay.  lightningd builds every spend with a fee
+ * input from our wallet in an asset this node accepts (onchain_control.c):
+ * the covenant demands the HTLC's whole value at the claim's output, so the
+ * fee cannot come out of it. */
+
+static const struct tap_tree2 *keep_tree(const tal_t *ctx,
+					 const struct tap_tree2 *tree)
+{
+	struct tap_tree2 *t = tal_dup(ctx, struct tap_tree2, tree);
+	t->leaf[0] = tal_dup_talarr(t, u8, tree->leaf[0]);
+	t->leaf[1] = tal_dup_talarr(t, u8, tree->leaf[1]);
+	return t;
+}
+
+/* Ask lightningd to spend @out by @leaf of its tree (-1: the key path). */
+static void tcov_propose(struct tracked_output *out,
+			 enum tcov_spend_signer signer,
+			 int leaf,
+			 const struct preimage *preimage,
+			 const struct tap_tree2 *dest,
+			 u32 locktime, u32 sequence, u32 minblock,
+			 enum tcov_spend_deadline deadline,
+			 enum tx_type tx_type)
+{
+	const struct tap_tree2 *tree = out->tcov_tree;
+	u8 *leaf_script, *cb, *cov_program;
+	const u8 *msg;
+
+	if (leaf >= 0) {
+		leaf_script = tal_dup_talarr(tmpctx, u8, tree->leaf[leaf]);
+		cb = tap_tree2_control_block(tmpctx, tree, leaf);
+	} else {
+		leaf_script = tal_arr(tmpctx, u8, 0);
+		cb = tal_arr(tmpctx, u8, 0);
+	}
+	if (dest) {
+		cov_program = tal_arr(tmpctx, u8, 32);
+		tap_tree2_program(dest, cov_program);
+	} else
+		cov_program = tal_arr(tmpctx, u8, 0);
+
+	msg = towire_onchaind_spend_tcov(NULL, &out->outpoint, out->sat,
+					 tap_tree2_scriptpubkey(tmpctx, tree),
+					 signer, commit_num,
+					 remote_per_commitment_point,
+					 remote_per_commitment_secret,
+					 leaf_script, cb, &tree->merkle_root,
+					 preimage, cov_program,
+					 locktime, sequence, minblock,
+					 deadline, out->htlc.id);
+	propose_resolution_to_master(out, take(msg), minblock, tx_type);
+}
+
+/* to_local of commitment @holder's (us: our keyset; them: theirs), which is
+ * also the D of every claim from it. */
+static void tcov_holder_to_local(const struct pubkey *holder_point,
+				 enum side holder,
+				 struct tap_tree2 *tree)
+{
+	tcov_to_local_tree(tmpctx, keyset, holder_point, to_self_delay[holder],
+			   tree);
+}
+
+static bool tcov_match_htlc(const struct wally_tx_output *o,
+			    struct amount_sat amt,
+			    const struct htlc_stub *htlc,
+			    const struct pubkey *holder_point,
+			    enum side holder,
+			    struct tap_tree2 *tree)
+{
+	/* The commitment's holder offered it? */
+	if (htlc->owner == holder)
+		tcov_offered_htlc_tree(tmpctx, keyset, holder_point,
+				       to_self_delay[holder], channel_asset,
+				       &htlc->ripemd, htlc->cltv_expiry, amt,
+				       tree);
+	else
+		tcov_received_htlc_tree(tmpctx, keyset, holder_point,
+					to_self_delay[holder], channel_asset,
+					&htlc->ripemd, htlc->cltv_expiry, amt,
+					tree);
+	return wally_tx_output_scripteq(o, tap_tree2_scriptpubkey(tmpctx, tree));
+}
+
+/* Our delayed output (to_local, or a claim's D): the DELAY leaf. */
+static void tcov_sweep_delayed(struct tracked_output *out)
+{
+	tcov_propose(out, TCOV_SIGN_DELAYED, TCOV_LEAF_DELAY, NULL, NULL,
+		     0, to_self_delay[LOCAL],
+		     rel_blockheight(out, to_self_delay[LOCAL]),
+		     TCOV_DEADLINE_SWEEP, OUR_DELAYED_RETURN_TO_WALLET);
+}
+
+/* A claim of ours from our commitment confirmed: track its D. */
+static void tcov_resolve_claim(struct tracked_output ***outs,
+			       size_t out_index,
+			       const struct tx_parts *claim,
+			       size_t input_num,
+			       u32 tx_blockheight)
+{
+	struct tracked_output *out;
+	struct amount_asset asset;
+	struct bitcoin_outpoint outpoint;
+	struct pubkey point;
+	struct tap_tree2 d;
+
+	/* The covenant put D at the input's own index. */
+	outpoint.txid = claim->txid;
+	outpoint.n = input_num;
+	asset = wally_tx_output_get_amount(claim->outputs[input_num]);
+	assert(amount_asset_is(&asset, channel_asset));
+	out = new_tracked_output(outs, &outpoint, tx_blockheight,
+				 (*outs)[out_index]->resolved->tx_type,
+				 amount_sat(asset.value),
+				 DELAYED_OUTPUT_TO_US, NULL, NULL, NULL);
+	hsm_get_per_commitment_point(&point);
+	tcov_holder_to_local(&point, LOCAL, &d);
+	if (!wally_tx_output_scripteq(claim->outputs[input_num],
+				      tap_tree2_scriptpubkey(tmpctx, &d)))
+		status_broken("Claim %s output %zu is not our delayed output",
+			      fmt_bitcoin_txid(tmpctx, &claim->txid), input_num);
+	out->tcov_tree = keep_tree(out, &d);
+	tcov_sweep_delayed(out);
+}
+
+/* They claimed an HTLC of their revoked commitment into their D: take it. */
+static void tcov_steal_claim(struct tracked_output *out,
+			     struct tracked_output ***outs,
+			     const struct tx_parts *claim,
+			     u32 tx_blockheight,
+			     enum tx_type claim_type,
+			     const struct bitcoin_outpoint *d_outpoint)
+{
+	struct tracked_output *d_out;
+	struct amount_asset asset;
+	struct tap_tree2 d;
+
+	asset = wally_tx_output_get_amount(claim->outputs[d_outpoint->n]);
+	assert(amount_asset_is(&asset, channel_asset));
+	d_out = new_tracked_output(outs, d_outpoint, tx_blockheight,
+				   claim_type, amount_sat(asset.value),
+				   DELAYED_CHEAT_OUTPUT_TO_THEM,
+				   &out->htlc, NULL, NULL);
+	resolved_by_other(out, &claim->txid, claim_type);
+
+	tcov_holder_to_local(remote_per_commitment_point, REMOTE, &d);
+	d_out->tcov_tree = keep_tree(d_out, &d);
+	tcov_propose(d_out, TCOV_SIGN_PENALTY, -1, NULL, NULL, 0, 0xFFFFFFFF,
+		     tx_blockheight + 1, TCOV_DEADLINE_NOW, OUR_PENALTY_TX);
+}
+
+/* They spent an HTLC we offered with its preimage: SUCCESS leaf, on either
+ * commitment, witness <sig> <preimage> <leaf> <control block>. */
+static void tcov_extract_preimage(struct tracked_output *out,
+				  const struct tx_parts *tx_parts,
+				  const struct bitcoin_outpoint *spend)
+{
+	const struct wally_tx_witness_stack *wit
+		= tx_parts->inputs[spend->n]->witness;
+	struct preimage preimage;
+	struct sha256 sha;
+	struct ripemd160 ripemd;
+
+	if (!wit || wit->num_items != 4
+	    || wit->items[1].witness_len != sizeof(preimage)) {
+		status_broken("%s/%s spent by %s with a witness that is not"
+			      " the SUCCESS leaf's",
+			      tx_type_name(out->tx_type),
+			      output_type_name(out->output_type),
+			      fmt_bitcoin_txid(tmpctx, &tx_parts->txid));
+		return;
+	}
+	memcpy(&preimage, wit->items[1].witness, sizeof(preimage));
+	sha256(&sha, &preimage, sizeof(preimage));
+	ripemd160(&ripemd, &sha, sizeof(sha));
+	if (!ripemd160_eq(&ripemd, &out->htlc.ripemd)) {
+		status_broken("%s/%s spent with preimage %s, not ours",
+			      tx_type_name(out->tx_type),
+			      output_type_name(out->output_type),
+			      fmt_preimage(tmpctx, &preimage));
+		return;
+	}
+	out->payment_hash = sha;
+	status_debug("%s/%s gave us preimage %s",
+		     tx_type_name(out->tx_type),
+		     output_type_name(out->output_type),
+		     fmt_preimage(tmpctx, &preimage));
+	wire_sync_write(REQ_FD,
+			take(towire_onchaind_extracted_preimage(NULL,
+							       &preimage)));
+}
+
+/* We hold @out's preimage: claim it, by covenant on our commitment, directly
+ * on theirs. */
+static void tcov_claim_with_preimage(struct tracked_output *out,
+				     const struct preimage *preimage)
+{
+	if (out->tx_type == OUR_UNILATERAL) {
+		struct pubkey point;
+		struct tap_tree2 d;
+
+		hsm_get_per_commitment_point(&point);
+		tcov_holder_to_local(&point, LOCAL, &d);
+		tcov_propose(out, TCOV_SIGN_LOCAL_HTLC,
+			     TCOV_LEAF_RECEIVED_SUCCESS, preimage, &d,
+			     0, 0xFFFFFFFF, out->tx_blockheight + 1,
+			     TCOV_DEADLINE_HTLC_IN, OUR_HTLC_SUCCESS_TX);
+	} else {
+		/* Their commitment: they offered it, our leaf of their
+		 * offered tree. */
+		tcov_propose(out, TCOV_SIGN_REMOTE_HTLC,
+			     TCOV_LEAF_OFFERED_SUCCESS, preimage, NULL,
+			     0, 0xFFFFFFFF, out->tx_blockheight + 1,
+			     TCOV_DEADLINE_HTLC_IN, THEIR_HTLC_FULFILL_TO_US);
+	}
+}
+
+/* Did the spend of input @input_num pay our static payment script at the
+ * same index?  That is a REVOKE leaf's KEEP, run by whoever held the
+ * revoked secret: the coin is ours, and the wallet learns it here. */
+static bool tcov_revoke_leaf_paid_us(const struct tx_parts *tx_parts,
+				     size_t input_num, u32 tx_blockheight)
+{
+	const u8 *ours = scriptpubkey_p2wpkh(tmpctx, &keyset->other_payment_key);
+	struct bitcoin_outpoint outpoint;
+	struct amount_asset asset;
+
+	if (input_num >= tal_count(tx_parts->outputs)
+	    || !tx_parts->outputs[input_num]
+	    || !wally_tx_output_scripteq(tx_parts->outputs[input_num], ours))
+		return false;
+	asset = wally_tx_output_get_amount(tx_parts->outputs[input_num]);
+	if (!amount_asset_is(&asset, channel_asset))
+		return false;
+	outpoint.txid = tx_parts->txid;
+	outpoint.n = input_num;
+	status_debug("REVOKE leaf paid us %s at %s",
+		     fmt_amount_sat(tmpctx, amount_sat(asset.value)),
+		     fmt_bitcoin_outpoint(tmpctx, &outpoint));
+	wire_sync_write(REQ_FD,
+			take(towire_onchaind_add_utxo(NULL, &outpoint, NULL,
+						     amount_sat(asset.value),
+						     tx_blockheight, ours, 1)));
+	return true;
+}
+
+static void handle_unilateral_tcov(const struct tx_parts *tx,
+				   u32 tx_blockheight,
+				   enum side holder,
+				   bool revoked,
+				   const struct basepoints basepoints[NUM_SIDES],
+				   struct tracked_output **outs)
+{
+	struct htlcs_info *htlcs_info;
+	struct keyset *ks;
+	struct pubkey holder_point;
+	struct tap_tree2 to_local;
+	u8 *to_local_spk, *to_remote_spk, **unmatched;
+	enum tx_type tx_type;
+	static const u8 marker;
+
+	if (holder == LOCAL) {
+		htlcs_info = init_reply(tx, "Tracking our own unilateral close");
+		onchain_annotate_txin(&tx->txid, 0, TX_CHANNEL_UNILATERAL);
+		resolved_by_other(outs[0], &tx->txid, OUR_UNILATERAL);
+		hsm_get_per_commitment_point(&holder_point);
+		tx_type = OUR_UNILATERAL;
+	} else {
+		htlcs_info = init_reply(tx, revoked
+					? "Tracking their illegal close: taking all funds"
+					: "Tracking their unilateral close");
+		onchain_annotate_txin(&tx->txid, 0,
+				      TX_CHANNEL_UNILATERAL | TX_THEIRS
+				      | (revoked ? TX_CHANNEL_CHEAT : 0));
+		holder_point = *remote_per_commitment_point;
+		tx_type = revoked ? THEIR_REVOKED_UNILATERAL : THEIR_UNILATERAL;
+		resolved_by_other(outs[0], &tx->txid, tx_type);
+	}
+
+	keyset = ks = tal(tx, struct keyset);
+	if (!derive_keyset(&holder_point, &basepoints[holder],
+			   &basepoints[!holder], true, ks))
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Deriving keyset for %"PRIu64, commit_num);
+
+	tcov_holder_to_local(&holder_point, holder, &to_local);
+	to_local_spk = tap_tree2_scriptpubkey(tmpctx, &to_local);
+	/* The holder's to_remote pays the other side's static key. */
+	to_remote_spk = scriptpubkey_p2wpkh(tmpctx, &keyset->other_payment_key);
+	status_debug("Taproot-covenant commitment %"PRIu64" held by %s:"
+		     " to_local %s, to_remote %s",
+		     commit_num, side_to_str(holder),
+		     tal_hex(tmpctx, to_local_spk),
+		     tal_hex(tmpctx, to_remote_spk));
+
+	/* note_missing_htlcs() reads a NULL entry as "found". */
+	unmatched = tal_arr(tmpctx, u8 *, tal_count(htlcs_info->htlcs));
+	for (size_t i = 0; i < tal_count(unmatched); i++)
+		unmatched[i] = (u8 *)&marker;
+
+	for (size_t i = 0; i < tal_count(tx->outputs); i++) {
+		struct tracked_output *out;
+		struct amount_asset asset = wally_tx_output_get_amount(tx->outputs[i]);
+		struct amount_sat amt;
+		struct bitcoin_outpoint outpoint;
+		struct tap_tree2 tree;
+		size_t h;
+
+		outpoint.txid = tx->txid;
+		outpoint.n = i;
+		assert(amount_asset_is(&asset, channel_asset));
+		amt = amount_sat(asset.value);
+
+		if (tx->outputs[i]->script_len == 0) {
+			out = new_tracked_output(&outs, &outpoint, tx_blockheight,
+						 tx_type, amt, ELEMENTS_FEE,
+						 NULL, NULL, NULL);
+			ignore_output(out);
+			continue;
+		}
+
+		if (wally_tx_output_scripteq(tx->outputs[i], to_local_spk)) {
+			if (holder == LOCAL) {
+				out = new_tracked_output(&outs, &outpoint,
+							 tx_blockheight, tx_type,
+							 amt, DELAYED_OUTPUT_TO_US,
+							 NULL, NULL, NULL);
+				out->tcov_tree = keep_tree(out, &to_local);
+				tcov_sweep_delayed(out);
+			} else if (revoked) {
+				out = new_tracked_output(&outs, &outpoint,
+							 tx_blockheight, tx_type,
+							 amt,
+							 DELAYED_CHEAT_OUTPUT_TO_THEM,
+							 NULL, NULL, NULL);
+				out->tcov_tree = keep_tree(out, &to_local);
+				tcov_propose(out, TCOV_SIGN_PENALTY, -1, NULL,
+					     NULL, 0, 0xFFFFFFFF,
+					     tx_blockheight + 1,
+					     TCOV_DEADLINE_NOW, OUR_PENALTY_TX);
+			} else {
+				out = new_tracked_output(&outs, &outpoint,
+							 tx_blockheight, tx_type,
+							 amt, DELAYED_OUTPUT_TO_THEM,
+							 NULL, NULL, NULL);
+				ignore_output(out);
+				record_external_deposit(out, tx_blockheight,
+							mk_mvt_tags(MVT_TO_THEM));
+			}
+			continue;
+		}
+
+		if (wally_tx_output_scripteq(tx->outputs[i], to_remote_spk)) {
+			if (holder == LOCAL) {
+				out = new_tracked_output(&outs, &outpoint,
+							 tx_blockheight, tx_type,
+							 amt, OUTPUT_TO_THEM,
+							 NULL, NULL, NULL);
+				ignore_output(out);
+				record_external_deposit(out, tx_blockheight,
+							mk_mvt_tags(MVT_TO_THEM));
+			} else
+				their_unilateral_local(&outs, tx, &outpoint,
+						       tx_blockheight, amt,
+						       to_remote_spk, tx_type,
+						       1);
+			continue;
+		}
+
+		for (h = 0; h < tal_count(htlcs_info->htlcs); h++) {
+			if (!unmatched[h])
+				continue;
+			if (tcov_match_htlc(tx->outputs[i], amt,
+					    &htlcs_info->htlcs[h],
+					    &holder_point, holder, &tree))
+				break;
+		}
+		if (h == tal_count(htlcs_info->htlcs)) {
+			record_external_output(&outpoint, amt, tx_blockheight,
+					       mk_mvt_tags(MVT_PENALTY));
+			status_failed(STATUS_FAIL_INTERNAL_ERROR,
+				      "Could not find resolution for output %zu",
+				      i);
+		}
+		unmatched[h] = NULL;
+
+		out = new_tracked_output(&outs, &outpoint, tx_blockheight,
+					 tx_type, amt,
+					 htlcs_info->htlcs[h].owner == LOCAL
+					 ? OUR_HTLC : THEIR_HTLC,
+					 &htlcs_info->htlcs[h], NULL, NULL);
+		out->tcov_tree = keep_tree(out, &tree);
+
+		if (revoked) {
+			/* Ours by the key path, at once. */
+			tcov_propose(out, TCOV_SIGN_PENALTY, -1, NULL, NULL,
+				     0, 0xFFFFFFFF, tx_blockheight + 1,
+				     TCOV_DEADLINE_NOW, OUR_PENALTY_TX);
+		} else if (holder == LOCAL && out->output_type == OUR_HTLC) {
+			/* Our timeout, by covenant to D, after its CLTV. */
+			tcov_propose(out, TCOV_SIGN_LOCAL_HTLC,
+				     TCOV_LEAF_OFFERED_TIMEOUT, NULL, &to_local,
+				     out->htlc.cltv_expiry, 0xFFFFFFFE,
+				     out->htlc.cltv_expiry + 1,
+				     TCOV_DEADLINE_HTLC_OUT,
+				     OUR_HTLC_TIMEOUT_TX);
+		} else if (holder == REMOTE && out->output_type == OUR_HTLC) {
+			/* Our timeout on their commitment: their received
+			 * tree's TIMEOUT leaf, to our wallet. */
+			tcov_propose(out, TCOV_SIGN_REMOTE_HTLC,
+				     TCOV_LEAF_RECEIVED_TIMEOUT, NULL, NULL,
+				     out->htlc.cltv_expiry, 0xFFFFFFFE,
+				     out->htlc.cltv_expiry + 1,
+				     TCOV_DEADLINE_HTLC_OUT,
+				     OUR_HTLC_TIMEOUT_TO_US);
+		} else {
+			/* Their HTLC: claimed once we hold the preimage
+			 * (handle_preimage), else theirs after its CLTV. */
+			propose_ignore(out, out->htlc.cltv_expiry,
+				       THEIR_HTLC_TIMEOUT_TO_THEM);
+		}
+	}
+
+	note_missing_htlcs(unmatched, htlcs_info);
+	tal_free(htlcs_info);
+	wait_for_resolved(outs);
+}
+
 int main(int argc, char *argv[])
 {
 	setup_locale();
@@ -3477,6 +3986,7 @@ int main(int argc, char *argv[])
 				   &static_remotekey_start[REMOTE],
 				   &option_anchor_outputs,
 				   &option_anchors_zero_fee_htlc_tx,
+				   &option_seq_taproot_covenant,
 				   &min_relay_feerate)) {
 		master_badmsg(WIRE_ONCHAIND_INIT, msg);
 	}
@@ -3542,7 +4052,33 @@ int main(int argc, char *argv[])
 			     ", revocations_received = %"PRIu64,
 			     commit_num, revocations_received(&shachain));
 
-		if (is_local_commitment(&tx->txid, &our_broadcast_txid))
+		if (option_seq_taproot_covenant
+		    && is_local_commitment(&tx->txid, &our_broadcast_txid))
+			handle_unilateral_tcov(tx, tx_blockheight, LOCAL,
+					       false, basepoints, outs);
+		else if (option_seq_taproot_covenant
+			 && shachain_get_secret(&shachain, commit_num,
+						&revocation_preimage)) {
+			struct pubkey *k = tal(tx, struct pubkey);
+			remote_per_commitment_secret
+				= tal_dup(tx, struct secret,
+					  (struct secret *)&revocation_preimage);
+			if (!pubkey_from_secret(remote_per_commitment_secret, k))
+				status_failed(STATUS_FAIL_INTERNAL_ERROR,
+					      "Bad per_commitment_secret");
+			remote_per_commitment_point = k;
+			handle_unilateral_tcov(tx, tx_blockheight, REMOTE,
+					       true, basepoints, outs);
+		} else if (option_seq_taproot_covenant
+			   && (commit_num == revocations_received(&shachain)
+			       || commit_num == revocations_received(&shachain) + 1)) {
+			remote_per_commitment_point
+				= commit_num == revocations_received(&shachain)
+				? &old_remote_per_commit_point
+				: &remote_per_commit_point;
+			handle_unilateral_tcov(tx, tx_blockheight, REMOTE,
+					       false, basepoints, outs);
+		} else if (is_local_commitment(&tx->txid, &our_broadcast_txid))
 			handle_our_unilateral(tx, tx_blockheight,
 					      basepoints,
 					      opener,

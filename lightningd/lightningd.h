@@ -54,6 +54,11 @@ struct config {
 	const char *watchtower_store;
 	bool watchtower_store_on;
 
+	/* SEQUENTIA: offer the taproot-covenant channel type
+	 * (common/tcov_commit_tx.h), where the chain has tapscript
+	 * introspection and the signer can sign its spends. */
+	bool taproot_covenant_channels;
+
 	/* Do we let the opener set any fee rate they want */
 	bool ignore_fee_limits;
 

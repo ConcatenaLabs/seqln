@@ -1,13 +1,20 @@
 #include "config.h"
 #include <bitcoin/feerate.h>
 #include <bitcoin/script.h>
+#include <bitcoin/tapscript.h>
+#include <bitcoin/varint.h>
+#include <ccan/asort/asort.h>
 #include <ccan/cast/cast.h>
 #include <ccan/tal/str/str.h>
 #include <common/htlc_tx.h>
 #include <common/memleak.h>
 #include <common/psbt_keypath.h>
+#include <common/tcov_scripts.h>
+#include <common/timeout.h>
+#include <common/utxo.h>
 #include <db/exec.h>
 #include <errno.h>
+#include <hsmd/hsm_utxo.h>
 #include <hsmd/hsmd_wiregen.h>
 #include <hsmd/permissions.h>
 #include <inttypes.h>
@@ -21,6 +28,9 @@
 #include <lightningd/subd.h>
 #include <onchaind/onchaind_wiregen.h>
 #include <wallet/txfilter.h>
+#include <wallet/wallet.h>
+#include <wally_psbt.h>
+#include <wally_transaction.h>
 
 /* If we're restarting, we keep a per-channel copy of watches, and replay */
 struct replay_tx {
@@ -264,6 +274,9 @@ out:
 	}
 }
 
+static void tcov_note_spent(const struct channel *channel,
+			    const struct bitcoin_outpoint *out);
+
 /**
  * Notify onchaind that an output was spent and register new watches.
  */
@@ -271,12 +284,16 @@ static void onchain_txo_spent(struct channel *channel, const struct bitcoin_tx *
 {
 	u8 *msg;
 	struct bitcoin_txid *txid;
+	struct bitcoin_outpoint spent;
 	/* Onchaind needs all inputs, since it uses those to compare
 	 * with existing spends (which can vary, with feerate changes). */
 	struct tx_parts *parts = tx_parts_from_wally_tx(tmpctx, tx->wtx,
 							-1, -1);
 
 	watch_tx_and_outputs(channel, tx);
+
+	bitcoin_tx_input_get_outpoint(tx, input_num, &spent);
+	tcov_note_spent(channel, &spent);
 
 	/* Reply will need this if we want to unwatch */
 	txid = tal(NULL, struct bitcoin_txid);
@@ -1696,6 +1713,641 @@ static void handle_onchaind_spend_htlc_expired(struct channel *channel,
 			  __func__);
 }
 
+/*~ SEQUENTIA: spends of a taproot-covenant channel's outputs
+ * (common/tcov_scripts.h), which onchaind asks for with onchaind_spend_tcov.
+ *
+ * Input 0 spends the channel's output by one leaf or by the key path.  A
+ * covenant leaf (our HTLC claims from our own commitment) demands that the
+ * output at the input's index carry the output's whole value to our delayed
+ * output D: the fee must come from another input, from our wallet, in any
+ * asset this node accepts for fees, the channel's own first.  Any other
+ * spend pays our wallet; its fee comes out of the output itself while the
+ * node accepts the channel's asset for fees, and from another input when it
+ * does not.  Every spend is rebuilt and signed again at each block until
+ * mined, at the feerate its deadline then calls for. */
+struct tcov_spend {
+	struct channel *channel;
+	enum tcov_spend_signer signer;
+	struct bitcoin_outpoint out;
+	struct amount_sat out_sats;
+	u8 *spent_spk;
+	u64 commit_num;
+	struct pubkey *remote_point;
+	struct secret *revocation_secret;
+	u8 *leaf, *cb;
+	struct sha256 merkle_root;
+	struct preimage *preimage;
+	/* The covenant's destination, or NULL: our wallet. */
+	u8 *cov_program;
+	u32 locktime, sequence, minblock, deadline_block;
+	/* What the last broadcast paid, in its fee asset, and the wallet
+	 * coins it spent (which it reserved, and may spend again). */
+	struct amount_sat fee;
+	u8 fee_asset[33];
+	struct bitcoin_outpoint *coins;
+	/* The output is spent on chain, by this spend or by the peer. */
+	bool spent;
+};
+
+/* The spends in progress.  Once the output one spends is spent on chain it
+ * stops: the broadcast follows the txid it first sent, so a replacement
+ * that confirmed, or the peer's spend, would otherwise have it rebuilt,
+ * signed again and its fee coins reserved again at every block until the
+ * channel is forgotten. */
+static struct tcov_spend **tcov_spends;
+
+static void destroy_tcov_spend(struct tcov_spend *ts)
+{
+	for (size_t i = 0; i < tal_count(tcov_spends); i++) {
+		if (tcov_spends[i] == ts) {
+			tal_arr_remove(&tcov_spends, i);
+			return;
+		}
+	}
+}
+
+static void tcov_spend_track(struct tcov_spend *ts)
+{
+	if (!tcov_spends)
+		tcov_spends = notleak(tal_arr(NULL, struct tcov_spend *, 0));
+	ts->spent = false;
+	tal_arr_expand(&tcov_spends, ts);
+	tal_add_destructor(ts, destroy_tcov_spend);
+}
+
+static void tcov_note_spent(const struct channel *channel,
+			    const struct bitcoin_outpoint *out)
+{
+	for (size_t i = 0; i < tal_count(tcov_spends); i++) {
+		if (tcov_spends[i]->channel == channel
+		    && bitcoin_outpoint_eq(&tcov_spends[i]->out, out))
+			tcov_spends[i]->spent = true;
+	}
+}
+
+/* The input 0 signature, from hsmd. */
+static bool tcov_sign_input0(const struct tcov_spend *ts,
+			     struct bitcoin_tx *tx,
+			     struct bip340sig *sig)
+{
+	struct lightningd *ld = ts->channel->peer->ld;
+	const struct node_id *id = &ts->channel->peer->id;
+	u64 dbid = ts->channel->dbid;
+	const u8 *msg;
+
+	switch (ts->signer) {
+	case TCOV_SIGN_DELAYED:
+		msg = towire_hsmd_sign_tcov_delayed_to_us(NULL, ts->commit_num,
+							  tx, 0, ts->leaf,
+							  id, dbid);
+		break;
+	case TCOV_SIGN_LOCAL_HTLC:
+		msg = towire_hsmd_sign_tcov_local_htlc(NULL, ts->commit_num,
+						       tx, 0, ts->leaf,
+						       id, dbid);
+		break;
+	case TCOV_SIGN_REMOTE_HTLC:
+		msg = towire_hsmd_sign_tcov_remote_htlc_to_us(NULL,
+							      ts->remote_point,
+							      tx, 0, ts->leaf,
+							      id, dbid);
+		break;
+	case TCOV_SIGN_PENALTY:
+		msg = towire_hsmd_sign_tcov_penalty(NULL, ts->revocation_secret,
+						    tx, 0, &ts->merkle_root,
+						    id, dbid);
+		break;
+	default:
+		return false;
+	}
+	msg = hsm_sync_req(tmpctx, ld, take(msg));
+	return fromwire_hsmd_sign_tcov_reply(msg, sig);
+}
+
+/* Input 0's witness: <sig> [<preimage>] <leaf> <control block>, or <sig>. */
+static u8 **tcov_witness(const tal_t *ctx, const struct tcov_spend *ts,
+			 const struct bip340sig *sig)
+{
+	u8 **w = tal_arr(ctx, u8 *, 0);
+
+	tal_arr_expand(&w, tap_sig_to_witness(w, sig, TAP_SIGHASH_DEFAULT));
+	if (tal_bytelen(ts->leaf) == 0)
+		return w;
+	if (ts->preimage)
+		tal_arr_expand(&w, tal_dup_arr(w, u8, ts->preimage->r,
+					       sizeof(ts->preimage->r), 0));
+	tal_arr_expand(&w, tal_dup_talarr(w, u8, ts->leaf));
+	tal_arr_expand(&w, tal_dup_talarr(w, u8, ts->cb));
+	return w;
+}
+
+static size_t tcov_input0_witness_weight(const struct tcov_spend *ts)
+{
+	/* count, the 64-byte signature, then the optional elements. */
+	size_t w = 1 + 1 + 64;
+
+	if (tal_bytelen(ts->leaf)) {
+		if (ts->preimage)
+			w += 1 + 32;
+		w += varint_size(tal_bytelen(ts->leaf)) + tal_bytelen(ts->leaf);
+		w += 1 + tal_bytelen(ts->cb);
+	}
+	return w;
+}
+
+/* Our wallet's script for what this spend pays us. */
+static u8 *tcov_wallet_spk(const tal_t *ctx, struct channel *channel,
+			   struct ext_key *ext)
+{
+	struct lightningd *ld = channel->peer->ld;
+	struct pubkey final_key;
+
+	if (ld->bip86_base) {
+		bip86_pubkey(ld, &final_key, channel->final_key_idx);
+		if (bip32_key_from_parent(ld->bip86_base, channel->final_key_idx,
+					  BIP32_FLAG_KEY_PUBLIC, ext) != WALLY_OK)
+			return NULL;
+	} else {
+		bip32_pubkey(ld, &final_key, channel->final_key_idx);
+		if (bip32_key_from_parent(ld->bip32_base, channel->final_key_idx,
+					  BIP32_FLAG_KEY_PUBLIC, ext) != WALLY_OK)
+			return NULL;
+	}
+	return scriptpubkey_p2wpkh(ctx, &final_key);
+}
+
+/* Mark @psbt's output @outnum as our wallet key's. */
+static void tcov_set_keypath(struct wally_psbt *psbt, size_t outnum,
+			     struct channel *channel, const struct ext_key *ext)
+{
+	tal_wally_start();
+	/* Only a hint for the wallet's bookkeeping: the output pays our
+	 * script whether or not it carries one. */
+	if (!psbt_output_set_keypath(channel->final_key_idx, ext, false,
+				     &psbt->outputs[outnum]))
+		log_unusual(channel->log, "tcov spend: no keypath on output %zu",
+			    outnum);
+	tal_wally_end(psbt);
+}
+
+/* Spendable wallet coins of @asset. */
+static bool tcov_own_coin(const struct tcov_spend *ts,
+			  const struct bitcoin_outpoint *op)
+{
+	for (size_t i = 0; i < tal_count(ts->coins); i++)
+		if (bitcoin_outpoint_eq(&ts->coins[i], op))
+			return true;
+	return false;
+}
+
+/* Spendable wallet coins of @asset: unreserved, or reserved by this very
+ * spend's last broadcast. */
+static struct utxo **tcov_coins(const tal_t *ctx, const struct tcov_spend *ts,
+				const u8 *asset, struct amount_sat *total)
+{
+	struct lightningd *ld = ts->channel->peer->ld;
+	struct utxo **all = wallet_get_unspent_utxos(tmpctx, ld->wallet);
+	struct utxo **coins = tal_arr(ctx, struct utxo *, 0);
+	u32 height = get_block_height(ld->topology);
+
+	*total = AMOUNT_SAT(0);
+	for (size_t i = 0; i < tal_count(all); i++) {
+		if (memcmp(all[i]->asset, asset, sizeof(all[i]->asset)) != 0)
+			continue;
+		if ((utxo_is_reserved(all[i], height)
+		     && !tcov_own_coin(ts, &all[i]->outpoint))
+		    || utxo_is_csv_locked(all[i], height)
+		    || !all[i]->blockheight
+		    || all[i]->close_info)
+			continue;
+		if (!amount_sat_add(total, *total, all[i]->amount))
+			continue;
+		tal_arr_expand(&coins, tal_steal(coins, all[i]));
+	}
+	return coins;
+}
+
+/* The weight of the spend paying @dest_spk, with @coins (none: the fee out
+ * of the output), a change output if @change, and the fee output. */
+static size_t tcov_weight(const struct tcov_spend *ts, const u8 *dest_spk,
+			  struct utxo **coins, bool change)
+{
+	struct wally_psbt *psbt = create_psbt(tmpctx, 0, 0, ts->locktime);
+	struct bitcoin_tx *tx;
+	size_t weight;
+	u8 dummy[33];
+
+	memset(dummy, 1, sizeof(dummy));
+	psbt_append_input(psbt, &ts->out, ts->sequence, NULL, NULL, NULL);
+	psbt_append_output_asset(psbt, dest_spk, ts->out_sats, dummy);
+	for (size_t i = 0; i < tal_count(coins); i++)
+		psbt_append_input(psbt, &coins[i]->outpoint, 0, NULL, NULL, NULL);
+	if (change)
+		psbt_append_output_asset(psbt, dest_spk, ts->out_sats, dummy);
+	psbt_append_output_asset(psbt, NULL, ts->out_sats, dummy);
+	tx = bitcoin_tx_with_psbt(tmpctx, psbt);
+	/* The inputs are counted; add their witnesses. */
+	weight = bitcoin_tx_weight(tx) + tcov_input0_witness_weight(ts);
+	for (size_t i = 0; i < tal_count(coins); i++)
+		weight += 1 + bitcoin_tx_input_witness_weight(coins[i]->utxotype);
+	return weight;
+}
+
+static int cmp_utxo_amount_desc(struct utxo *const *a, struct utxo *const *b,
+				void *unused)
+{
+	if (amount_sat_greater((*a)->amount, (*b)->amount))
+		return -1;
+	if (amount_sat_less((*a)->amount, (*b)->amount))
+		return 1;
+	return 0;
+}
+
+/* Build and sign the spend at @feerate (reference atoms per kw).  NULL if
+ * it cannot be paid for now. */
+static struct bitcoin_tx *tcov_build(const tal_t *ctx,
+				     struct tcov_spend *ts,
+				     u32 feerate)
+{
+	struct channel *channel = ts->channel;
+	struct lightningd *ld = channel->peer->ld;
+	const u8 *chan_asset = channel->channel_asset;
+	struct ext_key ext;
+	u8 *wallet_spk, *dest_spk;
+	struct wally_psbt *psbt;
+	struct utxo **coins = NULL;
+	const u8 *fee_asset = NULL;
+	struct amount_sat fee, change = AMOUNT_SAT(0), sum = AMOUNT_SAT(0);
+	struct bitcoin_tx *tx;
+	struct bip340sig sig;
+	const struct hsm_utxo **hsm_utxos;
+	const u8 *msg;
+	u64 chan_rate = topo_asset_fee_rate(ld->topology, chan_asset);
+
+	wallet_spk = tcov_wallet_spk(tmpctx, channel, &ext);
+	if (!wallet_spk) {
+		log_broken(channel->log, "tcov spend: no wallet key");
+		return NULL;
+	}
+	if (ts->cov_program) {
+		dest_spk = tal_arr(tmpctx, u8, 2 + 32);
+		dest_spk[0] = 0x51;
+		dest_spk[1] = 32;
+		memcpy(dest_spk + 2, ts->cov_program, 32);
+	} else
+		dest_spk = wallet_spk;
+
+	/* Not a covenant, and the channel's asset pays fees here: out of
+	 * the output itself, as for any other channel type. */
+	if (!ts->cov_program && chan_rate) {
+		size_t weight = tcov_weight(ts, dest_spk, NULL, false);
+		struct amount_sat left;
+
+		fee = amount_tx_fee(feerate_in_asset(feerate, chan_rate), weight);
+		if (!amount_sat_sub(&left, ts->out_sats, fee)
+		    || amount_sat_less(left, channel->our_config.dust_limit)) {
+			log_unusual(channel->log, "tcov spend of %s: %s cannot pay"
+				    " its own fee %s; looking for a fee coin",
+				    fmt_bitcoin_outpoint(tmpctx, &ts->out),
+				    fmt_amount_sat(tmpctx, ts->out_sats),
+				    fmt_amount_sat(tmpctx, fee));
+		} else {
+			psbt = create_psbt(tmpctx, 0, 0, ts->locktime);
+			psbt_append_input(psbt, &ts->out, ts->sequence, NULL,
+					  NULL, NULL);
+			psbt_input_set_wit_utxo_asset(psbt, 0, ts->spent_spk,
+						      ts->out_sats, chan_asset);
+			psbt_append_output_asset(psbt, dest_spk, left,
+						 chan_asset);
+			tcov_set_keypath(psbt, 0, channel, &ext);
+			psbt_append_output_asset(psbt, NULL, fee, chan_asset);
+			memcpy(ts->fee_asset, chan_asset, sizeof(ts->fee_asset));
+			goto sign;
+		}
+	}
+
+	/* A fee coin: the channel's asset if it pays fees here and we hold
+	 * enough of it, else the accepted asset whose coins are worth the
+	 * most to this node.  The Sequence token is one asset among them. */
+	for (size_t i = 0; i < tal_count(ld->topology->asset_fee_rates) + 1; i++) {
+		const u8 *asset;
+		u64 rate;
+		struct amount_sat total, need;
+		struct utxo **c;
+
+		if (i == 0) {
+			asset = chan_asset;
+			rate = chan_rate;
+		} else {
+			asset = ld->topology->asset_fee_rates[i-1].asset;
+			rate = ld->topology->asset_fee_rates[i-1].scaled_value;
+		}
+		if (!rate)
+			continue;
+		c = tcov_coins(tmpctx, ts, asset, &total);
+		if (tal_count(c) == 0)
+			continue;
+		need = amount_tx_fee(feerate_in_asset(feerate, rate),
+				     tcov_weight(ts, dest_spk, c, true));
+		if (amount_sat_less(total, need))
+			continue;
+		if (i == 0) {
+			coins = c;
+			fee_asset = asset;
+			break;
+		}
+		/* Their value to this node: atoms times its rate for them. */
+		double worth = (double)total.satoshis * rate; /* Raw: ranking */
+		double best = (double)sum.satoshis /* Raw: ranking */
+			* topo_asset_fee_rate(ld->topology, fee_asset ? fee_asset : asset);
+		if (!fee_asset || worth > best) {
+			coins = c;
+			fee_asset = asset;
+			sum = total;
+		}
+	}
+	if (!fee_asset) {
+		log_unusual(channel->log, "tcov spend of %s: no coin in an asset"
+			    " this node accepts for fees covers it; trying"
+			    " again",
+			    fmt_bitcoin_outpoint(tmpctx, &ts->out));
+		return NULL;
+	}
+
+	/* Fewest coins: largest first, until the fee and a change output
+	 * are covered. */
+	asort(coins, tal_count(coins), cmp_utxo_amount_desc, NULL);
+	{
+		u64 rate = topo_asset_fee_rate(ld->topology, fee_asset);
+		struct utxo **use = tal_arr(tmpctx, struct utxo *, 0);
+
+		sum = AMOUNT_SAT(0);
+		for (size_t i = 0; i < tal_count(coins); i++) {
+			tal_arr_expand(&use, coins[i]);
+			if (!amount_sat_add(&sum, sum, coins[i]->amount))
+				return NULL;
+			fee = amount_tx_fee(feerate_in_asset(feerate, rate),
+					    tcov_weight(ts, dest_spk, use, true));
+			if (amount_sat_greater_eq(sum, fee))
+				break;
+		}
+		coins = use;
+		if (!amount_sat_sub(&change, sum, fee))
+			return NULL;
+		/* Change below the chain's dust goes to the fee. */
+		if (amount_sat_less(change, chainparams->dust_limit)) {
+			fee = sum;
+			change = AMOUNT_SAT(0);
+		}
+	}
+
+	psbt = create_psbt(tmpctx, 0, 0, ts->locktime);
+	psbt_append_input(psbt, &ts->out, ts->sequence, NULL, NULL, NULL);
+	psbt_input_set_wit_utxo_asset(psbt, 0, ts->spent_spk, ts->out_sats,
+				      chan_asset);
+	psbt_append_output_asset(psbt, dest_spk, ts->out_sats, chan_asset);
+	if (!ts->cov_program)
+		tcov_set_keypath(psbt, 0, channel, &ext);
+	psbt = psbt_using_utxos(tmpctx, ld->wallet, coins, ts->locktime,
+				BITCOIN_TX_RBF_SEQUENCE, psbt);
+	if (amount_sat_greater(change, AMOUNT_SAT(0))) {
+		psbt_append_output_asset(psbt, wallet_spk, change, fee_asset);
+		tcov_set_keypath(psbt, psbt->num_outputs - 1, channel, &ext);
+	}
+	psbt_append_output_asset(psbt, NULL, fee, fee_asset);
+	memcpy(ts->fee_asset, fee_asset, sizeof(ts->fee_asset));
+
+sign:
+	tx = bitcoin_tx_with_psbt(tmpctx, psbt);
+	if (!tcov_sign_input0(ts, tx, &sig)) {
+		log_broken(channel->log, "tcov spend: hsmd did not sign %s",
+			   fmt_bitcoin_outpoint(tmpctx, &ts->out));
+		return NULL;
+	}
+	tal_wally_start();
+	{
+		u8 **wit = tcov_witness(tmpctx, ts, &sig);
+		struct wally_tx_witness_stack *stack;
+
+		wally_tx_witness_stack_init_alloc(tal_count(wit), &stack);
+		for (size_t i = 0; i < tal_count(wit); i++)
+			wally_tx_witness_stack_add(stack, wit[i],
+						   tal_bytelen(wit[i]));
+		wally_psbt_input_set_final_witness(&psbt->inputs[0], stack);
+		wally_tx_witness_stack_free(stack);
+	}
+	tal_wally_end(psbt);
+
+	if (tal_count(coins)) {
+		hsm_utxos = utxos_to_hsm_utxos(tmpctx, coins);
+		msg = towire_hsmd_sign_htlc_tx_mingle(NULL, &channel->peer->id,
+						      channel->dbid, hsm_utxos,
+						      psbt);
+		msg = hsm_sync_req(tmpctx, ld, take(msg));
+		if (!fromwire_hsmd_sign_htlc_tx_mingle_reply(tmpctx, msg, &psbt))
+			fatal("Reading sign_htlc_tx_mingle_reply: %s",
+			      tal_hex(tmpctx, msg));
+		/* Keep other spends off these coins until this one can
+		 * be mined, and a few blocks more. */
+		for (size_t i = 0; i < tal_count(coins); i++)
+			wallet_reserve_utxo(ld->wallet, coins[i],
+					    get_block_height(ld->topology),
+					    (ts->minblock > get_block_height(ld->topology)
+					     ? ts->minblock - get_block_height(ld->topology)
+					     : 0) + 12);
+	}
+	if (!psbt_finalize(psbt)) {
+		log_broken(channel->log, "tcov spend: cannot finalize %s",
+			   fmt_wally_psbt(tmpctx, psbt));
+		return NULL;
+	}
+	tx = tal(ctx, struct bitcoin_tx);
+	tx->chainparams = chainparams;
+	tx->wtx = psbt_final_tx(tx, psbt);
+	if (!tx->wtx)
+		return tal_free(tx);
+	tx->psbt = tal_steal(tx, psbt);
+	ts->fee = fee;
+	tal_free(ts->coins);
+	ts->coins = tal_arr(ts, struct bitcoin_outpoint, tal_count(coins));
+	for (size_t i = 0; i < tal_count(coins); i++)
+		ts->coins[i] = coins[i]->outpoint;
+	log_debug(channel->log, "tcov spend of %s (%s): fee %s of asset %s at"
+		  " %u/kw, %zu fee coin(s)",
+		  fmt_bitcoin_outpoint(tmpctx, &ts->out),
+		  ts->cov_program ? "by covenant" : "to our wallet",
+		  fmt_amount_sat(tmpctx, fee), fmt_asset_id(tmpctx, ts->fee_asset),
+		  feerate, tal_count(coins));
+	return tx;
+}
+
+static u32 tcov_feerate(const struct tcov_spend *ts)
+{
+	return feerate_for_target(ts->channel->peer->ld->topology,
+				  ts->deadline_block);
+}
+
+/* Each block: rebuild at the deadline's feerate, and replace the one out
+ * there if the new one pays more. */
+static bool tcov_rebroadcast(struct channel *channel,
+			     const struct bitcoin_tx **tx,
+			     struct tcov_spend *ts)
+{
+	struct amount_sat oldfee = ts->fee;
+	u8 oldasset[33];
+	struct bitcoin_tx *newtx;
+	struct bitcoin_txid oldtxid, newtxid;
+
+	if (ts->spent) {
+		log_debug(channel->log, "tcov spend of %s: output spent, done",
+			  fmt_bitcoin_outpoint(tmpctx, &ts->out));
+		return false;
+	}
+	memcpy(oldasset, ts->fee_asset, sizeof(oldasset));
+	newtx = tcov_build(tal_parent(*tx), ts, tcov_feerate(ts));
+	if (!newtx)
+		return true;
+	/* A replacement must pay more than what it replaces. */
+	if (memcmp(oldasset, ts->fee_asset, sizeof(oldasset)) == 0
+	    && amount_sat_less_eq(ts->fee, oldfee)) {
+		ts->fee = oldfee;
+		tal_free(newtx);
+		return true;
+	}
+	bitcoin_txid(*tx, &oldtxid);
+	bitcoin_txid(newtx, &newtxid);
+	log_(channel->log,
+	     LOG_INFORM, NULL, false,
+	     "RBF tcov spend %s (fee %s) with %s (fee %s of %s)",
+	     fmt_bitcoin_txid(tmpctx, &oldtxid),
+	     fmt_amount_sat(tmpctx, oldfee),
+	     fmt_bitcoin_txid(tmpctx, &newtxid),
+	     fmt_amount_sat(tmpctx, ts->fee),
+	     fmt_asset_id(tmpctx, ts->fee_asset));
+	tal_free(*tx);
+	*tx = newtx;
+	return true;
+}
+
+static void tcov_retry(struct tcov_spend *ts)
+{
+	/* broadcast_tx's macro names a type "struct channel": pass a plain
+	 * variable of that name. */
+	struct channel *channel = ts->channel;
+	struct lightningd *ld = channel->peer->ld;
+	struct bitcoin_tx *tx;
+
+	if (ts->spent) {
+		tal_free(ts);
+		return;
+	}
+	tx = tcov_build(ts, ts, tcov_feerate(ts));
+	if (!tx) {
+		notleak(new_reltimer(ld->timers, ts, time_from_sec(10),
+				     tcov_retry, ts));
+		return;
+	}
+	log_debug(channel->log, "Broadcast for onchaind tx %s",
+		  fmt_bitcoin_tx(tmpctx, tx));
+	/* The outgoing tx owns the spend from here, and frees it. */
+	broadcast_tx(channel, ld->topology, channel, take(tx), NULL,
+		     false, ts->minblock, NULL, tcov_rebroadcast, take(ts));
+}
+
+static void handle_onchaind_spend_tcov(struct channel *channel,
+				       const u8 *msg)
+{
+	struct lightningd *ld = channel->peer->ld;
+	struct tcov_spend *ts = tal(channel, struct tcov_spend);
+	u8 signer, deadline;
+	u64 htlc_id;
+	struct bitcoin_tx *tx;
+	struct onchain_witness_element **welements;
+	u8 **wit;
+
+	ts->coins = NULL;
+	ts->channel = channel;
+	tcov_spend_track(ts);
+	if (!fromwire_onchaind_spend_tcov(ts, msg, &ts->out, &ts->out_sats,
+					  &ts->spent_spk, &signer,
+					  &ts->commit_num, &ts->remote_point,
+					  &ts->revocation_secret,
+					  &ts->leaf, &ts->cb,
+					  &ts->merkle_root, &ts->preimage,
+					  &ts->cov_program,
+					  &ts->locktime, &ts->sequence,
+					  &ts->minblock, &deadline,
+					  &htlc_id)) {
+		channel_internal_error(channel, "Invalid onchaind_spend_tcov %s",
+				       tal_hex(tmpctx, msg));
+		tal_free(ts);
+		return;
+	}
+	ts->signer = signer;
+	if (tal_bytelen(ts->cov_program) == 0)
+		ts->cov_program = tal_free(ts->cov_program);
+	else if (tal_bytelen(ts->cov_program) != 32) {
+		channel_internal_error(channel, "onchaind_spend_tcov: bad program");
+		tal_free(ts);
+		return;
+	}
+
+	switch ((enum tcov_spend_deadline)deadline) {
+	case TCOV_DEADLINE_HTLC_IN:
+		ts->deadline_block = htlc_incoming_deadline(channel, htlc_id);
+		break;
+	case TCOV_DEADLINE_HTLC_OUT:
+		ts->deadline_block = htlc_outgoing_incoming_deadline(channel,
+								     htlc_id);
+		break;
+	case TCOV_DEADLINE_NOW:
+		ts->deadline_block = get_block_height(ld->topology) + 2;
+		break;
+	case TCOV_DEADLINE_SWEEP:
+	default:
+		ts->deadline_block = slow_sweep_deadline(ld->topology, channel,
+							 max_unsigned(get_block_height(ld->topology),
+								      ts->minblock));
+		break;
+	}
+
+	tx = tcov_build(ts, ts, tcov_feerate(ts));
+
+	/* Elements to recognise our spend by: the signature changes with
+	 * every rebuild, the rest does not. */
+	{
+		struct bip340sig dummy;
+		memset(&dummy, 0, sizeof(dummy));
+		wit = tcov_witness(tmpctx, ts, &dummy);
+	}
+	welements = tal_arr(tmpctx, struct onchain_witness_element *,
+			    tal_count(wit));
+	for (size_t i = 0; i < tal_count(wit); i++) {
+		welements[i] = tal(welements, struct onchain_witness_element);
+		welements[i]->is_signature = (i == 0);
+		welements[i]->witness = tal_dup_talarr(welements[i], u8, wit[i]);
+	}
+
+	/* onchaind recognises our spend by these whether or not it is
+	 * built yet. */
+	subd_send_msg(channel->owner,
+		      take(towire_onchaind_spend_created(NULL, true,
+				cast_const2(const struct onchain_witness_element **,
+					    welements))));
+
+	if (!tx) {
+		/* Nothing to pay its fee with yet: try again later. */
+		notleak(new_reltimer(ld->timers, ts, time_from_sec(10),
+				     tcov_retry, ts));
+		return;
+	}
+
+	log_debug(channel->log, "Broadcast for onchaind tx %s",
+		  fmt_bitcoin_tx(tmpctx, tx));
+	broadcast_tx(channel, ld->topology, channel, take(tx), NULL, false,
+		     ts->minblock, NULL, tcov_rebroadcast, take(ts));
+}
+
 static unsigned int onchain_msg(struct subd *sd, const u8 *msg, const int *fds UNUSED)
 {
 	enum onchaind_wire t = fromwire_peektype(msg);
@@ -1763,6 +2415,10 @@ static unsigned int onchain_msg(struct subd *sd, const u8 *msg, const int *fds U
 
 	case WIRE_ONCHAIND_SPEND_HTLC_EXPIRED:
 		handle_onchaind_spend_htlc_expired(sd->channel, msg);
+		break;
+
+	case WIRE_ONCHAIND_SPEND_TCOV:
+		handle_onchaind_spend_tcov(sd->channel, msg);
 		break;
 
 	/* We send these, not receive them */
@@ -1931,6 +2587,7 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 				  channel->static_remotekey_start[REMOTE],
 				   channel_has(channel, OPT_ANCHOR_OUTPUTS_DEPRECATED),
 				   channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX),
+				   channel_has(channel, OPT_SEQ_TAPROOT_COVENANT),
 				  feerate_min(ld, NULL));
 	subd_send_msg(channel->owner, take(msg));
 

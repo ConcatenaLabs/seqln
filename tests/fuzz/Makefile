@@ -10,7 +10,7 @@ tests/fuzz/fuzz-wire-*.o: tests/fuzz/wire.h
 tests/fuzz/fuzz-bolt12-*.o: tests/fuzz/bolt12.h
 
 tests/fuzz/fuzz-handle_onion_message: connectd/onion_message.o connectd/connectd_wiregen.o
-tests/fuzz/fuzz-full_channel: channeld/full_channel.o channeld/commit_tx.o
+tests/fuzz/fuzz-full_channel: channeld/full_channel.o channeld/commit_tx.o channeld/tcov_channel.o
 tests/fuzz/fuzz-open_channel: hsmd/hsmd_wiregen.o openingd/common.o openingd/openingd_wiregen.o
 
 FUZZ_TARGETS_SRC := $(wildcard tests/fuzz/fuzz-*.c)

@@ -531,3 +531,56 @@ msgdata,hsmd_sign_htlc_tx_mingle,psbt,wally_psbt,
 
 msgtype,hsmd_sign_htlc_tx_mingle_reply,150
 msgdata,hsmd_sign_htlc_tx_mingle_reply,psbt,wally_psbt,
+
+# SEQUENTIA: the taproot-covenant channel type (common/tcov_scripts.h).
+# lightningd asks for one BIP340 signature, SIGHASH_DEFAULT, over one input
+# of a spend of one of the channel's taproot outputs.  The PSBT holds every
+# input's previous output: the Elements taproot signature hash commits to
+# all of them, fee inputs in another asset included.
+# Our to_local, or what a claim from our commitment paid, by its DELAY leaf:
+# our delayed payment key for commit_num.
+msgtype,hsmd_sign_tcov_delayed_to_us,61
+msgdata,hsmd_sign_tcov_delayed_to_us,commit_num,u64,
+msgdata,hsmd_sign_tcov_delayed_to_us,tx,bitcoin_tx,
+msgdata,hsmd_sign_tcov_delayed_to_us,input,u32,
+msgdata,hsmd_sign_tcov_delayed_to_us,leaf_len,u16,
+msgdata,hsmd_sign_tcov_delayed_to_us,leaf,u8,leaf_len
+msgdata,hsmd_sign_tcov_delayed_to_us,peerid,node_id,
+msgdata,hsmd_sign_tcov_delayed_to_us,channel_dbid,u64,
+
+# An HTLC on our commitment, by its covenant leaf (the TIMEOUT of one we
+# offered, the SUCCESS of one we received): our HTLC key for commit_num.
+msgtype,hsmd_sign_tcov_local_htlc,62
+msgdata,hsmd_sign_tcov_local_htlc,commit_num,u64,
+msgdata,hsmd_sign_tcov_local_htlc,tx,bitcoin_tx,
+msgdata,hsmd_sign_tcov_local_htlc,input,u32,
+msgdata,hsmd_sign_tcov_local_htlc,leaf_len,u16,
+msgdata,hsmd_sign_tcov_local_htlc,leaf,u8,leaf_len
+msgdata,hsmd_sign_tcov_local_htlc,peerid,node_id,
+msgdata,hsmd_sign_tcov_local_htlc,channel_dbid,u64,
+
+# An HTLC on their commitment, by the leaf that pays us directly (the
+# SUCCESS of one they offered, the TIMEOUT of one they received): our HTLC
+# key for their per-commitment point.
+msgtype,hsmd_sign_tcov_remote_htlc_to_us,63
+msgdata,hsmd_sign_tcov_remote_htlc_to_us,remote_per_commitment_point,pubkey,
+msgdata,hsmd_sign_tcov_remote_htlc_to_us,tx,bitcoin_tx,
+msgdata,hsmd_sign_tcov_remote_htlc_to_us,input,u32,
+msgdata,hsmd_sign_tcov_remote_htlc_to_us,leaf_len,u16,
+msgdata,hsmd_sign_tcov_remote_htlc_to_us,leaf,u8,leaf_len
+msgdata,hsmd_sign_tcov_remote_htlc_to_us,peerid,node_id,
+msgdata,hsmd_sign_tcov_remote_htlc_to_us,channel_dbid,u64,
+
+# An output of their revoked commitment, or what a claim from it paid, by
+# the key path: the revocation key, tweaked for the output's script tree.
+msgtype,hsmd_sign_tcov_penalty,64
+msgdata,hsmd_sign_tcov_penalty,revocation_secret,secret,
+msgdata,hsmd_sign_tcov_penalty,tx,bitcoin_tx,
+msgdata,hsmd_sign_tcov_penalty,input,u32,
+msgdata,hsmd_sign_tcov_penalty,merkle_root,sha256,
+msgdata,hsmd_sign_tcov_penalty,peerid,node_id,
+msgdata,hsmd_sign_tcov_penalty,channel_dbid,u64,
+
+# Reply for the four above.
+msgtype,hsmd_sign_tcov_reply,161
+msgdata,hsmd_sign_tcov_reply,sig,bip340sig,
