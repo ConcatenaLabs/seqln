@@ -11,6 +11,7 @@
 #include <common/lease_rates.h>
 #include <common/memleak.h>
 #include <common/peer_billboard.h>
+#include <common/point_lock.h>
 #include <common/status.h>
 #include <common/subdaemon.h>
 #include <common/tcov_scripts.h>
@@ -1555,9 +1556,14 @@ static void handle_preimage(struct tracked_output **outs,
 	size_t i;
 	struct sha256 sha;
 	struct ripemd160 ripemd;
+	struct pubkey point;
+	bool is_point;
 
 	sha256(&sha, preimage, sizeof(*preimage));
 	ripemd160(&ripemd, &sha, sizeof(sha));
+	/* SEQUENTIA: for a point-locked HTLC we are told the scalar that
+	 * opens its lock point (common/point_lock.h). */
+	is_point = point_lock_point_of(preimage, &point);
 
 	for (i = 0; i < tal_count(outs); i++) {
 		const u8 *msg;
@@ -1565,7 +1571,11 @@ static void handle_preimage(struct tracked_output **outs,
 		if (outs[i]->output_type != THEIR_HTLC)
 			continue;
 
-		if (!ripemd160_eq(&outs[i]->htlc.ripemd, &ripemd))
+		if (outs[i]->htlc.has_lock_point) {
+			if (!is_point
+			    || !pubkey_eq(&outs[i]->htlc.lock_point, &point))
+				continue;
+		} else if (!ripemd160_eq(&outs[i]->htlc.ripemd, &ripemd))
 			continue;
 
 		/* If HTLC has timed out, we will already have
@@ -1581,7 +1591,10 @@ static void handle_preimage(struct tracked_output **outs,
 		}
 
 		/* stash the payment_hash so we can track this coin movement */
-		outs[i]->payment_hash = sha;
+		if (outs[i]->htlc.has_lock_point)
+			point_lock_payment_hash(&point, &outs[i]->payment_hash);
+		else
+			outs[i]->payment_hash = sha;
 
 		/* SEQUENTIA: a revoked taproot-covenant commitment's HTLC
 		 * is ours by the penalty already proposed. */
@@ -3575,13 +3588,15 @@ static bool tcov_match_htlc(const struct wally_tx_output *o,
 	if (htlc->owner == holder)
 		tcov_offered_htlc_tree(tmpctx, keyset, holder_point,
 				       to_self_delay[holder], channel_asset,
-				       &htlc->ripemd, htlc->cltv_expiry, amt,
-				       tree);
+				       &htlc->ripemd,
+				       htlc->has_lock_point ? &htlc->lock_point : NULL,
+				       htlc->cltv_expiry, amt, tree);
 	else
 		tcov_received_htlc_tree(tmpctx, keyset, holder_point,
 					to_self_delay[holder], channel_asset,
-					&htlc->ripemd, htlc->cltv_expiry, amt,
-					tree);
+					&htlc->ripemd,
+					htlc->has_lock_point ? &htlc->lock_point : NULL,
+					htlc->cltv_expiry, amt, tree);
 	return wally_tx_output_scripteq(o, tap_tree2_scriptpubkey(tmpctx, tree));
 }
 
@@ -3674,6 +3689,28 @@ static void tcov_extract_preimage(struct tracked_output *out,
 		return;
 	}
 	memcpy(&preimage, wit->items[1].witness, sizeof(preimage));
+	/* SEQUENTIA: a point-locked HTLC's SUCCESS leaf took the scalar of
+	 * its lock point (common/point_lock.h). */
+	if (out->htlc.has_lock_point) {
+		if (!point_lock_opens(&out->htlc.lock_point, &preimage)) {
+			status_broken("%s/%s spent with scalar %s, which does"
+				      " not open its point lock",
+				      tx_type_name(out->tx_type),
+				      output_type_name(out->output_type),
+				      fmt_preimage(tmpctx, &preimage));
+			return;
+		}
+		point_lock_payment_hash(&out->htlc.lock_point,
+					&out->payment_hash);
+		status_debug("%s/%s gave us scalar %s",
+			     tx_type_name(out->tx_type),
+			     output_type_name(out->output_type),
+			     fmt_preimage(tmpctx, &preimage));
+		wire_sync_write(REQ_FD,
+				take(towire_onchaind_extracted_preimage(NULL,
+								       &preimage)));
+		return;
+	}
 	sha256(&sha, &preimage, sizeof(preimage));
 	ripemd160(&ripemd, &sha, sizeof(sha));
 	if (!ripemd160_eq(&ripemd, &out->htlc.ripemd)) {

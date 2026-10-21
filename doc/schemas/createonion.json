@@ -37,6 +37,12 @@
               "description": [
                 "Payload to be sent to the node."
               ]
+            },
+            "assocdata": {
+              "type": "hex",
+              "description": [
+                "The associated data this hop's layer commits to, in place of the top-level *assocdata*: on a Sequentia network a point-locked payment binds each hop's layer to the payment hash that hop sees, its lock point's x coordinate."
+              ]
             }
           }
         }

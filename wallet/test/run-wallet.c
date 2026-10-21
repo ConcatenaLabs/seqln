@@ -685,7 +685,7 @@ u8 *towire_channeld_got_commitsig_reply(const tal_t *ctx UNNEEDED)
 u8 *towire_channeld_got_revoke_reply(const tal_t *ctx UNNEEDED)
 { fprintf(stderr, "towire_channeld_got_revoke_reply called!\n"); abort(); }
 /* Generated stub for towire_channeld_offer_htlc */
-u8 *towire_channeld_offer_htlc(const tal_t *ctx UNNEEDED, struct amount_msat amount_msat UNNEEDED, u32 cltv_expiry UNNEEDED, const struct sha256 *payment_hash UNNEEDED, const u8 onion_routing_packet[1366] UNNEEDED, const struct pubkey *path_key UNNEEDED, const u8 *extra_tlvs UNNEEDED)
+u8 *towire_channeld_offer_htlc(const tal_t *ctx UNNEEDED, struct amount_msat amount_msat UNNEEDED, u32 cltv_expiry UNNEEDED, const struct sha256 *payment_hash UNNEEDED, const u8 onion_routing_packet[1366] UNNEEDED, const struct pubkey *path_key UNNEEDED, const u8 *extra_tlvs UNNEEDED, const struct pubkey *lock_point UNNEEDED)
 { fprintf(stderr, "towire_channeld_offer_htlc called!\n"); abort(); }
 /* Generated stub for towire_channeld_sending_commitsig_reply */
 u8 *towire_channeld_sending_commitsig_reply(const tal_t *ctx UNNEEDED)

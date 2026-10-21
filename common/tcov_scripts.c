@@ -206,6 +206,45 @@ static void add_hashlock(u8 **s, const struct ripemd160 *payment_ripemd)
 	op(s, OP_EQUALVERIFY);
 }
 
+/* The point lock: witness <t>, [t L G] -> OP_ROT -> [L G t]:
+ * OP_ECMULSCALARVERIFY checks L == t * G, t 32 bytes (the opcode refuses any
+ * other size), L with its parity. */
+static void add_pointlock(u8 **s, const struct pubkey *lock_point)
+{
+	push_der(s, lock_point);
+	push(s, generator_der, sizeof(generator_der));
+	op(s, OP_ROT);
+	op(s, TCOV_OP_ECMULSCALARVERIFY);
+}
+
+u8 *tcov_leaf_offered_success_point(const tal_t *ctx,
+				    const struct pubkey *lock_point,
+				    const struct pubkey *other_htlc_key)
+{
+	u8 *s = tal_arr(ctx, u8, 0);
+
+	add_pointlock(&s, lock_point);
+	push_xonly(&s, other_htlc_key);
+	op(&s, OP_CHECKSIG);
+	return s;
+}
+
+u8 *tcov_leaf_received_success_point(const tal_t *ctx,
+				     const struct pubkey *lock_point,
+				     const struct pubkey *self_htlc_key,
+				     const u8 *asset_id,
+				     struct amount_sat x,
+				     const u8 d_program[32])
+{
+	u8 *s = tal_arr(ctx, u8, 0);
+
+	add_pointlock(&s, lock_point);
+	push_xonly(&s, self_htlc_key);
+	op(&s, OP_CHECKSIGVERIFY);
+	add_cov(&s, asset_id, x, d_program);
+	return s;
+}
+
 u8 *tcov_leaf_offered_success(const tal_t *ctx,
 			      const struct ripemd160 *payment_ripemd,
 			      const struct pubkey *other_htlc_key)
@@ -275,6 +314,7 @@ void tcov_offered_htlc_tree(const tal_t *ctx,
 			    u16 to_self_delay,
 			    const u8 *asset_tag,
 			    const struct ripemd160 *payment_ripemd,
+			    const struct pubkey *lock_point,
 			    u32 cltv_expiry,
 			    struct amount_sat htlc_sats,
 			    struct tap_tree2 *tree)
@@ -292,9 +332,14 @@ void tcov_offered_htlc_tree(const tal_t *ctx,
 					    cltv_expiry,
 					    tcov_asset_id(asset_tag),
 					    htlc_sats, d_program);
-	tree->leaf[TCOV_LEAF_OFFERED_SUCCESS]
-		= tcov_leaf_offered_success(ctx, payment_ripemd,
-					    &keyset->other_htlc_key);
+	if (lock_point)
+		tree->leaf[TCOV_LEAF_OFFERED_SUCCESS]
+			= tcov_leaf_offered_success_point(ctx, lock_point,
+							  &keyset->other_htlc_key);
+	else
+		tree->leaf[TCOV_LEAF_OFFERED_SUCCESS]
+			= tcov_leaf_offered_success(ctx, payment_ripemd,
+						    &keyset->other_htlc_key);
 	tap_tree2_finish(tree);
 }
 
@@ -304,6 +349,7 @@ void tcov_received_htlc_tree(const tal_t *ctx,
 			     u16 to_self_delay,
 			     const u8 *asset_tag,
 			     const struct ripemd160 *payment_ripemd,
+			     const struct pubkey *lock_point,
 			     u32 cltv_expiry,
 			     struct amount_sat htlc_sats,
 			     struct tap_tree2 *tree)
@@ -316,11 +362,18 @@ void tcov_received_htlc_tree(const tal_t *ctx,
 	tap_tree2_program(&d, d_program);
 
 	tree->internal_key = keyset->self_revocation_key;
-	tree->leaf[TCOV_LEAF_RECEIVED_SUCCESS]
-		= tcov_leaf_received_success(ctx, payment_ripemd,
-					     &keyset->self_htlc_key,
-					     tcov_asset_id(asset_tag),
-					     htlc_sats, d_program);
+	if (lock_point)
+		tree->leaf[TCOV_LEAF_RECEIVED_SUCCESS]
+			= tcov_leaf_received_success_point(ctx, lock_point,
+							   &keyset->self_htlc_key,
+							   tcov_asset_id(asset_tag),
+							   htlc_sats, d_program);
+	else
+		tree->leaf[TCOV_LEAF_RECEIVED_SUCCESS]
+			= tcov_leaf_received_success(ctx, payment_ripemd,
+						     &keyset->self_htlc_key,
+						     tcov_asset_id(asset_tag),
+						     htlc_sats, d_program);
 	tree->leaf[TCOV_LEAF_RECEIVED_TIMEOUT]
 		= tcov_leaf_received_timeout(ctx, &keyset->other_htlc_key,
 					     cltv_expiry);

@@ -84,6 +84,12 @@ struct bolt11 {
 	 * Every invoice on a Sequentia network has one; NULL elsewhere. */
 	u8 *asset;
 
+	/* SEQUENTIA: the payment point T = p * G, where p is the payment
+	 * preimage, from the `t` field: a payer whose every hop takes point
+	 * locks may lock the payment to it (common/point_lock.h).  NULL if
+	 * absent. */
+	struct pubkey *payment_point;
+
 	struct list_head extra_fields;
 };
 

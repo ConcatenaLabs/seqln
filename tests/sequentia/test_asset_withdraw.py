@@ -152,13 +152,16 @@ def test_close_output_asset_migration(node_factory, bitcoind):
     assert n == []
 
     # A database from before the upgrade: back to the version before the
-    # migration that fills the asset in.  The migrations after it add the
-    # penalty_htlcs second-stage columns, which such a database lacks too.
+    # migration that fills the asset in.  The migrations after it add
+    # columns such a database lacks too: each is undone, newest first.
     l2.stop()
     version = query("SELECT version FROM version")[0][0]
-    later = ('stage2_txid', 'stage2_amount')
-    for column in later:
-        query("ALTER TABLE penalty_htlcs DROP COLUMN {}".format(column))
+    later = ("ALTER TABLE channel_htlcs DROP COLUMN point_add",
+             "ALTER TABLE channel_htlcs DROP COLUMN lock_point",
+             "ALTER TABLE penalty_htlcs DROP COLUMN stage2_amount",
+             "ALTER TABLE penalty_htlcs DROP COLUMN stage2_txid")
+    for undo in later:
+        query(undo)
     back = version - 1 - len(later)
     query("UPDATE version SET version=?", back)
     l2.daemon.opts['database-upgrade'] = 'true'

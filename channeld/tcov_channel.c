@@ -39,6 +39,7 @@ struct bitcoin_tx *tcov_channel_commit_tx(const tal_t *ctx,
 		ripemd160(&outs[i].payment_ripemd,
 			  committed[i]->rhash.u.u8,
 			  sizeof(committed[i]->rhash.u.u8));
+		outs[i].lock_point = committed[i]->lock_point;
 		outs[i].cltv_expiry = abs_locktime_to_blocks(&committed[i]->expiry);
 		outs[i].handle = committed[i];
 	}

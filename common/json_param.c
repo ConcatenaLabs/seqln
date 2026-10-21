@@ -714,7 +714,7 @@ struct command_result *param_hops_array(struct command *cmd, const char *name,
 					const char *buffer, const jsmntok_t *tok,
 					struct sphinx_hop **hops)
 {
-	const jsmntok_t *hop, *payloadtok, *pubkeytok;
+	const jsmntok_t *hop, *payloadtok, *pubkeytok, *assoctok;
 	struct sphinx_hop h;
 	size_t i;
 	if (tok->type != JSMN_ARRAY) {
@@ -727,6 +727,17 @@ struct command_result *param_hops_array(struct command *cmd, const char *name,
 	json_for_each_arr(i, hop, tok) {
 		payloadtok = json_get_member(buffer, hop, "payload");
 		pubkeytok = json_get_member(buffer, hop, "pubkey");
+		/* SEQUENTIA: a hop's own associated data (common/sphinx.h). */
+		assoctok = json_get_member(buffer, hop, "assocdata");
+		h.assocdata = NULL;
+		if (assoctok) {
+			h.assocdata = json_tok_bin_from_hex(*hops, buffer,
+							    assoctok);
+			if (!h.assocdata)
+				return command_fail_badparam(cmd, name, buffer,
+							     assoctok,
+							     "should be hex");
+		}
 
 		if (!pubkeytok)
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,

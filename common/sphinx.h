@@ -57,6 +57,10 @@ struct sphinx_path;
 struct sphinx_hop {
 	struct pubkey pubkey;
 	const u8 *raw_payload;
+	/* SEQUENTIA: the associated data this hop's HMAC commits to, when it
+	 * is not the path's: a point-locked payment binds each hop's onion
+	 * to the payment_hash that hop sees (common/point_lock.h). */
+	const u8 *assocdata;
 };
 
 struct route_step {
@@ -195,6 +199,13 @@ struct sphinx_path *sphinx_path_new_with_key(const tal_t *ctx,
 					     const u8 *associated_data,
 					     size_t associated_data_len,
 					     const struct secret *session_key);
+
+/**
+ * sphinx_set_hop_assocdata - bind hop @hopnum's HMAC to @assocdata
+ * (copied) instead of the path's associated data.
+ */
+void sphinx_set_hop_assocdata(struct sphinx_path *path, size_t hopnum,
+			      const u8 *assocdata);
 
 /**
  * Add a payload hop to the path (already has length prepended).

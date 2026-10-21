@@ -11,6 +11,8 @@
 #include <common/json_param.h>
 #include <common/json_stream.h>
 #include <common/memleak.h>
+#include <common/point_lock.h>
+#include <common/randbytes.h>
 #include <plugins/channel_hint.h>
 #include <plugins/libplugin-pay.h>
 #include <stdio.h>
@@ -989,6 +991,26 @@ static struct command_result *json_pay(struct command *cmd,
 			    cmd, JSONRPC2_INVALID_PARAMS,
 			    "Invalid bolt11:"
 			    " sets feature var_onion with no secret");
+		/* SEQUENTIA: a payee that takes point locks, paid by a node
+		 * that offers them: lock the payment to its point
+		 * (common/point_lock.h), as one part, falling back to the
+		 * hash lock if no route takes point locks. */
+		if (b11->payment_point
+		    && feature_offered(b11->features, OPT_SEQ_POINT_LOCKS)
+		    && feature_offered(plugin_feature_set(cmd->plugin)
+				       ->bits[INIT_FEATURE],
+				       OPT_SEQ_POINT_LOCKS)
+		    && !node_id_eq(&my_id, p->pay_destination)) {
+			do
+				randbytes(&p->point_c, sizeof(p->point_c));
+			while (!point_lock_tweak(b11->payment_point,
+						 &p->point_c,
+						 &p->point_lock0));
+			point_lock_payment_hash(&p->point_lock0,
+						&p->point_hash0);
+			p->point_lock = tal_dup(p, struct pubkey,
+						b11->payment_point);
+		}
 	} else {
 		b12 = invoice_decode(tmpctx, b11str, strlen(b11str),
 				     plugin_feature_set(cmd->plugin),
@@ -1159,7 +1181,9 @@ static struct command_result *json_pay(struct command *cmd,
 	}
 
 	shadow_route = payment_mod_shadowroute_get_data(p);
-	payment_mod_adaptive_splitter_get_data(p)->disable = disablempp;
+	/* SEQUENTIA: a point-locked payment goes as one part. */
+	payment_mod_adaptive_splitter_get_data(p)->disable
+		= disablempp || p->point_lock != NULL;
 	payment_mod_route_exclusions_get_data(p)->exclusions = exclusions;
 
 	/* This is an MPP enabled pay command, disable amount fuzzing. */

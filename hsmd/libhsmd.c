@@ -123,6 +123,7 @@ bool hsmd_check_client_capabilities(struct hsmd_client *client,
 	case WIRE_HSMD_VALIDATE_COMMITMENT_TX:
 	case WIRE_HSMD_REVOKE_COMMITMENT_TX:
 	case WIRE_HSMD_VALIDATE_REVOCATION:
+	case WIRE_HSMD_TCOV_HTLC_LOCKS:
 		return (client->capabilities & HSM_PERM_SIGN_REMOTE_TX) != 0;
 
 	case WIRE_HSMD_SIGN_MUTUAL_CLOSE_TX:
@@ -217,6 +218,7 @@ bool hsmd_check_client_capabilities(struct hsmd_client *client,
 	case WIRE_HSMD_SIGN_ANCHORSPEND_REPLY:
 	case WIRE_HSMD_SIGN_HTLC_TX_MINGLE_REPLY:
 	case WIRE_HSMD_SIGN_TCOV_REPLY:
+	case WIRE_HSMD_TCOV_HTLC_LOCKS_REPLY:
 	case WIRE_HSMD_SIGN_ANY_CANNOUNCEMENT_REPLY:
 		break;
 	}
@@ -2341,6 +2343,20 @@ static u8 *handle_sign_tcov_remote_htlc_to_us(struct hsmd_client *c,
 	return tcov_sign(c, msg_in, tx, input_num, leaf, NULL, &privkey);
 }
 
+/* SEQUENTIA: the point locks of a commitment's HTLCs.  This signer does not
+ * rebuild commitments, so it needs nothing from them; listing the message
+ * says it can sign for channels that carry point-locked HTLCs. */
+static u8 *handle_tcov_htlc_locks(struct hsmd_client *c, const u8 *msg_in)
+{
+	struct sha256 *hashes;
+	struct pubkey *points;
+
+	if (!fromwire_hsmd_tcov_htlc_locks(tmpctx, msg_in, &hashes, &points)
+	    || tal_count(hashes) != tal_count(points))
+		return hsmd_status_malformed_request(c, msg_in);
+	return towire_hsmd_tcov_htlc_locks_reply(NULL);
+}
+
 static u8 *handle_sign_tcov_penalty(struct hsmd_client *c, const u8 *msg_in)
 {
 	u64 dbid;
@@ -2507,6 +2523,8 @@ u8 *hsmd_handle_client_message(const tal_t *ctx, struct hsmd_client *client,
 		return handle_sign_tcov_remote_htlc_to_us(client, msg);
 	case WIRE_HSMD_SIGN_TCOV_PENALTY:
 		return handle_sign_tcov_penalty(client, msg);
+	case WIRE_HSMD_TCOV_HTLC_LOCKS:
+		return handle_tcov_htlc_locks(client, msg);
 
 	case WIRE_HSMD_DEV_MEMLEAK:
 	case WIRE_HSMD_ECDH_RESP:
@@ -2549,6 +2567,7 @@ u8 *hsmd_handle_client_message(const tal_t *ctx, struct hsmd_client *client,
 	case WIRE_HSMD_CHECK_BIP86_PUBKEY_REPLY:
 	case WIRE_HSMD_SIGN_ANCHORSPEND_REPLY:
 	case WIRE_HSMD_SIGN_HTLC_TX_MINGLE_REPLY:
+	case WIRE_HSMD_TCOV_HTLC_LOCKS_REPLY:
 	case WIRE_HSMD_SIGN_TCOV_REPLY:
 	case WIRE_HSMD_SIGN_ANY_CANNOUNCEMENT_REPLY:
 		break;
@@ -2645,6 +2664,7 @@ u8 *hsmd_init(const u8 *secret_data, size_t secret_len, const u64 hsmd_version,
 		WIRE_HSMD_SIGN_TCOV_LOCAL_HTLC,
 		WIRE_HSMD_SIGN_TCOV_REMOTE_HTLC_TO_US,
 		WIRE_HSMD_SIGN_TCOV_PENALTY,
+		WIRE_HSMD_TCOV_HTLC_LOCKS,
 	};
 	u32 *caps;
 

@@ -11,7 +11,9 @@
 #include <common/bolt12_id.h>
 #include <common/bolt12_merkle.h>
 #include <common/clock_time.h>
+#include <common/features.h>
 #include <common/json_command.h>
+#include <common/point_lock.h>
 #include <common/randbytes.h>
 #include <common/random_select.h>
 #include <common/timeout.h>
@@ -1390,6 +1392,17 @@ static struct command_result *json_invoice(struct command *cmd,
 	if (chainparams->has_anchor_header)
 		info->b11->asset = tal_dup_arr(info->b11, u8, info->asset,
 					       33, 0);
+
+	/* SEQUENTIA: with point locks, the payment point of the preimage
+	 * (common/point_lock.h), for a payer whose every hop takes them. */
+	if (feature_offered(cmd->ld->our_features->bits[INIT_FEATURE],
+			    OPT_SEQ_POINT_LOCKS)) {
+		info->b11->payment_point = tal(info->b11, struct pubkey);
+		if (!point_lock_point_of(&info->payment_preimage,
+					 info->b11->payment_point))
+			info->b11->payment_point
+				= tal_free(info->b11->payment_point);
+	}
 
 	info->b11->routes = unpack_routes(info->b11, buffer, dev_routes);
 

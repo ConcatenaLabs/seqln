@@ -27,6 +27,9 @@ struct tcov_htlc_out {
 	struct amount_msat amount;
 	/* RIPEMD160 of its payment hash. */
 	struct ripemd160 payment_ripemd;
+	/* Its lock point if it is point-locked (common/point_lock.h), else
+	 * NULL. */
+	const struct pubkey *lock_point;
 	u32 cltv_expiry;
 	/* The caller's handle for it, returned in @htlcmap. */
 	const void *handle;

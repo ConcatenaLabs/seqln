@@ -86,6 +86,7 @@ COMMON_SRC_NOGEN :=				\
 	common/permute_tx.c			\
 	common/ping.c				\
 	common/plugin.c				\
+	common/point_lock.c			\
 	common/psbt_internal.c			\
 	common/psbt_keypath.c			\
 	common/psbt_open.c			\

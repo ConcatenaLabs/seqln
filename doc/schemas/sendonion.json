@@ -135,6 +135,12 @@
         ],
         "default": "0",
         "added": "v25.05"
+      },
+      "lock_point": {
+        "type": "pubkey",
+        "description": [
+          "On a Sequentia network, lock the first HTLC to this point rather than to a hash (a point lock, needing a taproot-covenant channel whose peer takes point locks): *payment_hash* must be the point's x coordinate, and the payment is complete with the scalar that opens it."
+        ]
       }
     }
   },

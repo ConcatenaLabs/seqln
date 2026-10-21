@@ -158,6 +158,8 @@ struct htlc_in *new_htlc_in(const tal_t *ctx,
 	hin->preimage = NULL;
 	hin->we_filled = NULL;
 	hin->payload = NULL;
+	hin->lock_point = NULL;
+	hin->point_add = NULL;
 
 	hin->received_time = clock_time();
 
@@ -186,7 +188,12 @@ struct htlc_out *htlc_out_check(const struct htlc_out *hout,
 			return corrupt(abortstr, "Input cltv_expiry %u"
 				       " less than %u",
 				       hout->in->cltv_expiry, hout->cltv_expiry);
-		if (!sha256_eq(&hout->in->payment_hash, &hout->payment_hash))
+		/* SEQUENTIA: a forwarded point lock is tweaked, so its
+		 * payment_hash (the point's x) differs hop by hop. */
+		if (!!hout->in->lock_point != !!hout->lock_point)
+			return corrupt(abortstr, "Point lock in != out");
+		if (!hout->lock_point
+		    && !sha256_eq(&hout->in->payment_hash, &hout->payment_hash))
 			return corrupt(abortstr, "Input hash != output hash");
 		/* If output is resolved, input must be resolved same
 		 * way (or not resolved yet). */
@@ -275,7 +282,8 @@ struct htlc_out *new_htlc_out(const tal_t *ctx,
 			      struct amount_msat final_msat,
 			      u64 partid,
 			      u64 groupid,
-			      struct htlc_in *in)
+			      struct htlc_in *in,
+			      const struct pubkey *lock_point)
 {
 	struct htlc_out *hout = tal(ctx, struct htlc_out);
 
@@ -297,6 +305,7 @@ struct htlc_out *new_htlc_out(const tal_t *ctx,
 	hout->timeout = NULL;
 
 	hout->path_key = tal_dup_or_null(hout, struct pubkey, path_key);
+	hout->lock_point = tal_dup_or_null(hout, struct pubkey, lock_point);
 
 	if (extra_tlvs)
 		hout->extra_tlvs = tlv_field_arr_dup(hout, extra_tlvs);

@@ -18,6 +18,8 @@ struct added_htlc {
 	bool fail_immediate;
 	struct pubkey *path_key;
 	struct tlv_field *extra_tlvs;
+	/* SEQUENTIA: the lock point of a point-locked HTLC, else NULL. */
+	struct pubkey *lock_point;
 };
 
 /* This is how lightningd tells us about HTLCs which already exist at startup */
@@ -35,6 +37,8 @@ struct existing_htlc {
 	/* If failed, this is set */
 	const struct failed_htlc *failed;
 	struct tlv_field *extra_tlvs;
+	/* SEQUENTIA: the lock point of a point-locked HTLC, else NULL. */
+	struct pubkey *lock_point;
 };
 
 struct fulfilled_htlc {
@@ -76,7 +80,8 @@ struct existing_htlc *new_existing_htlc(const tal_t *ctx,
 					const struct pubkey *path_key TAKES,
 					const struct preimage *preimage TAKES,
 					const struct failed_htlc *failed TAKES,
-					const struct tlv_field *extra_tlvs TAKES);
+					const struct tlv_field *extra_tlvs TAKES,
+					const struct pubkey *lock_point TAKES);
 
 void towire_added_htlc(u8 **pptr, const struct added_htlc *added);
 void towire_existing_htlc(u8 **pptr, const struct existing_htlc *existing);

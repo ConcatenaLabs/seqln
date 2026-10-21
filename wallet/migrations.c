@@ -1131,6 +1131,13 @@ static const struct db_migration dbmigrations[] = {
      SQL("ALTER TABLE penalty_htlcs DROP COLUMN stage2_txid"), NULL},
     {SQL("ALTER TABLE penalty_htlcs ADD stage2_amount BIGINT DEFAULT 0;"), NULL,
      SQL("ALTER TABLE penalty_htlcs DROP COLUMN stage2_amount"), NULL},
+    /* Point-locked HTLCs (common/point_lock.h): an HTLC's lock point
+     * (33 bytes, NULL for a hash-locked one), and for an incoming one the
+     * scalar we add to what we learn to open it (32 bytes). */
+    {SQL("ALTER TABLE channel_htlcs ADD lock_point BLOB DEFAULT NULL;"), NULL,
+     SQL("ALTER TABLE channel_htlcs DROP COLUMN lock_point"), NULL},
+    {SQL("ALTER TABLE channel_htlcs ADD point_add BLOB DEFAULT NULL;"), NULL,
+     SQL("ALTER TABLE channel_htlcs DROP COLUMN point_add"), NULL},
 };
 
 const struct db_migration *get_db_migrations(size_t *num)

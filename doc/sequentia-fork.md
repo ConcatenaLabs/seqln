@@ -350,6 +350,80 @@ Files: `bitcoin/chainparams.{c,h}`, `bitcoin/tapscript.{c,h}`, `common/tcov_scri
 signature hashes and signatures against vectors from the Sequentia node's test framework) and
 `tests/sequentia/test_taproot_covenant.py` (section 10).
 
+## 5c. Point-locked HTLCs (`option_seq_point_locks`)
+
+On a taproot-covenant channel (section 5b) an HTLC can be locked to a point L rather than to a
+hash: its SUCCESS leaf opens with the 32-byte scalar t where t*G equals L, checked by
+`OP_ECMULSCALARVERIFY`, where a hash-locked one takes a preimage. Nothing else about the
+channel changes: commitments are signed as before and there are no adaptor signatures. A
+payment locked this way is decorrelated: every hop sees a different point, unrelated to the
+payee's invoice. Point locks are for payments that never leave Sequentia. A payment between
+SeqLN and Bitcoin Lightning, and a cross-chain swap, stay hash-locked end to end under one
+hash, because no hop can derive a point from a hash a Bitcoin payee chose.
+
+**Enabling it.** Start the node with `--point-locks` beside `--taproot-covenant-channels`
+(lightningd-config(5)). It then offers feature bit 174/175 in `init`, its node announcement
+and its invoices, and every invoice carries, in the field `t`, the payment point T = p*G of
+its preimage p (`decode` shows it as `payment_point`). lightningd withdraws the feature when
+`hsmd` does not list `hsmd_tcov_htlc_locks`: the device signer (`contrib/seqln-signer`) does
+not, so a keyless node takes no point locks and its payments stay hash-locked.
+
+**The leaves** (`common/tcov_scripts.h`). The hash lock of the SUCCESS leaf,
+`SIZE 32 EQUALVERIFY HASH160 <RIPEMD160(payment_hash)> EQUALVERIFY` (27 bytes), becomes the
+point lock `<L> <G> ROT ECMULSCALARVERIFY` (70 bytes; L compressed, its parity included).
+The rest of each tree is unchanged: the offered HTLC's SUCCESS leaf is
+`<L> <G> ROT ECMULSCALARVERIFY <other htlc key> CHECKSIG` (104 bytes), the received HTLC's
+is the point lock, `<self htlc key> CHECKSIGVERIFY` and `COV(A,X,D)`.
+
+**On the wire.** A point-locked `update_add_htlc` carries the TLV `seq_point_lock` (type
+174174, the 33-byte point), and its `payment_hash` is the point's x coordinate, so every
+place that keys an HTLC on its hash keeps working; `update_fulfill_htlc` carries the scalar
+where it would carry the preimage. channeld refuses the TLV on a channel that is not of the
+taproot-covenant type or from a peer it did not offer point locks to, and a fulfil whose
+scalar does not open the point. The onion payload of each hop carries `seq_point_tweak`
+(174174, 32 bytes), and the payee's also `seq_point_payment_hash` (174176): the invoice's
+payment hash. Each hop's onion layer commits, as its associated data, to the payment_hash
+that hop sees.
+
+**A payment.** The payer picks a scalar c and locks the first HTLC to L0 = T + c*G (`pay`
+does this; `sendonion` takes `lock_point`, and `createonion` an `assocdata` per hop). Each
+forwarding hop is told d in its onion and offers the next HTLC locked to L + d*G; the payee
+is told r = c + the sum of the d's and the invoice's payment hash, and opens its HTLC with
+p + r. Going back, each hop takes its d off the scalar it learns, so the payer receives
+p + c and keeps p: the invoice's preimage, the proof of payment. `pay` locks a payment to the
+point when the invoice has one and offers the feature, the paying node offers it too, and a
+route exists whose every node announces it; it then routes only through such nodes and sends
+in one part. Otherwise, or if no such route exists before any part has been sent, it pays by
+the invoice's hash (logging "Paying by hash lock, not point lock"). A node that announces
+point locks but has no taproot-covenant channel to the next hop fails the HTLC with
+`required_channel_feature_missing`, and `pay` routes around it.
+
+**State.** `channel_htlcs` holds each HTLC's `lock_point`, and for an incoming one
+`point_add`: what the node adds to the scalar it learns to open that HTLC (the payee's r,
+or minus a forwarder's d), so a restart in the middle of a payment loses nothing.
+`listpeerchannels` shows an HTLC's `lock_point`; the `htlc_accepted` hook shows it and, for
+the payee, `invoice_payment_hash`, and a plugin that resolves such an HTLC may give the
+invoice's preimage or the scalar itself.
+
+**On the chain.** onchaind (`onchaind/onchaind.c`) builds a point-locked HTLC's tree from the
+lock in its HTLC stub, claims it with the scalar exactly as it claims a hash-locked one with
+the preimage, and reads the scalar out of the peer's SUCCESS witness, checking it opens the
+point, for lightningd to settle the HTLC it was forwarded from.
+
+**Signers.** channeld sends `hsmd_tcov_htlc_locks` (the payment hashes and points of a
+commitment's point-locked HTLCs) before `hsmd_validate_commitment_tx` and
+`hsmd_sign_remote_commitment_tx`, for a signer that rebuilds commitments; libhsmd, which
+does not, acknowledges it.
+
+Files: `common/point_lock.{c,h}`, `common/tcov_scripts.{c,h}`, `common/tcov_commit_tx.{c,h}`,
+`common/bolt11.{c,h}`, `common/sphinx.{c,h}`, `common/htlc_wire.{c,h}`,
+`wire/peer_wire.csv`, `wire/onion_wire.csv`, `channeld/channeld.c`,
+`channeld/full_channel.c`, `channeld/tcov_channel.c`, `hsmd/hsmd_wire.csv`,
+`hsmd/libhsmd.c`, `lightningd/peer_htlcs.c`, `lightningd/pay.c`, `lightningd/invoice.c`,
+`lightningd/hsm_control.c`, `lightningd/options.c`, `wallet/wallet.c`,
+`wallet/migrations.c`, `onchaind/onchaind.c`, `plugins/libplugin-pay.c`, `plugins/pay.c`.
+Tests: `tests/sequentia/test_point_locks.py` (section 10).
+
 ## 6. Asset-aware gossip, routing, payments
 
 - How route finding learns a channel's asset. The channel announcement and the channel update are
@@ -615,6 +689,7 @@ The Specula design note is not yet published in this repository; the header comm
 | `contrib/crossasset-seq/` | New plugin: quoted cross-asset forwarding (signed quotes, one forward per quote, settle or fail both HTLCs together) |
 | `contrib/seqln-signer/` | New crate: Rust device signer (native + WASM) |
 | `channeld`, `onchaind`, `lightningd/onchain_control.c`, `hsmd`, `speculad` | Taproot-covenant channel type: taproot commitments, covenant HTLC claims with the fee attached at claim time, keyless tower template (section 5b) |
+| `channeld`, `onchaind`, `lightningd/peer_htlcs.c`, `plugins/pay.c` | Point-locked HTLCs: the lock in the SUCCESS leaves, forwarding with a per-hop tweak, the payee's invoice point, `pay`'s choice of lock (section 5c) |
 
 ## 9. libwally dependency
 
@@ -722,7 +797,13 @@ both ways, an HTLC in flight at a force-close claimed by its covenant past its C
 from a coin in another asset and claimed with its preimage, the peer's claims on the closer's
 commitment by either leaf, a revoked commitment punished by the victim and, while the victim is
 offline, by `speculad`, and a keyless node whose device signs the commitments, the claim and its
-fee coin, and the sweeps, refusing nothing (`test_taproot_covenant.py`). They need `sequentiad`, `sequentia-cli`
+fee coin, and the sweeps, refusing nothing (`test_taproot_covenant.py`), and point-locked HTLCs
+(section 5c): a payment over two hops whose every HTLC is locked to its own point, none of them
+the invoice's point or hash, settled after the forwarder restarts mid-payment, with a
+hash-locked payment beside it to a payee that takes no point locks; a point invoice paid by its
+hash through a hop that takes none; and a point-locked HTLC claimed on chain with its scalar,
+which the forwarder reads from the witness to settle the payment upstream
+(`test_point_locks.py`). They need `sequentiad`, `sequentia-cli`
 and a Bitcoin Core `bitcoind` on `PATH`, and the keyless tests need the device signer built
 (`cargo build --release` in `contrib/seqln-signer`, or `SEQLN_SIGNER=/path/to/seqln-signer`).
 The test plugins run under the `python3` on `PATH`, which needs the `pyln` packages, so the

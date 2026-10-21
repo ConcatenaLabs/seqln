@@ -127,7 +127,7 @@ int main(int argc, char *argv[])
 	check("to_local cb revoke", tap_tree2_control_block(tmpctx, &tl, TCOV_LEAF_REVOKE), V_TO_LOCAL_CB_REVOKE);
 
 	/* The HTLC outputs */
-	tcov_offered_htlc_tree(tmpctx, &ks, &pcp, V_DELAY, asset_tag, &rmd,
+	tcov_offered_htlc_tree(tmpctx, &ks, &pcp, V_DELAY, asset_tag, &rmd, NULL,
 			       V_CLTV, amount_sat(V_X), &off);
 	check("offered timeout leaf", off.leaf[TCOV_LEAF_OFFERED_TIMEOUT], V_OFFERED_TIMEOUT_LEAF);
 	check("offered success leaf", off.leaf[TCOV_LEAF_OFFERED_SUCCESS], V_OFFERED_SUCCESS_LEAF);
@@ -135,7 +135,7 @@ int main(int argc, char *argv[])
 	check("offered spk", tap_tree2_scriptpubkey(tmpctx, &off), V_OFFERED_SPK);
 	check("offered cb timeout", tap_tree2_control_block(tmpctx, &off, TCOV_LEAF_OFFERED_TIMEOUT), V_OFFERED_CB_TIMEOUT);
 
-	tcov_received_htlc_tree(tmpctx, &ks, &pcp, V_DELAY, asset_tag, &rmd,
+	tcov_received_htlc_tree(tmpctx, &ks, &pcp, V_DELAY, asset_tag, &rmd, NULL,
 				V_CLTV, amount_sat(V_X), &rcv);
 	check("received success leaf", rcv.leaf[TCOV_LEAF_RECEIVED_SUCCESS], V_RECEIVED_SUCCESS_LEAF);
 	check("received timeout leaf", rcv.leaf[TCOV_LEAF_RECEIVED_TIMEOUT], V_RECEIVED_TIMEOUT_LEAF);

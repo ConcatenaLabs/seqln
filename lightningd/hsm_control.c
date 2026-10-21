@@ -204,6 +204,21 @@ struct ext_key *hsm_init(struct lightningd *ld)
 							OPTIONAL_FEATURE(OPT_SEQ_TAPROOT_COVENANT)));
 	}
 
+	/* SEQUENTIA: point locks need that channel type, and a signer that
+	 * says it can sign for channels carrying them (a device signer that
+	 * rebuilds each commitment must build their SUCCESS leaves). */
+	if (feature_offered(ld->our_features->bits[INIT_FEATURE],
+			    OPT_SEQ_POINT_LOCKS)
+	    && (!feature_offered(ld->our_features->bits[INIT_FEATURE],
+				 OPT_SEQ_TAPROOT_COVENANT)
+		|| !hsm_capable(ld, WIRE_HSMD_TCOV_HTLC_LOCKS))) {
+		log_unusual(ld->log, "The signer cannot sign for point-locked"
+			    " HTLCs: not offering point locks");
+		feature_set_sub(ld->our_features,
+				feature_set_for_feature(tmpctx,
+							OPTIONAL_FEATURE(OPT_SEQ_POINT_LOCKS)));
+	}
+
 	/* Check if we have a mnemonic-based HSM secret from TLV */
 	if (tlvs->bip86_base) {
 		ld->bip86_base = tal_steal(ld, tlvs->bip86_base);

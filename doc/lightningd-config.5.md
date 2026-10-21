@@ -467,6 +467,17 @@ whose scripts have Elements' introspection opcodes, and only when
 *hsmd* can sign the type's spends; elsewhere the option offers
 nothing and logs why.
 
+* **point-locks**
+
+  With **taproot-covenant-channels**, take and offer point-locked HTLCs
+(feature bit 174/175): an HTLC locked to a point rather than a hash,
+opened by the scalar whose multiple of the generator the point is. Every
+hop of such a payment sees a different point, so no two hops can tell they
+carry the same payment. Invoices then carry the payment point of their
+preimage (field `t`), and `pay` locks a payment to it when every node on
+its route takes point locks, and to the invoice's hash otherwise. A node
+whose signer cannot take them (a device signer) offers none, and logs why.
+
 * (deprecated in v23.05) **max-locktime-blocks**=*BLOCKS*
 
   The longest our funds can be delayed (ie. the longest
