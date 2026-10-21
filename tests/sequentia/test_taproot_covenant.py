@@ -538,6 +538,9 @@ def test_tcov_keyless_device_signs_channel_and_claims(node_factory, bitcoind, ex
         unhold = os.path.join(l2.daemon.lightning_dir, TEST_NETWORK, 'unhold')
         open(unhold, 'w').close()
         pay(l1, l2, 4_000_000_000, gold)
+        # l1's pay returns once it has the preimage; l2 can spend what it
+        # received only once its side of the channel has settled the HTLC.
+        wait_for(lambda: only_one(l2.rpc.listpeerchannels(l1.info['id'])['channels'])['htlcs'] == [])
         pay(l2, l1, 1_000_000_000, gold)
         os.remove(unhold)
         msat = 3_000_000_000

@@ -20,11 +20,17 @@ struct privkey;
 /* BIP341's default sighash type: SIGHASH_ALL, with a 64-byte signature. */
 #define TAP_SIGHASH_DEFAULT 0x00
 
-/* A taproot output whose script tree holds exactly two leaves. */
+/* A taproot output whose script tree holds two leaves, or three: with three,
+ * leaf 2 sits at depth one and leaves 0 and 1 below it, at depth two (the
+ * tree [leaf 2, [leaf 0, leaf 1]]). */
 struct tap_tree2 {
-	/* The two leaf scripts (tapscript). */
-	const u8 *leaf[2];
-	struct sha256 leaf_hash[2];
+	/* 2 or 3: set by whoever fills in leaf[]. */
+	int nleaves;
+	/* The leaf scripts (tapscript); leaf[2] only with three. */
+	const u8 *leaf[3];
+	struct sha256 leaf_hash[3];
+	/* With three leaves: the branch over leaves 0 and 1. */
+	struct sha256 branch01;
 	struct sha256 merkle_root;
 	struct pubkey internal_key;
 	/* The tweaked output key, compressed: its first byte gives its
@@ -52,8 +58,10 @@ u8 *tap_tree2_scriptpubkey(const tal_t *ctx, const struct tap_tree2 *tree);
 /* The 32-byte witness program of that scriptPubKey. */
 void tap_tree2_program(const struct tap_tree2 *tree, u8 program[32]);
 
-/* The control block that spends leaf @leaf (0 or 1):
- * (0xc4 | parity) || x-only internal key || the other leaf's hash. */
+/* The control block that spends leaf @leaf (0 or 1, or 2 with three leaves):
+ * (0xc4 | parity) || x-only internal key || the merkle path: the other
+ * leaf's hash; with three leaves, for leaf 0 or 1 then leaf 2's hash, and
+ * for leaf 2 the branch over leaves 0 and 1. */
 u8 *tap_tree2_control_block(const tal_t *ctx, const struct tap_tree2 *tree,
 			    int leaf);
 

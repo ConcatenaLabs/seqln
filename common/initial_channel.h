@@ -89,6 +89,12 @@ struct channel {
 
 	/* When the lease expires for the funds in this channel */
 	u32 lease_expiry;
+
+	/* SEQUENTIA: on a credit channel, the latest note's credit
+	 * (common/credit_scripts.h): the provider (the opener) keeps it on
+	 * top of its reserve, so its balance output can always pay the note's
+	 * CLAIM.  Zero otherwise. */
+	struct amount_sat credit_floor;
 };
 
 /**
@@ -194,4 +200,17 @@ bool channel_has(const struct channel *channel, int feature);
 bool channel_has_anchors(const struct channel *channel);
 
 char *fmt_channel(const tal_t *ctx, const struct channel *channel);
+/* SEQUENTIA: a credit channel's provider and credit leaves
+ * (common/credit_scripts.h): the opener provides, and waits the delay the
+ * holder asked of it on its output on the holder's commitment.  NULL if the
+ * channel has no credit. */
+struct tcov_credit;
+const struct tcov_credit *channel_tcov_credit(const tal_t *ctx,
+					      const struct channel *channel);
+
+/* What @side must keep in the channel: the reserve the other side asked of
+ * it, and, for a credit channel's provider, the latest note's credit. */
+struct amount_sat channel_reserve_of(const struct channel *channel,
+				     enum side side);
+
 #endif /* LIGHTNING_COMMON_INITIAL_CHANNEL_H */

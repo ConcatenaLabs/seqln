@@ -72,10 +72,17 @@ void tap_tree2_finish(struct tap_tree2 *tree)
 {
 	u8 der[PUBKEY_CMPR_LEN];
 
+	assert(tree->nleaves == 2 || tree->nleaves == 3);
 	tap_leaf_hash(tree->leaf[0], &tree->leaf_hash[0]);
 	tap_leaf_hash(tree->leaf[1], &tree->leaf_hash[1]);
 	tap_branch_hash(&tree->leaf_hash[0], &tree->leaf_hash[1],
-			&tree->merkle_root);
+			&tree->branch01);
+	if (tree->nleaves == 3) {
+		tap_leaf_hash(tree->leaf[2], &tree->leaf_hash[2]);
+		tap_branch_hash(&tree->leaf_hash[2], &tree->branch01,
+				&tree->merkle_root);
+	} else
+		tree->merkle_root = tree->branch01;
 
 	pubkey_to_der(der, &tree->internal_key);
 	/* libwally lifts the key to its even-y form (BIP341's x-only
@@ -108,13 +115,20 @@ u8 *tap_tree2_scriptpubkey(const tal_t *ctx, const struct tap_tree2 *tree)
 u8 *tap_tree2_control_block(const tal_t *ctx, const struct tap_tree2 *tree,
 			    int leaf)
 {
-	u8 *cb = tal_arr(ctx, u8, 1 + 32 + 32);
+	size_t depth = (tree->nleaves == 3 && leaf != 2) ? 2 : 1;
+	u8 *cb = tal_arr(ctx, u8, 1 + 32 + 32 * depth);
 
-	assert(leaf == 0 || leaf == 1);
+	assert(leaf >= 0 && leaf < tree->nleaves);
 	cb[0] = TAPSCRIPT_LEAF_VERSION_ELEMENTS
 		| (tree->output_der[0] == SECP256K1_TAG_PUBKEY_ODD ? 1 : 0);
 	pubkey_to_xonly(&tree->internal_key, cb + 1);
-	memcpy(cb + 33, tree->leaf_hash[!leaf].u.u8, 32);
+	if (leaf == 2)
+		memcpy(cb + 33, tree->branch01.u.u8, 32);
+	else {
+		memcpy(cb + 33, tree->leaf_hash[!leaf].u.u8, 32);
+		if (depth == 2)
+			memcpy(cb + 65, tree->leaf_hash[2].u.u8, 32);
+	}
 	return cb;
 }
 

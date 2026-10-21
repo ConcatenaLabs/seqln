@@ -14356,7 +14356,8 @@
                     "anchors/even",
                     "scid_alias/even",
                     "zeroconf/even",
-                    "seq_taproot_covenant/even"
+                    "seq_taproot_covenant/even",
+                    "seq_credit/even"
                   ],
                   "description": [
                     "Name of feature bit."
@@ -14833,7 +14834,8 @@
                     "anchors/even",
                     "scid_alias/even",
                     "zeroconf/even",
-                    "seq_taproot_covenant/even"
+                    "seq_taproot_covenant/even",
+                    "seq_credit/even"
                   ],
                   "description": [
                     "Name of feature bit."
@@ -19599,7 +19601,8 @@
                           "anchors_zero_fee_htlc_tx/even",
                           "scid_alias/even",
                           "zeroconf/even",
-                          "seq_taproot_covenant/even"
+                          "seq_taproot_covenant/even",
+                          "seq_credit/even"
                         ],
                         "description": [
                           "Name of feature bit."
@@ -25149,7 +25152,8 @@
                           "anchors_zero_fee_htlc_tx/even",
                           "scid_alias/even",
                           "zeroconf/even",
-                          "seq_taproot_covenant/even"
+                          "seq_taproot_covenant/even",
+                          "seq_credit/even"
                         ],
                         "description": [
                           "Name of feature bit."
@@ -25880,6 +25884,12 @@
                           "The hash of the payment_preimage which will prove payment."
                         ]
                       },
+                      "lock_point": {
+                        "type": "pubkey",
+                        "description": [
+                          "For a point-locked HTLC on a Sequentia network, the point it is locked to (*payment_hash* is its x coordinate): it is opened by the scalar whose multiple of the generator this point is."
+                        ]
+                      },
                       "local_trimmed": {
                         "type": "boolean",
                         "enum": [
@@ -25920,6 +25930,7 @@
                             "msatoshi": {},
                             "expiry": {},
                             "payment_hash": {},
+                            "lock_point": {},
                             "local_trimmed": {},
                             "status": {},
                             "alias": {},
@@ -25970,6 +25981,7 @@
                             "msatoshi": {},
                             "expiry": {},
                             "payment_hash": {},
+                            "lock_point": {},
                             "local_trimmed": {},
                             "status": {},
                             "peer_id": {},
@@ -28546,7 +28558,8 @@
                           "anchors/even",
                           "scid_alias/even",
                           "zeroconf/even",
-                          "seq_taproot_covenant/even"
+                          "seq_taproot_covenant/even",
+                          "seq_credit/even"
                         ],
                         "description": [
                           "Name of feature bit."
@@ -29581,7 +29594,8 @@
                     "anchors/even",
                     "scid_alias/even",
                     "zeroconf/even",
-                    "seq_taproot_covenant/even"
+                    "seq_taproot_covenant/even",
+                    "seq_credit/even"
                   ],
                   "description": [
                     "Name of feature bit."
@@ -29891,7 +29905,8 @@
                     "anchors/even",
                     "scid_alias/even",
                     "zeroconf/even",
-                    "seq_taproot_covenant/even"
+                    "seq_taproot_covenant/even",
+                    "seq_credit/even"
                   ],
                   "description": [
                     "Name of feature bit."
@@ -30231,7 +30246,8 @@
                     "anchors/even",
                     "scid_alias/even",
                     "zeroconf/even",
-                    "seq_taproot_covenant/even"
+                    "seq_taproot_covenant/even",
+                    "seq_credit/even"
                   ],
                   "description": [
                     "Name of feature bit."

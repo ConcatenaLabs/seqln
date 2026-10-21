@@ -330,6 +330,43 @@ impl Signer {
         format!("[{}]", items.join(","))
     }
 
+    /// The credit notes this device holds (`option_seq_credit`: what the
+    /// provider of a credit channel owes this side, signed while the device
+    /// was away), as JSON: an array of `{peerId, dbid, channelId,
+    /// fundingTxid, fundingOutnum, credit, paymentHash, signature,
+    /// preimage}`, one per channel, its latest note. `channelId` is BOLT 2's
+    /// as lightningd prints it, `fundingTxid` in display order, `credit` in
+    /// atoms of the channel's asset, `preimage` null until known; hex
+    /// strings throughout. With its preimage a note is enforceable by
+    /// anyone from either commitment. `[]` when there are none.
+    #[wasm_bindgen(js_name = creditNotes)]
+    pub fn credit_notes(&self) -> String {
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let items: Vec<String> = self
+            .inner
+            .credit_notes()
+            .into_iter()
+            .map(|(node_id, dbid, txid, outnum, n)| {
+                let cid = seqln_signer::taproot::channel_id(&txid, outnum);
+                let mut display = txid;
+                display.reverse();
+                format!(
+                    "{{\"peerId\":\"{}\",\"dbid\":{},\"channelId\":\"{}\",\"fundingTxid\":\"{}\",\"fundingOutnum\":{},\"credit\":{},\"paymentHash\":\"{}\",\"signature\":\"{}\",\"preimage\":{}}}",
+                    hex(&node_id),
+                    dbid,
+                    hex(&cid),
+                    hex(&display),
+                    outnum,
+                    n.credit,
+                    hex(&n.payment_hash),
+                    hex(&n.sig),
+                    n.preimage.map_or("null".to_string(), |p| format!("\"{}\"", hex(&p)))
+                )
+            })
+            .collect();
+        format!("[{}]", items.join(","))
+    }
+
     /// Is this (peer, dbid) tracked?
     #[wasm_bindgen(js_name = hasChannel)]
     pub fn has_channel(&self, node_id: &[u8], dbid: u64) -> Result<bool, JsError> {
@@ -360,6 +397,7 @@ impl Signer {
         option_static_remotekey: bool,
         option_anchors: bool,
         option_tcov: bool,
+        option_credit: bool,
     ) -> Result<bool, JsError> {
         let mut txid = arr32(funding_txid, "funding_txid")?;
         txid.reverse(); // display -> internal byte order (as setup_channel carries it)
@@ -392,6 +430,10 @@ impl Signer {
             predates_validation: false,
             limits: None,
             peer_reached_reserve: false,
+            option_credit: option_tcov && option_credit,
+            // The notes the node holds reach the device again from the
+            // channel's next start (HSMD_CREDIT_NOTE).
+            credit: None,
         };
         self.inner
             .arm_channel(arr33(node_id, "node_id")?, dbid, st)

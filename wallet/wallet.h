@@ -842,6 +842,22 @@ void wallet_htlc_save_in(struct wallet *wallet,
  *
  * See comment for wallet_htlc_save_in.
  */
+/* SEQUENTIA: credit notes (lightningd/credit.h). */
+struct credit_note;
+/* Save @n for channel @chan_dbid, or add its preimage to the one saved. */
+void wallet_credit_note_save(struct wallet *w, u64 chan_dbid, bool issued,
+			     const struct credit_note *n);
+/* The highest note, only one with its preimage if @need_preimage. */
+struct credit_note *wallet_credit_note_latest(const tal_t *ctx,
+					      struct wallet *w, u64 chan_dbid,
+					      bool need_preimage);
+struct credit_note *wallet_credit_note_by_hash(const tal_t *ctx,
+					       struct wallet *w, u64 chan_dbid,
+					       const struct sha256 *hash);
+/* Every note, lowest credit first. */
+struct credit_note **wallet_credit_notes(const tal_t *ctx, struct wallet *w,
+					 u64 chan_dbid);
+
 /**
  * wallet_htlc_set_point_add - store what opens a point-locked incoming HTLC
  *

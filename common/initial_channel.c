@@ -64,6 +64,7 @@ struct channel *new_initial_channel(const tal_t *ctx,
 		return tal_free(channel);
 
 	channel->opener = opener;
+	channel->credit_floor = AMOUNT_SAT(0);
 	channel->config[LOCAL] = *local;
 	channel->config[REMOTE] = *remote;
 	channel->funding_pubkey[LOCAL] = *local_funding_pubkey;
@@ -147,7 +148,8 @@ struct bitcoin_tx *initial_channel_tx(const tal_t *ctx,
 					 channel->view[side].owed[!side],
 					 NULL, NULL, direct_outputs,
 					 0 ^ channel->commitment_number_obscurer,
-					 side, err_reason);
+					 side, channel_tcov_credit(tmpctx, channel),
+					 err_reason);
 		goto add_pubkeys;
 	}
 
@@ -237,6 +239,39 @@ u32 channel_blockheight(const struct channel *channel, enum side side)
 			       channel->opener, side);
 }
 
+const struct tcov_credit *channel_tcov_credit(const tal_t *ctx,
+					      const struct channel *channel)
+{
+	struct tcov_credit *credit;
+	enum side provider = channel->opener;
+	struct channel_id cid;
+
+	if (!channel_has(channel, OPT_SEQ_CREDIT))
+		return NULL;
+	/* The note's tag binds the channel by its funding outpoint (the
+	 * acceptor still has the temporary id while it opens). */
+	derive_channel_id(&cid, &channel->funding);
+	credit = tal(ctx, struct tcov_credit);
+	if (!tcov_credit_init(credit, &cid, provider,
+			      &channel->funding_pubkey[provider],
+			      &channel->basepoints[!provider].payment,
+			      channel->config[!provider].to_self_delay,
+			      credit))
+		return tal_free(credit);
+	return credit;
+}
+
+struct amount_sat channel_reserve_of(const struct channel *channel,
+				     enum side side)
+{
+	struct amount_sat reserve = channel->config[!side].channel_reserve;
+
+	if (side == channel->opener
+	    && !amount_sat_add(&reserve, reserve, channel->credit_floor))
+		abort();
+	return reserve;
+}
+
 struct channel_type *channel_upgradable_type(const tal_t *ctx,
 					     const struct channel *channel)
 {
@@ -255,6 +290,8 @@ struct channel_type *channel_desired_type(const tal_t *ctx,
 
 	/* SEQUENTIA: nor the taproot-covenant type, whose outputs no other
 	 * type can read. */
+	if (channel_has(channel, OPT_SEQ_CREDIT))
+		return channel_type_seq_credit(ctx);
 	if (channel_has(channel, OPT_SEQ_TAPROOT_COVENANT))
 		return channel_type_seq_taproot_covenant(ctx);
 

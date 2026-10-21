@@ -424,6 +424,121 @@ Files: `common/point_lock.{c,h}`, `common/tcov_scripts.{c,h}`, `common/tcov_comm
 `wallet/migrations.c`, `onchaind/onchaind.c`, `plugins/libplugin-pay.c`, `plugins/pay.c`.
 Tests: `tests/sequentia/test_point_locks.py` (section 10).
 
+## 5d. Provider-signed credit (`option_seq_credit`)
+
+A hosted user's channel moves only when the user's device signs, so while the device is away
+the user cannot be paid over it. A credit channel lets the side that opened it, the
+**provider**, credit the other side, the **holder**, without a channel update: the provider
+signs a **credit note**, "the holder is owed c atoms of the channel's asset in all",
+conditional on the preimage of the payment the note was issued for. Credit is cumulative: each
+note states the whole amount owed, so the latest supersedes every earlier one. The holder
+claims it on chain from either commitment, or the channel's mutual close pays it.
+
+**What a note binds the provider to.** Once a note and its payment's preimage are out,
+the provider cannot take that credit back:
+
+- every commitment of the channel, the provider's and the holder's, pays the provider's
+  balance to a script whose CLAIM leaf pays the holder what the latest note still owes, out of
+  that output, with no signature from the holder and none from the provider beyond the note.
+  Anyone holding the note and the preimage can make the claim; it pays only the holder's
+  static payment script;
+- the provider's balance cannot drop below the latest note: the holder's channeld, and the
+  holder's device signer, refuse a commitment whose provider output could not pay it, an HTLC
+  or a fee change included, and the provider's own node refuses to offer an HTLC that would;
+- a mutual close pays the holder its balance and the latest note, out of the provider's side.
+  A close that leaves the note out is not signed by the holder, its node or its device.
+
+What the provider can still do: before a note reaches the holder, the holder has the provider's
+word only, because the payment was made to the provider. The provider decides whether and when
+to issue a note, and the holder sees a payment it expected go uncredited. The provider can close
+the channel at any time; the credit is then paid by the close or claimed from the commitment.
+After a claim, what remains of the provider's output is the provider's after its delay, counted
+again from the claim. Credit is never folded into the holder's channel balance: it stays a
+separate claim on the provider's output until the channel closes.
+
+**Enabling it.** Start both nodes with `--credit-channels` beside
+`--taproot-covenant-channels` (lightningd-config(5)). They offer feature bit 176/177; the
+channel type is `[12, 172, 176]` (`seq_credit/even` in `channel_type.names`). A node opens such
+a channel, as provider, only when its `hsmd` lists `hsmd_sign_credit_note` and
+`hsmd_sign_tcov_payment_to_us`: libhsmd does, the device signer does not, so a keyless node never
+provides. It accepts one, as holder, only when its `hsmd` lists `hsmd_credit_note`: libhsmd and
+the device signer both do.
+
+**The scripts** (`common/credit_scripts.h`). The CLAIM leaf (172 bytes) takes the witness
+`<sig> <c> <x>`:
+
+    SIZE 32 EQUALVERIFY SHA256 OVER <Dtag> SWAP CAT SWAP CAT ROT SWAP <Pc> CHECKSIGFROMSTACKVERIFY
+    <B> PUSHCURRENTINPUTINDEX INSPECTINPUTVALUE 1 EQUALVERIFY SUB64 VERIFY        (paid = B - input)
+    2DUP GREATERTHAN64 VERIFY OVER SWAP SUB64 VERIFY                              (c > paid; c - paid)
+    output i+1: that value, the holder's program U, this input's asset
+    <B> SWAP SUB64 VERIFY; output i: B - c, this input's own script and asset
+
+The note is a BIP340 signature by the credit key Pc over the 72 bytes
+`Dtag || c (8 bytes, little-endian) || SHA256(x)`. Dtag = tagged_hash("SeqLN/credit",
+channel_id), BOLT 2's channel id from the funding outpoint, binds a note to its channel; Pc is the
+provider's funding key plus tagged_hash("SeqLN/credit-key", funding key)*G, a key that signs
+nothing but notes. B is the output's value in its commitment, so paid is what earlier claims on
+that output took; U is P2WPKH of the holder's payment basepoint.
+
+| Output | Internal key | Leaves |
+| --- | --- | --- |
+| The provider's `to_local` on its own commitment | revocation key | CLAIM at depth 1; DELAY and REVOKE (section 5b) at depth 2 |
+| The provider's output on the holder's commitment | BIP341's NUMS point (no key path) | CLAIM; PROVIDER: `<provider payment key> CHECKSIGVERIFY <holder's to_self_delay> CSV` |
+
+D, the output the provider's own HTLC claims pay, keeps the two-leaf `to_local` tree: a smaller
+output under the CLAIM script would let one note pay a second time.
+
+**Notes on the wire.** The provider sends each note to the holder in the custom peer message
+48033 (odd, so a peer that does not know it ignores it): `[channel_id][u64 credit]
+[sha256 payment_hash][64 signature][u8 has_preimage][32 preimage]`, again whenever the channel
+reconnects. The holder's node checks the note against the channel's credit key and the preimage
+against its hash, keeps it (`credit_notes` table), and hands its latest to channeld, which tells
+the signer (`hsmd_credit_note`, with the preimage) before it signs anything more on the
+channel, and to onchaind.
+
+**Commands.** `issuecredit id amount_msat payment_hash [preimage] [channel_id]` (provider):
+add `amount_msat` to the credit of the channel with peer `id`, sign the cumulative note and
+send it; refused when the provider's spendable balance less its dust limit cannot pay the new
+total. `addcreditnote id credit payment_hash signature [preimage] [channel_id]` (holder):
+keep a note received another way, refused unless the channel's credit key signed it.
+`listcreditnotes [id]`: every note of every credit channel, each with `peer_id`,
+`channel_id`, `role` (`provider` or `holder`), `credit`, `payment_hash`, `signature` and,
+once known, `preimage`. The plugin `contrib/credit-seq` issues notes from paid invoices:
+`creditinvoice id amount_msat` makes an invoice of the provider whose payment credits peer `id`,
+and its `invoice_payment` hook calls `issuecredit` before accepting the payment, refusing the
+payment when no note can be issued.
+
+**On the chain.** When a commitment of the channel confirms, the holder's onchaind claims its
+latest note from the provider's output by CLAIM, with a fee coin from its wallet in any asset
+the node accepts, and watches what remains for a later note; the provider's onchaind sweeps
+what remains after its delay. A claim on the holder's commitment with a fee coin in another
+asset is 464 vB.
+
+**Mutual close.** closingd's close pays the holder the latest note out of the provider's side
+(lightningd logs "Closing pays the holder ... of credit"). Each side computes the close from
+the latest note it holds; if they disagree, neither signature checks and the channel goes to
+chain, where the holder claims its note.
+
+**Signers.** libhsmd signs notes with the credit key (`hsmd_sign_credit_note`), the
+provider's PROVIDER leaf spends (`hsmd_sign_tcov_payment_to_us`), and acknowledges
+`hsmd_credit_note`. The device signer (`contrib/seqln-signer`) holds credit: it checks each
+note it is told of (the channel's id, the credit key's signature, the preimage), keeps the
+latest with its preimage in its channel store, validates the channel's commitments against
+the credit trees, refuses a commitment whose provider output cannot pay that note and a close
+that does not pay it, and signs a credit claim's fee coins. Its WASM build and SDK give a wallet
+the notes it holds (`creditNotes()`, and the SDK's `onCredit` when a new one arrives), with
+everything a claim needs.
+
+Files: `common/credit_scripts.{c,h}`, `bitcoin/tapscript.{c,h}`, `common/tcov_commit_tx.{c,h}`,
+`common/initial_channel.{c,h}`, `common/features.{c,h}`, `channeld/channeld.c`,
+`channeld/full_channel.c`, `closingd` (via `lightningd/closing_control.c`),
+`lightningd/credit.{c,h}`, `lightningd/peer_htlcs.c`, `lightningd/onchain_control.c`,
+`lightningd/opening_control.c`, `lightningd/hsm_control.c`, `lightningd/options.c`,
+`onchaind/onchaind.c`, `hsmd/hsmd_wire.csv`, `hsmd/libhsmd.c`, `hsmd/hsmd_proxy.c`,
+`wallet/wallet.c`, `wallet/migrations.c`, `contrib/credit-seq/`, `contrib/seqln-signer/`.
+Tests: `tests/sequentia/test_credit.py`, `common/test/run-credit_scripts.c` and the signer's
+`cargo test` (section 10).
+
 ## 6. Asset-aware gossip, routing, payments
 
 - How route finding learns a channel's asset. The channel announcement and the channel update are
@@ -690,6 +805,7 @@ The Specula design note is not yet published in this repository; the header comm
 | `contrib/seqln-signer/` | New crate: Rust device signer (native + WASM) |
 | `channeld`, `onchaind`, `lightningd/onchain_control.c`, `hsmd`, `speculad` | Taproot-covenant channel type: taproot commitments, covenant HTLC claims with the fee attached at claim time, keyless tower template (section 5b) |
 | `channeld`, `onchaind`, `lightningd/peer_htlcs.c`, `plugins/pay.c` | Point-locked HTLCs: the lock in the SUCCESS leaves, forwarding with a per-hop tweak, the payee's invoice point, `pay`'s choice of lock (section 5c) |
+| `channeld`, `closingd`, `onchaind`, `lightningd/credit.c`, `hsmd`, `contrib/credit-seq/`, `contrib/seqln-signer/` | Provider-signed credit: the CLAIM leaf on the provider's balance output, notes issued and held, the floor, the close and the claim (section 5d) |
 
 ## 9. libwally dependency
 
@@ -803,7 +919,15 @@ the invoice's point or hash, settled after the forwarder restarts mid-payment, w
 hash-locked payment beside it to a payee that takes no point locks; a point invoice paid by its
 hash through a hop that takes none; and a point-locked HTLC claimed on chain with its scalar,
 which the forwarder reads from the witness to settle the payment upstream
-(`test_point_locks.py`). They need `sequentiad`, `sequentia-cli`
+(`test_point_locks.py`), and the provider-signed credit (section 5d): two invoices of the
+provider paid for the holder, a cumulative note for each, a forged note refused, the provider's
+node refusing to pay its balance below the note, the holder's commitment dropped and the latest
+note claimed from it with the fee in another asset, the rest swept by the provider after its
+delay; a mutual close paying the holder the note; a provider that forgets its notes, whose close
+without them the holder will not sign, and whose own commitment the holder claims from; the same
+provider's HTLC below the note refused by the holder's channeld; and a keyless holder whose device
+is stopped while it is paid twice, then returns, learns the latest note and signs the claim's fee
+coin, refusing nothing (`test_credit.py`). They need `sequentiad`, `sequentia-cli`
 and a Bitcoin Core `bitcoind` on `PATH`, and the keyless tests need the device signer built
 (`cargo build --release` in `contrib/seqln-signer`, or `SEQLN_SIGNER=/path/to/seqln-signer`).
 The test plugins run under the `python3` on `PATH`, which needs the `pyln` packages, so the

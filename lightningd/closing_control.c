@@ -14,6 +14,7 @@
 #include <lightningd/channel.h>
 #include <lightningd/closing_control.h>
 #include <lightningd/connect_control.h>
+#include <lightningd/credit.h>
 #include <lightningd/dual_open_control.h>
 #include <lightningd/feerate.h>
 #include <lightningd/hsm_control.h>
@@ -393,6 +394,7 @@ void peer_start_closingd(struct channel *channel, struct peer_fd *peer_fd)
 	u8 *initmsg;
 	u32 min_feerate, feerate, max_feerate;
 	struct amount_msat their_msat;
+	struct amount_sat our_sat, their_sat, credit;
 	int hsmfd;
 	struct lightningd *ld = channel->peer->ld;
 	u32 final_commit_feerate;
@@ -499,6 +501,36 @@ void peer_start_closingd(struct channel *channel, struct peer_fd *peer_fd)
 		return;
 	}
 
+	our_sat = amount_msat_to_sat_round_down(channel->our_msat);
+	their_sat = amount_msat_to_sat_round_down(their_msat);
+	/* SEQUENTIA: on a credit channel (lightningd/credit.h) the close pays
+	 * the holder what the latest note owes it, out of the provider's side,
+	 * as the CLAIM leaf would on chain.  The two sides sign the same close
+	 * only if they agree on that note; if not, neither signature checks
+	 * and the channel goes to chain, where the holder claims its note. */
+	credit = amount_sat(channel_credit_owed(channel));
+	if (!amount_sat_is_zero(credit)) {
+		struct amount_sat *provider, *holder;
+
+		if (channel->opener == LOCAL) {
+			provider = &our_sat;
+			holder = &their_sat;
+		} else {
+			provider = &their_sat;
+			holder = &our_sat;
+		}
+		if (!amount_sat_sub(provider, *provider, credit)
+		    || !amount_sat_add(holder, *holder, credit)) {
+			channel_fail_permanent(channel, REASON_LOCAL,
+					       "Credit %s exceeds the provider's"
+					       " balance on closing",
+					       fmt_amount_sat(tmpctx, credit));
+			return;
+		}
+		log_info(channel->log, "Closing pays the holder %s of credit",
+			 fmt_amount_sat(tmpctx, credit));
+	}
+
 	// Determine the wallet index for our output or NULL if not found.
 	u32 *local_wallet_index = NULL;
 	struct ext_key *local_wallet_ext_key = NULL;
@@ -529,8 +561,7 @@ void peer_start_closingd(struct channel *channel, struct peer_fd *peer_fd)
 				       &channel->local_funding_pubkey,
 				       &channel->channel_info.remote_fundingkey,
 				       channel->opener,
-				       amount_msat_to_sat_round_down(channel->our_msat),
-				       amount_msat_to_sat_round_down(their_msat),
+				       our_sat, their_sat,
 				       channel->our_config.dust_limit,
 				       min_feerate, feerate, max_feerate,
 				       local_wallet_index,

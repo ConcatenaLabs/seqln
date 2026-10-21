@@ -59,6 +59,14 @@ fn chan(seed: u8) -> ChannelState {
         predates_validation: false,
         limits: None,
         peer_reached_reserve: false,
+        option_credit: seed == 10,
+        // A held note, its preimage known, rides the round trip too.
+        credit: (seed == 10).then_some(seqln_signer::policy::CreditNote {
+            credit: 45_000,
+            payment_hash: [seed.wrapping_add(11); 32],
+            sig: [seed.wrapping_add(12); 64],
+            preimage: Some([seed.wrapping_add(13); 32]),
+        }),
     }
 }
 

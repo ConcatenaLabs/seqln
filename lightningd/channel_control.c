@@ -16,6 +16,7 @@
 #include <lightningd/channel_gossip.h>
 #include <lightningd/closing_control.h>
 #include <lightningd/connect_control.h>
+#include <lightningd/credit.h>
 #include <lightningd/dual_open_control.h>
 #include <lightningd/feerate.h>
 #include <lightningd/hsm_control.h>
@@ -1808,6 +1809,7 @@ static unsigned channel_msg(struct subd *sd, const u8 *msg, const int *fds)
 	/* And we never get these from channeld. */
 	case WIRE_CHANNELD_INIT:
 	case WIRE_CHANNELD_FUNDING_DEPTH:
+	case WIRE_CHANNELD_CREDIT_NOTE:
 	case WIRE_CHANNELD_OFFER_HTLC:
 	case WIRE_CHANNELD_FULFILL_HTLC:
 	case WIRE_CHANNELD_FAIL_HTLC:
@@ -2128,6 +2130,8 @@ bool peer_start_channeld(struct channel *channel,
 
 	/* We don't expect a response: we are triggered by funding_depth_cb. */
 	subd_send_msg(channel->owner, take(initmsg));
+	/* SEQUENTIA: a credit channel's latest note (lightningd/credit.h). */
+	credit_channel_started(channel);
 
 	/* On restart, feerate and blockheight
 	 * might not be what we expect: adjust now. */

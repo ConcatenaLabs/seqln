@@ -305,6 +305,7 @@ void tcov_to_local_tree(const tal_t *ctx,
 	tree->leaf[TCOV_LEAF_REVOKE]
 		= tcov_leaf_revoke(ctx, per_commitment_point,
 				   tcov_revoke_dest(tmpctx, keyset));
+	tree->nleaves = 2;
 	tap_tree2_finish(tree);
 }
 
@@ -340,6 +341,7 @@ void tcov_offered_htlc_tree(const tal_t *ctx,
 		tree->leaf[TCOV_LEAF_OFFERED_SUCCESS]
 			= tcov_leaf_offered_success(ctx, payment_ripemd,
 						    &keyset->other_htlc_key);
+	tree->nleaves = 2;
 	tap_tree2_finish(tree);
 }
 
@@ -377,5 +379,6 @@ void tcov_received_htlc_tree(const tal_t *ctx,
 	tree->leaf[TCOV_LEAF_RECEIVED_TIMEOUT]
 		= tcov_leaf_received_timeout(ctx, &keyset->other_htlc_key,
 					     cltv_expiry);
+	tree->nleaves = 2;
 	tap_tree2_finish(tree);
 }

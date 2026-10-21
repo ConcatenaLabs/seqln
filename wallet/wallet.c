@@ -20,6 +20,7 @@
 #include <lightningd/channel_gossip.h>
 #include <lightningd/closed_channel.h>
 #include <lightningd/coin_mvts.h>
+#include <lightningd/credit.h>
 #include <lightningd/hsm_control.h>
 #include <lightningd/notification.h>
 #include <lightningd/peer_htlcs.h>
@@ -3522,6 +3523,110 @@ void wallet_htlc_save_in(struct wallet *wallet,
 		db_bind_null(stmt);
 
 	db_exec_prepared_v2(take(stmt));
+}
+
+/* SEQUENTIA: credit notes (lightningd/credit.h). */
+static struct credit_note *stmt2credit_note(const tal_t *ctx,
+					    struct db_stmt *stmt)
+{
+	struct credit_note *n = tal(ctx, struct credit_note);
+
+	n->credit = db_col_u64(stmt, "credit");
+	db_col_sha256(stmt, "payment_hash", &n->payment_hash);
+	assert(db_col_bytes(stmt, "signature") == sizeof(n->sig.u8));
+	memcpy(n->sig.u8, db_col_blob(stmt, "signature"), sizeof(n->sig.u8));
+	n->preimage = db_col_optional(n, stmt, "preimage", preimage);
+	return n;
+}
+
+void wallet_credit_note_save(struct wallet *w, u64 chan_dbid, bool issued,
+			     const struct credit_note *n)
+{
+	struct db_stmt *stmt;
+	bool exists;
+
+	stmt = db_prepare_v2(w->db, SQL("SELECT credit FROM credit_notes"
+					" WHERE channel_id = ? AND credit = ?;"));
+	db_bind_u64(stmt, chan_dbid);
+	db_bind_u64(stmt, n->credit);
+	db_query_prepared(stmt);
+	exists = db_step(stmt);
+	if (exists)
+		db_col_ignore(stmt, "credit");
+	tal_free(stmt);
+
+	if (exists) {
+		if (!n->preimage)
+			return;
+		stmt = db_prepare_v2(w->db, SQL("UPDATE credit_notes SET"
+						" preimage = ?"
+						" WHERE channel_id = ?"
+						" AND credit = ?;"));
+		db_bind_preimage(stmt, n->preimage);
+		db_bind_u64(stmt, chan_dbid);
+		db_bind_u64(stmt, n->credit);
+		db_exec_prepared_v2(take(stmt));
+		return;
+	}
+	stmt = db_prepare_v2(w->db, SQL("INSERT INTO credit_notes ("
+					"  channel_id, issued, credit,"
+					"  payment_hash, signature, preimage)"
+					" VALUES (?, ?, ?, ?, ?, ?);"));
+	db_bind_u64(stmt, chan_dbid);
+	db_bind_int(stmt, issued);
+	db_bind_u64(stmt, n->credit);
+	db_bind_sha256(stmt, &n->payment_hash);
+	db_bind_blob(stmt, n->sig.u8, sizeof(n->sig.u8));
+	if (n->preimage)
+		db_bind_preimage(stmt, n->preimage);
+	else
+		db_bind_null(stmt);
+	db_exec_prepared_v2(take(stmt));
+}
+
+struct credit_note *wallet_credit_note_latest(const tal_t *ctx,
+					      struct wallet *w, u64 chan_dbid,
+					      bool need_preimage)
+{
+	struct credit_note **notes = wallet_credit_notes(tmpctx, w, chan_dbid);
+
+	for (size_t i = tal_count(notes); i > 0; i--) {
+		if (need_preimage && !notes[i-1]->preimage)
+			continue;
+		return tal_steal(ctx, notes[i-1]);
+	}
+	return NULL;
+}
+
+struct credit_note *wallet_credit_note_by_hash(const tal_t *ctx,
+					       struct wallet *w, u64 chan_dbid,
+					       const struct sha256 *hash)
+{
+	struct credit_note **notes = wallet_credit_notes(tmpctx, w, chan_dbid);
+
+	for (size_t i = 0; i < tal_count(notes); i++)
+		if (sha256_eq(&notes[i]->payment_hash, hash))
+			return tal_steal(ctx, notes[i]);
+	return NULL;
+}
+
+struct credit_note **wallet_credit_notes(const tal_t *ctx, struct wallet *w,
+					 u64 chan_dbid)
+{
+	struct db_stmt *stmt;
+	struct credit_note **notes = tal_arr(ctx, struct credit_note *, 0);
+
+	stmt = db_prepare_v2(w->db, SQL("SELECT credit, payment_hash,"
+					" signature, preimage"
+					" FROM credit_notes"
+					" WHERE channel_id = ?"
+					" ORDER BY credit;"));
+	db_bind_u64(stmt, chan_dbid);
+	db_query_prepared(stmt);
+	while (db_step(stmt))
+		tal_arr_expand(&notes, stmt2credit_note(notes, stmt));
+	tal_free(stmt);
+	return notes;
 }
 
 void wallet_htlc_set_point_add(struct wallet *wallet,

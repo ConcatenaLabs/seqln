@@ -84,7 +84,7 @@ const HSMD_NAMES = {
   32: 'CHECK_OUTPOINT', 34: 'FORGET_CHANNEL', 35: 'VALIDATE_COMMITMENT_TX',
   36: 'VALIDATE_REVOCATION', 37: 'LOCK_OUTPOINT', 40: 'REVOKE_COMMITMENT_TX',
   142: 'SIGN_ANY_DELAYED_PAYMENT_TO_US', 143: 'SIGN_ANY_REMOTE_HTLC_TO_US',
-  144: 'SIGN_ANY_PENALTY_TO_US',
+  144: 'SIGN_ANY_PENALTY_TO_US', 67: 'CREDIT_NOTE',
 };
 function hsmdName(t) { return HSMD_NAMES[t] || `type ${t}`; }
 
@@ -144,6 +144,11 @@ export class SeqlnSigner {
     // Fires once, after the persisted store is restored, with the channels
     // that predate validation (see predatingChannels()), when there are any.
     this.onPredating = opts.onPredating || null;
+    // Fires with creditNotes() whenever the device learns a credit note: the
+    // provider of a credit channel credited this side while the device was
+    // away. The wallet shows what its user is owed and keeps a copy.
+    this.onCredit = opts.onCredit || null;
+    this._creditSeen = '';
     // TEST-ONLY hook (opt-in; null in production). A Set of hsmd wire types to
     // reject ONCE each: the first time such a type is seen the serve loop sends
     // the zero-length error sentinel instead of the wasm reply, then serves it
@@ -248,12 +253,14 @@ export class SeqlnSigner {
   armChannel({ peerId, dbid, fundingSats, fundingTxid, fundingOutnum,
                localToSelfDelay, remoteToSelfDelay,
                revocation, payment, htlc, delayed, funding,
-               staticRemotekey = true, anchors = false, taprootCovenant = false }) {
+               staticRemotekey = true, anchors = false, taprootCovenant = false,
+               credit = false }) {
     const added = this._inner.armChannel(
       hexToBytes(peerId), BigInt(dbid), BigInt(fundingSats), hexToBytes(fundingTxid),
       fundingOutnum, localToSelfDelay, remoteToSelfDelay,
       hexToBytes(revocation), hexToBytes(payment), hexToBytes(htlc),
-      hexToBytes(delayed), hexToBytes(funding), staticRemotekey, anchors, taprootCovenant);
+      hexToBytes(delayed), hexToBytes(funding), staticRemotekey, anchors, taprootCovenant,
+      credit);
     if (added) this._persistChannels();
     return added;
   }
@@ -264,6 +271,20 @@ export class SeqlnSigner {
   // device sends only to its own addresses. Each { peerId, dbid, fundingTxid
   // (display order), fundingOutnum, fundingSats }.
   predatingChannels() { return JSON.parse(this._inner.predatingChannels()); }
+  // The credit notes this device holds, one per credit channel (its latest):
+  // what the channel's provider owes this side, signed while the device was
+  // away. Each { peerId, dbid, channelId, fundingTxid (display order),
+  // fundingOutnum, credit (atoms of the channel's asset), paymentHash,
+  // signature, preimage (null until known) }. A note with its preimage is
+  // enforceable by anyone from either commitment of its channel.
+  creditNotes() { return JSON.parse(this._inner.creditNotes()); }
+  _emitCredit() {
+    if (!this.onCredit) return;
+    const now = this._inner.creditNotes();
+    if (now === this._creditSeen) return;
+    this._creditSeen = now;
+    try { this.onCredit(JSON.parse(now)); } catch {}
+  }
   // Compute the transport pubkey a host must pin for a given device privkey,
   // without constructing a signer (handy for provisioning UIs).
   static async devicePubkey(privkey, opts = {}) {
@@ -414,6 +435,7 @@ export class SeqlnSigner {
           // and surface any untracked-channel refusal for the re-arm flow.
           this._persistChannels();
           this._emitUntracked();
+          this._emitCredit();
           ws.send(noise.encrypt(reply));
           if (closed) break;
         }

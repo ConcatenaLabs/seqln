@@ -38,6 +38,7 @@
  * v6 with setup_channel dust limits and reserves (Sequentia, a TLV): e5b9838099bb644ba32fdc2e616b7170e07cc1908a688e108f4788efb1365391
  * v6 with sign_tcov_* (Sequentia taproot-covenant channels): 06bae93b28b6489b83a1ee2a358332a8554bc2ac6583b732c5874e3ba963828e
  * v6 with tcov_htlc_locks (Sequentia point locks): d04dad9498fb8db4f6978f7ce4cc675a870976a6698f5d4aa0e17ab2ea44f25c
+ * v6 with credit notes (Sequentia provider-signed credit): 12ad766083ec58c222bfc509d619f8eb6659ccdf2c06a1c3a1f821605a692444
  */
 #define HSM_MIN_VERSION 5
 #define HSM_MAX_VERSION 6

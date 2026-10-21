@@ -16,6 +16,7 @@
 #include <db/exec.h>
 #include <lightningd/channel.h>
 #include <lightningd/coin_mvts.h>
+#include <lightningd/credit.h>
 #include <lightningd/notification.h>
 #include <lightningd/onchain_presign.h>
 #include <lightningd/peer_control.h>
@@ -780,6 +781,28 @@ const u8 *send_htlc_out(const tal_t *ctx,
 	u8 *msg, *raw_tlvs = NULL;
 
 	*houtp = NULL;
+
+	/* SEQUENTIA: a credit provider keeps its balance able to pay what it
+	 * owes the holder (lightningd/credit.h). */
+	if (channel_has_credit(out) && out->opener == LOCAL) {
+		struct credit_note *n = channel_credit_latest(tmpctx, out);
+		struct amount_msat floor, left;
+
+		if (n
+		    && (!amount_msat_sub(&left, channel_amount_spendable(out),
+					 amount)
+			|| !amount_msat_add_sat(&floor,
+						amount_msat(n->credit * 1000),
+						out->our_config.dust_limit)
+			|| amount_msat_less(left, floor))) {
+			log_info(out->log, "Not offering %s: this node's"
+				 " balance must keep paying the %"PRIu64
+				 " atoms it owes as credit",
+				 fmt_amount_msat(tmpctx, amount), n->credit);
+			return towire_temporary_channel_failure(ctx,
+								channel_update_for_error(tmpctx, in, out));
+		}
+	}
 
 	/* SEQUENTIA: a point lock goes only where the scripts and the peer
 	 * take one. */

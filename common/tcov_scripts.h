@@ -71,6 +71,10 @@ enum tcov_spend_signer {
 	TCOV_SIGN_REMOTE_HTLC = 2,
 	/* The revocation key, tweaked: the key path. */
 	TCOV_SIGN_PENALTY = 3,
+	/* SEQUENTIA: our static payment key: a credit provider's own
+	 * output on the holder's commitment, by its PROVIDER leaf
+	 * (common/credit_scripts.h). */
+	TCOV_SIGN_PAYMENT = 4,
 };
 
 /* When the spend must be mined by. */

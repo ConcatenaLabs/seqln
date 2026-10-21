@@ -478,6 +478,18 @@ preimage (field `t`), and `pay` locks a payment to it when every node on
 its route takes point locks, and to the invoice's hash otherwise. A node
 whose signer cannot take them (a device signer) offers none, and logs why.
 
+* **credit-channels**
+
+  With **taproot-covenant-channels**, offer the credit channel type
+(feature bit 176/177): the side that opens such a channel, its provider,
+can credit the other side, its holder, while the holder cannot sign a
+channel update, by signing a note of what it owes the holder in all. Every
+commitment then pays the provider's balance to a script from which the
+holder claims its latest note, and a mutual close pays it. The node opens
+credit channels when its *hsmd* can sign notes, and accepts them when its
+*hsmd* can hold them (a device signer holds, and never provides); it logs
+why when it can do neither.
+
 * (deprecated in v23.05) **max-locktime-blocks**=*BLOCKS*
 
   The longest our funds can be delayed (ie. the longest

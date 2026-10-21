@@ -62,6 +62,9 @@ struct config {
 	/* SEQUENTIA: offer point-locked HTLCs (--point-locks). */
 	bool point_locks;
 
+	/* SEQUENTIA: offer credit channels (--credit-channels). */
+	bool credit_channels;
+
 	/* Do we let the opener set any fee rate they want */
 	bool ignore_fee_limits;
 
@@ -458,6 +461,11 @@ struct lightningd {
 
 	/* Whether connectd should pad messages to make them equal length */
 	bool message_padding;
+
+	/* SEQUENTIA: can this node's signer issue credit notes (sign them and
+	 * sweep a credit output)?  Then it opens credit channels as their
+	 * provider (common/credit_scripts.h). */
+	bool credit_issuer;
 };
 
 /* Turning this on allows a tal allocation to return NULL, rather than aborting.

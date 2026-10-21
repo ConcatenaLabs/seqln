@@ -221,7 +221,8 @@
                       "anchors/even",
                       "scid_alias/even",
                       "zeroconf/even",
-                      "seq_taproot_covenant/even"
+                      "seq_taproot_covenant/even",
+                      "seq_credit/even"
                     ],
                     "description": [
                       "Name of feature bit."

@@ -431,3 +431,14 @@ msgdata,channeld_blockheight,blockheight,u32,
 # Tell channeld about peer's shachain seed.
 msgtype,channeld_dev_peer_shachain,1013
 msgdata,channeld_dev_peer_shachain,seed,sha256,
+
+# SEQUENTIA: a credit channel's latest note (lightningd/credit.h): for the
+# holder, the highest it can enforce, which channeld hands to the signer and
+# keeps the provider's balance able to pay; for the provider, the highest it
+# issued, below which it offers nothing.
+#include <bitcoin/signature.h>
+msgtype,channeld_credit_note,1040
+msgdata,channeld_credit_note,credit,u64,
+msgdata,channeld_credit_note,payment_hash,sha256,
+msgdata,channeld_credit_note,sig,bip340sig,
+msgdata,channeld_credit_note,preimage,?preimage,

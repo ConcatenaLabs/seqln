@@ -6948,6 +6948,41 @@ static void handle_dev_quiesce(struct peer *peer, const u8 *msg)
 	maybe_send_stfu(peer);
 }
 
+/* SEQUENTIA: a credit channel's latest note (lightningd/credit.h): the
+ * signer learns it before it signs anything more on this channel. */
+static void handle_credit_note(struct peer *peer, const u8 *msg)
+{
+	u64 credit;
+	struct sha256 payment_hash;
+	struct bip340sig sig;
+	struct preimage *preimage;
+	const u8 *reply;
+	struct channel_id tagid;
+
+	if (!fromwire_channeld_credit_note(tmpctx, msg, &credit, &payment_hash,
+					   &sig, &preimage))
+		master_badmsg(WIRE_CHANNELD_CREDIT_NOTE, msg);
+	/* The note's tag binds the funding outpoint (common/credit_scripts.h). */
+	derive_channel_id(&tagid, &peer->channel->funding);
+	reply = hsm_req(tmpctx, take(towire_hsmd_credit_note(NULL,
+							     &tagid,
+							     credit,
+							     &payment_hash,
+							     &sig,
+							     preimage)));
+	if (!fromwire_hsmd_credit_note_reply(reply))
+		status_failed(STATUS_FAIL_HSM_IO,
+			      "Reading credit_note reply: %s",
+			      tal_hex(tmpctx, reply));
+	status_debug("Signer told of credit note %"PRIu64, credit);
+	/* From now on the provider keeps the credit on top of its reserve
+	 * (channel_reserve_of): an update that would leave its balance unable
+	 * to pay the note's CLAIM fails, whichever side proposes it.  Notes
+	 * are cumulative, so the floor only rises. */
+	if (amount_sat_greater(amount_sat(credit), peer->channel->credit_floor))
+		peer->channel->credit_floor = amount_sat(credit);
+}
+
 static void req_in(struct peer *peer, const u8 *msg)
 {
 	enum channeld_wire t = fromwire_peektype(msg);
@@ -6960,6 +6995,9 @@ static void req_in(struct peer *peer, const u8 *msg)
 		if (handle_master_request_later(peer, msg))
 			return;
 		handle_offer_htlc(peer, msg);
+		return;
+	case WIRE_CHANNELD_CREDIT_NOTE:
+		handle_credit_note(peer, msg);
 		return;
 	case WIRE_CHANNELD_FEERATES:
 		if (handle_master_request_later(peer, msg))
