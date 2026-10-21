@@ -23,7 +23,7 @@ use seqln_signer::dispatch::{Outcome, Signer as InnerSigner};
 use seqln_signer::frame;
 use seqln_signer::hsm_secret;
 use seqln_signer::noise::{self, Initiator, Transport};
-use seqln_signer::payments::AssetKey;
+use seqln_signer::payments::{AssetKey, DefaultLimit};
 use seqln_signer::policy::{ChannelState, Policy};
 use wasm_bindgen::prelude::*;
 
@@ -121,8 +121,8 @@ impl Signer {
 
     /// Set the payment limit, in atoms per period, for one asset (`asset` a
     /// display-order asset id or `"btc"`) or, with `asset` undefined, the
-    /// default for every asset. `atoms` undefined or null: no limit. The
-    /// default is 10,000,000 atoms of each asset per day.
+    /// same number of atoms for every asset in place of the default in the
+    /// reference unit. `atoms` undefined or null: no limit.
     #[wasm_bindgen(js_name = setPaymentLimit)]
     pub fn set_payment_limit(&mut self, asset: Option<String>, atoms: Option<f64>) -> Result<(), JsError> {
         let atoms = match atoms {
@@ -131,13 +131,62 @@ impl Signer {
         };
         let mut limits = self.inner.limits().clone();
         match asset {
-            None => limits.default_atoms = atoms,
+            None => {
+                limits.default = match atoms {
+                    Some(a) => DefaultLimit::Atoms(a),
+                    None => DefaultLimit::None,
+                }
+            }
             Some(a) => {
                 limits.per_asset.insert(AssetKey::parse(&a).map_err(|e| JsError::new(&e))?, atoms);
             }
         }
         self.inner.set_limits(limits);
         Ok(())
+    }
+
+    /// Set the default payment limit, in reference atoms per period, that
+    /// every asset without a limit of its own is held to at its rate
+    /// (`setAssetRate`). `reference` undefined or null: no limit. The default
+    /// is 1,000 reference units (10^11 reference atoms) a day.
+    #[wasm_bindgen(js_name = setReferencePaymentLimit)]
+    pub fn set_reference_payment_limit(&mut self, reference: Option<f64>) -> Result<(), JsError> {
+        let mut limits = self.inner.limits().clone();
+        limits.default = match reference {
+            Some(r) => DefaultLimit::Reference(whole(r, "reference atoms")?),
+            None => DefaultLimit::None,
+        };
+        self.inner.set_limits(limits);
+        Ok(())
+    }
+
+    /// Give the rate the reference limit is converted at for one asset
+    /// (`asset` a display-order asset id or `"btc"`), as the node's fee
+    /// exchange rates give it: reference atoms per 10^8 atoms of the asset.
+    /// `rate` undefined, null or 0 forgets it, and the asset is then held to
+    /// 10,000,000 of its own atoms.
+    #[wasm_bindgen(js_name = setAssetRate)]
+    pub fn set_asset_rate(&mut self, asset: String, rate: Option<f64>) -> Result<(), JsError> {
+        let key = AssetKey::parse(&asset).map_err(|e| JsError::new(&e))?;
+        let mut limits = self.inner.limits().clone();
+        match rate {
+            Some(r) if r > 0.0 => {
+                limits.rates.insert(key, whole(r, "rate")?);
+            }
+            _ => {
+                limits.rates.remove(&key);
+            }
+        }
+        self.inner.set_limits(limits);
+        Ok(())
+    }
+
+    /// The payment limit for one asset (`asset` a display-order asset id or
+    /// `"btc"`), in its atoms per period; undefined when it has none.
+    #[wasm_bindgen(js_name = paymentLimit)]
+    pub fn payment_limit(&self, asset: String) -> Result<Option<f64>, JsError> {
+        let key = AssetKey::parse(&asset).map_err(|e| JsError::new(&e))?;
+        Ok(self.inner.limits().limit_atoms(&key).map(|a| a as f64))
     }
 
     /// Set the period the payment limits apply over, in seconds (default a

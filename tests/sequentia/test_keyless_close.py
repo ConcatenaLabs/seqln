@@ -39,7 +39,8 @@ DEVICE = os.environ.get('SEQLN_DEVICE', 'native')
 MNEMONIC = ' '.join(['abandon'] * 11 + ['about'])
 PAR = 10**8
 # The device's payment limit (atoms of each asset a day) in these tests: their
-# payments are larger than the default of 10,000,000.
+# payments are larger than the 10,000,000 atoms the device allows an asset it
+# has no rate for.
 TEST_PAY_LIMIT = '1000000000'
 
 
@@ -62,7 +63,7 @@ class Device(object):
     """The device signer, reconnecting whenever its session ends, as a
     browser does."""
     def __init__(self, directory, port, priv, host_pub, trace=False, pay_limit=TEST_PAY_LIMIT,
-                 pay_limits=None, close_to=None):
+                 pay_limits=None, close_to=None, rates=None):
         self.dir = os.path.join(directory, 'device')
         os.makedirs(self.dir, exist_ok=True)
         with open(os.path.join(self.dir, 'hsm_secret'), 'wb') as f:
@@ -70,8 +71,12 @@ class Device(object):
         self.log = os.path.join(self.dir, 'device.log')
         self.env = dict(os.environ, SEQLN_SIGNER_PRIVKEY=priv,
                         SEQLN_HOST_PEER_PUBKEY=host_pub,
-                        SEQLN_SIGNER_POLICY='enforce',
-                        SEQLN_SIGNER_PAY_LIMIT=pay_limit)
+                        SEQLN_SIGNER_POLICY='enforce')
+        # pay_limit None: the device's own default, in the reference unit.
+        if pay_limit is not None:
+            self.env['SEQLN_SIGNER_PAY_LIMIT'] = pay_limit
+        if rates:
+            self.env['SEQLN_SIGNER_RATES'] = rates
         if pay_limits:
             self.env['SEQLN_SIGNER_PAY_LIMITS'] = pay_limits
         if close_to:
@@ -114,9 +119,11 @@ class Device(object):
 
 
 def keyless_node(node_factory, directory, trace=False, pay_limit=TEST_PAY_LIMIT, pay_limits=None,
-                 close_to=None, dev_fail=True, **node_opts):
+                 close_to=None, dev_fail=True, rates=None, **node_opts):
     """A node whose hsmd is the proxy, served by a device in enforce mode.
+    `pay_limit` is SEQLN_SIGNER_PAY_LIMIT (None: the device's default);
     `pay_limits` is SEQLN_SIGNER_PAY_LIMITS (`<asset>=<atoms>,...`);
+    `rates` is SEQLN_SIGNER_RATES (`<asset>=<rate>,...`);
     `close_to` the scripts (hex) its wallet names for a close to pay.
     `dev_fail=False` runs lightningd without the harness's
     dev-fail-on-subdaemon-fail, which exits it on any subdaemon failure, so a
@@ -124,7 +131,7 @@ def keyless_node(node_factory, directory, trace=False, pay_limit=TEST_PAY_LIMIT,
     port = free_port()
     host_priv, host_pub = genkey()
     dev_priv, dev_pub = genkey()
-    device = Device(directory, port, dev_priv, host_pub, trace, pay_limit, pay_limits, close_to)
+    device = Device(directory, port, dev_priv, host_pub, trace, pay_limit, pay_limits, close_to, rates)
     device.start()
     options = dict(node_opts.pop('options', {}), subdaemon='hsmd:' + PROXY)
     node = node_factory.get_node(start=False, may_fail=True, options=options, **node_opts)

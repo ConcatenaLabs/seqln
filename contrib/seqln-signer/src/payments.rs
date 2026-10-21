@@ -23,8 +23,9 @@
 //!    that leaves this side less is refused ([`BalanceCheck`]). In permissive
 //!    mode the shortfall is charged to the allowance instead.
 //!
-//! The limit is an amount per asset, in the asset's own atoms, over a sliding
-//! period; Bitcoin is an asset like any other. An offered HTLC is charged when
+//! The limit is an amount per asset over a sliding period; Bitcoin is an
+//! asset like any other. By default it is one value in the reference unit,
+//! converted to each asset's atoms at the rate the wallet gives the device. An offered HTLC is charged when
 //! it is first committed, whether the payment then succeeds or fails, so a
 //! failed attempt still counts until the period has passed.
 
@@ -83,10 +84,19 @@ impl AssetKey {
     }
 }
 
-/// The default limit, in atoms of each asset per period: a default for a
-/// day's spending. A channel can hold more; a wallet sets its own limits per
-/// asset (`SEQLN_SIGNER_PAY_LIMITS`, or `setPaymentLimit` in the WASM build).
-pub const DEFAULT_LIMIT_ATOMS: u64 = 10_000_000;
+/// The default limit, in reference atoms per period: 1,000 units of the
+/// reference unit a day. The reference unit is the one the node's fee
+/// exchange rates are quoted in (the price feed's numeraire, the US dollar on
+/// the testnet), so the default is the same value in every asset and
+/// privileges none. A thousand a day covers what a phone pays over Lightning
+/// on any day short of an exceptional one, and it bounds what a host that
+/// turned against its user could have this device approve in a day. A wallet
+/// sets its own limits in developer mode.
+pub const DEFAULT_LIMIT_REFERENCE: u64 = 1_000 * 100_000_000;
+/// The limit, in its own atoms per period, of an asset the wallet gave no
+/// rate for: the device cannot value it, so it keeps a limit in the asset's
+/// own atoms rather than none.
+pub const UNRATED_LIMIT_ATOMS: u64 = 10_000_000;
 /// The default period: a day.
 pub const DEFAULT_PERIOD_SECS: u64 = 86_400;
 /// At most this many approved payment hashes are kept (the oldest go).
@@ -102,20 +112,39 @@ pub fn fee_allowance_msat(amount_msat: u64) -> u64 {
     (amount_msat / 200).max(5_000)
 }
 
+/// The limit of an asset that has none of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DefaultLimit {
+    /// A value in reference atoms, converted to each asset's atoms at its
+    /// rate; an asset with no rate is held to [`UNRATED_LIMIT_ATOMS`].
+    Reference(u64),
+    /// The same number of atoms of every asset.
+    Atoms(u64),
+    /// No limit.
+    None,
+}
+
 /// The configured limits: a default for every asset, overrides per asset
-/// (`None` = no limit) and the period they apply over.
+/// (`None` = no limit), the rates the default is converted at, and the
+/// period they apply over.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Limits {
-    pub default_atoms: Option<u64>,
+    pub default: DefaultLimit,
     pub per_asset: BTreeMap<AssetKey, Option<u64>>,
+    /// Each asset's rate as the node's fee exchange rates give it
+    /// (`getfeeexchangerates`): reference atoms per 10^8 atoms of the asset,
+    /// so that `atoms = reference atoms × 10^8 / rate`. The wallet supplies
+    /// them; the host never does.
+    pub rates: BTreeMap<AssetKey, u64>,
     pub period_secs: u64,
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Limits {
-            default_atoms: Some(DEFAULT_LIMIT_ATOMS),
+            default: DefaultLimit::Reference(DEFAULT_LIMIT_REFERENCE),
             per_asset: BTreeMap::new(),
+            rates: BTreeMap::new(),
             period_secs: DEFAULT_PERIOD_SECS,
         }
     }
@@ -131,26 +160,84 @@ fn parse_atoms(v: &str) -> Result<Option<u64>, String> {
         .map_err(|_| format!("limit {v:?} is neither a number of atoms nor `none`"))
 }
 
+/// `reference` reference atoms in atoms of an asset whose rate is `rate`
+/// (rounded down, at most `u64::MAX`).
+pub fn reference_to_atoms(reference: u64, rate: u64) -> u64 {
+    if rate == 0 {
+        return u64::MAX;
+    }
+    let atoms = reference as u128 * 100_000_000u128 / rate as u128;
+    atoms.min(u64::MAX as u128) as u64
+}
+
 impl Limits {
-    /// The limit for `asset`, in msat; `None` when it has none.
-    pub fn limit_msat(&self, asset: &AssetKey) -> Option<u64> {
-        self.per_asset
-            .get(asset)
-            .copied()
-            .unwrap_or(self.default_atoms)
-            .map(|a| a.saturating_mul(1000))
+    /// The limit for `asset`, in its atoms; `None` when it has none.
+    pub fn limit_atoms(&self, asset: &AssetKey) -> Option<u64> {
+        if let Some(own) = self.per_asset.get(asset) {
+            return *own;
+        }
+        match self.default {
+            DefaultLimit::None => None,
+            DefaultLimit::Atoms(a) => Some(a),
+            DefaultLimit::Reference(r) => Some(match self.rates.get(asset) {
+                Some(&rate) if rate > 0 => reference_to_atoms(r, rate),
+                _ => UNRATED_LIMIT_ATOMS,
+            }),
+        }
     }
 
-    /// Read `SEQLN_SIGNER_PAY_LIMIT` (atoms per period for every asset, or
-    /// `none`), `SEQLN_SIGNER_PAY_LIMITS` (`<asset>=<atoms|none>,...`, the
-    /// asset `btc` or a display-order id) and `SEQLN_SIGNER_PAY_PERIOD`
-    /// (seconds). Unset variables keep the defaults; a malformed one is an
-    /// error, so a typo never leaves the device without the limit it was meant
-    /// to have.
+    /// The limit for `asset`, in msat; `None` when it has none.
+    pub fn limit_msat(&self, asset: &AssetKey) -> Option<u64> {
+        self.limit_atoms(asset).map(|a| a.saturating_mul(1000))
+    }
+
+    /// The limit for a payment that names no asset, while the device has no
+    /// channel to say which asset it would be in: the default in atoms, or
+    /// the limit of an asset it cannot value.
+    pub fn unnamed_limit_atoms(&self) -> Option<u64> {
+        match self.default {
+            DefaultLimit::None => None,
+            DefaultLimit::Atoms(a) => Some(a),
+            DefaultLimit::Reference(_) => Some(UNRATED_LIMIT_ATOMS),
+        }
+    }
+
+    /// Read `SEQLN_SIGNER_PAY_LIMIT_REFERENCE` (reference atoms per period,
+    /// the default for every asset, converted at its rate), `SEQLN_SIGNER_RATES`
+    /// (`<asset>=<rate>,...`), `SEQLN_SIGNER_PAY_LIMIT` (atoms per period for
+    /// every asset, or `none`, in place of the reference default),
+    /// `SEQLN_SIGNER_PAY_LIMITS` (`<asset>=<atoms|none>,...`) and
+    /// `SEQLN_SIGNER_PAY_PERIOD` (seconds); each asset is `btc` or a
+    /// display-order id. Unset variables keep the defaults; a malformed one is
+    /// an error, so a typo never leaves the device without the limit it was
+    /// meant to have.
     pub fn from_env() -> Result<Limits, String> {
         let mut l = Limits::default();
+        if let Ok(v) = std::env::var("SEQLN_SIGNER_PAY_LIMIT_REFERENCE") {
+            l.default = match parse_atoms(&v)? {
+                Some(r) => DefaultLimit::Reference(r),
+                None => DefaultLimit::None,
+            };
+        }
         if let Ok(v) = std::env::var("SEQLN_SIGNER_PAY_LIMIT") {
-            l.default_atoms = parse_atoms(&v)?;
+            l.default = match parse_atoms(&v)? {
+                Some(a) => DefaultLimit::Atoms(a),
+                None => DefaultLimit::None,
+            };
+        }
+        if let Ok(v) = std::env::var("SEQLN_SIGNER_RATES") {
+            for item in v.split(',').filter(|s| !s.trim().is_empty()) {
+                let (a, n) = item
+                    .split_once('=')
+                    .ok_or_else(|| format!("SEQLN_SIGNER_RATES item {item:?} is not <asset>=<rate>"))?;
+                let rate = n
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|&r| r > 0)
+                    .ok_or_else(|| format!("SEQLN_SIGNER_RATES rate {n:?} is not a positive integer"))?;
+                l.rates.insert(AssetKey::parse(a)?, rate);
+            }
         }
         if let Ok(v) = std::env::var("SEQLN_SIGNER_PAY_LIMITS") {
             for item in v.split(',').filter(|s| !s.trim().is_empty()) {
@@ -758,7 +845,7 @@ mod tests {
         let gold = AssetKey::Asset([7; 32]);
         limits.per_asset.insert(AssetKey::Btc, None);
         let mut l = Ledger::default();
-        assert_eq!(l.remaining_msat(&limits, &gold, 0), Some(DEFAULT_LIMIT_ATOMS * 1000));
+        assert_eq!(l.remaining_msat(&limits, &gold, 0), Some(UNRATED_LIMIT_ATOMS * 1000));
         l.charge(gold, 9_000_000_000, 10);
         assert!(l.check_spend(&limits, &gold, 1_000_000_000, 20).is_ok());
         let e = l.check_spend(&limits, &gold, 1_000_000_001, 20).unwrap_err();
@@ -776,6 +863,56 @@ mod tests {
         }
         assert!(l.spends.len() <= MAX_SPENDS);
         assert_eq!(l.spent_msat(&gold, 700, DEFAULT_PERIOD_SECS), 9_000_000_000 + MAX_SPENDS as u64 + 10);
+    }
+
+    /// The default is one value in the reference unit: each asset's limit is
+    /// that value at the asset's rate, so a dollar-priced asset and Bitcoin
+    /// get the same worth of allowance, and an asset without a rate keeps
+    /// the atom limit. An asset's own limit, or a default set in atoms,
+    /// comes first.
+    #[test]
+    fn default_limit_is_a_reference_value() {
+        // Rates as getfeeexchangerates gives them: reference atoms per 10^8
+        // atoms. USDX (8 decimals) at 1 reference unit; Bitcoin at 60,000;
+        // the Sequence token at 0.05.
+        let usdx = AssetKey::Asset([1; 32]);
+        let seq = AssetKey::Asset([2; 32]);
+        let unrated = AssetKey::Asset([3; 32]);
+        let mut limits = Limits::default();
+        assert_eq!(limits.default, DefaultLimit::Reference(DEFAULT_LIMIT_REFERENCE));
+        limits.rates.insert(usdx, 100_000_000);
+        limits.rates.insert(AssetKey::Btc, 6_000_000_000_000);
+        limits.rates.insert(seq, 5_000_000);
+        assert_eq!(limits.limit_atoms(&usdx), Some(1_000 * 100_000_000));
+        assert_eq!(limits.limit_atoms(&AssetKey::Btc), Some(1_666_666));
+        assert_eq!(limits.limit_atoms(&seq), Some(20_000 * 100_000_000));
+        assert_eq!(limits.limit_atoms(&unrated), Some(UNRATED_LIMIT_ATOMS));
+        // 5 USDX, with the routing-fee allowance, fits a day's allowance;
+        // under the old default of 10,000,000 atoms it did not.
+        let five = 5 * 100_000_000 * 1000u64;
+        let need = five + fee_allowance_msat(five);
+        let l = Ledger::default();
+        assert!(need <= l.remaining_msat(&limits, &usdx, 0).unwrap());
+        assert!(l.check_spend(&limits, &usdx, need, 0).is_ok());
+        assert!(need > UNRATED_LIMIT_ATOMS * 1000);
+        // A whole day's worth, and not an atom more.
+        assert!(l.check_spend(&limits, &usdx, 1_000 * 100_000_000 * 1000, 0).is_ok());
+        assert!(l.check_spend(&limits, &usdx, 1_000 * 100_000_000 * 1000 + 1, 0).is_err());
+        // An asset's own limit wins; a default in atoms replaces the
+        // reference one; no default means no limit.
+        limits.per_asset.insert(usdx, Some(7));
+        assert_eq!(limits.limit_atoms(&usdx), Some(7));
+        limits.default = DefaultLimit::Atoms(42);
+        assert_eq!(limits.limit_atoms(&seq), Some(42));
+        assert_eq!(limits.unnamed_limit_atoms(), Some(42));
+        limits.default = DefaultLimit::None;
+        assert_eq!(limits.limit_atoms(&seq), None);
+        // A rate so small the conversion overflows is held at u64::MAX.
+        assert_eq!(reference_to_atoms(u64::MAX, 1), u64::MAX);
+        // A rate of zero values nothing: the asset is held as unrated.
+        limits.default = DefaultLimit::Reference(DEFAULT_LIMIT_REFERENCE);
+        limits.rates.insert(unrated, 0);
+        assert_eq!(limits.limit_atoms(&unrated), Some(UNRATED_LIMIT_ATOMS));
     }
 
     #[test]
