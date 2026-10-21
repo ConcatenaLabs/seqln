@@ -46,6 +46,12 @@ pub mod msg {
     pub const HSMD_SIGN_ANY_PENALTY_TO_US: u16 = 144;
     pub const HSMD_SIGN_ANY_LOCAL_HTLC_TX: u16 = 146;
     pub const HSMD_SIGN_ANCHORSPEND: u16 = 147;
+    pub const HSMD_SIGN_HTLC_TX_MINGLE: u16 = 149;
+    // The taproot-covenant channel type (`crate::taproot`).
+    pub const HSMD_SIGN_TCOV_DELAYED_TO_US: u16 = 61;
+    pub const HSMD_SIGN_TCOV_LOCAL_HTLC: u16 = 62;
+    pub const HSMD_SIGN_TCOV_REMOTE_HTLC_TO_US: u16 = 63;
+    pub const HSMD_SIGN_TCOV_PENALTY: u16 = 64;
 
     pub const HSMD_ECDH_RESP: u16 = 100;
     pub const HSMD_CANNOUNCEMENT_SIG_REPLY: u16 = 102;
@@ -76,6 +82,8 @@ pub mod msg {
     pub const HSMD_PREAPPROVE_KEYSEND_CHECK_REPLY: u16 = 152;
     pub const HSMD_CHECK_BIP86_PUBKEY_REPLY: u16 = 156;
     pub const HSMD_SIGN_ANCHORSPEND_REPLY: u16 = 148;
+    pub const HSMD_SIGN_HTLC_TX_MINGLE_REPLY: u16 = 150;
+    pub const HSMD_SIGN_TCOV_REPLY: u16 = 161;
 }
 
 /// Append-only big-endian wire builder.
@@ -239,11 +247,15 @@ pub fn peektype(msg: &[u8]) -> Option<u16> {
     Some(u16::from_be_bytes([msg[0], msg[1]]))
 }
 
-/// The bits of `hsmd_init` the kernel needs: the BIP32 version words and the
-/// negotiated version range. Mirrors the parse in `signerd_init`.
+/// The bits of `hsmd_init` the kernel needs: the BIP32 version words, the
+/// chain's genesis hash and the negotiated version range. Mirrors the parse
+/// in `signerd_init`.
 pub struct InitFields {
     pub bip32_pubkey_version: u32,
     pub bip32_privkey_version: u32,
+    /// The chain's genesis block hash (internal byte order), which an
+    /// Elements taproot signature hash commits to.
+    pub genesis: [u8; 32],
     pub min_version: u32,
     pub max_version: u32,
 }
@@ -261,7 +273,7 @@ pub fn parse_init(msg: &[u8]) -> Option<InitFields> {
     }
     let bip32_pubkey_version = r.u32()?;
     let bip32_privkey_version = r.u32()?;
-    r.skip(32)?; // chainparams genesis blockhash
+    let genesis = r.arr32()?; // chainparams genesis blockhash
     r.optional(32)?; // hsm_encryption_key : ?secret
     r.optional(32)?; // dev_force_privkey : ?privkey
     r.optional(32)?; // dev_force_bip32_seed : ?secret
@@ -272,6 +284,7 @@ pub fn parse_init(msg: &[u8]) -> Option<InitFields> {
     Some(InitFields {
         bip32_pubkey_version,
         bip32_privkey_version,
+        genesis,
         min_version,
         max_version,
     })
@@ -585,6 +598,70 @@ fn parse_bitcoin_tx_span(d: &[u8]) -> Option<(ElementsTx, BitcoinSpans)> {
         },
         BitcoinSpans { body: (body_start, body_end), locktime: p },
     ))
+}
+
+/// [`read_bitcoin_tx`] for an Elements transaction whose signature hash
+/// commits to every input's issuance proofs and every output's proofs
+/// (taproot): also says whether all of those are empty, as they are in a
+/// transaction with no issuance and no blinded output.
+pub fn read_elements_tx_proofs(r: &mut Reader) -> Option<(BitcoinTx, bool)> {
+    let len = r.u32()? as usize;
+    let lin = r.take_slice(len)?;
+    let plen = r.u32()? as usize;
+    let psbt = r.take_bytes(plen)?;
+    if detect_network(&psbt) != Network::Elements {
+        return None;
+    }
+    let empty = elements_proofs_empty(lin)?;
+    let (tx, txid) = parse_tx_with_txid(lin, Network::Elements)?;
+    Some((BitcoinTx { tx, psbt, txid }, empty))
+}
+
+/// Whether a linearized Elements transaction's witness section, if it has
+/// one, carries no issuance proof and no output proof (the script and
+/// peg-in witnesses may hold anything). `None` if it is malformed.
+fn elements_proofs_empty(d: &[u8]) -> Option<bool> {
+    let (tx, mut p) = parse_elements_tx_span(d)?;
+    if *d.get(4)? & 1 == 0 {
+        return Some(p == d.len());
+    }
+    let mut empty = true;
+    let varbuff = |p: &mut usize| -> Option<usize> {
+        let n = read_compact(d, p)? as usize;
+        d.get(*p..p.checked_add(n)?)?;
+        *p += n;
+        Some(n)
+    };
+    for _ in &tx.inputs {
+        empty &= varbuff(&mut p)? == 0; // issuance amount range proof
+        empty &= varbuff(&mut p)? == 0; // inflation keys range proof
+        for _ in 0..2 {
+            // script witness, then peg-in witness
+            let items = read_compact(d, &mut p)?;
+            for _ in 0..items {
+                varbuff(&mut p)?;
+            }
+        }
+    }
+    for _ in &tx.outputs {
+        empty &= varbuff(&mut p)? == 0; // surjection proof
+        empty &= varbuff(&mut p)? == 0; // range proof
+    }
+    Some(empty && p == d.len())
+}
+
+/// Input `input_index`'s previous output from its Elements
+/// `PSBT_IN_WITNESS_UTXO`: (asset, value, scriptPubKey), the commitments as
+/// serialized. What a taproot signature hash commits to for every input.
+pub fn psbt_input_elements_prevout(psbt: &[u8], input_index: usize) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let val = psbt_witness_utxo_raw(psbt, input_index)?;
+    let mut p = 0usize;
+    let asset = commit_field(val, &mut p, false)?.to_vec();
+    let value = commit_field(val, &mut p, true)?.to_vec();
+    commit_field(val, &mut p, false)?; // nonce
+    let slen = read_compact(val, &mut p)? as usize;
+    let script = val.get(p..p.checked_add(slen)?)?.to_vec();
+    Some((asset, value, script))
 }
 
 /// Read a `bitcoin_tx` wire object from the reader (`fromwire_bitcoin_tx`).
@@ -983,8 +1060,18 @@ pub fn parse_sign_withdrawal(m: &[u8]) -> Option<(Vec<HsmUtxo>, Vec<u8>)> {
 /// inputs(hsm_utxo * num_inputs) || psbt(wally_psbt: u32 len || bytes). This is
 /// the SIGN_WITHDRAWAL tail with a peerid + dbid prefix.
 pub fn parse_sign_anchorspend(m: &[u8]) -> Option<([u8; 33], u64, Vec<HsmUtxo>, Vec<u8>)> {
+    parse_sign_utxos_psbt(m, msg::HSMD_SIGN_ANCHORSPEND)
+}
+
+/// Parse `hsmd_sign_htlc_tx_mingle`, laid out as `hsmd_sign_anchorspend`.
+pub fn parse_sign_htlc_tx_mingle(m: &[u8]) -> Option<([u8; 33], u64, Vec<HsmUtxo>, Vec<u8>)> {
+    parse_sign_utxos_psbt(m, msg::HSMD_SIGN_HTLC_TX_MINGLE)
+}
+
+/// peer_id(33) dbid(8) num_inputs(2) hsm_utxo*num_inputs psbt, after type `t`.
+fn parse_sign_utxos_psbt(m: &[u8], t: u16) -> Option<([u8; 33], u64, Vec<HsmUtxo>, Vec<u8>)> {
     let mut r = Reader::new(m);
-    if r.u16()? != msg::HSMD_SIGN_ANCHORSPEND {
+    if r.u16()? != t {
         return None;
     }
     let peer_id = r.arr33()?;

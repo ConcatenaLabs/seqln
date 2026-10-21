@@ -126,8 +126,8 @@ def keyless_node(node_factory, directory, trace=False, pay_limit=TEST_PAY_LIMIT,
     dev_priv, dev_pub = genkey()
     device = Device(directory, port, dev_priv, host_pub, trace, pay_limit, pay_limits, close_to)
     device.start()
-    node = node_factory.get_node(start=False, may_fail=True,
-                                 options={'subdaemon': 'hsmd:' + PROXY}, **node_opts)
+    options = dict(node_opts.pop('options', {}), subdaemon='hsmd:' + PROXY)
+    node = node_factory.get_node(start=False, may_fail=True, options=options, **node_opts)
     if not dev_fail:
         node.daemon.opts.pop('dev-fail-on-subdaemon-fail', None)
     node.daemon.env.update({'SEQLN_SIGNER_LISTEN': '127.0.0.1:{}'.format(port),

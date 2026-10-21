@@ -133,6 +133,7 @@ fn channel(k: &Kernel) -> ChannelState {
         remote_funding: point(k, 5),
         option_static_remotekey: true,
         option_anchors: false,
+        option_tcov: false,
         is_outbound: Some(true),
         local_shutdown_script: Vec::new(),
         remote_shutdown_script: Vec::new(),

@@ -240,12 +240,12 @@ export class SeqlnSigner {
   armChannel({ peerId, dbid, fundingSats, fundingTxid, fundingOutnum,
                localToSelfDelay, remoteToSelfDelay,
                revocation, payment, htlc, delayed, funding,
-               staticRemotekey = true, anchors = false }) {
+               staticRemotekey = true, anchors = false, taprootCovenant = false }) {
     const added = this._inner.armChannel(
       hexToBytes(peerId), BigInt(dbid), BigInt(fundingSats), hexToBytes(fundingTxid),
       fundingOutnum, localToSelfDelay, remoteToSelfDelay,
       hexToBytes(revocation), hexToBytes(payment), hexToBytes(htlc),
-      hexToBytes(delayed), hexToBytes(funding), staticRemotekey, anchors);
+      hexToBytes(delayed), hexToBytes(funding), staticRemotekey, anchors, taprootCovenant);
     if (added) this._persistChannels();
     return added;
   }
