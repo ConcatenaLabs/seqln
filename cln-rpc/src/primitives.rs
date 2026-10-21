@@ -532,6 +532,7 @@ impl Display for ChannelTypeName {
             ChannelTypeName::SCID_ALIAS_EVEN => write!(f, "SCID_ALIAS_EVEN"),
             ChannelTypeName::ZEROCONF_EVEN => write!(f, "ZEROCONF_EVEN"),
             ChannelTypeName::ANCHORS_EVEN => write!(f, "ANCHORS_EVEN"),
+            ChannelTypeName::SEQ_TAPROOT_COVENANT_EVEN => write!(f, "SEQ_TAPROOT_COVENANT_EVEN"),
         }
     }
 }
