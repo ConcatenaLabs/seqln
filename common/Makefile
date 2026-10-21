@@ -103,6 +103,7 @@ COMMON_SRC_NOGEN :=				\
 	common/status_levels.c			\
 	common/status_wire.c			\
 	common/subdaemon.c			\
+	common/tcov_scripts.c			\
 	common/timeout.c			\
 	common/trace.c				\
 	common/tx_roles.c			\

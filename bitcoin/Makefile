@@ -14,6 +14,7 @@ BITCOIN_SRC :=					\
 	bitcoin/shadouble.c			\
 	bitcoin/short_channel_id.c		\
 	bitcoin/signature.c			\
+	bitcoin/tapscript.c			\
 	bitcoin/tx.c				\
 	bitcoin/tx_parts.c			\
 	bitcoin/varint.c
@@ -34,6 +35,7 @@ BITCOIN_HEADERS := bitcoin/address.h		\
 	bitcoin/shadouble.h			\
 	bitcoin/short_channel_id.h		\
 	bitcoin/signature.h			\
+	bitcoin/tapscript.h			\
 	bitcoin/tx.h				\
 	bitcoin/tx_parts.h			\
 	bitcoin/varint.h
