@@ -751,9 +751,11 @@ by one atom, a 33-byte key) forced into a block; `tests/sequentia/test_symmetric
   `forward_event` and `invoice_payment` notifications (`asset`) name the asset of the channel the
   HTLC arrived on, as a 32-byte display id, the Sequence token's included; the amounts are in
   thousandths of that asset's atoms. The fields appear on Sequentia networks only. The schemas in
-  `doc/schemas/hook/` and `doc/schemas/notification/` describe them; the generated typed bindings
-  (`.msggen.json`, `cln-rpc`, `cln-grpc`) are not regenerated from them, so a typed client does
-  not see the fields.
+  `doc/schemas/hook/` and `doc/schemas/notification/` describe them, and the typed bindings
+  msggen generates from the schemas (`cln-rpc`, `cln-grpc`, `pyln-grpc-proto`) carry them, as
+  they carry the fork's request fields (`asset` on `pay`, `invoice`, `fundchannel`, `withdraw` and
+  the rest, `lock_point` on `sendonion`). Every field the fork adds to a schema takes an
+  `"added"` annotation, or msggen, and with it CI's Check source, stops.
 
 Invoices: standard BOLT11 with the network's Lightning HRP (`tsqt` on the testnet, so invoices
 read `lntsqt...`) and one more tagged field, which carries the asset:

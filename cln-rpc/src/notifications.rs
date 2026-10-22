@@ -537,6 +537,8 @@ impl ToString for ForwardEventStatus {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ForwardEventNotification {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub asset: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub failcode: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failreason: Option<String>,
@@ -568,6 +570,8 @@ pub struct InvoiceCreationNotification {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct InvoicePaymentNotification {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asset: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outpoint: Option<Outpoint>,
     pub label: String,
