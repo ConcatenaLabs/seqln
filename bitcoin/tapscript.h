@@ -44,6 +44,11 @@ void pubkey_to_xonly(const struct pubkey *key, u8 xonly[32]);
 /* tagged_hash("TapLeaf/elements", 0xc4 || compact_size(len) || script) */
 void tap_leaf_hash(const u8 *script, struct sha256 *hash);
 
+/* The same for a leaf of any version: a Simplicity leaf (0xbe) hashes its
+ * program's 32-byte CMR. */
+void tap_leaf_hash_version(u8 version, const u8 *script, size_t script_len,
+			   struct sha256 *hash);
+
 /* tagged_hash("TapBranch/elements", min(a,b) || max(a,b)) */
 void tap_branch_hash(const struct sha256 *a, const struct sha256 *b,
 		     struct sha256 *hash);
