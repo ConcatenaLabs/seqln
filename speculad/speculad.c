@@ -80,6 +80,7 @@
 #include <common/json_parse_simple.h>
 #include <common/presign_templates.h>	/* enum wt_tmpl_kind (stable on-disk u8) */
 #include <common/setup.h>
+#include <common/sym_factory.h>
 #include <common/sym_scripts.h>
 #include <common/sym_state.h>
 #include <common/utils.h>
@@ -136,7 +137,17 @@ struct spd_sym {
 	bool we_opened;
 	struct sym_state *best, *pending;
 	struct sym_channel sc;
+	/* A factory channel's factory (common/sym_factory.h), or NULL:
+	 * `funding` is then its id, and its output the factory output until
+	 * the split, its KO after it. */
+	struct sym_factory *factory;
 };
+
+/* The output the walk starts from: the funding, or the factory output. */
+static const struct bitcoin_outpoint *sym_anchor(const struct spd_sym *s)
+{
+	return s->factory ? &s->factory->out : &s->funding;
+}
 
 struct watched_channel {
 	u64 dbid;
@@ -504,7 +515,7 @@ static struct watched_channel **load_channels(const tal_t *ctx,
 			c->sweeps = tal_arr(c, struct spd_blob *, 0);
 			c->preempt_tx = NULL;
 			c->preempt_armed = false;
-			c->funding = c->sym->funding;
+			c->funding = *sym_anchor(c->sym);
 			tal_arr_expand(&chans, c);
 			continue;
 		}
@@ -1806,7 +1817,8 @@ struct sym_cursor {
 static struct sym_cursor **g_sym_cursors;
 
 #define SYM_FUNDING_NUM ((s64)-2)
-#define WT_SYM_VERSION 1
+/* Version 2 appends the factory; version 1 records still read. */
+#define WT_SYM_VERSION 2
 
 static struct spd_sym *read_sym(const tal_t *ctx, const char *chandir)
 {
@@ -1823,7 +1835,7 @@ static struct spd_sym *read_sym(const tal_t *ctx, const char *chandir)
 	max = tal_bytelen(contents) - 1;	/* grab_file_str's NUL */
 	s = tal(ctx, struct spd_sym);
 	version = fromwire_u64(&cursor, &max);
-	if (version != WT_SYM_VERSION) {
+	if (version != 1 && version != WT_SYM_VERSION) {
 		fprintf(stderr, "speculad: %s: unknown version %"PRIu64"\n",
 			path, version);
 		return tal_free(s);
@@ -1842,6 +1854,14 @@ static struct spd_sym *read_sym(const tal_t *ctx, const char *chandir)
 		? fromwire_sym_state(s, &cursor, &max) : NULL;
 	s->pending = fromwire_bool(&cursor, &max)
 		? fromwire_sym_state(s, &cursor, &max) : NULL;
+	s->factory = NULL;
+	if (version >= 2 && fromwire_bool(&cursor, &max)) {
+		s->factory = fromwire_sym_factory(s, &cursor, &max);
+		if (s->factory && s->factory->slot >= tal_count(s->factory->slots))
+			s->factory = tal_free(s->factory);
+		if (!s->factory)
+			fromwire_fail(&cursor, &max);
+	}
 	if (!cursor) {
 		fprintf(stderr, "speculad: %s does not decode\n", path);
 		return tal_free(s);
@@ -1888,11 +1908,11 @@ static struct sym_cursor *sym_cursor_get(const struct spd_sym *s)
 	for (size_t i = 0; i < tal_count(g_sym_cursors); i++)
 		if (g_sym_cursors[i]->dbid == s->dbid
 		    && bitcoin_outpoint_eq(&g_sym_cursors[i]->funding,
-					   &s->funding))
+					   sym_anchor(s)))
 			return g_sym_cursors[i];
 	k = tal(g_state_ctx, struct sym_cursor);
 	k->dbid = s->dbid;
-	k->funding = s->funding;
+	k->funding = *sym_anchor(s);
 	k->cur_spk = NULL;
 	k->said = NULL;
 	sym_cursor_reset(k);
@@ -1968,8 +1988,23 @@ static void sym_follow(const struct spd_sym *s, struct sym_cursor *k,
 	if (k->num == SYM_FUNDING_NUM) {
 		struct sym_tree ko;
 
+		/* A factory's split pays the channel's KO at the output
+		 * numbered as its slot, whatever input spends F. */
+		if (s->factory) {
+			i = s->factory->slot;
+			o = i < tx->wtx->num_outputs ? &tx->wtx->outputs[i]
+				: NULL;
+		}
 		sym_kickoff_tree(tmpctx, &s->sc, &ko);
 		spk = sym_tree_spk(tmpctx, &ko);
+		if (s->factory && (!o || !memeq(o->script, o->script_len, spk,
+						 tal_bytelen(spk)))) {
+			sym_say(k, "factory output spent by %s, which does not"
+				" pay this channel's KO: nothing to watch",
+				fmt_bitcoin_txid(tmpctx, txid));
+			k->done = true;
+			return;
+		}
 		if (!o || !memeq(o->script, o->script_len, spk, tal_bytelen(spk))) {
 			sym_say(k, "funding spent by %s, not a kickoff (a mutual"
 				" close): nothing to watch",
@@ -2218,8 +2253,9 @@ static void defend_sym(const struct spd_sym *s, long tip, bool may_broadcast)
 		sym_say(k, "its record is for another chain: ignored");
 		return;
 	}
-	fs = rpc_txout_state(tmpctx, fmt_bitcoin_txid(tmpctx, &s->funding.txid),
-			     s->funding.n);
+	fs = rpc_txout_state(tmpctx,
+			     fmt_bitcoin_txid(tmpctx, &sym_anchor(s)->txid),
+			     sym_anchor(s)->n);
 	if (fs == SPD_TXOUT_UNKNOWN)
 		return;
 	if (fs == SPD_TXOUT_UNSPENT) {

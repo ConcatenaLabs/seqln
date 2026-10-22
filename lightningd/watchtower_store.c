@@ -7,6 +7,7 @@
 #include <ccan/tal/path/path.h>
 #include <ccan/tal/str/str.h>
 #include <channeld/channeld_wiregen.h>
+#include <common/sym_factory.h>
 #include <common/sym_state.h>
 #include <dirent.h>
 #include <errno.h>
@@ -15,6 +16,7 @@
 #include <lightningd/channel.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/log.h>
+#include <lightningd/sym_factory.h>
 #include <lightningd/symmetric.h>
 #include <lightningd/watchtower_store.h>
 #include <sys/stat.h>
@@ -672,6 +674,11 @@ bool wt_store_put_sym(struct lightningd *ld, const struct channel *channel)
 	towire_bool(&buf, channel->sym_remote_pending != NULL);
 	if (channel->sym_remote_pending)
 		towire_sym_state(&buf, channel->sym_remote_pending);
+	/* A factory channel: the factory, from whose output the tower walks
+	 * (lightningd/sym_factory.h). */
+	towire_bool(&buf, channel_is_sym_factory(channel));
+	if (channel_is_sym_factory(channel))
+		towire_sym_factory(&buf, channel->sym_factory);
 
 	dir = channel_store_dir(tmpctx, ld, channel, NULL);
 	if (!dir)
