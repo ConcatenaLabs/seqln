@@ -1,8 +1,10 @@
 /* speculad -- the Specula keyless watchtower broadcaster (Phase C).
  *
  * A standalone, always-on, device-INDEPENDENT daemon (its own systemd unit, NOT
- * a CLN plugin, NOT spawned by lightningd).  It loads NO secret and runs NO
- * crypto.  It:
+ * a CLN plugin, NOT spawned by lightningd).  It loads NO secret and signs
+ * nothing (the fee input aside, which the fee wallet signs); its only
+ * cryptography is public, the hashes and tweaks that rebuild a symmetric
+ * channel's state outputs.  It:
  *   1. reads the fsync-durable, secret-free watchtower store written by Phase B
  *      (documented on-disk format in lightningd/watchtower_store.h), reaching
  *      defensive posture purely from disk with no hsm_init (survives cold boot);
@@ -50,15 +52,22 @@
  * remote_htlc_to_us sweeps of the peer's commitment, writing them to the state
  * file's sweep set this daemon loads.  They drop into the same watch/broadcast
  * loop as the justice set.
+ *
+ * SYMMETRIC CHANNELS (common/sym_scripts.h): nothing to punish; the store is
+ * one `sym` record per channel, and the tower replaces an older state by the
+ * stored best one and settles the latest after the shared delay (defend_sym,
+ * near the end of this file).
  */
 #include "config.h"
 #include <assert.h>
+#include <bitcoin/block.h>
 #include <bitcoin/chainparams.h>
 #include <bitcoin/feerate.h>
 #include <bitcoin/script.h>
 #include <bitcoin/tx.h>
 #include <ccan/compiler/compiler.h>
 #include <ccan/err/err.h>
+#include <ccan/mem/mem.h>
 #include <ccan/noerr/noerr.h>
 #include <ccan/read_write_all/read_write_all.h>
 #include <ccan/str/hex/hex.h>
@@ -71,6 +80,8 @@
 #include <common/json_parse_simple.h>
 #include <common/presign_templates.h>	/* enum wt_tmpl_kind (stable on-disk u8) */
 #include <common/setup.h>
+#include <common/sym_scripts.h>
+#include <common/sym_state.h>
 #include <common/utils.h>
 #include <ctype.h>
 #include <dirent.h>
@@ -78,6 +89,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -112,6 +124,20 @@ struct revoked_commit {
 	long confirmations;	/* recomputed each poll (depth clock) */
 };
 
+struct spd_sym {
+	u64 dbid;
+	struct bitcoin_blkid genesis;
+	struct bitcoin_outpoint funding;
+	u32 funding_height;
+	struct amount_sat funding_sats;
+	u8 asset[33];
+	u16 delay;
+	struct pubkey key[2];
+	bool we_opened;
+	struct sym_state *best, *pending;
+	struct sym_channel sc;
+};
+
 struct watched_channel {
 	u64 dbid;
 	char *chandir;			/* <netdir>/watchtower/<dbid> */
@@ -126,6 +152,8 @@ struct watched_channel {
 	u64 preempt_commit_num;		   /* the commitment num it names */
 	bool preempt_armed;		   /* device-down-mid-round flag present */
 	u64 preempt_armed_commit_num;	   /* the commit_num the arm was set for */
+	/* A symmetric channel's record (the `sym` file), or NULL. */
+	struct spd_sym *sym;
 };
 
 /* ---- Globals (config; all box-owned, no secrets) ------------------------- */
@@ -165,6 +193,7 @@ struct justice_state {
 	struct amount_sat fee_paid;	/* its fee, in atoms of fee_asset33 */
 };
 static struct justice_state **g_states;	/* persistent registry */
+static struct spd_sym *read_sym(const tal_t *ctx, const char *chandir);
 static const tal_t *g_state_ctx;	/* owns g_states + entries (== top) */
 
 static void handle_sig(int s UNUSED)
@@ -470,6 +499,15 @@ static struct watched_channel **load_channels(const tal_t *ctx,
 		c->dbid = strtoull(ent->d_name, NULL, 10);
 		c->chandir = tal_strdup(c, chandir);
 		c->revoked = tal_arr(c, struct revoked_commit *, 0);
+		c->sym = read_sym(c, chandir);
+		if (c->sym) {
+			c->sweeps = tal_arr(c, struct spd_blob *, 0);
+			c->preempt_tx = NULL;
+			c->preempt_armed = false;
+			c->funding = c->sym->funding;
+			tal_arr_expand(&chans, c);
+			continue;
+		}
 		if (!read_state(c, chandir)) {
 			/* The layout before the state bundle: meta beside
 			 * sweeps/ and preempt/. */
@@ -1720,6 +1758,569 @@ static void defend_honest_close(struct watched_channel *c, long tip_height,
 		defend_sweep(c, c->sweeps[k], tip_height, may_broadcast);
 }
 
+/* ---- Symmetric channels (common/sym_scripts.h) ----------------------------- *
+ * A symmetric channel has nothing to punish: an old state on chain is
+ * replaced by a newer one, and the latest settles after the shared delay.
+ * Its store is one record, `sym` (lightningd/watchtower_store.h): the
+ * channel's constants and the best state the node holds with both update
+ * signatures, plus the peer's newest, which the node signed alone.  That is
+ * enough to answer ANY older state, because an update's witness publishes
+ * the new state's number and R, from which the state output, its UPD leaf
+ * and control block are rebuilt (sym_rebuild_state): public hashes and
+ * tweaks, no key.
+ *
+ * Each round, while the funding output is spent, the tower follows the
+ * chain of spends from it through the blocks: the kickoff to KO, each update
+ * to its state output.  Over the state output that stands, it publishes an
+ * update into the stored best state when that is newer; once the state that
+ * stands is the stored one (or the peer's newest) and the delay has passed,
+ * it publishes the settlement.  Either pays its fee from the fee wallet, as
+ * a justice transaction does (choose_fee_coin), and is raised by replacement
+ * at each new block until its input is spent.  A reorg below what was
+ * scanned restarts the walk from the funding output, so the tower always acts
+ * on the chain as it now stands.  HTLC outputs of the settlement are left to
+ * the node: claiming them needs its key. */
+
+/* Where the walk of one channel's spends stands (cross-round). */
+struct sym_cursor {
+	u64 dbid;
+	struct bitcoin_outpoint funding;
+	/* Last block scanned (0: none yet), and its hash. */
+	u32 scanned;
+	struct bitcoin_blkid scanned_hash;
+	/* The output that stands: the funding (num -2), KO (-1) or state
+	 * num's, created by a transaction confirmed at cur_height. */
+	struct bitcoin_outpoint cur;
+	s64 num;
+	struct sha256 rest;
+	struct amount_sat cur_sats;
+	u8 *cur_spk;
+	u32 cur_height;
+	/* Spent by a settle or by something that is not a kickoff. */
+	bool done;
+	/* Tip height of our last broadcast over cur: one per block. */
+	long bcast_tip;
+	/* Last thing said, so a round says it once. */
+	char *said;
+};
+static struct sym_cursor **g_sym_cursors;
+
+#define SYM_FUNDING_NUM ((s64)-2)
+#define WT_SYM_VERSION 1
+
+static struct spd_sym *read_sym(const tal_t *ctx, const char *chandir)
+{
+	char *path = path_join(tmpctx, chandir, "sym");
+	u8 *contents = grab_file_str(tmpctx, path);
+	const u8 *cursor;
+	size_t max;
+	struct spd_sym *s;
+	u64 version;
+
+	if (!contents)
+		return NULL;
+	cursor = contents;
+	max = tal_bytelen(contents) - 1;	/* grab_file_str's NUL */
+	s = tal(ctx, struct spd_sym);
+	version = fromwire_u64(&cursor, &max);
+	if (version != WT_SYM_VERSION) {
+		fprintf(stderr, "speculad: %s: unknown version %"PRIu64"\n",
+			path, version);
+		return tal_free(s);
+	}
+	s->dbid = fromwire_u64(&cursor, &max);
+	fromwire_bitcoin_blkid(&cursor, &max, &s->genesis);
+	fromwire_bitcoin_outpoint(&cursor, &max, &s->funding);
+	s->funding_height = fromwire_u32(&cursor, &max);
+	s->funding_sats = fromwire_amount_sat(&cursor, &max);
+	fromwire_u8_array(&cursor, &max, s->asset, sizeof(s->asset));
+	s->delay = fromwire_u16(&cursor, &max);
+	fromwire_pubkey(&cursor, &max, &s->key[SYM_OPENER]);
+	fromwire_pubkey(&cursor, &max, &s->key[SYM_ACCEPTER]);
+	s->we_opened = fromwire_bool(&cursor, &max);
+	s->best = fromwire_bool(&cursor, &max)
+		? fromwire_sym_state(s, &cursor, &max) : NULL;
+	s->pending = fromwire_bool(&cursor, &max)
+		? fromwire_sym_state(s, &cursor, &max) : NULL;
+	if (!cursor) {
+		fprintf(stderr, "speculad: %s does not decode\n", path);
+		return tal_free(s);
+	}
+	sym_channel_init(&s->sc, &s->genesis, &s->funding,
+			 &s->key[SYM_OPENER], &s->key[SYM_ACCEPTER],
+			 s->asset, s->delay);
+	return s;
+}
+
+static void sym_say(struct sym_cursor *k, const char *fmt, ...)
+	PRINTF_FMT(2, 3);
+
+static void sym_say(struct sym_cursor *k, const char *fmt, ...)
+{
+	va_list ap;
+	char *msg;
+
+	va_start(ap, fmt);
+	msg = tal_vfmt(tmpctx, fmt, ap);
+	va_end(ap);
+	if (k->said && streq(k->said, msg))
+		return;
+	fprintf(stderr, "speculad: sym dbid=%"PRIu64": %s\n", k->dbid, msg);
+	tal_free(k->said);
+	k->said = tal_strdup(k, msg);
+}
+
+static void sym_cursor_reset(struct sym_cursor *k)
+{
+	k->scanned = 0;
+	k->cur = k->funding;
+	k->num = SYM_FUNDING_NUM;
+	k->cur_spk = tal_free(k->cur_spk);
+	k->cur_height = 0;
+	k->done = false;
+	k->bcast_tip = -1;
+}
+
+static struct sym_cursor *sym_cursor_get(const struct spd_sym *s)
+{
+	struct sym_cursor *k;
+
+	for (size_t i = 0; i < tal_count(g_sym_cursors); i++)
+		if (g_sym_cursors[i]->dbid == s->dbid
+		    && bitcoin_outpoint_eq(&g_sym_cursors[i]->funding,
+					   &s->funding))
+			return g_sym_cursors[i];
+	k = tal(g_state_ctx, struct sym_cursor);
+	k->dbid = s->dbid;
+	k->funding = s->funding;
+	k->cur_spk = NULL;
+	k->said = NULL;
+	sym_cursor_reset(k);
+	tal_arr_expand(&g_sym_cursors, k);
+	return k;
+}
+
+/* The block at @height, and its hash; NULL on RPC failure. */
+static struct bitcoin_block *sym_block_at(const tal_t *ctx, u32 height,
+					  struct bitcoin_blkid *hash)
+{
+	const char **extra = tal_arr(tmpctx, const char *, 1);
+	char *hex, *res;
+
+	extra[0] = tal_fmt(extra, "%u", height);
+	hex = run_cli(tmpctx, "getblockhash", extra);
+	if (!hex)
+		return NULL;
+	hex = trim(hex);
+	if (!bitcoin_blkid_from_hex(hex, strlen(hex), hash))
+		return NULL;
+	extra = tal_arr(tmpctx, const char *, 2);
+	extra[0] = hex;
+	extra[1] = "0";
+	res = run_cli(tmpctx, "getblock", extra);
+	if (!res)
+		return NULL;
+	res = trim(res);
+	return bitcoin_block_from_hex(ctx, chainparams, res, strlen(res));
+}
+
+static bool sym_block_hash_is(u32 height, const struct bitcoin_blkid *hash)
+{
+	const char **extra = tal_arr(tmpctx, const char *, 1);
+	struct bitcoin_blkid h;
+	char *hex;
+
+	extra[0] = tal_fmt(extra, "%u", height);
+	hex = run_cli(tmpctx, "getblockhash", extra);
+	if (!hex)
+		return true;	/* unknown: keep what we have */
+	hex = trim(hex);
+	return bitcoin_blkid_from_hex(hex, strlen(hex), &h)
+		&& bitcoin_blkid_eq(&h, hash);
+}
+
+static u8 **sym_input_witness(const tal_t *ctx, const struct wally_tx_input *in)
+{
+	u8 **items;
+
+	if (!in->witness)
+		return tal_arr(ctx, u8 *, 0);
+	items = tal_arr(ctx, u8 *, in->witness->num_items);
+	for (size_t i = 0; i < in->witness->num_items; i++)
+		items[i] = tal_dup_arr(items, u8, in->witness->items[i].witness,
+				       in->witness->items[i].witness_len, 0);
+	return items;
+}
+
+/* @tx's input @i spends k->cur: move the walk on. */
+static void sym_follow(const struct spd_sym *s, struct sym_cursor *k,
+		       const struct bitcoin_tx *tx,
+		       const struct bitcoin_txid *txid, size_t i, u32 height)
+{
+	const struct wally_tx_output *o = i < tx->wtx->num_outputs
+		? &tx->wtx->outputs[i] : NULL;
+	u8 **wit = sym_input_witness(tmpctx, &tx->wtx->inputs[i]);
+	struct amount_asset a;
+	u8 *spk;
+	s64 n;
+	struct sha256 rest;
+
+	if (k->num == SYM_FUNDING_NUM) {
+		struct sym_tree ko;
+
+		sym_kickoff_tree(tmpctx, &s->sc, &ko);
+		spk = sym_tree_spk(tmpctx, &ko);
+		if (!o || !memeq(o->script, o->script_len, spk, tal_bytelen(spk))) {
+			sym_say(k, "funding spent by %s, not a kickoff (a mutual"
+				" close): nothing to watch",
+				fmt_bitcoin_txid(tmpctx, txid));
+			k->done = true;
+			return;
+		}
+		n = -1;
+	} else if (tal_count(wit) == 2) {
+		sym_say(k, "state %"PRId64" settled by %s", k->num,
+			fmt_bitcoin_txid(tmpctx, txid));
+		k->done = true;
+		return;
+	} else {
+		u8 *leaf, *cb;
+
+		if (!sym_parse_update_witness((const u8 **)wit, &n, &rest)) {
+			sym_say(k, "state %"PRId64" spent by %s, neither an"
+				" update nor a settle", k->num,
+				fmt_bitcoin_txid(tmpctx, txid));
+			k->done = true;
+			return;
+		}
+		sym_rebuild_state(tmpctx, &s->sc, n, &rest, &spk, &leaf, &cb);
+		if (!o || !memeq(o->script, o->script_len, spk, tal_bytelen(spk))) {
+			sym_say(k, "update %s does not pay state %"PRId64"'s"
+				" output at %zu", fmt_bitcoin_txid(tmpctx, txid),
+				n, i);
+			k->done = true;
+			return;
+		}
+		k->rest = rest;
+	}
+	a = wally_tx_output_get_amount(o);
+	k->cur.txid = *txid;
+	k->cur.n = i;
+	k->num = n;
+	k->cur_sats = amount_sat(a.value);
+	tal_free(k->cur_spk);
+	k->cur_spk = tal_dup_talarr(k, u8, spk);
+	k->cur_height = height;
+	k->bcast_tip = -1;
+	fprintf(stderr, "speculad: sym dbid=%"PRIu64": %s %s:%zu at height %u\n",
+		k->dbid, n == -1 ? "kickoff, KO" : tal_fmt(tmpctx, "state %"PRId64,
+							   n),
+		fmt_bitcoin_txid(tmpctx, txid), i, height);
+}
+
+/* Scan blocks up to @tip, following the spends.  False on RPC failure. */
+static bool sym_scan(const struct spd_sym *s, struct sym_cursor *k, long tip)
+{
+	if (k->scanned && !sym_block_hash_is(k->scanned, &k->scanned_hash)) {
+		fprintf(stderr, "speculad: sym dbid=%"PRIu64": reorg below"
+			" height %u: following the spends again\n", k->dbid,
+			k->scanned);
+		sym_cursor_reset(k);
+	}
+	if (!k->scanned) {
+		u32 from = s->funding_height;
+		if (!from)
+			from = tip > 2016 ? tip - 2016 : 1;
+		k->scanned = from - 1;
+	}
+	while (!k->done && (long)k->scanned < tip) {
+		u32 h = k->scanned + 1;
+		struct bitcoin_blkid hash;
+		struct bitcoin_block *b = sym_block_at(tmpctx, h, &hash);
+
+		if (!b)
+			return false;
+		for (size_t t = 0; t < tal_count(b->tx) && !k->done; t++) {
+			const struct bitcoin_tx *tx = b->tx[t];
+
+			for (size_t i = 0; i < tx->wtx->num_inputs; i++) {
+				if (!wally_tx_input_spends(&tx->wtx->inputs[i],
+							   &k->cur))
+					continue;
+				sym_follow(s, k, tx, &b->txids[t], i, h);
+				break;
+			}
+		}
+		k->scanned = h;
+		k->scanned_hash = hash;
+	}
+	return true;
+}
+
+/* The state stored under @num, or NULL. */
+static const struct sym_state *sym_stored(const struct spd_sym *s, s64 num)
+{
+	if (s->best && s->best->num == num)
+		return s->best;
+	if (s->pending && s->pending->num == num)
+		return s->pending;
+	return NULL;
+}
+
+/* Input 0 spends k->cur with @witness and @sequence into @outs; the fee
+ * input, its change and the fee follow, in the fee coin's asset.  Signed by
+ * the fee wallet, input 0's witness restored after. */
+static char *sym_fund(const tal_t *ctx, const struct spd_sym *s,
+		      const struct sym_cursor *k, struct justice_state *st,
+		      u8 **witness, u32 sequence,
+		      const struct sym_state_out *outs, u32 feerate_perkw)
+{
+	struct bitcoin_tx *tx, *stx;
+	struct amount_sat feeamt, minfee, maxfee, changeamt;
+	int change_idx, fee_idx = -1;
+	char *hex, *signed_hex, *res;
+	const char **extra;
+	size_t weight;
+	u64 rate;
+	u8 *raw;
+
+	if (!g_fee_wallet)
+		return NULL;
+	if (st->have_feeutxo && asset_rate(st->fee_asset_hex) == 0)
+		st->have_feeutxo = false;
+	if (!st->have_feeutxo) {
+		struct fee_coin coin;
+		const char *why;
+
+		if (!choose_fee_coin(tmpctx, s->asset, 2000, &coin, &why)) {
+			fprintf(stderr, "speculad: %s: cannot fund it: %s\n",
+				st->key, why);
+			return NULL;
+		}
+		st->feeutxo = coin.op;
+		st->feeutxo_val = coin.value;
+		tal_free(st->feeutxo_spk);
+		st->feeutxo_spk = tal_steal(g_state_ctx, coin.spk);
+		memcpy(st->fee_asset33, coin.asset33, 33);
+		tal_free(st->fee_asset_hex);
+		st->fee_asset_hex = tal_strdup(g_state_ctx, coin.asset_hex);
+		st->have_feeutxo = true;
+	}
+	rate = asset_rate(st->fee_asset_hex);
+
+	tx = bitcoin_tx(ctx, chainparams, 2, tal_count(outs) + 2, 0);
+	bitcoin_tx_set_output_asset(tx, s->asset);
+	bitcoin_tx_add_input(tx, &k->cur, sequence, NULL, k->cur_sats,
+			     k->cur_spk, NULL);
+	bitcoin_tx_input_set_witness(tx, 0, witness);
+	for (size_t i = 0; i < tal_count(outs); i++)
+		bitcoin_tx_add_output(tx, outs[i].spk, NULL, outs[i].amount);
+	bitcoin_tx_set_output_asset(tx, st->fee_asset33);
+	bitcoin_tx_add_input(tx, &st->feeutxo, SPD_RBF_SEQUENCE, NULL,
+			     amount_sat(st->feeutxo_val), st->feeutxo_spk, NULL);
+	change_idx = bitcoin_tx_add_output(tx, st->feeutxo_spk, NULL,
+					   amount_sat(st->feeutxo_val));
+	if (chainparams->is_elements)
+		fee_idx = bitcoin_tx_add_output(tx, NULL, NULL, AMOUNT_SAT(0));
+
+	weight = bitcoin_tx_weight(tx) + 108;
+	feeamt = amount_tx_fee(feerate_in_asset(feerate_perkw, rate), weight);
+	minfee = amount_tx_fee(feerate_in_asset(FEERATE_FLOOR, rate), weight);
+	if (amount_sat_less(feeamt, minfee))
+		feeamt = minfee;
+	if (!amount_sat_sub(&maxfee, amount_sat(st->feeutxo_val), SPD_DUST_SAT))
+		return NULL;
+	if (amount_sat_greater(feeamt, maxfee))
+		feeamt = maxfee;
+	if (!amount_sat_sub(&changeamt, amount_sat(st->feeutxo_val), feeamt))
+		return NULL;
+	bitcoin_tx_output_set_amount(tx, change_idx, changeamt);
+	if (fee_idx >= 0)
+		bitcoin_tx_output_set_amount(tx, fee_idx, feeamt);
+	st->fee_paid = feeamt;
+
+	raw = linearize_tx(tmpctx, tx);
+	hex = tal_hexstr(tmpctx, raw, tal_bytelen(raw));
+	extra = tal_arr(tmpctx, const char *, 1);
+	extra[0] = hex;
+	res = run_cli_wallet(tmpctx, "signrawtransactionwithwallet", extra);
+	if (!res)
+		return NULL;
+	signed_hex = json_find_string(tmpctx, res, "hex");
+	if (!signed_hex)
+		return NULL;
+	/* The wallet strips the witness of the input it does not own. */
+	stx = bitcoin_tx_from_hex(tmpctx, signed_hex, strlen(signed_hex));
+	if (!stx)
+		return NULL;
+	bitcoin_tx_input_copy_witness(stx, 0, tx, 0);
+	/* NON-CUSTODY GUARD: what the state pays, and nothing else, in
+	 * outputs 0 .. m-1. */
+	for (size_t i = 0; i < tal_count(outs); i++) {
+		const struct wally_tx_output *got = &stx->wtx->outputs[i];
+		struct amount_asset a = wally_tx_output_get_amount(got);
+
+		if (!memeq(got->script, got->script_len, outs[i].spk,
+			   tal_bytelen(outs[i].spk))
+		    || !amount_asset_is(&a, s->asset)
+		    || a.value != outs[i].amount.satoshis) { /* Raw: compare */
+			fprintf(stderr, "speculad: REFUSING -- output %zu is not"
+				" the state's\n", i);
+			return NULL;
+		}
+	}
+	raw = linearize_tx(tmpctx, stx);
+	return tal_hexstr(ctx, raw, tal_bytelen(raw));
+}
+
+/* Feerate: from the base toward the ceiling as the deadline (the delay
+ * after the stale state confirmed) nears, plus a step per replacement. */
+static u32 sym_feerate(long elapsed, u32 window, u32 rung)
+{
+	double urgency;
+	u64 fr;
+
+	if (elapsed < 0)
+		elapsed = 0;
+	if (window && (u32)elapsed > window)
+		elapsed = window;
+	urgency = window ? (double)elapsed / (double)window : 0;
+	fr = (u64)g_fee_base_perkw
+		+ (u64)(urgency * (double)(g_fee_max_perkw - g_fee_base_perkw))
+		+ (u64)rung * (g_fee_base_perkw / 4 + 1);
+	if (fr > g_fee_max_perkw)
+		fr = g_fee_max_perkw;
+	if (fr < FEERATE_FLOOR)
+		fr = FEERATE_FLOOR;
+	return (u32)fr;
+}
+
+static void defend_sym(const struct spd_sym *s, long tip, bool may_broadcast)
+{
+	struct sym_cursor *k = sym_cursor_get(s);
+	enum spd_txout_state fs;
+	const struct sym_state *st;
+	const struct bip340sig *sig_op, *sig_acc;
+	struct sym_tree tree;
+	struct sym_state_out *outs;
+	u8 **witness;
+	u32 sequence, feerate;
+	bool update;
+	struct justice_state *js;
+	const char **extra;
+	char *hex, *res;
+
+	if (tip < 0)
+		return;
+	if (!bitcoin_blkid_eq(&s->genesis, &chainparams->genesis_blockhash)) {
+		sym_say(k, "its record is for another chain: ignored");
+		return;
+	}
+	fs = rpc_txout_state(tmpctx, fmt_bitcoin_txid(tmpctx, &s->funding.txid),
+			     s->funding.n);
+	if (fs == SPD_TXOUT_UNKNOWN)
+		return;
+	if (fs == SPD_TXOUT_UNSPENT) {
+		if (k->scanned)
+			sym_cursor_reset(k);
+		return;
+	}
+	if (!sym_scan(s, k, tip) || k->done || k->num == SYM_FUNDING_NUM)
+		return;
+	/* Spent in a block this round's scan has not reached: the next
+	 * round follows it. */
+	if (rpc_txout_state(tmpctx, fmt_bitcoin_txid(tmpctx, &k->cur.txid),
+			    k->cur.n) != SPD_TXOUT_UNSPENT)
+		return;
+
+	update = s->best && s->best->num > k->num
+		&& sym_state_signed(s->best, s->we_opened ? LOCAL : REMOTE,
+				    &sig_op, &sig_acc);
+	if (update) {
+		u8 *prev_leaf, *prev_cb, *spk;
+		struct sym_tree prev;
+
+		if (k->num == -1) {
+			sym_kickoff_tree(tmpctx, &s->sc, &prev);
+			prev_leaf = prev.upd;
+			prev_cb = sym_tree_control_block(tmpctx, &prev,
+							 SYM_LEAF_UPD);
+		} else
+			sym_rebuild_state(tmpctx, &s->sc, k->num, &k->rest,
+					  &spk, &prev_leaf, &prev_cb);
+		sym_state_tree_of(tmpctx, &s->sc, s->best, &tree);
+		witness = sym_update_witness(tmpctx, sig_op, sig_acc, &tree,
+					     prev_leaf, prev_cb);
+		outs = tal_arr(tmpctx, struct sym_state_out, 1);
+		outs[0].amount = k->cur_sats;
+		outs[0].spk = sym_tree_spk(outs, &tree);
+		sequence = SYM_SEQUENCE;
+		sym_say(k, "%s %"PRId64" stands: replacing it by state %"PRId64,
+			k->num == -1 ? "KO" : "state", k->num, s->best->num);
+	} else {
+		u8 *spk;
+
+		st = sym_stored(s, k->num);
+		if (!st) {
+			sym_say(k, "state %"PRId64" stands and its settlement is"
+				" not stored here: its holder settles it",
+				k->num);
+			return;
+		}
+		sym_state_tree_of(tmpctx, &s->sc, st, &tree);
+		spk = sym_tree_spk(tmpctx, &tree);
+		if (!memeq(spk, tal_bytelen(spk), k->cur_spk,
+			   tal_bytelen(k->cur_spk))) {
+			sym_say(k, "state %"PRId64" stands with another"
+				" settlement than the one stored", k->num);
+			return;
+		}
+		/* CSV: the settle may be mined at cur_height + delay. */
+		if (tip + 1 < (long)k->cur_height + s->delay) {
+			sym_say(k, "state %"PRId64" stands: settling it at height"
+				" %u", k->num, k->cur_height + s->delay);
+			return;
+		}
+		witness = sym_settle_witness(tmpctx, &tree);
+		outs = st->outs;
+		sequence = s->delay;
+	}
+	if (!may_broadcast || k->bcast_tip == tip)
+		return;
+
+	js = spd_get_state(tal_fmt(tmpctx, "sym:%"PRIu64":%s:%u:%s", s->dbid,
+				   fmt_bitcoin_txid(tmpctx, &k->cur.txid),
+				   k->cur.n, update ? "update" : "settle"));
+	feerate = update
+		? sym_feerate(tip - k->cur_height + 1, s->delay, js->rung)
+		: sym_feerate(0, 0, js->rung);
+	hex = sym_fund(tmpctx, s, k, js, witness, sequence, outs, feerate);
+	if (!hex)
+		return;
+	extra = tal_arr(tmpctx, const char *, 1);
+	extra[0] = hex;
+	res = run_cli(tmpctx, "sendrawtransaction", extra);
+	if (!res) {
+		fprintf(stderr, "speculad: %s: sendrawtransaction rejected\n",
+			js->key);
+		js->have_feeutxo = false;
+		return;
+	}
+	k->bcast_tip = tip;
+	js->rung++;
+	tal_free(js->broadcast_txid);
+	js->broadcast_txid = tal_strdup(g_state_ctx, trim(res));
+	fprintf(stderr, "speculad: sym dbid=%"PRIu64": broadcast %s over %s"
+		" %"PRId64" -> txid %s (rung %u, ~%u reference atoms/kw, fee %"
+		PRIu64" atoms of asset %s)\n", s->dbid,
+		update ? tal_fmt(tmpctx, "the update to state %"PRId64,
+				 s->best->num) : "the settlement",
+		k->num == -1 ? "KO" : "state", k->num, js->broadcast_txid,
+		js->rung, feerate,
+		js->fee_paid.satoshis, /* Raw: an atom count */
+		js->fee_asset_hex);
+}
+
 /* ---- Sole-broadcaster lease (heartbeat, not a static lockfile) ------------ *
  * A standby speculad refuses to broadcast while a peer's heartbeat is fresh, so
  * two instances never double-RBF one fee input.  Heartbeat = atomically rewrite
@@ -1807,6 +2408,7 @@ int main(int argc, char *argv[])
 	g_cli_base = tal_arr(top, const char *, 0);
 	g_state_ctx = top;
 	g_states = tal_arr(top, struct justice_state *, 0);
+	g_sym_cursors = tal_arr(top, struct sym_cursor *, 0);
 
 	for (int i = 1; i < argc; i++) {
 		if (strstarts(argv[i], "--netdir="))
@@ -1901,6 +2503,13 @@ int main(int argc, char *argv[])
 		chans = load_channels(tmpctx, netdir);
 		for (size_t i = 0; i < tal_count(chans); i++) {
 			struct watched_channel *c = chans[i];
+
+			/* A symmetric channel: nothing to punish, an old state
+			 * to replace and the latest to settle. */
+			if (c->sym) {
+				defend_sym(c->sym, tip_height, may_broadcast);
+				continue;
+			}
 
 			/* Phase F: race the peer to the funding outpoint with OUR
 			 * current commitment if the device dropped mid-round.  Run

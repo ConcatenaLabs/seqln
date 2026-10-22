@@ -2853,13 +2853,18 @@ void peer_got_commitsig(struct channel *channel, const u8 *msg)
 	 * (never a revoked one) -- the Specula-vs-Vigilia guard.  Fail-soft (B6):
 	 * a device REJECT / store failure is logged, never fatal. */
 	preempt_tx = NULL;
+	/* SEQUENTIA: a symmetric channel's last_tx is its kickoff, whose
+	 * signatures are SIGHASH_SINGLE|ANYONECANPAY, and its store is the
+	 * `sym` record, written as its states advance (lightningd/symmetric.c). */
 	if (wt_store_enabled(ld)
+	    && !channel_type_has(channel->type, OPT_SEQ_SYMMETRIC)
 	    && channel->last_tx && !invalid_last_tx(channel->last_tx))
 		preempt_tx = sign_last_tx(tmpctx, channel, channel->last_tx,
 					  &channel->last_sig);
 	/* The sweeps and the preempt commitment go to disk in ONE write: the
 	 * store's flush count is what a commitment step costs. */
 	if (wt_store_enabled(ld)
+	    && !channel_type_has(channel->type, OPT_SEQ_SYMMETRIC)
 	    && !wt_store_put_advance(ld, channel, commitnum, sweeps, preempt_tx))
 		log_broken(channel->log,
 			   "watchtower: failed storing the state advance "

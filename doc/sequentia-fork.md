@@ -624,7 +624,9 @@ asset whose coins are worth most to it, rebuilds it each block at a rising fee u
 is spent, and releases the coins of a spend that lost to another. The settlement's own balance
 output goes to the wallet; an HTLC the node offered is taken back by its TIMEOUT leaf after its
 expiry, one it received by its SUCCESS leaf once the preimage is known, and the preimage of one
-the peer claims is passed upstream. The update and the settle need no key.
+the peer claims is passed upstream. The update and the settle need no key, so a node that keeps
+the watchtower store has `speculad` replace a stale state and settle while it is down (section
+7b).
 
 **Delays.** Every output waits for the settlement, HTLCs included, and a peer that withheld its
 last acknowledgement can publish the state it holds just before the delay runs out, restarting
@@ -901,6 +903,19 @@ On a taproot-covenant channel (section 5b) the tower's template for a revoked co
 REVOKE leaf's witness, which needs no signature; `speculad` finds that commitment's `to_local`
 and every claim output of it by their script and returns each to the victim.
 
+On a symmetric channel (section 5e) nothing is punished, so the store holds one record per
+channel, `sym`, rewritten before channeld goes on whenever the best state the node holds whole,
+or the peer's newest, changes: the channel's constants and those two states, with their update
+signatures. `speculad` follows the spends from the funding output through the blocks, the kickoff
+to KO and each update to its state output. Over the state output that stands it publishes an
+update into the stored best state when that is newer; once the stored state, or the peer's
+newest, stands and the delay has passed, it publishes its settlement. Each pays its fee from the
+fee wallet as a justice transaction does and is raised by replacement at each new block until
+its input is spent. Any older state output is rebuilt from the number and R its update
+published, so the record does not grow with the states. A reorg below what it scanned restarts
+the walk from the funding output. The settlement's HTLC outputs are left to the node, whose key
+claims them.
+
 The Specula design note is not yet published in this repository; the header comment of
 `speculad/speculad.c` is the fullest description of the model.
 
@@ -1056,7 +1071,9 @@ whose kickoff, update and settlement each take their fee from a coin in another 
 each side its balance; a stale state, published and mined by a peer that kept it while the
 other was away, replaced by the latest one when that side returns within the delay, and the
 latest split settled; HTLCs in flight claimed from the settlement by their SUCCESS leaf with the
-preimage, and by their TIMEOUT leaf after the expiry; and a mutual close
+preimage, and by their TIMEOUT leaf after the expiry; a mutual close; and, with the victim
+offline, `speculad` holding only its store replacing the stale state by the latest and settling
+it after the delay, each with a fee coin from its own wallet in another asset
 (`test_symmetric.py`). They need `sequentiad`, `sequentia-cli`
 and a Bitcoin Core `bitcoind` on `PATH`, and the keyless tests need the device signer built
 (`cargo build --release` in `contrib/seqln-signer`, or `SEQLN_SIGNER=/path/to/seqln-signer`).

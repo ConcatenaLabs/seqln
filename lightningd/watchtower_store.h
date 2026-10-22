@@ -52,6 +52,23 @@
  *   height) so speculad recomputes the deadline after a reorg; the blob binds
  *   only its input outpoint, never a height.
  *
+ *     sym                      a SYMMETRIC channel's whole record (common/
+ *                              sym_scripts.h), in place of the files above:
+ *                              nothing is ever punished, so nothing is kept
+ *                              per old state.  u64 version(=1), u64
+ *                              channel_dbid, bitcoin_blkid genesis,
+ *                              bitcoin_outpoint funding, u32 funding_height
+ *                              (0 before lock-in), amount_sat funding_sats,
+ *                              u8 asset[33], u16 shared_delay, pubkey
+ *                              opener_update_key, pubkey accepter_update_key,
+ *                              bool we_opened, then bool has_best [sym_state
+ *                              best: the best state this node holds with both
+ *                              update signatures], then bool has_pending
+ *                              [sym_state pending: the peer's newest, signed
+ *                              by this node only], each towire_sym_state.
+ *                              Rewritten whenever either changes, before
+ *                              channeld goes on (wt_store_put_sym).
+ *
  *   Readers also take the layouts this grew out of, so a store written by an
  *   earlier lightningd is read as it stands until its next advance rewrites
  *   it: a `meta` file (u64 version 1|2, u64 dbid, u64 current_commit_num[,
@@ -76,6 +93,8 @@ bool wt_store_enabled(const struct lightningd *ld);
 #define WT_STATE_FILE "state"
 #define WT_BLOB_SET_VERSION 1
 #define WT_BLOB_SET_FILE "blobs"
+#define WT_SYM_VERSION 1
+#define WT_SYM_FILE "sym"
 
 struct lightningd;
 struct channel;
@@ -137,6 +156,10 @@ bool wt_store_put_preempt(struct lightningd *ld,
 bool wt_store_set_preempt_armed(struct lightningd *ld,
 				const struct channel *channel,
 				bool armed);
+
+/* A symmetric channel's record (the `sym` file above): durable on return.
+ * False on any I/O failure (the caller logs). */
+bool wt_store_put_sym(struct lightningd *ld, const struct channel *channel);
 
 /* The channel is gone from this node (lightningd forgets a closed channel
  * once every output of its close is irrevocably resolved): remove its whole

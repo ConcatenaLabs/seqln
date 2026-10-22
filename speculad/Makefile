@@ -3,11 +3,11 @@
 # speculad: the Specula keyless watchtower broadcaster (Phase C).
 #
 # A standalone, always-on, device-INDEPENDENT daemon with its OWN systemd unit
-# (NOT a CLN plugin, NOT spawned by lightningd).  It loads no secret and runs no
-# crypto: it reads the fsync-durable watchtower store (see
-# lightningd/watchtower_store.h), watches the chain via elements-cli RPC, and
-# broadcasts the device-pre-signed justice/sweep blobs while the signing device
-# is offline.
+# (NOT a CLN plugin, NOT spawned by lightningd).  It loads no secret: it reads
+# the fsync-durable watchtower store (see lightningd/watchtower_store.h),
+# watches the chain via elements-cli RPC, and broadcasts the device-pre-signed
+# justice/sweep blobs, and a symmetric channel's stored latest state and its
+# settlement, while the signing device is offline.
 #
 # Like cli/lightning-cli it is a single translation unit linked over libcommon.a
 # (which pulls libwallycore/libsecp256k1 in via EXTERNAL_LDLIBS); it needs no

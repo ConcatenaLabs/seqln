@@ -347,8 +347,10 @@ struct watchtower_blob **onchain_presign_current_sweeps(const tal_t *ctx,
 	struct watchtower_blob **blobs;
 
 	/* SEQUENTIA: these sweeps spend P2WSH outputs and pre-signed HTLC
-	 * transactions, which a taproot-covenant channel does not have. */
-	if (channel_has(channel, OPT_SEQ_TAPROOT_COVENANT))
+	 * transactions, which a taproot-covenant channel does not have; a
+	 * symmetric channel's store is its `sym` record. */
+	if (channel_has(channel, OPT_SEQ_TAPROOT_COVENANT)
+	    || channel_has(channel, OPT_SEQ_SYMMETRIC))
 		return NULL;
 
 	/* Stash the keyset ingredients for the fulfill-time (kind-5) rebuild:
@@ -550,7 +552,8 @@ void onchain_presign_remote_htlc_sweeps(struct channel *channel,
 		= pbase->commitment_num >= channel->static_remotekey_start[REMOTE];
 
 	/* SEQUENTIA: see onchain_presign_current_sweeps. */
-	if (channel_has(channel, OPT_SEQ_TAPROOT_COVENANT))
+	if (channel_has(channel, OPT_SEQ_TAPROOT_COVENANT)
+	    || channel_has(channel, OPT_SEQ_SYMMETRIC))
 		return;
 
 	/* Stash the REMOTE commitment ingredients for the fulfill-time
@@ -619,7 +622,8 @@ bool onchain_presign_htlc_success(struct channel *channel, struct htlc_in *hin)
 
 	/* SEQUENTIA: see onchain_presign_current_sweeps.  Nothing to store
 	 * first, so the preimage may go. */
-	if (channel_has(channel, OPT_SEQ_TAPROOT_COVENANT))
+	if (channel_has(channel, OPT_SEQ_TAPROOT_COVENANT)
+	    || channel_has(channel, OPT_SEQ_SYMMETRIC))
 		return true;
 
 	/* Best-effort on testnet: if the keyset stash is absent (e.g. right
