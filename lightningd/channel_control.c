@@ -166,7 +166,7 @@ static struct amount_msat channel_dust_cap(struct lightningd *ld,
 	rate = topo_asset_fee_rate(ld->topology, channel->channel_asset);
 	if (!rate)
 		return cap;
-	v = (__uint128_t)cap.millisatoshis * EXCHANGE_RATE_SCALE / rate;
+	v = (__uint128_t)cap.millisatoshis * EXCHANGE_RATE_SCALE / rate; /* Raw: rescaled */
 	if (v > UINT64_MAX)
 		v = UINT64_MAX;
 	return amount_msat((u64)v);
