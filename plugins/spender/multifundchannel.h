@@ -117,6 +117,9 @@ struct multifundchannel_destination {
 	/* the output index for this destination.  */
 	unsigned int outnum;
 
+	/* SEQUENTIA: in a factory, this destination's slot. */
+	unsigned int factory_slot;
+
 	/* whether the channel to this destination will
 	be announced.
 	*/
@@ -219,6 +222,12 @@ struct multifundchannel_command {
 	struct wally_psbt *psbt;
 	/* The actual feerate of the PSBT.  */
 	u32 feerate_per_kw;
+
+	/* SEQUENTIA: open every destination as a slot of one factory
+	 * (common/sym_factory.h), destination i in slot i, funded by one
+	 * output; and that factory's nonce, fresh for each attempt. */
+	bool factory;
+	struct bitcoin_txid factory_nonce;
 	/* The expected weight of the PSBT after adding in all the outputs.
 	 * In weight units (sipa).  */
 	u32 estimated_final_weight;

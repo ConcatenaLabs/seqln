@@ -707,6 +707,78 @@ negative case (an older update over a newer one, a settle before its delay, a se
 by one atom, a 33-byte key) forced into a block; `tests/sequentia/test_symmetric.py` (section
 10).
 
+## 5f. Factory channels (`option_seq_symmetric_factory`)
+
+One funding output, the factory output F, opens a symmetric channel (section 5e) between a hub
+and each of its members. Each member's channel is used while the others are offline, and one
+member exits without the others.
+
+**Enabling it.** `--symmetric-channels` offers feature bit 182/183 beside 178/179, and lightningd
+withdraws both unless hsmd signs the symmetric type. The hub runs
+`multifundchannel destinations=[...] factory=true`, every destination naming the same `asset`
+and its `amount`: it opens every destination as a slot of one factory, destination i in slot i,
+funds F alone, and opens all of them or none. The channel type is `[12, 178, 182]`
+(`seq_symmetric_factory/even` beside `seq_symmetric/even`), never announced. Underneath,
+`fundchannel_start` takes `factory_nonce`, `factory_slot` and `factory_size` and answers with
+the slot's KO as its `scriptpubkey`, and `fundchannel_complete` finds F in the PSBT, built from
+every slot of that nonce started on this node, in the channel's asset and for the factory's
+whole value.
+
+**Transactions** (`common/sym_factory.h`, which carries every script). F is `tr(H, SPLIT)`, H the
+NUMS point: no key path and no signature. SPLIT fixes outputs 0 .. N-1 as `(asset, c_j, KO_j)`,
+slot by slot, by SETTLE's streaming hash with no delay; any other input and any later output
+pays the fee, in any asset the publisher's node accepts. KO_j is slot j's channel's KO,
+`tr(H, UPD(-1))`, as a plain symmetric channel's kickoff pays it, so from KO_j on a factory
+channel closes exactly as section 5e describes: an update into the best state, its settlement
+after the shared delay.
+
+**The channel's id.** A factory channel's KO is fixed before F exists, so its tag cannot name a
+funding outpoint. It names the channel's id in the factory instead, `(nonce, slot)`: the hub's
+32-byte nonce in the place of a txid and the slot in the place of an output index. The node keeps
+that id as the channel's `funding`, so the channel id, the tag, `hsmd_sign_sym_state` and the
+device's `setup_channel` are those of a plain channel with that outpoint. Each channel's update
+keys are its own, so no two channels share both a tag and a pair of keys; a member also refuses a
+nonce that is the funding txid of a channel it has. `listpeerchannels` shows the factory under
+`seq_factory`: the nonce, the slot, the factory's size, F's outpoint, and the channel's KO once
+the factory has split.
+
+**On the wire.** `funding_created` carries the factory in TLV 48043 `sym_factory` (nonce, slot,
+asset, F's outpoint, and each slot's KO program and amount), and its `funding_txid` and
+`funding_output_index` are the channel's id. The member checks that its slot holds its own KO and
+its channel's amount, that the factory is in the channel's asset with at least two slots, none
+empty, and that the channel is not announced. There is no kickoff, so the `signature` fields of
+`funding_created`, `funding_signed` and `commitment_signed` are zero and nobody checks them.
+
+**On chain.** A channel's output is F until the split and its KO after it
+(`lightningd/sym_factory.h`). The node watches F once, whichever of its channels in the factory
+holds the watch, and when F is spent, by anyone, every one of those channels takes its KO as its
+output and goes on: a channel's update signatures name no outpoint, so nothing is re-signed. A
+KO has no clock: a channel anchored on it stays open until someone publishes a state over it.
+Its short channel id is F's block and transaction with `0x8000 + slot` as the output number,
+which no real output can have, so a hub's channels never share one.
+
+A unilateral close (`close` on a factory channel is always unilateral: there is no 2-of-2 to close
+together) publishes the split with a fee coin if F is unspent, then, once the split is mined, the
+best state over the channel's KO; when the KO is spent, onchaind takes the channel from the update
+it finds there, replacing an older state or settling the latest, as in section 5e. Each of these
+spends is built and fee-bumped as the symmetric type's are, and none starts for an output the node
+has seen spent.
+
+**What it gives up.** The cooperative close: a factory channel always closes by split, update and
+settle. A member offline when the factory is created cannot be given a slot: its first states are
+signed before F is funded.
+
+Files: `common/sym_factory.{c,h}`, `lightningd/sym_factory.{c,h}`, and the factory branches of
+`openingd/openingd.c`, `channeld/channeld.c`, `onchaind/onchaind.c` (`onchaind_sym_anchor`),
+`lightningd/opening_control.c`, `lightningd/peer_control.c`, `lightningd/closing_control.c`,
+`lightningd/onchain_control.c`, `plugins/spender/multifundchannel.c` and `wallet/wallet.c`
+(table `channel_sym_factory`). Tests: `common/test/run-sym_factory.c` checks SPLIT, F, its
+witness, a slot's tag and KO against vectors from the builders that were spent on a Sequentia
+chain with each negative case (a split moving value between slots, paying a slot elsewhere,
+reordered, short, taking its fee from a slot; one member's channel signatures over another's KO;
+the same keys in another slot or another factory) forced into a block;
+`tests/sequentia/test_sym_factory.py` (section 10).
+
 ## 6. Asset-aware gossip, routing, payments
 
 - How route finding learns a channel's asset. The channel announcement and the channel update are
@@ -990,6 +1062,7 @@ The Specula design note is not yet published in this repository; the header comm
 | `channeld`, `onchaind`, `lightningd/peer_htlcs.c`, `plugins/pay.c` | Point-locked HTLCs: the lock in the SUCCESS leaves, forwarding with a per-hop tweak, the payee's invoice point, `pay`'s choice of lock (section 5c) |
 | `channeld`, `closingd`, `onchaind`, `lightningd/credit.c`, `hsmd`, `contrib/credit-seq/`, `contrib/seqln-signer/` | Provider-signed credit: the CLAIM leaf on the provider's balance output, notes issued and held, the floor, the close and the claim (section 5d) |
 | `openingd`, `channeld`, `onchaind`, `lightningd/symmetric.c`, `hsmd` | Symmetric channels: the kickoff, update signatures per state, the replacement of older states and the settlement on chain, each with a fee coin (section 5e) |
+| `openingd`, `onchaind`, `lightningd/sym_factory.c`, `plugins/spender/multifundchannel.c` | Factory channels: one output for many symmetric channels, the split, each channel moving on to its own output (section 5f) |
 
 ## 9. libwally dependency
 
@@ -1128,7 +1201,14 @@ offline, `speculad` holding only its store replacing the stale state by the late
 it after the delay, each with a fee coin from its own wallet in another asset; and a keyless
 node whose device signs the kickoff, every state, the revocations, the funding and each stage's
 fee coins of a unilateral close, and, holding an HTLC it received, its claim by the SUCCESS leaf,
-refusing nothing (`test_symmetric.py`). They need `sequentiad`, `sequentia-cli`
+refusing nothing (`test_symmetric.py`), and factory channels (section 5f): one output opening
+four channels, two of them paid both ways while the other two members are offline, one member's
+unilateral exit (the split, its state over its KO, the settlement, each with a fee coin in
+another asset) while the other three channels stay open on their KOs and are paid again, the
+offline members included once they return; the hub's stale state over a member's KO, mined while
+that member is away, replaced by the member's latest when it returns; and a split mined in a
+block whose Bitcoin anchor is reorganised away, mined again, and the exit carried on from it
+(`test_sym_factory.py`). They need `sequentiad`, `sequentia-cli`
 and a Bitcoin Core `bitcoind` on `PATH`, and the keyless tests need the device signer built
 (`cargo build --release` in `contrib/seqln-signer`, or `SEQLN_SIGNER=/path/to/seqln-signer`).
 The test plugins run under the `python3` on `PATH`, which needs the `pyln` packages, so the

@@ -101,7 +101,8 @@
                 "zeroconf/even",
                 "seq_taproot_covenant/even",
                 "seq_credit/even",
-                "seq_symmetric/even"
+                "seq_symmetric/even",
+                "seq_symmetric_factory/even"
               ],
               "description": [
                 "Name of feature bit."

@@ -247,6 +247,7 @@ class Type(FieldSet):
         'blinded_path',
         'penalty_base',
         'sym_state',
+        'sym_factory',
         'route_hop',
         'tx_parts',
         'wally_psbt',

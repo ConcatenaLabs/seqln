@@ -12,6 +12,8 @@
 #include <common/memleak.h>
 #include <common/psbt_open.h>
 #include <common/pseudorand.h>
+#include <common/randbytes.h>
+#include <common/sym_factory.h>
 #include <inttypes.h>
 #include <plugins/spender/multifundchannel.h>
 #include <plugins/spender/openchannel.h>
@@ -866,6 +868,54 @@ perform_funding_tx_finalize(struct multifundchannel_command *mfc)
 		   		fmt_wally_psbt(tmpctx, mfc->psbt));
 	}
 
+	/* SEQUENTIA: a factory: one output, F, committing to every slot's
+	 * KO (the scriptpubkey each fundchannel_start answered with). */
+	if (mfc->factory) {
+		struct sym_factory_slot *slots
+			= tal_arr(tmpctx, struct sym_factory_slot,
+				  tal_count(mfc->destinations));
+		struct amount_sat total = AMOUNT_SAT(0);
+		const char *asset = mfc->destinations[0].asset;
+		u8 tag[33], id[32];
+
+		if (!asset)
+			return mfc_fail(mfc, JSONRPC2_INVALID_PARAMS,
+					"A factory names its asset");
+		if (!hex_decode(asset, strlen(asset), id, sizeof(id)))
+			return mfc_fail(mfc, JSONRPC2_INVALID_PARAMS,
+					"invalid asset id %s", asset);
+		tag[0] = 0x01;
+		for (size_t k = 0; k < sizeof(id); k++)
+			tag[1 + k] = id[sizeof(id) - 1 - k];
+		for (i = 0; i < tal_count(mfc->destinations); i++) {
+			struct multifundchannel_destination *d
+				= &mfc->destinations[i];
+
+			if (tal_bytelen(d->funding_script) != 34
+			    || d->funding_script[0] != 0x51
+			    || d->funding_script[1] != 32)
+				return mfc_fail(mfc, LIGHTNINGD,
+						"Slot %zu did not answer with"
+						" a KO", i);
+			memcpy(slots[d->factory_slot].program,
+			       d->funding_script + 2, 32);
+			slots[d->factory_slot].amount = d->amount;
+			if (!amount_sat_add(&total, total, d->amount))
+				return mfc_fail(mfc, JSONRPC2_INVALID_PARAMS,
+						"Factory value overflows");
+		}
+		(void) psbt_insert_output_asset(mfc->psbt,
+						sym_factory_spk(tmpctx, tag,
+								slots),
+						total, tag, 0);
+		for (i = 0; i < tal_count(mfc->destinations); i++)
+			mfc->destinations[i].outnum = 0;
+		tal_append_fmt(&content, "factory of %zu: %s",
+			       tal_count(mfc->destinations),
+			       fmt_amount_sat(tmpctx, total));
+		goto outputs_added;
+	}
+
 	/* Construct a deck of destinations.  */
 	deck = tal_arr(tmpctx, struct multifundchannel_destination *,
 		       v1_dest_count);
@@ -945,6 +995,7 @@ perform_funding_tx_finalize(struct multifundchannel_command *mfc)
 		return perform_openchannel_update(mfc);
 	}
 
+outputs_added:
 	/* We've only got v1 destinations, move onward */
 	/* Elements requires a fee output.  */
 	psbt_elements_normalize_fees(mfc->psbt);
@@ -1173,6 +1224,14 @@ fundchannel_start_dest(struct multifundchannel_destination *dest)
 	if (dest->asset)
 		json_add_string(req->js, "asset", dest->asset);
 
+	/* SEQUENTIA: a slot of the factory. */
+	if (mfc->factory) {
+		json_add_txid(req->js, "factory_nonce", &mfc->factory_nonce);
+		json_add_u32(req->js, "factory_slot", dest->factory_slot);
+		json_add_u32(req->js, "factory_size",
+			     tal_count(mfc->destinations));
+	}
+
 	send_outreq(req);
 }
 
@@ -1188,6 +1247,20 @@ perform_channel_start(struct multifundchannel_command *mfc)
 		   fmt_wally_psbt(tmpctx, mfc->psbt));
 
 	mfc->pending = tal_count(mfc->destinations);
+
+	/* SEQUENTIA: each attempt is a factory of its own: a fresh nonce,
+	 * and the slots numbered as the destinations stand now. */
+	if (mfc->factory) {
+		randbytes(&mfc->factory_nonce, sizeof(mfc->factory_nonce));
+		for (i = 0; i < tal_count(mfc->destinations); ++i) {
+			if (is_v2(&mfc->destinations[i]))
+				return mfc_fail(mfc, JSONRPC2_INVALID_PARAMS,
+						"A factory slot opens with"
+						" fundchannel_start, not"
+						" dual funding");
+			mfc->destinations[i].factory_slot = i;
+		}
+	}
 
 	/* Since v2 is now available, we branch depending
 	 * on the capability of the peer and our feaures */
@@ -2027,6 +2100,7 @@ json_multifundchannel(struct command *cmd,
 	struct multifundchannel_destination *dests;
 	u32 *minconf;
 	u32 *minchannels;
+	bool *factory;
 
 	struct multifundchannel_command *mfc;
 
@@ -2038,8 +2112,34 @@ json_multifundchannel(struct command *cmd,
 		   p_opt("utxos", param_utxos_str, &mfc->utxos_str),
 		   p_opt("minchannels", param_positive_number, &minchannels),
 		   p_opt("commitment_feerate", param_string, &mfc->cmtmt_feerate_str),
+		   p_opt_def("factory", param_bool, &factory, false),
 		   NULL))
 		return command_param_failed();
+
+	/* SEQUENTIA: a factory of at least two, every slot or none, in one
+	 * asset (common/sym_factory.h). */
+	mfc->factory = *factory;
+	if (mfc->factory) {
+		if (tal_count(dests) < 2)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "A factory has at least two"
+					    " channels");
+		if (minchannels && *minchannels != tal_count(dests))
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "A factory opens every channel or"
+					    " none");
+		for (size_t i = 0; i < tal_count(dests); i++) {
+			if (dests[i].all)
+				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+						    "A factory slot names its"
+						    " amount");
+			if (!dests[i].asset
+			    || !streq(dests[i].asset, dests[0].asset))
+				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+						    "Every slot of a factory"
+						    " names the same asset");
+		}
+	}
 
 	/* Should exist; it would only nonexist if it were a notification.  */
 	assert(cmd->id);

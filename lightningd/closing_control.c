@@ -22,6 +22,7 @@
 #include <lightningd/lightningd.h>
 #include <lightningd/opening_common.h>
 #include <lightningd/peer_fd.h>
+#include <lightningd/sym_factory.h>
 #include <openingd/dualopend_wiregen.h>
 
 struct close_command {
@@ -882,6 +883,19 @@ static struct command_result *json_close(struct command *cmd,
 
 	/* Works fine if feerate_range is NULL */
 	channel->closing_feerate_range = tal_steal(channel, feerate_range);
+
+	/* SEQUENTIA: a factory channel has no 2-of-2 output to close
+	 * together: it splits the factory and publishes its best state over
+	 * its KO (lightningd/sym_factory.h). */
+	if (channel_is_sym_factory(channel)
+	    && (channel->state == CHANNELD_NORMAL
+		|| channel->state == CHANNELD_AWAITING_LOCKIN)) {
+		register_close_command(cmd->ld, cmd, channel, 0);
+		/* drop_to_chain answers the command, at once. */
+		channel_fail_permanent(channel, REASON_USER,
+				       "A factory channel closes unilaterally");
+		return command_its_complicated("answered by drop_to_chain");
+	}
 
 	/* Normal case.
 	 * We allow states shutting down and sigexchange; a previous

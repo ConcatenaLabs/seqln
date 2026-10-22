@@ -27,6 +27,7 @@
 #include <lightningd/onchain_control.h>
 #include <lightningd/peer_htlcs.h>
 #include <lightningd/subd.h>
+#include <lightningd/sym_factory.h>
 #include <lightningd/symmetric.h>
 #include <onchaind/onchaind_wiregen.h>
 #include <wallet/txfilter.h>
@@ -2691,6 +2692,7 @@ static unsigned int onchain_msg(struct subd *sd, const u8 *msg, const int *fds U
 
 	/* We send these, not receive them */
 	case WIRE_ONCHAIND_SYM_INIT:
+	case WIRE_ONCHAIND_SYM_ANCHOR:
 	case WIRE_ONCHAIND_INIT:
 	case WIRE_ONCHAIND_SPENT:
 	case WIRE_ONCHAIND_DEPTH:
@@ -2873,7 +2875,9 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 		/* onchaind starts afresh (a restart, a reorg): the spends it
 		 * replays are noted again. */
 		channel->sym_spent_seen = tal_free(channel->sym_spent_seen);
-		sym_note_spent(channel, &channel->funding);
+		sym_note_spent(channel, channel_is_sym_factory(channel)
+			       ? sym_factory_anchor(channel)
+			       : &channel->funding);
 		if (channel->sym_dev_stale)
 			log_unusual(channel->log, "dev-sym-snapshot: closing"
 				    " with state %"PRId64" as if it were our"
@@ -2890,6 +2894,12 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 							    channel->sym_dev_stale
 							    ? NULL
 							    : channel->sym_remote_pending)));
+		subd_send_msg(channel->owner,
+			      take(towire_onchaind_sym_anchor(NULL,
+							      channel_is_sym_factory(channel)
+							      ? sym_factory_anchor(channel)
+							      : &channel->funding,
+							      channel_is_sym_factory(channel))));
 	}
 
 	/* If we're replaying, we just watch this */

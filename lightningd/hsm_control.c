@@ -216,6 +216,9 @@ struct ext_key *hsm_init(struct lightningd *ld)
 		feature_set_sub(ld->our_features,
 				feature_set_for_feature(tmpctx,
 							OPTIONAL_FEATURE(OPT_SEQ_SYMMETRIC)));
+		feature_set_sub(ld->our_features,
+				feature_set_for_feature(tmpctx,
+							OPTIONAL_FEATURE(OPT_SEQ_SYMMETRIC_FACTORY)));
 	}
 
 	/* SEQUENTIA: credit channels need that channel type, and a signer

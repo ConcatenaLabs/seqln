@@ -81,6 +81,24 @@
         "description": [
           "On an asset-aware chain, the 32-byte display id of the asset the channel is funded in; *amount* is then in that asset's atoms. The default is the chain's policy asset."
         ]
+      },
+      "factory_nonce": {
+        "type": "txid",
+        "description": [
+          "On a Sequentia network, open this channel as a slot of the factory with this 32-byte nonce (with *factory_slot* and *factory_size*). The channel's funding is then its id in the factory, (*factory_nonce*, *factory_slot*), and *scriptpubkey* is the output the factory pays the channel when it splits. **multifundchannel** with *factory* sets all three."
+        ]
+      },
+      "factory_slot": {
+        "type": "u32",
+        "description": [
+          "The channel's slot in the factory, below *factory_size*."
+        ]
+      },
+      "factory_size": {
+        "type": "u32",
+        "description": [
+          "How many channels the factory opens, at least two."
+        ]
       }
     },
     "pairedWith": [
@@ -106,7 +124,7 @@
       "funding_address": {
         "type": "string",
         "description": [
-          "The address to send funding to for the channel. DO NOT SEND COINS TO THIS ADDRESS YET."
+          "The address to send funding to for the channel. DO NOT SEND COINS TO THIS ADDRESS YET. For a factory slot, the channel's own output in the factory: fund the factory output instead (**multifundchannel** with *factory*)."
         ]
       },
       "scriptpubkey": {
@@ -157,7 +175,8 @@
                 "zeroconf/even",
                 "seq_taproot_covenant/even",
                 "seq_credit/even",
-                "seq_symmetric/even"
+                "seq_symmetric/even",
+                "seq_symmetric_factory/even"
               ],
               "description": [
                 "Name of feature bit."

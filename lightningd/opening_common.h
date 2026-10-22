@@ -111,6 +111,13 @@ struct funding_channel {
 
 	/* Were we told to withhold the commitment tx? */
 	bool withheld;
+
+	/* SEQUENTIA: a factory channel's id, (nonce, slot), the factory's
+	 * size, and the factory once fundchannel_complete found it
+	 * (lightningd/sym_factory.h). */
+	struct bitcoin_outpoint *factory_id;
+	u32 factory_size;
+	struct sym_factory *factory;
 };
 
 struct uncommitted_channel *new_uncommitted_channel(struct peer *peer);

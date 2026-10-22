@@ -6,6 +6,7 @@
 #include <common/channel_type.h>
 #include <common/derive_basepoints.h>
 #include <common/features.h>
+#include <common/sym_factory.h>
 #include <common/sym_state.h>
 
 msgtype,openingd_init,6000
@@ -110,6 +111,9 @@ msgdata,openingd_funder_start,channel_flags,u8,
 msgdata,openingd_funder_start,reserve,?amount_sat,
 msgdata,openingd_funder_start,channel_type,channel_type,
 msgdata,openingd_funder_start,channel_asset,byte,33
+# SEQUENTIA: a factory channel's id, (nonce, slot) (common/sym_factory.h):
+# the funding script it answers with is then the channel's KO.
+msgdata,openingd_funder_start,factory_id,?bitcoin_outpoint,
 
 # openingd->master: send back output script for 2-of-2 funding output
 msgtype,openingd_funder_start_reply,6102
@@ -125,6 +129,9 @@ msgtype,openingd_funder_complete,6012
 msgdata,openingd_funder_complete,funding_txid,bitcoin_txid,
 msgdata,openingd_funder_complete,funding_txout,u16,
 msgdata,openingd_funder_complete,channel_type,channel_type,
+# SEQUENTIA: a factory channel's factory; funding_txid and funding_txout are
+# then its id, (nonce, slot).
+msgdata,openingd_funder_complete,factory,?sym_factory,
 
 #master->openingd: cancel channel establishment for a funding
 msgtype,openingd_funder_cancel,6013
@@ -165,6 +172,8 @@ msgdata,openingd_fundee,channel_asset,byte,33
 msgdata,openingd_fundee,sym_kickoff_sig,?bitcoin_signature,
 msgdata,openingd_fundee,sym_local,?sym_state,
 msgdata,openingd_fundee,sym_remote,?sym_state,
+# SEQUENTIA: a factory channel's factory, as the peer sent it and we checked.
+msgdata,openingd_fundee,factory,?sym_factory,
 
 # master -> openingd: do you have a memleak?
 msgtype,openingd_dev_memleak,6033

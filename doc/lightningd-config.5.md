@@ -502,7 +502,10 @@ unilateral close is a kickoff, an update into the latest state and its
 settlement after the shared delay, and each attaches its fee when it is
 broadcast, in any asset the node accepts for fees. Only on the Sequentia
 networks and only when *hsmd* can sign the type's kickoff, states and
-HTLC claims; elsewhere the option offers nothing and logs why.
+HTLC claims; elsewhere the option offers nothing and logs why. It also
+offers the type's channels opened from a factory (feature bit 182/183),
+which **multifundchannel** opens with *factory*: one output funds a
+symmetric channel to every destination.
 
 * **symmetric-delay**=*BLOCKS*
 

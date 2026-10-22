@@ -296,6 +296,14 @@ msgdata,onchaind_sym_init,local,?sym_state,
 msgdata,onchaind_sym_init,remote,?sym_state,
 msgdata,onchaind_sym_init,remote_pending,?sym_state,
 
+# Right after onchaind_sym_init: the output the channel's close spent.  A plain
+# channel's is its funding, spent by the kickoff; a factory channel's is its
+# KO, spent by an update, as its funding is its id in the factory
+# (lightningd/sym_factory.h).
+msgtype,onchaind_sym_anchor,5054
+msgdata,onchaind_sym_anchor,anchor,bitcoin_outpoint,
+msgdata,onchaind_sym_anchor,factory,bool,
+
 # Spend a symmetric channel's output whose input 0 needs no signature of
 # ours: an update (both update signatures in the witness) or a settle (none).
 # Outputs 0 .. m-1 are those of `outs`, in the channel's asset; lightningd
