@@ -125,6 +125,10 @@ tlvtype,open_channel_tlvs,channel_type,1
 tlvdata,open_channel_tlvs,channel_type,type,byte,...
 tlvtype,open_channel_tlvs,asset_id,3
 tlvdata,open_channel_tlvs,asset_id,asset,byte,...
+# SEQUENTIA: a channel of several assets (common/sym_lanes.h): each lane
+# beside the channel's own, as its asset (33 bytes) and amount (u64).
+tlvtype,open_channel_tlvs,seq_lanes,48048
+tlvdata,open_channel_tlvs,seq_lanes,lanes,byte,...
 msgtype,accept_channel,33
 msgdata,accept_channel,temporary_channel_id,byte,32
 msgdata,accept_channel,dust_limit_satoshis,u64,
@@ -163,12 +167,20 @@ tlvdata,funding_created_tlvs,sym_sig,sig,bip340sig,
 # no kickoff, so `signature` is zero.
 tlvtype,funding_created_tlvs,sym_factory,48043
 tlvdata,funding_created_tlvs,sym_factory,factory,byte,...
+# SEQUENTIA: on a channel of several assets (common/sym_lanes.h), each other
+# lane's funding output index (u32) in the funding transaction and the
+# sender's signature on that lane's kickoff.
+tlvtype,funding_created_tlvs,seq_lanes,48048
+tlvdata,funding_created_tlvs,seq_lanes,lanes,byte,...
 msgtype,funding_signed,35
 msgdata,funding_signed,channel_id,channel_id,
 msgdata,funding_signed,signature,signature,
 msgdata,funding_signed,tlvs,funding_signed_tlvs,
 tlvtype,funding_signed_tlvs,sym_sig,48041
 tlvdata,funding_signed_tlvs,sym_sig,sig,bip340sig,
+# SEQUENTIA: each other lane's kickoff signature (common/sym_lanes.h).
+tlvtype,funding_signed_tlvs,seq_lanes,48048
+tlvdata,funding_signed_tlvs,seq_lanes,lanes,byte,...
 msgtype,channel_ready,36
 msgdata,channel_ready,channel_id,channel_id,
 msgdata,channel_ready,second_per_commitment_point,point,
@@ -302,6 +314,10 @@ tlvtype,update_add_htlc_tlvs,blinded_path,0
 tlvdata,update_add_htlc_tlvs,blinded_path,path_key,point,
 tlvtype,update_add_htlc_tlvs,seq_point_lock,174174
 tlvdata,update_add_htlc_tlvs,seq_point_lock,lock_point,point,
+# SEQUENTIA: the HTLC's lane on a channel of several assets
+# (common/sym_lanes.h); absent, the channel's own.
+tlvtype,update_add_htlc_tlvs,seq_lane,48044
+tlvdata,update_add_htlc_tlvs,seq_lane,lane,u16,
 msgtype,update_fulfill_htlc,130
 msgdata,update_fulfill_htlc,channel_id,channel_id,
 msgdata,update_fulfill_htlc,id,u64,
@@ -335,6 +351,15 @@ tlvdata,commitment_signed_tlvs,splice_info,funding_txid,sha256,
 # signatures.
 tlvtype,commitment_signed_tlvs,sym_sig,48041
 tlvdata,commitment_signed_tlvs,sym_sig,sig,bip340sig,
+# SEQUENTIA: a swap between two lanes (common/sym_lanes.h), sent as part of
+# the commitment that first carries it: the sender gives give_msat in lane
+# give_lane and takes take_msat in lane take_lane.
+tlvtype,commitment_signed_tlvs,seq_swap,48046
+tlvdata,commitment_signed_tlvs,seq_swap,id,u64,
+tlvdata,commitment_signed_tlvs,seq_swap,give_lane,u16,
+tlvdata,commitment_signed_tlvs,seq_swap,give_msat,u64,
+tlvdata,commitment_signed_tlvs,seq_swap,take_lane,u16,
+tlvdata,commitment_signed_tlvs,seq_swap,take_msat,u64,
 msgtype,revoke_and_ack,133
 msgdata,revoke_and_ack,channel_id,channel_id,
 msgdata,revoke_and_ack,per_commitment_secret,byte,32

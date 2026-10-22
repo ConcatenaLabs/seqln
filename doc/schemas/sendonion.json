@@ -142,6 +142,13 @@
         "description": [
           "On a Sequentia network, lock the first HTLC to this point rather than to a hash (a point lock, needing a taproot-covenant channel whose peer takes point locks): *payment_hash* must be the point's x coordinate, and the payment is complete with the scalar that opens it."
         ]
+      },
+      "asset": {
+        "added": "v26.06",
+        "type": "hex",
+        "description": [
+          "On a Sequentia network, the 32-byte display id of the asset the first hop pays in. On a channel of several assets it picks the lane the HTLC is added to; on any other channel it must be the channel's own asset. The default is the first channel's own asset."
+        ]
       }
     }
   },

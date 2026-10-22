@@ -3,6 +3,7 @@
 #include <bitcoin/script.h>
 #include <common/initial_channel.h>
 #include <common/sym_channel.h>
+#include <common/sym_lanes.h>
 #include <common/utils.h>
 
 u16 sym_shared_delay(const struct channel *channel)
@@ -36,6 +37,7 @@ struct sym_state *sym_channel_state(const tal_t *ctx,
 				    const struct channel *channel,
 				    enum side side, u64 commit_num,
 				    const struct sym_htlc *htlcs,
+				    const u16 *htlc_lanes,
 				    const char **err)
 {
 	struct pubkey pay[NUM_SIDES], htlc[NUM_SIDES];
@@ -45,9 +47,16 @@ struct sym_state *sym_channel_state(const tal_t *ctx,
 		pay[s] = channel->basepoints[s].payment;
 		htlc[s] = channel->basepoints[s].htlc;
 	}
-	outs = sym_settlement(tmpctx, channel->funding_sats, channel->opener,
-			      pay, htlc, channel->view[side].owed, htlcs,
-			      sym_dust_limit(channel), err);
+	/* A channel of several assets settles every lane
+	 * (common/sym_lanes.h). */
+	if (channel->sym_lanes)
+		outs = sym_lanes_settlement(tmpctx, channel, side, htlcs,
+					    htlc_lanes, err);
+	else
+		outs = sym_settlement(tmpctx, channel->funding_sats,
+				      channel->opener, pay, htlc,
+				      channel->view[side].owed, htlcs,
+				      sym_dust_limit(channel), err);
 	if (!outs)
 		return NULL;
 	return sym_state_new(ctx, side, commit_num,

@@ -551,6 +551,19 @@ void psbt_elements_input_set_asset(struct wally_psbt *psbt, size_t in,
 	tal_wally_end(psbt);
 }
 
+/* SEQUENTIA: is input @i in @asset?  One without a witness utxo is taken to
+ * be (a Bitcoin input). */
+static bool psbt_input_in_asset(const struct wally_psbt *psbt, size_t i,
+				const u8 *asset)
+{
+	struct amount_asset ia;
+
+	if (!psbt->inputs[i].witness_utxo)
+		return true;
+	ia = wally_tx_output_get_amount(psbt->inputs[i].witness_utxo);
+	return amount_asset_is(&ia, asset);
+}
+
 void psbt_elements_normalize_fees(struct wally_psbt *psbt)
 {
 	size_t fee_output_idx = psbt->num_outputs;
@@ -575,9 +588,13 @@ void psbt_elements_normalize_fees(struct wally_psbt *psbt)
 	}
 
 	/* Elements requires that every input value is accounted for,
-	 * including the fees */
+	 * including the fees.  SEQUENTIA: in the fee asset; the inputs of any
+	 * other asset balance with its own outputs (a channel of several
+	 * assets, common/sym_lanes.h, funds every lane in one transaction). */
 	struct amount_sat total_fee = AMOUNT_SAT(0), val;
 	for (size_t i = 0; i < psbt->num_inputs; i++) {
+		if (!psbt_input_in_asset(psbt, i, fee_asset))
+			continue;
 		val = psbt_input_get_amount(psbt, i);
 		if (!amount_sat_add(&total_fee, total_fee, val))
 			return;
@@ -1082,6 +1099,10 @@ struct amount_sat psbt_compute_fee(const struct wally_psbt *psbt)
 
 	fee = AMOUNT_SAT(0);
 	for (size_t i = 0; i < psbt->num_inputs; i++) {
+		/* SEQUENTIA: the fee asset's inputs alone. */
+		if (chainparams->is_elements
+		    && !psbt_input_in_asset(psbt, i, fee_asset))
+			continue;
 		input_amt = psbt_input_get_amount(psbt, i);
 		ok = amount_sat_add(&fee, fee, input_amt);
 		assert(ok);

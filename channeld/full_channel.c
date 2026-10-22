@@ -2,6 +2,7 @@
 #include <bitcoin/psbt.h>
 #include <bitcoin/script.h>
 #include <ccan/array_size/array_size.h>
+#include <ccan/tal/str/str.h>
 #include <channeld/commit_tx.h>
 #include <channeld/full_channel.h>
 #include <channeld/tcov_channel.h>
@@ -16,6 +17,7 @@
 #include <common/point_lock.h>
 #include <common/status.h>
 #include <common/sym_channel.h>
+#include <common/sym_lanes.h>
 #include <inttypes.h>
 #include <stdio.h>
   /* Needs to be at end, since it doesn't include its own hdrs */
@@ -72,6 +74,60 @@ static bool balance_ok(const struct balance *balance,
 		return false;
 	*msat = amount_msat(balance->msat);
 	return true;
+}
+
+/* SEQUENTIA: a lane's balances (common/sym_lanes.h), as struct balance. */
+struct lane_owed {
+	struct balance b[NUM_SIDES];
+};
+struct lane_view_owed {
+	struct balance b[NUM_SIDES][NUM_SIDES];
+};
+
+/* A swap (common/sym_lanes.h) moves its two legs: its owner gives in one
+ * lane and takes in the other. */
+static void balance_swap(struct balance owed0[NUM_SIDES],
+			 struct lane_owed *lanes,
+			 const struct sym_swap *swap)
+{
+	enum side owner = htlc_state_owner(swap->state);
+	struct balance *g = swap->give_lane ? lanes[swap->give_lane - 1].b
+		: owed0;
+	struct balance *t = swap->take_lane ? lanes[swap->take_lane - 1].b
+		: owed0;
+
+	g[owner].msat -= swap->give.millisatoshis; /* Raw: balance */
+	g[!owner].msat += swap->give.millisatoshis; /* Raw: balance */
+	t[!owner].msat -= swap->take.millisatoshis; /* Raw: balance */
+	t[owner].msat += swap->take.millisatoshis; /* Raw: balance */
+}
+
+/* What @payer has promised, in lane @lane, to a swap that @view has not
+ * committed yet: ours in flight, or the one we asked for. */
+static struct amount_msat swap_promised(const struct channel *channel,
+					enum side view, size_t lane,
+					enum side payer)
+{
+	struct amount_msat total = AMOUNT_MSAT(0);
+	const struct sym_swap *swaps[] = { channel->sym_swap,
+					   channel->sym_swap_req };
+
+	for (size_t i = 0; i < ARRAY_SIZE(swaps); i++) {
+		const struct sym_swap *s = swaps[i];
+		enum side owner;
+
+		if (!s || (htlc_state_flags(s->state)
+			   & HTLC_FLAG(view, HTLC_F_COMMITTED)))
+			continue;
+		owner = htlc_state_owner(s->state);
+		if (owner == payer && s->give_lane == lane
+		    && !amount_msat_accumulate(&total, s->give))
+			abort();
+		if (owner != payer && s->take_lane == lane
+		    && !amount_msat_accumulate(&total, s->take))
+			abort();
+	}
+	return total;
 }
 
 struct channel *new_full_channel(const tal_t *ctx,
@@ -164,12 +220,12 @@ void dump_htlcs(const struct channel *channel, const char *prefix)
  *
  * Also returns number of HTLCs for other side.
  */
-static size_t gather_htlcs(const tal_t *ctx,
-			   const struct channel *channel,
-			   enum side side,
-			   const struct htlc ***committed,
-			   const struct htlc ***pending_removal,
-			   const struct htlc ***pending_addition)
+static size_t gather_lane_htlcs(const tal_t *ctx,
+				const struct channel *channel,
+				enum side side, int lane,
+				const struct htlc ***committed,
+				const struct htlc ***pending_removal,
+				const struct htlc ***pending_addition)
 {
 	struct htlc_map_iter it;
 	const struct htlc *htlc;
@@ -189,6 +245,9 @@ static size_t gather_htlcs(const tal_t *ctx,
 	for (htlc = htlc_map_first(channel->htlcs, &it);
 	     htlc;
 	     htlc = htlc_map_next(channel->htlcs, &it)) {
+		/* SEQUENTIA: one lane's (common/sym_lanes.h), or all. */
+		if (lane >= 0 && htlc->lane != lane)
+			continue;
 		if (htlc_has(htlc, committed_flag)) {
 #ifdef SUPERVERBOSE
 			dump_htlc(htlc, "COMMITTED");
@@ -213,13 +272,26 @@ static size_t gather_htlcs(const tal_t *ctx,
 	return num_other_side;
 }
 
+/* The channel's own lane: every HTLC of a channel of one asset.  Fees,
+ * reserves and dust are counted in it alone. */
+static size_t gather_htlcs(const tal_t *ctx,
+			   const struct channel *channel,
+			   enum side side,
+			   const struct htlc ***committed,
+			   const struct htlc ***pending_removal,
+			   const struct htlc ***pending_addition)
+{
+	return gather_lane_htlcs(ctx, channel, side, 0, committed,
+				 pending_removal, pending_addition);
+}
+
 const struct htlc **channel_committed_htlcs(const tal_t *ctx,
 					     const struct channel *channel,
 					     enum side side)
 {
 	const struct htlc **committed;
 
-	gather_htlcs(ctx, channel, side, &committed, NULL, NULL);
+	gather_lane_htlcs(ctx, channel, side, -1, &committed, NULL, NULL);
 	return committed;
 }
 
@@ -509,6 +581,10 @@ static bool get_room_above_reserve(const struct channel *channel,
 	for (size_t i = 0; i < tal_count(adding); i++)
 		balance_add_htlc(&balance, adding[i], side);
 
+	/* SEQUENTIA: and what it has promised a swap (common/sym_lanes.h). */
+	balance.msat -= swap_promised(channel, view - channel->view, 0,
+				      side).millisatoshis; /* Raw: balance */
+
 	/* Can happen if amount completely exceeds capacity */
 	if (!balance_ok(&balance, remainder)) {
 		status_debug("Failed to add %zu remove %zu htlcs",
@@ -670,6 +746,31 @@ static bool local_opener_has_fee_headroom(const struct channel *channel,
 	return false;
 }
 
+/* SEQUENTIA: can @sender, in @recipient's view, pay @adding in lane @lane
+ * (not the channel's own)?  Such a lane carries no reserve and pays no fee
+ * (common/sym_lanes.h). */
+static bool lane_room(const struct channel *channel, enum side recipient,
+		      size_t lane, const struct htlc **adding,
+		      const struct htlc **removing, enum side sender)
+{
+	struct balance balance;
+	struct amount_msat left;
+
+	to_balance(&balance, sym_lane_owed(channel, lane, recipient, sender));
+	for (size_t i = 0; i < tal_count(removing); i++)
+		balance_remove_htlc(&balance, removing[i], sender);
+	for (size_t i = 0; i < tal_count(adding); i++)
+		balance_add_htlc(&balance, adding[i], sender);
+	balance.msat -= swap_promised(channel, recipient, lane,
+				      sender).millisatoshis; /* Raw: balance */
+	if (!balance_ok(&balance, &left)) {
+		status_debug("%s cannot afford it in lane %zu",
+			     side_to_str(sender), lane);
+		return false;
+	}
+	return true;
+}
+
 static enum channel_add_err add_htlc(struct channel *channel,
 				     enum htlc_state state,
 				     u64 id,
@@ -682,7 +783,8 @@ static enum channel_add_err add_htlc(struct channel *channel,
 				     bool enforce_aggregate_limits,
 				     struct amount_sat *htlc_fee,
 				     struct tlv_field *extra_tlvs,
-				     bool err_immediate_failures)
+				     bool err_immediate_failures,
+				     u16 lane)
 {
 	struct htlc *htlc, *old;
 	struct amount_msat msat_in_htlcs, committed_msat,
@@ -695,9 +797,14 @@ static enum channel_add_err add_htlc(struct channel *channel,
 	bool option_anchors_zero_fee_htlc_tx = channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX);
 	u32 feerate, feerate_ceil;
 
+	/* SEQUENTIA: a lane the channel has (common/sym_lanes.h). */
+	if (lane >= sym_num_lanes(channel))
+		return CHANNEL_ERR_CHANNEL_CAPACITY_EXCEEDED;
+
 	htlc = tal(tmpctx, struct htlc);
 
 	htlc->id = id;
+	htlc->lane = lane;
 	htlc->amount = amount;
 	htlc->state = state;
 	htlc->fail_immediate = false;
@@ -776,8 +883,13 @@ static enum channel_add_err add_htlc(struct channel *channel,
 		return CHANNEL_ERR_MAX_HTLC_VALUE_EXCEEDED;
 	}
 
-	/* Figure out what receiver will already be committed to. */
-	htlc_count = gather_htlcs(tmpctx, channel, recipient, &committed, &removing, &adding);
+	/* Figure out what receiver will already be committed to: as many
+	 * HTLCs in every lane, as much money in the HTLC's own
+	 * (common/sym_lanes.h). */
+	htlc_count = gather_lane_htlcs(tmpctx, channel, recipient, -1,
+				       &committed, &removing, &adding);
+	gather_lane_htlcs(tmpctx, channel, recipient, lane, &committed,
+			  &removing, &adding);
 	htlc_arr_append(&adding, htlc);
 
 	/* BOLT #2:
@@ -799,6 +911,16 @@ static enum channel_add_err add_htlc(struct channel *channel,
 	if (enforce_aggregate_limits && sender == LOCAL
 	    && htlc_count + 1 > channel->config[LOCAL].max_accepted_htlcs) {
 		return CHANNEL_ERR_TOO_MANY_HTLCS;
+	}
+
+	/* SEQUENTIA: another lane than the channel's own moves only its
+	 * balance. */
+	if (lane != 0) {
+		if (enforce_aggregate_limits
+		    && !lane_room(channel, recipient, lane, adding, removing,
+				  sender))
+			return CHANNEL_ERR_CHANNEL_CAPACITY_EXCEEDED;
+		goto add;
 	}
 
 	/* These cannot overflow with HTLC amount limitations, but
@@ -991,6 +1113,7 @@ static enum channel_add_err add_htlc(struct channel *channel,
 		if (err_immediate_failures)
 			return CHANNEL_ERR_DUST_FAILURE;
 	}
+add:
 	dump_htlc(htlc, "NEW:");
 	htlc_map_add(channel->htlcs, tal_steal(channel, htlc));
 	if (htlcp)
@@ -1028,7 +1151,28 @@ enum channel_add_err channel_add_htlc(struct channel *channel,
 
 	return add_htlc(channel, state, id, amount, cltv_expiry,
 			payment_hash, routing, path_key,
-			htlcp, true, htlc_fee, extra_tlvs, err_immediate_failures);
+			htlcp, true, htlc_fee, extra_tlvs, err_immediate_failures,
+			0);
+}
+
+enum channel_add_err channel_add_lane_htlc(struct channel *channel,
+					   enum side sender,
+					   u64 id,
+					   struct amount_msat amount,
+					   u32 cltv_expiry,
+					   const struct sha256 *payment_hash,
+					   const u8 routing[TOTAL_PACKET_SIZE(ROUTING_INFO_SIZE)],
+					   const struct pubkey *path_key TAKES,
+					   struct htlc **htlcp,
+					   struct amount_sat *htlc_fee,
+					   struct tlv_field *extra_tlvs,
+					   bool err_immediate_failures,
+					   u16 lane)
+{
+	return add_htlc(channel, sender == LOCAL ? SENT_ADD_HTLC : RCVD_ADD_HTLC,
+			id, amount, cltv_expiry, payment_hash, routing,
+			path_key, htlcp, true, htlc_fee, extra_tlvs,
+			err_immediate_failures, lane);
 }
 
 struct htlc *channel_get_htlc(struct channel *channel, enum side sender, u64 id)
@@ -1266,16 +1410,25 @@ static int change_htlcs(struct channel *channel,
 	int cflags = 0;
 	int i;
 	struct balance owed[NUM_SIDES];
+	/* SEQUENTIA: every other lane's (common/sym_lanes.h). */
+	size_t nlanes = tal_count(channel->sym_lane_bal);
+	struct lane_owed *lowed = tal_arr(tmpctx, struct lane_owed, nlanes);
 
 	for (i = 0; i < NUM_SIDES; i++)
 		to_balance(&owed[i], channel->view[sidechanged].owed[i]);
+	for (size_t l = 0; l < nlanes; l++)
+		for (i = 0; i < NUM_SIDES; i++)
+			to_balance(&lowed[l].b[i],
+				   channel->sym_lane_bal[l].owed[sidechanged][i]);
 
 	for (h = htlc_map_first(channel->htlcs, &it);
 	     h;
 	     h = htlc_map_next(channel->htlcs, &it)) {
 		for (i = 0; i < n_hstates; i++) {
 			if (h->state == htlc_states[i]) {
-				htlc_incstate(channel, h, sidechanged, owed);
+				htlc_incstate(channel, h, sidechanged,
+					      h->lane ? lowed[h->lane - 1].b
+					      : owed);
 				if (htlc_is_dead(h)) {
 					htlc_map_delval(channel->htlcs, &it);
 					tal_steal(htlcs ? *htlcs : tmpctx, h);
@@ -1289,6 +1442,31 @@ static int change_htlcs(struct channel *channel,
 		}
 	}
 
+	/* SEQUENTIA: a swap (common/sym_lanes.h) advances as an HTLC that is
+	 * added and never removed: once committed on a side, both its legs
+	 * move in that side's view. */
+	if (channel->sym_swap) {
+		struct sym_swap *s = channel->sym_swap;
+		const int committed_f = HTLC_FLAG(sidechanged, HTLC_F_COMMITTED);
+
+		for (i = 0; i < n_hstates; i++) {
+			int pre, post;
+
+			if (s->state != htlc_states[i])
+				continue;
+			pre = htlc_state_flags(s->state);
+			post = htlc_state_flags(s->state + 1);
+			status_debug("swap %"PRIu64": %s->%s", s->id,
+				     htlc_state_name(s->state),
+				     htlc_state_name(s->state + 1));
+			s->state++;
+			if (!(pre & committed_f) && (post & committed_f))
+				balance_swap(owed, lowed, s);
+			cflags |= pre ^ post;
+			break;
+		}
+	}
+
 	for (i = 0; i < NUM_SIDES; i++) {
 		if (!balance_ok(&owed[i], &channel->view[sidechanged].owed[i])) {
 			status_failed(STATUS_FAIL_INTERNAL_ERROR,
@@ -1298,6 +1476,18 @@ static int change_htlcs(struct channel *channel,
 				      fmt_amount_msat(tmpctx,
 						      channel->view[sidechanged].owed[i]),
 				      owed[i].msat);
+		}
+	}
+	for (size_t l = 0; l < nlanes; l++) {
+		for (i = 0; i < NUM_SIDES; i++) {
+			if (!balance_ok(&lowed[l].b[i],
+					&channel->sym_lane_bal[l].owed[sidechanged][i]))
+				status_failed(STATUS_FAIL_INTERNAL_ERROR,
+					      "%s: %s balance underflow in lane"
+					      " %zu: %"PRId64,
+					      side_to_str(sidechanged),
+					      side_to_str(i), l + 1,
+					      lowed[l].b[i].msat);
 		}
 	}
 
@@ -1680,6 +1870,12 @@ bool pending_updates(const struct channel *channel, enum side side)
 			return true;
 	}
 
+	/* SEQUENTIA: a swap (common/sym_lanes.h) waits as an HTLC does. */
+	if (channel->sym_swap
+	    && (htlc_state_flags(channel->sym_swap->state)
+		& HTLC_FLAG(side, HTLC_F_WILL_SEND)))
+		return true;
+
 	/* Are we still waiting for the side to send something? */
 	for (htlc = htlc_map_first(channel->htlcs, &it);
 	     htlc;
@@ -1694,6 +1890,16 @@ bool channel_force_htlcs(struct channel *channel,
 			 const struct existing_htlc **htlcs)
 {
 	struct balance view_owed[NUM_SIDES][NUM_SIDES];
+	/* SEQUENTIA: every other lane's (common/sym_lanes.h). */
+	size_t nlanes = tal_count(channel->sym_lane_bal);
+	struct lane_view_owed *lowed = tal_arr(tmpctx, struct lane_view_owed,
+					       nlanes);
+
+	for (size_t l = 0; l < nlanes; l++)
+		for (int view = 0; view < NUM_SIDES; view++)
+			for (int side = 0; side < NUM_SIDES; side++)
+				to_balance(&lowed[l].b[view][side],
+					   channel->sym_lane_bal[l].owed[view][side]);
 
 	/* You'd think, since we traverse HTLCs in ID order, this would never
 	 * go negative.  But this ignores the fact that HTLCs ids from each
@@ -1728,7 +1934,7 @@ bool channel_force_htlcs(struct channel *channel,
 			     htlcs[i]->onion_routing_packet,
 			     htlcs[i]->path_key,
 			     &htlc, false, NULL,
-			     htlcs[i]->extra_tlvs, false);
+			     htlcs[i]->extra_tlvs, false, htlcs[i]->lane);
 		if (e != CHANNEL_ERR_ADD_OK) {
 			status_broken("%s HTLC %"PRIu64" failed error %u",
 				     htlc_state_owner(htlcs[i]->state) == LOCAL
@@ -1743,8 +1949,28 @@ bool channel_force_htlcs(struct channel *channel,
 		if (htlcs[i]->failed)
 			htlc->failed = tal_steal(htlc, htlcs[i]->failed);
 
-		if (!adjust_balance(view_owed, htlc))
+		if (!adjust_balance(htlc->lane ? lowed[htlc->lane - 1].b
+				    : view_owed, htlc))
 			return false;
+	}
+
+	/* SEQUENTIA: a swap in flight moves the views that committed it. */
+	if (channel->sym_swap) {
+		for (int view = 0; view < NUM_SIDES; view++) {
+			struct lane_owed *lo = tal_arr(tmpctx, struct lane_owed,
+						       nlanes);
+
+			if (!(htlc_state_flags(channel->sym_swap->state)
+			      & HTLC_FLAG(view, HTLC_F_COMMITTED)))
+				continue;
+			for (size_t l = 0; l < nlanes; l++)
+				memcpy(lo[l].b, lowed[l].b[view],
+				       sizeof(lo[l].b));
+			balance_swap(view_owed[view], lo, channel->sym_swap);
+			for (size_t l = 0; l < nlanes; l++)
+				memcpy(lowed[l].b[view], lo[l].b,
+				       sizeof(lo[l].b));
+		}
 	}
 
 	/* Convert back and check */
@@ -1759,9 +1985,96 @@ bool channel_force_htlcs(struct channel *channel,
 					      view_owed[view][side].msat);
 				return false;
 			}
+			for (size_t l = 0; l < nlanes; l++) {
+				if (!balance_ok(&lowed[l].b[view][side],
+						&channel->sym_lane_bal[l].owed[view][side])) {
+					status_broken("view %s[%s] balance"
+						      " underflow in lane %zu",
+						      side_to_str(view),
+						      side_to_str(side), l + 1);
+					return false;
+				}
+			}
 		}
 	}
 
+	return true;
+}
+
+/* SEQUENTIA: can @payer pay @amount in lane @lane in both views, beyond
+ * what its pending HTLCs and promised swaps take, and in the channel's own
+ * lane above its reserve (common/sym_lanes.h)?  Removals are left out: they
+ * can only add to a side's balance. */
+static bool swap_affordable(const struct channel *channel, enum side payer,
+			    size_t lane, struct amount_msat amount)
+{
+	for (enum side view = 0; view < NUM_SIDES; view++) {
+		const struct htlc **committed, **adding, **removing;
+		struct balance balance;
+		struct amount_msat left;
+
+		gather_lane_htlcs(tmpctx, channel, view, lane, &committed,
+				  &removing, &adding);
+		to_balance(&balance, sym_lane_owed(channel, lane, view, payer));
+		for (size_t i = 0; i < tal_count(adding); i++)
+			balance_add_htlc(&balance, adding[i], payer);
+		balance.msat -= swap_promised(channel, view, lane,
+					      payer).millisatoshis; /* Raw: balance */
+		balance.msat -= amount.millisatoshis; /* Raw: balance */
+		if (!balance_ok(&balance, &left))
+			return false;
+		if (lane == 0
+		    && !amount_msat_deduct_sat(&left,
+					       channel_reserve_of(channel, payer)))
+			return false;
+	}
+	return true;
+}
+
+const char *channel_sym_swap_check(const tal_t *ctx,
+				   const struct channel *channel,
+				   const struct sym_swap *swap)
+{
+	enum side owner = htlc_state_owner(swap->state);
+	size_t n = sym_num_lanes(channel);
+
+	if (!channel->sym_lanes)
+		return "the channel holds one asset";
+	if (channel->sym_swap)
+		return "a swap is in flight";
+	if (swap->give_lane == swap->take_lane
+	    || swap->give_lane >= n || swap->take_lane >= n)
+		return tal_fmt(ctx, "a swap between lanes %u and %u of %zu",
+			       swap->give_lane, swap->take_lane, n);
+	if (amount_msat_is_zero(swap->give) || amount_msat_is_zero(swap->take))
+		return "a swap moves both its legs";
+	if (!swap_affordable(channel, owner, swap->give_lane, swap->give))
+		return tal_fmt(ctx, "%s cannot give %s in lane %u",
+			       side_to_str(owner),
+			       fmt_amount_msat(tmpctx, swap->give),
+			       swap->give_lane);
+	if (!swap_affordable(channel, !owner, swap->take_lane, swap->take))
+		return tal_fmt(ctx, "%s cannot give %s in lane %u",
+			       side_to_str(!owner),
+			       fmt_amount_msat(tmpctx, swap->take),
+			       swap->take_lane);
+	return NULL;
+}
+
+void channel_sym_swap_add(struct channel *channel, const struct sym_swap *swap)
+{
+	assert(!channel->sym_swap);
+	assert(swap->state == SENT_ADD_HTLC || swap->state == RCVD_ADD_HTLC);
+	channel->sym_swap = tal_dup(channel, struct sym_swap, swap);
+}
+
+bool channel_sym_swap_done(struct channel *channel)
+{
+	if (!channel->sym_swap
+	    || (channel->sym_swap->state != SENT_ADD_ACK_REVOCATION
+		&& channel->sym_swap->state != RCVD_ADD_ACK_REVOCATION))
+		return false;
+	channel->sym_swap = tal_free(channel->sym_swap);
 	return true;
 }
 

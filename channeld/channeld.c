@@ -41,6 +41,7 @@
 #include <common/status.h>
 #include <common/subdaemon.h>
 #include <common/sym_channel.h>
+#include <common/sym_lanes.h>
 #include <common/timeout.h>
 #include <common/utils.h>
 #include <common/wire_error.h>
@@ -701,8 +702,16 @@ static void handle_peer_add_htlc(struct peer *peer, const u8 *msg)
 	/* BOLT #2:
 	 *  - MUST allow multiple HTLCs with the same `payment_hash`.
 	 */
+	/* SEQUENTIA: an HTLC in another lane than the channel's own needs a
+	 * channel of several assets (common/sym_lanes.h). */
+	if (tlvs->seq_lane && *tlvs->seq_lane != 0
+	    && !channel_has(peer->channel, OPT_SEQ_SYMMETRIC_LANES))
+		peer_failed_warn(peer->pps, &peer->channel_id,
+				 "Bad peer_add_htlc: a lane on a channel of"
+				 " one asset");
+
 	/* We do: the key is the id, not the payment_hash */
-	add_err = channel_add_htlc(peer->channel, REMOTE, id, amount,
+	add_err = channel_add_lane_htlc(peer->channel, REMOTE, id, amount,
 				   cltv_expiry, &payment_hash,
 				   onion_routing_packet,
 				   take(tlvs->blinded_path), &htlc, NULL,
@@ -712,7 +721,8 @@ static void handle_peer_add_htlc(struct peer *peer, const u8 *msg)
 				   /* We don't immediately fail incoming htlcs,
 				    * instead we wait and fail them after
 				    * they've been committed */
-				   false);
+				   false,
+				   tlvs->seq_lane ? *tlvs->seq_lane : 0);
 	if (add_err != CHANNEL_ERR_ADD_OK)
 		peer_failed_warn(peer->pps, &peer->channel_id,
 				 "Bad peer_add_htlc: %s",
@@ -898,7 +908,8 @@ static u8 *sending_commitsig_msg(const tal_t *ctx,
 				 const struct fee_states *fee_states,
 				 const struct height_states *blockheight_states,
 				 const struct htlc **changed_htlcs,
-				 const struct sym_state *sym_remote)
+				 const struct sym_state *sym_remote,
+				 const struct sym_swap *sym_swap)
 {
 	struct changed_htlc *changed;
 	u8 *msg;
@@ -910,7 +921,7 @@ static u8 *sending_commitsig_msg(const tal_t *ctx,
 						remote_per_commit,
 						pbase, fee_states,
 						blockheight_states, changed,
-						sym_remote);
+						sym_remote, sym_swap);
 	return msg;
 }
 
@@ -1321,6 +1332,21 @@ static u8 *send_commit_part(const tal_t *ctx,
 		peer->sym_remote_pending = st;
 		cs_tlv->sym_sig = tal_dup(cs_tlv, struct bip340sig,
 					  &st->sig[LOCAL]);
+		/* A swap of ours rides in the commitment that first carries
+		 * it (common/sym_lanes.h), and in its retransmission. */
+		if (peer->channel->sym_swap
+		    && peer->channel->sym_swap->state == SENT_ADD_COMMIT) {
+			const struct sym_swap *s = peer->channel->sym_swap;
+
+			cs_tlv->seq_swap
+				= tal(cs_tlv,
+				      struct tlv_commitment_signed_tlvs_seq_swap);
+			cs_tlv->seq_swap->id = s->id;
+			cs_tlv->seq_swap->give_lane = s->give_lane;
+			cs_tlv->seq_swap->give_msat = s->give;
+			cs_tlv->seq_swap->take_lane = s->take_lane;
+			cs_tlv->seq_swap->take_msat = s->take;
+		}
 		*anchor = NULL;
 		if (peer->dev_disable_commit) {
 			(*peer->dev_disable_commit)--;
@@ -1332,7 +1358,8 @@ static u8 *send_commit_part(const tal_t *ctx,
 						    remote_per_commit, NULL,
 						    peer->channel->fee_states,
 						    peer->channel->blockheight_states,
-						    changed_htlcs, st);
+						    changed_htlcs, st,
+						    peer->channel->sym_swap);
 			master_wait_sync_reply(tmpctx, peer, take(msg),
 					       WIRE_CHANNELD_SENDING_COMMITSIG_REPLY);
 		}
@@ -1452,7 +1479,7 @@ save_penalty_base:
 					    pbase,
 					    peer->channel->fee_states,
 					    peer->channel->blockheight_states,
-					    changed_htlcs, NULL);
+					    changed_htlcs, NULL, NULL);
 		/* Message is empty; receiving it is the point. */
 		master_wait_sync_reply(tmpctx, peer, take(msg),
 				       WIRE_CHANNELD_SENDING_COMMITSIG_REPLY);
@@ -1857,6 +1884,7 @@ static void marshall_htlc_info(const tal_t *ctx,
 			a->extra_tlvs = htlc->extra_tlvs;
 			a->fail_immediate = htlc->fail_immediate;
 			a->lock_point = htlc->lock_point;
+			a->lane = htlc->lane;
 			tal_arr_expand(added, a);
 		} else if (htlc->state == RCVD_REMOVE_COMMIT) {
 			if (htlc->r) {
@@ -1940,9 +1968,12 @@ static void send_revocation(struct peer *peer,
 					       splice_commitsigs,
 					       local_per_commit,
 					       htlc_infos,
-					       sym_local);
+					       sym_local,
+					       peer->channel->sym_swap);
 	master_wait_sync_reply(tmpctx, peer, take(msg_for_master),
 			       WIRE_CHANNELD_GOT_COMMITSIG_REPLY);
+	/* SEQUENTIA: a swap that this finished is in the balances now. */
+	channel_sym_swap_done(peer->channel);
 
 	/* Now that the master has persisted the new commitment advance the HSMD
 	 * and fetch the revocation secret for the old one. */
@@ -2218,6 +2249,38 @@ struct commitsig_info {
  * with index 0 being the funding commit_sig and the rest being inflights. The
  * inflight msgs must be in the same order as the inflight array.
  */
+/* SEQUENTIA: the peer's swap, in its commitment_signed: it must be the one
+ * we asked for (channeld_sym_swap_request), and still affordable. */
+static void take_peer_swap(struct peer *peer,
+			   const struct tlv_commitment_signed_tlvs_seq_swap *s)
+{
+	struct sym_swap swap;
+	const struct sym_swap *req = peer->channel->sym_swap_req;
+	const char *err;
+
+	swap.id = s->id;
+	swap.state = RCVD_ADD_HTLC;
+	swap.give_lane = s->give_lane;
+	swap.give = s->give_msat;
+	swap.take_lane = s->take_lane;
+	swap.take = s->take_msat;
+	if (!req || req->id != swap.id
+	    || req->give_lane != swap.give_lane
+	    || req->take_lane != swap.take_lane
+	    || !amount_msat_eq(req->give, swap.give)
+	    || !amount_msat_eq(req->take, swap.take))
+		peer_failed_warn(peer->pps, &peer->channel_id,
+				 "commit_sig with swap %"PRIu64
+				 " that we did not ask for", swap.id);
+	peer->channel->sym_swap_req = tal_free(peer->channel->sym_swap_req);
+	err = channel_sym_swap_check(tmpctx, peer->channel, &swap);
+	if (err)
+		peer_failed_warn(peer->pps, &peer->channel_id,
+				 "commit_sig with swap %"PRIu64": %s",
+				 swap.id, err);
+	channel_sym_swap_add(peer->channel, &swap);
+}
+
 static struct commitsig_info *handle_peer_commit_sig(struct peer *peer,
 						     const u8 *msg,
 						     u32 commit_index,
@@ -2301,6 +2364,11 @@ static struct commitsig_info *handle_peer_commit_sig(struct peer *peer,
 		peer_failed_err(peer->pps, &peer->channel_id,
 				"Must send funding_txid when sending"
 				" a commitment batch");
+
+	/* SEQUENTIA: a swap rides in the commitment that first carries it
+	 * (common/sym_lanes.h): only the one we asked for, as we asked. */
+	if (cs_tlv->seq_swap && !changed_htlcs)
+		take_peer_swap(peer, cs_tlv->seq_swap);
 
 	if (!changed_htlcs) {
 		changed_htlcs = tal_arr(msg, const struct htlc *, 0);
@@ -2885,7 +2953,7 @@ static u8 *got_revoke_msg(struct peer *peer, u64 revoke_num,
 					pbase, ptx,
 					cast_const2(const struct watchtower_blob **,
 						    wt_blobs),
-					sym_remote);
+					sym_remote, peer->channel->sym_swap);
 	tal_free(ptx);
 	return msg;
 }
@@ -2994,6 +3062,8 @@ static void handle_peer_revoke_and_ack(struct peer *peer, const u8 *msg)
 			     sym_remote);
 	master_wait_sync_reply(tmpctx, peer, take(msg),
 			       WIRE_CHANNELD_GOT_REVOKE_REPLY);
+	/* SEQUENTIA: a swap that this finished is in the balances now. */
+	channel_sym_swap_done(peer->channel);
 
 	peer->old_remote_per_commit = peer->remote_per_commit;
 	peer->remote_per_commit = next_per_commit;
@@ -5760,9 +5830,12 @@ static void resend_commitment(struct peer *peer, struct changed_htlc *last)
 
 		if (h->state == SENT_ADD_COMMIT) {
 			struct tlv_update_add_htlc_tlvs *tlvs = NULL;
-			if (h->extra_tlvs || h->path_key || h->lock_point) {
+			if (h->extra_tlvs || h->path_key || h->lock_point
+			    || h->lane) {
 				tlvs = tlv_update_add_htlc_tlvs_new(tmpctx);
 			}
+			if (h->lane)
+				tlvs->seq_lane = tal_dup(tlvs, u16, &h->lane);
 			if (h->lock_point)
 				tlvs->seq_point_lock
 					= tal_dup(tlvs, struct pubkey,
@@ -6731,6 +6804,76 @@ static void handle_funding_depth(struct peer *peer, const u8 *msg)
 	billboard_update(peer);
 }
 
+/* SEQUENTIA: we ask the peer for a swap (common/sym_lanes.h): @swap is the
+ * swap as it will send it, which we then take in its commitment. */
+static void handle_sym_swap_request(struct peer *peer, const u8 *inmsg)
+{
+	struct sym_swap swap;
+	u32 expiry;
+	const char *err;
+
+	if (!fromwire_channeld_sym_swap_request(inmsg, &swap, &expiry))
+		master_badmsg(WIRE_CHANNELD_SYM_SWAP_REQUEST, inmsg);
+	swap.state = RCVD_ADD_HTLC;
+	if (!peer->channel_ready[LOCAL] || !peer->channel_ready[REMOTE])
+		err = "the channel is not ready";
+	else if (peer->channel->sym_swap_req)
+		err = "a swap we asked for is outstanding";
+	else
+		err = channel_sym_swap_check(tmpctx, peer->channel, &swap);
+	if (!err) {
+		peer->channel->sym_swap_req = tal_dup(peer->channel,
+						      struct sym_swap, &swap);
+		/* As we see it: we give what it takes. */
+		peer_write(peer->pps,
+			   take(towire_seq_swap_request(NULL,
+							&peer->channel_id,
+							swap.id,
+							swap.take_lane,
+							swap.take,
+							swap.give_lane,
+							swap.give, expiry)));
+	}
+	wire_sync_write(MASTER_FD,
+			take(towire_channeld_sym_swap_request_reply(NULL,
+								    err)));
+}
+
+/* SEQUENTIA: we take the peer's swap: ours to send, in our next
+ * commitment. */
+static void handle_sym_swap_accept(struct peer *peer, const u8 *inmsg)
+{
+	struct sym_swap swap;
+	const char *err;
+
+	if (!fromwire_channeld_sym_swap_accept(inmsg, &swap))
+		master_badmsg(WIRE_CHANNELD_SYM_SWAP_ACCEPT, inmsg);
+	swap.state = SENT_ADD_HTLC;
+	if (!peer->channel_ready[LOCAL] || !peer->channel_ready[REMOTE])
+		err = "the channel is not ready";
+	else if (peer->channel->sym_swap_req)
+		err = "we asked for a swap ourselves";
+	else
+		err = channel_sym_swap_check(tmpctx, peer->channel, &swap);
+	if (!err) {
+		channel_sym_swap_add(peer->channel, &swap);
+		start_commit_timer(peer);
+	}
+	wire_sync_write(MASTER_FD,
+			take(towire_channeld_sym_swap_accept_reply(NULL, err)));
+}
+
+static void handle_sym_swap_cancel(struct peer *peer, const u8 *inmsg)
+{
+	u64 id;
+
+	if (!fromwire_channeld_sym_swap_cancel(inmsg, &id))
+		master_badmsg(WIRE_CHANNELD_SYM_SWAP_CANCEL, inmsg);
+	if (peer->channel->sym_swap_req && peer->channel->sym_swap_req->id == id)
+		peer->channel->sym_swap_req
+			= tal_free(peer->channel->sym_swap_req);
+}
+
 static void handle_offer_htlc(struct peer *peer, const u8 *inmsg)
 {
 	u8 *msg;
@@ -6748,6 +6891,7 @@ static void handle_offer_htlc(struct peer *peer, const u8 *inmsg)
 	u8 *extra_tlvs_raw;
 	struct pubkey *lock_point;
 	struct htlc *htlc;
+	u16 lane;
 
 	if (!peer->channel_ready[LOCAL] || !peer->channel_ready[REMOTE])
 		status_failed(STATUS_FAIL_MASTER_IO,
@@ -6756,8 +6900,15 @@ static void handle_offer_htlc(struct peer *peer, const u8 *inmsg)
 	if (!fromwire_channeld_offer_htlc(tmpctx, inmsg, &amount,
 					 &cltv_expiry, &payment_hash,
 					 onion_routing_packet, &path_key, &extra_tlvs_raw,
-					 &lock_point))
+					 &lock_point, &lane))
 		master_badmsg(WIRE_CHANNELD_OFFER_HTLC, inmsg);
+
+	/* SEQUENTIA: lightningd names a lane only on a channel of several
+	 * assets (common/sym_lanes.h). */
+	if (lane != 0 && !channel_has(peer->channel, OPT_SEQ_SYMMETRIC_LANES))
+		status_failed(STATUS_FAIL_MASTER_IO,
+			      "offer_htlc: lane %u on a channel of one asset",
+			      lane);
 
 	/* SEQUENTIA: lightningd offers a point-locked HTLC only on a channel
 	 * that takes one (offer_point_lock_ok in lightningd/peer_htlcs.c). */
@@ -6769,11 +6920,13 @@ static void handle_offer_htlc(struct peer *peer, const u8 *inmsg)
 			      "offer_htlc: a point lock on a channel that"
 			      " takes none");
 
-	if (extra_tlvs_raw || path_key || lock_point) {
+	if (extra_tlvs_raw || path_key || lock_point || lane) {
 		tlvs = tlv_update_add_htlc_tlvs_new(tmpctx);
 	} else {
 		tlvs = NULL;
 	}
+	if (lane)
+		tlvs->seq_lane = tal_dup(tlvs, u16, &lane);
 
 	if (extra_tlvs_raw) {
 		const u8 *cursor = extra_tlvs_raw;
@@ -6796,10 +6949,10 @@ static void handle_offer_htlc(struct peer *peer, const u8 *inmsg)
 	if (lock_point)
 		tlvs->seq_point_lock = tal_dup(tlvs, struct pubkey, lock_point);
 
-	e = channel_add_htlc(peer->channel, LOCAL, peer->htlc_id,
-			     amount, cltv_expiry, &payment_hash,
-			     onion_routing_packet, take(path_key), &htlc,
-			     &htlc_fee, extra_tlvs, true);
+	e = channel_add_lane_htlc(peer->channel, LOCAL, peer->htlc_id,
+				  amount, cltv_expiry, &payment_hash,
+				  onion_routing_packet, take(path_key), &htlc,
+				  &htlc_fee, extra_tlvs, true, lane);
 	if (e == CHANNEL_ERR_ADD_OK && lock_point)
 		htlc->lock_point = tal_dup(htlc, struct pubkey, lock_point);
 	status_debug("Adding HTLC %"PRIu64" amount=%s cltv=%u gave %s",
@@ -7147,6 +7300,19 @@ static void req_in(struct peer *peer, const u8 *msg)
 	case WIRE_CHANNELD_CREDIT_NOTE:
 		handle_credit_note(peer, msg);
 		return;
+	case WIRE_CHANNELD_SYM_SWAP_REQUEST:
+		if (handle_master_request_later(peer, msg))
+			return;
+		handle_sym_swap_request(peer, msg);
+		return;
+	case WIRE_CHANNELD_SYM_SWAP_ACCEPT:
+		if (handle_master_request_later(peer, msg))
+			return;
+		handle_sym_swap_accept(peer, msg);
+		return;
+	case WIRE_CHANNELD_SYM_SWAP_CANCEL:
+		handle_sym_swap_cancel(peer, msg);
+		return;
 	case WIRE_CHANNELD_FEERATES:
 		if (handle_master_request_later(peer, msg))
 			return;
@@ -7244,6 +7410,8 @@ static void req_in(struct peer *peer, const u8 *msg)
 	case WIRE_CHANNELD_LOCAL_ANCHOR_INFO:
 	case WIRE_CHANNELD_REESTABLISHED:
 	case WIRE_CHANNELD_DEV_PEER_SHACHAIN:
+	case WIRE_CHANNELD_SYM_SWAP_REQUEST_REPLY:
+	case WIRE_CHANNELD_SYM_SWAP_ACCEPT_REPLY:
 		break;
 	}
 	master_badmsg(-1, msg);
@@ -7273,6 +7441,9 @@ static void init_channel(struct peer *peer)
 	struct penalty_base **pbases;
 	struct channel_type *channel_type;
 	bool found_locked_inflight;
+	struct sym_lane *sym_lanes;
+	struct amount_msat *sym_lane_local_msat;
+	struct sym_swap *sym_swap, *sym_swap_req;
 
 	assert(!(fcntl(MASTER_FD, F_GETFL) & O_NONBLOCK));
 
@@ -7331,7 +7502,11 @@ static void init_channel(struct peer *peer)
 				    &peer->dev_disable_commit,
 				    &pbases,
 				    &peer->splice_state->inflights,
-				    &peer->local_alias)) {
+				    &peer->local_alias,
+				    &sym_lanes,
+				    &sym_lane_local_msat,
+				    &sym_swap,
+				    &sym_swap_req)) {
 		master_badmsg(WIRE_CHANNELD_INIT, msg);
 	}
 
@@ -7423,6 +7598,42 @@ static void init_channel(struct peer *peer)
 	 * our commitment/close math denominates in it. */
 	memcpy(peer->channel->channel_asset, channel_asset,
 	       sizeof(peer->channel->channel_asset));
+
+	/* SEQUENTIA: a channel of several assets (common/sym_lanes.h): its
+	 * other lanes and our balance in each, before the HTLCs and the swap
+	 * in flight move them. */
+	if (tal_count(sym_lanes)) {
+		const char *why = sym_lanes_check(tmpctx, sym_lanes,
+						  channel_asset);
+		if (why)
+			status_failed(STATUS_FAIL_MASTER_IO, "Lanes: %s", why);
+		peer->channel->sym_lanes = tal_steal(peer->channel, sym_lanes);
+		peer->channel->sym_lane_bal
+			= tal_arr(peer->channel, struct sym_lane_balance,
+				  tal_count(sym_lanes));
+		for (size_t l = 0; l < tal_count(sym_lanes); l++) {
+			struct amount_msat remote;
+
+			if (!amount_sat_sub_msat(&remote,
+						 sym_lanes[l].funding_sats,
+						 sym_lane_local_msat[l]))
+				status_failed(STATUS_FAIL_MASTER_IO,
+					      "Lane %zu: our %s of %s", l + 1,
+					      fmt_amount_msat(tmpctx,
+							      sym_lane_local_msat[l]),
+					      fmt_amount_sat(tmpctx,
+							     sym_lanes[l].funding_sats));
+			for (enum side v = 0; v < NUM_SIDES; v++) {
+				peer->channel->sym_lane_bal[l].owed[v][LOCAL]
+					= sym_lane_local_msat[l];
+				peer->channel->sym_lane_bal[l].owed[v][REMOTE]
+					= remote;
+			}
+		}
+	}
+	tal_free(sym_lane_local_msat);
+	peer->channel->sym_swap = tal_steal(peer->channel, sym_swap);
+	peer->channel->sym_swap_req = tal_steal(peer->channel, sym_swap_req);
 
 	if (!channel_force_htlcs(peer->channel,
 			 cast_const2(const struct existing_htlc **, htlcs)))

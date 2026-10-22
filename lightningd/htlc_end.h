@@ -65,6 +65,9 @@ struct htlc_in {
 	/* SEQUENTIA: a point-locked HTLC's lock point, else NULL
 	 * (common/point_lock.h). */
 	struct pubkey *lock_point;
+	/* SEQUENTIA: its lane on a channel of several assets
+	 * (lightningd/sym_lanes.h), whose asset it is in; 0 on every other. */
+	u16 lane;
 	/* What we add to the scalar we learn (the payee's invoice preimage,
 	 * or the one opening the HTLC we forwarded) to open this one: the
 	 * payee's tweak r, or minus a forwarder's d.  NULL until the onion
@@ -124,6 +127,10 @@ struct htlc_out {
 
 	/* SEQUENTIA: a point-locked HTLC's lock point, else NULL. */
 	struct pubkey *lock_point;
+
+	/* SEQUENTIA: its lane on a channel of several assets
+	 * (lightningd/sym_lanes.h), whose asset it is in; 0 on every other. */
+	u16 lane;
 };
 
 static inline const struct htlc_key *keyof_htlc_in(const struct htlc_in *in)

@@ -81,6 +81,7 @@
 #include <common/presign_templates.h>	/* enum wt_tmpl_kind (stable on-disk u8) */
 #include <common/setup.h>
 #include <common/sym_factory.h>
+#include <common/sym_lanes.h>
 #include <common/sym_scripts.h>
 #include <common/sym_state.h>
 #include <common/utils.h>
@@ -141,6 +142,9 @@ struct spd_sym {
 	 * `funding` is then its id, and its output the factory output until
 	 * the split, its KO after it. */
 	struct sym_factory *factory;
+	/* A channel of several assets' other lanes (common/sym_lanes.h), or
+	 * NULL: each its own funding output, walked as lane 0's is. */
+	struct sym_lane *lanes;
 };
 
 /* The output the walk starts from: the funding, or the factory output. */
@@ -1796,6 +1800,10 @@ static void defend_honest_close(struct watched_channel *c, long tip_height,
 struct sym_cursor {
 	u64 dbid;
 	struct bitcoin_outpoint funding;
+	/* Its lane on a channel of several assets (0: the channel's own), and
+	 * that lane's asset: every output on its walk holds it. */
+	u16 lane;
+	u8 asset[33];
 	/* Last block scanned (0: none yet), and its hash. */
 	u32 scanned;
 	struct bitcoin_blkid scanned_hash;
@@ -1817,8 +1825,10 @@ struct sym_cursor {
 static struct sym_cursor **g_sym_cursors;
 
 #define SYM_FUNDING_NUM ((s64)-2)
-/* Version 2 appends the factory; version 1 records still read. */
+/* Version 2 appends the factory, version 3 the lanes; version 1 records
+ * still read. */
 #define WT_SYM_VERSION 2
+#define WT_SYM_VERSION_LANES 3
 
 static struct spd_sym *read_sym(const tal_t *ctx, const char *chandir)
 {
@@ -1835,7 +1845,8 @@ static struct spd_sym *read_sym(const tal_t *ctx, const char *chandir)
 	max = tal_bytelen(contents) - 1;	/* grab_file_str's NUL */
 	s = tal(ctx, struct spd_sym);
 	version = fromwire_u64(&cursor, &max);
-	if (version != 1 && version != WT_SYM_VERSION) {
+	if (version != 1 && version != WT_SYM_VERSION
+	    && version != WT_SYM_VERSION_LANES) {
 		fprintf(stderr, "speculad: %s: unknown version %"PRIu64"\n",
 			path, version);
 		return tal_free(s);
@@ -1861,6 +1872,18 @@ static struct spd_sym *read_sym(const tal_t *ctx, const char *chandir)
 			s->factory = tal_free(s->factory);
 		if (!s->factory)
 			fromwire_fail(&cursor, &max);
+	}
+	s->lanes = NULL;
+	if (version >= WT_SYM_VERSION_LANES && fromwire_bool(&cursor, &max)) {
+		u16 n = fromwire_u16(&cursor, &max);
+
+		if (n == 0 || n > SYM_MAX_LANES || s->factory)
+			fromwire_fail(&cursor, &max);
+		else {
+			s->lanes = tal_arr(s, struct sym_lane, n);
+			for (size_t i = 0; i < n; i++)
+				fromwire_sym_lane(&cursor, &max, &s->lanes[i]);
+		}
 	}
 	if (!cursor) {
 		fprintf(stderr, "speculad: %s does not decode\n", path);
@@ -1901,18 +1924,26 @@ static void sym_cursor_reset(struct sym_cursor *k)
 	k->bcast_tip = -1;
 }
 
-static struct sym_cursor *sym_cursor_get(const struct spd_sym *s)
+static struct sym_cursor *sym_cursor_get(const struct spd_sym *s, u16 lane)
 {
 	struct sym_cursor *k;
+	struct bitcoin_outpoint anchor = *sym_anchor(s);
 
+	/* Lane i > 0's walk starts at its own funding output, in the same
+	 * transaction (common/sym_lanes.h). */
+	if (lane)
+		anchor.n = s->lanes[lane - 1].outnum;
 	for (size_t i = 0; i < tal_count(g_sym_cursors); i++)
 		if (g_sym_cursors[i]->dbid == s->dbid
 		    && bitcoin_outpoint_eq(&g_sym_cursors[i]->funding,
-					   sym_anchor(s)))
+					   &anchor))
 			return g_sym_cursors[i];
 	k = tal(g_state_ctx, struct sym_cursor);
 	k->dbid = s->dbid;
-	k->funding = *sym_anchor(s);
+	k->funding = anchor;
+	k->lane = lane;
+	memcpy(k->asset, lane ? s->lanes[lane - 1].asset : s->asset,
+	       sizeof(k->asset));
 	k->cur_spk = NULL;
 	k->said = NULL;
 	sym_cursor_reset(k);
@@ -2146,7 +2177,7 @@ static char *sym_fund(const tal_t *ctx, const struct spd_sym *s,
 	rate = asset_rate(st->fee_asset_hex);
 
 	tx = bitcoin_tx(ctx, chainparams, 2, tal_count(outs) + 2, 0);
-	bitcoin_tx_set_output_asset(tx, s->asset);
+	bitcoin_tx_set_output_asset(tx, k->asset);
 	bitcoin_tx_add_input(tx, &k->cur, sequence, NULL, k->cur_sats,
 			     k->cur_spk, NULL);
 	bitcoin_tx_input_set_witness(tx, 0, witness);
@@ -2199,7 +2230,7 @@ static char *sym_fund(const tal_t *ctx, const struct spd_sym *s,
 
 		if (!memeq(got->script, got->script_len, outs[i].spk,
 			   tal_bytelen(outs[i].spk))
-		    || !amount_asset_is(&a, s->asset)
+		    || !amount_asset_is(&a, k->asset)
 		    || a.value != outs[i].amount.satoshis) { /* Raw: compare */
 			fprintf(stderr, "speculad: REFUSING -- output %zu is not"
 				" the state's\n", i);
@@ -2232,9 +2263,10 @@ static u32 sym_feerate(long elapsed, u32 window, u32 rung)
 	return (u32)fr;
 }
 
-static void defend_sym(const struct spd_sym *s, long tip, bool may_broadcast)
+static void defend_sym_lane(const struct spd_sym *s, u16 lane, long tip,
+			    bool may_broadcast)
 {
-	struct sym_cursor *k = sym_cursor_get(s);
+	struct sym_cursor *k = sym_cursor_get(s, lane);
 	enum spd_txout_state fs;
 	const struct sym_state *st;
 	const struct bip340sig *sig_op, *sig_acc;
@@ -2254,8 +2286,8 @@ static void defend_sym(const struct spd_sym *s, long tip, bool may_broadcast)
 		return;
 	}
 	fs = rpc_txout_state(tmpctx,
-			     fmt_bitcoin_txid(tmpctx, &sym_anchor(s)->txid),
-			     sym_anchor(s)->n);
+			     fmt_bitcoin_txid(tmpctx, &k->funding.txid),
+			     k->funding.n);
 	if (fs == SPD_TXOUT_UNKNOWN)
 		return;
 	if (fs == SPD_TXOUT_UNSPENT) {
@@ -2298,6 +2330,13 @@ static void defend_sym(const struct spd_sym *s, long tip, bool may_broadcast)
 	} else {
 		u8 *spk;
 
+		/* A channel of several assets settles every lane in one
+		 * transaction: that is its node's to do. */
+		if (s->lanes) {
+			sym_say(k, "lane %u stands at state %"PRId64": its node"
+				" settles every lane at once", k->lane, k->num);
+			return;
+		}
 		st = sym_stored(s, k->num);
 		if (!st) {
 			sym_say(k, "state %"PRId64" stands and its settlement is"
@@ -2357,6 +2396,13 @@ static void defend_sym(const struct spd_sym *s, long tip, bool may_broadcast)
 		js->rung, feerate,
 		js->fee_paid.satoshis, /* Raw: an atom count */
 		js->fee_asset_hex);
+}
+
+/* Every lane of the channel: a channel of one asset has lane 0 alone. */
+static void defend_sym(const struct spd_sym *s, long tip, bool may_broadcast)
+{
+	for (u16 l = 0; l <= tal_count(s->lanes); l++)
+		defend_sym_lane(s, l, tip, may_broadcast);
 }
 
 /* ---- Sole-broadcaster lease (heartbeat, not a static lockfile) ------------ *

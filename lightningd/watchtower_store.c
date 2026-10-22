@@ -17,6 +17,7 @@
 #include <lightningd/lightningd.h>
 #include <lightningd/log.h>
 #include <lightningd/sym_factory.h>
+#include <lightningd/sym_lanes.h>
 #include <lightningd/symmetric.h>
 #include <lightningd/watchtower_store.h>
 #include <sys/stat.h>
@@ -656,8 +657,10 @@ bool wt_store_put_sym(struct lightningd *ld, const struct channel *channel)
 
 	sym_channel_from(channel, &sc);
 	/* A plain channel's record is version 1, as an older tower reads it;
-	 * a factory channel's is version 2, which carries the factory. */
-	towire_u64(&buf, channel_is_sym_factory(channel) ? WT_SYM_VERSION : 1);
+	 * a factory channel's is version 2, which carries the factory, and a
+	 * channel of several assets' version 3, which carries its lanes. */
+	towire_u64(&buf, channel_is_sym_lanes(channel) ? WT_SYM_VERSION_LANES
+		   : channel_is_sym_factory(channel) ? WT_SYM_VERSION : 1);
 	towire_u64(&buf, channel->dbid);
 	towire_bitcoin_blkid(&buf, &chainparams->genesis_blockhash);
 	towire_bitcoin_outpoint(&buf, &channel->funding);
@@ -681,6 +684,15 @@ bool wt_store_put_sym(struct lightningd *ld, const struct channel *channel)
 	if (channel_is_sym_factory(channel)) {
 		towire_bool(&buf, true);
 		towire_sym_factory(&buf, channel->sym_factory);
+	} else if (channel_is_sym_lanes(channel))
+		towire_bool(&buf, false);
+	/* A channel of several assets: its other lanes, each a funding
+	 * output from which the tower walks too (lightningd/sym_lanes.h). */
+	if (channel_is_sym_lanes(channel)) {
+		towire_bool(&buf, true);
+		towire_u16(&buf, tal_count(channel->sym_lanes->lanes));
+		for (size_t i = 0; i < tal_count(channel->sym_lanes->lanes); i++)
+			towire_sym_lane(&buf, &channel->sym_lanes->lanes[i]);
 	}
 
 	dir = channel_store_dir(tmpctx, ld, channel, NULL);

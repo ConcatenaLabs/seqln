@@ -23,6 +23,7 @@
 #include <lightningd/peer_htlcs.h>
 #include <lightningd/plugin_hook.h>
 #include <lightningd/subd.h>
+#include <lightningd/sym_lanes.h>
 #include <lightningd/symmetric.h>
 #include <lightningd/watchtower_store.h>
 #include <onchaind/onchaind_wiregen.h>
@@ -607,7 +608,7 @@ static void handle_localpay(struct htlc_in *hin,
 		     invoice_hash ? invoice_hash : &hin->payment_hash,
 		     payment_secret,
 		     chainparams->is_elements
-		     ? hin->key.channel->channel_asset : NULL,
+		     ? htlc_in_asset(hin) : NULL,
 		     local_fail_in_htlc,
 		     htlc_set_fulfill_htlc,
 		     hin);
@@ -764,6 +765,11 @@ static void htlc_offer_timeout(struct htlc_out *out)
 			      "Adding HTLC timed out: killed connection");
 }
 
+const u8 *htlc_in_asset(const struct htlc_in *hin)
+{
+	return channel_lane_asset(hin->key.channel, hin->lane);
+}
+
 /* Returns failmsg, or NULL on success. */
 const u8 *send_htlc_out(const tal_t *ctx,
 			struct channel *out,
@@ -777,11 +783,26 @@ const u8 *send_htlc_out(const tal_t *ctx,
 			const u8 *onion_routing_packet,
 			struct htlc_in *in,
 			const struct pubkey *lock_point,
+			const u8 *asset,
 			struct htlc_out **houtp)
 {
 	u8 *msg, *raw_tlvs = NULL;
+	int lane = 0;
 
 	*houtp = NULL;
+
+	/* SEQUENTIA: the HTLC's asset is its lane's on a channel of several
+	 * assets (lightningd/sym_lanes.h); every other channel holds its own
+	 * alone. */
+	if (asset) {
+		lane = channel_lane_of_asset(out, asset);
+		if (lane < 0) {
+			log_info(out->log, "Not offering an HTLC in %s: the"
+				 " channel does not hold it",
+				 fmt_asset_id(tmpctx, asset));
+			return towire_unknown_next_peer(ctx);
+		}
+	}
 
 	/* SEQUENTIA: a credit provider keeps its balance able to pay what it
 	 * owes the holder (lightningd/credit.h). */
@@ -854,6 +875,7 @@ const u8 *send_htlc_out(const tal_t *ctx,
 			      in == NULL,
 			      final_msat,
 			      partid, groupid, in, lock_point);
+	(*houtp)->lane = lane;
 	tal_add_destructor(*houtp, destroy_hout_subd_died);
 
 	/* Give channel 30 seconds to commit this htlc. */
@@ -873,7 +895,7 @@ const u8 *send_htlc_out(const tal_t *ctx,
 
 	msg = towire_channeld_offer_htlc(out, amount, cltv, payment_hash,
 					onion_routing_packet, path_key,
-					raw_tlvs, lock_point);
+					raw_tlvs, lock_point, lane);
 	subd_req(out->peer->ld, out->owner, take(msg), -1, 0, rcvd_htlc_reply,
 		 *houtp);
 
@@ -975,8 +997,7 @@ static void forward_htlc(struct htlc_in *hin,
 	 * value.  BOLT has no asset concept, so we report "no next peer" for this
 	 * route; asset-aware pathfinding will not build such routes, and this is
 	 * the backstop against a hand-crafted or buggy cross-asset route. */
-	if (memcmp(hin->key.channel->channel_asset, next->channel_asset,
-		   sizeof(next->channel_asset)) != 0) {
+	if (channel_lane_of_asset(next, htlc_in_asset(hin)) < 0) {
 		log_unusual(hin->key.channel->log,
 			    "Refusing to forward HTLC across an asset boundary:"
 			    " incoming and outgoing channels denominate"
@@ -1082,7 +1103,8 @@ static void forward_htlc(struct htlc_in *hin,
 				outgoing_cltv_value, AMOUNT_MSAT(0),
 				&next_payment_hash,
 				next_path_key, extra_tlvs, 0 /* partid */, 0 /* groupid */,
-				next_onion, hin, next_lock_point, &hout);
+				next_onion, hin, next_lock_point,
+				htlc_in_asset(hin), &hout);
 	if (!failmsg)
 		return;
 
@@ -1444,7 +1466,7 @@ static void htlc_accepted_hook_serialize(struct htlc_accepted_hook_payload *p,
 	 * on: its amount is in thousandths of that asset's atoms. */
 	if (chainparams->has_anchor_header)
 		json_add_string(s, "asset",
-				fmt_asset_id(tmpctx, hin->key.channel->channel_asset));
+				fmt_asset_id(tmpctx, htlc_in_asset(hin)));
 	json_object_end(s);
 }
 
@@ -2242,8 +2264,14 @@ static void remove_htlc_in(struct channel *channel, struct htlc_in *hin)
 		  : hin->badonion ? onion_wire_name(hin->badonion)
 		  : "REMOTEFAIL");
 
-	/* If we fulfilled their HTLC, credit us. */
-	if (hin->preimage) {
+	/* SEQUENTIA: in another lane than the channel's own
+	 * (lightningd/sym_lanes.h), only that lane's balance moves; the
+	 * coin movements record the channel's own asset. */
+	if (hin->preimage && hin->lane) {
+		if (!sym_lanes_credit(channel, hin->lane, hin->msat, true))
+			channel_internal_error(channel, "Overflow in lane %u",
+					       hin->lane);
+	} else if (hin->preimage) {
 		struct amount_msat oldamt = channel->our_msat;
 		const struct channel_coin_mvt *mvt;
 
@@ -2296,6 +2324,11 @@ static void remove_htlc_out(struct channel *channel, struct htlc_out *hout)
 	/* If it's failed, now we can forward since it's completely locked-in */
 	if (!hout->preimage) {
 		fail_out_htlc(hout, NULL);
+	} else if (hout->lane) {
+		/* SEQUENTIA: another lane's balance (lightningd/sym_lanes.h). */
+		if (!sym_lanes_credit(channel, hout->lane, hout->msat, false))
+			channel_internal_error(channel, "Underflow in lane %u",
+					       hout->lane);
 	} else {
 		const struct channel_coin_mvt *mvt;
 		struct amount_msat oldamt = channel->our_msat;
@@ -2488,6 +2521,7 @@ void peer_sending_commitsig(struct channel *channel, const u8 *msg)
 	 * remote_htlc_to_us pre-sign off the PEER commitment. */
 	struct pubkey remote_per_commit;
 	struct sym_state *sym_remote;
+	struct sym_swap *sym_swap;
 
 	if (!fromwire_channeld_sending_commitsig(msg, msg,
 						&commitnum,
@@ -2496,13 +2530,16 @@ void peer_sending_commitsig(struct channel *channel, const u8 *msg)
 						&fee_states,
 						&blockheight_states,
 						&changed_htlcs,
-						&sym_remote)
+						&sym_remote,
+						&sym_swap)
 	    || !fee_states_valid(fee_states, channel->opener)
 	    || !height_states_valid(blockheight_states, channel->opener)) {
 		channel_internal_error(channel, "bad channel_sending_commitsig %s",
 				       tal_hex(channel, msg));
 		return;
 	}
+	/* SEQUENTIA: a swap in flight (lightningd/sym_lanes.h). */
+	sym_lanes_swap_step(channel, sym_swap);
 
 	/* SEQUENTIA: a symmetric channel: the peer's newest state, with our
 	 * signature, before channeld sends it (lightningd/symmetric.h). */
@@ -2626,6 +2663,13 @@ static bool channel_added_their_htlc(struct channel *channel,
 			  added->extra_tlvs,
 			  added->fail_immediate);
 	hin->lock_point = tal_dup_or_null(hin, struct pubkey, added->lock_point);
+	/* SEQUENTIA: its lane (lightningd/sym_lanes.h), as channeld took it. */
+	if (added->lane >= channel_num_lanes(channel)) {
+		channel_internal_error(channel, "HTLC in lane %u of %zu",
+				       added->lane, channel_num_lanes(channel));
+		return false;
+	}
+	hin->lane = added->lane;
 
 	/* Save an incoming htlc to the wallet */
 	wallet_htlc_save_in(ld->wallet, channel, hin);
@@ -2711,6 +2755,7 @@ void peer_got_commitsig(struct channel *channel, const u8 *msg)
 	struct watchtower_blob **sweeps;
 	struct bitcoin_tx *preempt_tx;
 	struct sym_state *sym_local;
+	struct sym_swap *sym_swap;
 
 	if (!fromwire_channeld_got_commitsig(msg, msg,
 					    &commitnum,
@@ -2726,7 +2771,8 @@ void peer_got_commitsig(struct channel *channel, const u8 *msg)
 					    &inflight_commit_sigs,
 					    &local_per_commit,
 					    &htlc_infos,
-					    &sym_local)
+					    &sym_local,
+					    &sym_swap)
 	    || !fee_states_valid(fee_states, channel->opener)
 	    || !height_states_valid(blockheight_states, channel->opener)) {
 		channel_internal_error(channel,
@@ -2759,6 +2805,8 @@ void peer_got_commitsig(struct channel *channel, const u8 *msg)
 	 * channeld revokes the one before (lightningd/symmetric.h). */
 	if (sym_local)
 		sym_record_local(channel, sym_local);
+	/* SEQUENTIA: a swap in flight (lightningd/sym_lanes.h). */
+	sym_lanes_swap_step(channel, sym_swap);
 
 	log_debug(channel->log,
 		  "got commitsig %"PRIu64
@@ -2964,6 +3012,7 @@ void peer_got_revoke(struct channel *channel, const u8 *msg)
 	struct bitcoin_tx *penalty_tx;
 	struct watchtower_blob **wt_blobs;
 	struct sym_state *sym_remote;
+	struct sym_swap *sym_swap;
 
 	if (!fromwire_channeld_got_revoke(msg, msg,
 					 &revokenum, &per_commitment_secret,
@@ -2974,7 +3023,8 @@ void peer_got_revoke(struct channel *channel, const u8 *msg)
 					 &pbase,
 					 &penalty_tx,
 					 &wt_blobs,
-					 &sym_remote)
+					 &sym_remote,
+					 &sym_swap)
 	    || !fee_states_valid(fee_states, channel->opener)
 	    || !height_states_valid(blockheight_states, channel->opener)) {
 		channel_internal_error(channel, "bad fromwire_channeld_got_revoke %s",
@@ -2990,6 +3040,8 @@ void peer_got_revoke(struct channel *channel, const u8 *msg)
 	 * they revoked, now whole (lightningd/symmetric.h). */
 	if (sym_remote)
 		sym_record_revoked(channel, sym_remote);
+	/* SEQUENTIA: a swap in flight (lightningd/sym_lanes.h). */
+	sym_lanes_swap_step(channel, sym_swap);
 
 	/* Save any immediate failures for after we reply. */
 	badonions = tal_arrz(msg, enum onion_wire, tal_count(changed));
@@ -3162,7 +3214,8 @@ const struct existing_htlc **peer_htlcs(const tal_t *ctx,
 					     hin->preimage,
 					     f,
 					     hin->extra_tlvs,
-					     hin->lock_point);
+					     hin->lock_point,
+					     hin->lane);
 		tal_arr_expand(&htlcs, existing);
 	}
 
@@ -3196,7 +3249,8 @@ const struct existing_htlc **peer_htlcs(const tal_t *ctx,
 					     hout->preimage,
 					     f,
 					     hout->extra_tlvs,
-					     hout->lock_point);
+					     hout->lock_point,
+					     hout->lane);
 		tal_arr_expand(&htlcs, existing);
 	}
 

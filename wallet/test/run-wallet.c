@@ -1089,7 +1089,7 @@ static bool test_wallet_outputs(struct lightningd *ld, const tal_t *ctx, bool bi
 					   AMOUNT_SAT(3),
 					   &channel,
 					   NULL,
-					   5),
+					   5, channel.channel_asset),
 		  "wallet_add_utxo with close_info and csv > 1");
 	CHECK_MSG(!wallet_err, wallet_err);
 	/* Normally freed by destroy_channel, but we don't call that */

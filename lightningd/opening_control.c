@@ -12,6 +12,7 @@
 #include <common/json_command.h>
 #include <common/memleak.h>
 #include <common/sym_factory.h>
+#include <common/sym_lanes.h>
 #include <connectd/connectd_wiregen.h>
 #include <errno.h>
 #include <hsmd/permissions.h>
@@ -27,6 +28,7 @@
 #include <lightningd/plugin_hook.h>
 #include <lightningd/subd.h>
 #include <lightningd/sym_factory.h>
+#include <lightningd/sym_lanes.h>
 #include <lightningd/symmetric.h>
 #include <openingd/openingd_wiregen.h>
 #include <unistd.h>
@@ -399,6 +401,8 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 	u8 channel_asset[33];
 	struct bitcoin_signature *sym_kickoff_sig;
 	struct sym_state *sym_local, *sym_remote;
+	struct sym_lane *lanes;
+	struct bitcoin_signature *lane_sigs, *lane_local_sigs;
 
 	/* This is a new channel_info.their_config so set its ID to 0 */
 	channel_info.their_config.id = 0;
@@ -424,7 +428,10 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 					   channel_asset,
 					   &sym_kickoff_sig,
 					   &sym_local,
-					   &sym_remote)) {
+					   &sym_remote,
+					   &lanes,
+					   &lane_sigs,
+					   &lane_local_sigs)) {
 		log_broken(fc->uc->log,
 			   "bad OPENING_FUNDER_REPLY %s",
 			   tal_hex(resp, resp));
@@ -483,6 +490,9 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 	 * watched (lightningd/sym_factory.h). */
 	if (fc->factory)
 		sym_factory_attach(channel, fc->factory);
+	/* SEQUENTIA: a channel of several assets (lightningd/sym_lanes.h). */
+	if (tal_count(lanes))
+		sym_lanes_attach(channel, lanes, lane_sigs, lane_local_sigs);
 
 	/* Watch for funding confirms */
 	channel_watch_funding(ld, channel);
@@ -535,6 +545,8 @@ static void opening_fundee_finished(struct subd *openingd,
 	struct bitcoin_signature *sym_kickoff_sig;
 	struct sym_state *sym_local, *sym_remote;
 	struct sym_factory *factory;
+	struct sym_lane *lanes;
+	struct bitcoin_signature *lane_sigs, *lane_local_sigs;
 
 	log_debug(uc->log, "Got opening_fundee_finish_response");
 
@@ -568,7 +580,10 @@ static void opening_fundee_finished(struct subd *openingd,
 				     &sym_kickoff_sig,
 				     &sym_local,
 				     &sym_remote,
-				     &factory)) {
+				     &factory,
+				     &lanes,
+				     &lane_sigs,
+				     &lane_local_sigs)) {
 		log_broken(uc->log, "bad OPENING_FUNDEE_REPLY %s",
 			   tal_hex(reply, reply));
 		uncommitted_channel_disconnect(uc, LOG_BROKEN,
@@ -642,6 +657,9 @@ static void opening_fundee_finished(struct subd *openingd,
 	/* SEQUENTIA: a factory channel's factory (lightningd/sym_factory.h). */
 	if (factory)
 		sym_factory_attach(channel, take(tal_steal(NULL, factory)));
+	/* SEQUENTIA: a channel of several assets (lightningd/sym_lanes.h). */
+	if (tal_count(lanes))
+		sym_lanes_attach(channel, lanes, lane_sigs, lane_local_sigs);
 
 	channel_watch_funding(ld, channel);
 
@@ -1126,6 +1144,105 @@ bool peer_start_openingd(struct peer *peer, struct peer_fd *peer_fd)
 	return true;
 }
 
+/* SEQUENTIA: a channel of several assets' fundchannel_complete
+ * (lightningd/sym_lanes.h): one output to the funding script in each lane's
+ * asset, the channel's own lane 0, and every other for its lane's amount. */
+static struct command_result *lanes_find(struct command *cmd,
+					 struct funding_channel *fc,
+					 const struct wally_psbt *psbt,
+					 u32 **lane0)
+{
+	bool *found = tal_arrz(tmpctx, bool, tal_count(fc->sym_lanes));
+
+	*lane0 = NULL;
+	for (size_t i = 0; i < psbt->num_outputs; i++) {
+		struct amount_asset a;
+		size_t l;
+
+		if (!memeq(psbt->outputs[i].script, psbt->outputs[i].script_len,
+			   fc->funding_scriptpubkey,
+			   tal_bytelen(fc->funding_scriptpubkey)))
+			continue;
+		a = wally_psbt_output_get_amount(&psbt->outputs[i]);
+		if (amount_asset_is(&a, fc->channel_asset)) {
+			if (*lane0)
+				return command_fail(cmd, FUNDING_PSBT_INVALID,
+						    "Two outputs to open channel");
+			*lane0 = tal(cmd, u32);
+			**lane0 = i;
+			continue;
+		}
+		for (l = 0; l < tal_count(fc->sym_lanes); l++)
+			if (amount_asset_is(&a, fc->sym_lanes[l].asset))
+				break;
+		if (l == tal_count(fc->sym_lanes))
+			return command_fail(cmd, FUNDING_PSBT_INVALID,
+					    "Output %zu pays the channel an"
+					    " asset it does not hold", i);
+		if (found[l])
+			return command_fail(cmd, FUNDING_PSBT_INVALID,
+					    "Two outputs for lane %zu", l + 1);
+		if (!amount_asset_extract_value(tmpctx, &a)
+		    || !amount_sat_eq(amount_sat(a.value),
+				      fc->sym_lanes[l].funding_sats))
+			return command_fail(cmd, FUNDING_PSBT_INVALID,
+					    "Output %zu for lane %zu must hold"
+					    " %s, explicitly", i, l + 1,
+					    fmt_amount_sat(tmpctx,
+							   fc->sym_lanes[l].funding_sats));
+		if (i > UINT16_MAX)
+			return command_fail(cmd, FUNDING_PSBT_INVALID,
+					    "Output %zu too far", i);
+		found[l] = true;
+		fc->sym_lanes[l].outnum = i;
+	}
+	for (size_t l = 0; l < tal_count(fc->sym_lanes); l++)
+		if (!found[l])
+			return command_fail(cmd, FUNDING_PSBT_INVALID,
+					    "No output for lane %zu", l + 1);
+	return NULL;
+}
+
+/* SEQUENTIA: fundchannel_start's lanes: [{asset, amount}, ...]. */
+static struct command_result *param_sym_lanes(struct command *cmd,
+					      const char *name,
+					      const char *buffer,
+					      const jsmntok_t *tok,
+					      struct sym_lane **lanes)
+{
+	size_t i;
+	const jsmntok_t *t;
+
+	if (tok->type != JSMN_ARRAY || tok->size == 0
+	    || tok->size > SYM_MAX_LANES)
+		return command_fail_badparam(cmd, name, buffer, tok,
+					     tal_fmt(tmpctx, "an array of 1 to"
+						     " %u lanes",
+						     SYM_MAX_LANES));
+	*lanes = tal_arrz(cmd, struct sym_lane, tok->size);
+	json_for_each_arr(i, t, tok) {
+		const jsmntok_t *at = json_get_member(buffer, t, "asset");
+		const jsmntok_t *mt = json_get_member(buffer, t, "amount");
+		const u8 *asset;
+		struct amount_sat *amount;
+		struct command_result *ret;
+
+		if (!at || !mt)
+			return command_fail_badparam(cmd, name, buffer, t,
+						     "each lane names its asset"
+						     " and amount");
+		ret = param_asset_tag(cmd, name, buffer, at, &asset);
+		if (ret)
+			return ret;
+		ret = param_sat(cmd, name, buffer, mt, &amount);
+		if (ret)
+			return ret;
+		memcpy((*lanes)[i].asset, asset, 33);
+		(*lanes)[i].funding_sats = *amount;
+	}
+	return NULL;
+}
+
 /* SEQUENTIA: a factory slot's fundchannel_complete: every slot of the
  * factory must have started here, the PSBT must pay F (common/sym_factory.h)
  * once, in the channel's asset and for the factory's whole value. */
@@ -1288,14 +1405,21 @@ static struct command_result *json_fundchannel_complete(struct command *cmd,
 						      &fc->factory_id->txid,
 						      fc->factory_id->n,
 						      fc->channel_type,
-						      fc->factory);
+						      fc->factory, NULL);
 		subd_send_msg(peer->uncommitted_channel->open_daemon,
 			      take(msg));
 		return command_still_pending(cmd);
 	}
 
-	/* Figure out the correct output, and perform sanity checks. */
-	for (size_t i = 0; i < funding_psbt->num_outputs; i++) {
+	/* Figure out the correct output, and perform sanity checks.
+	 * SEQUENTIA: on a channel of several assets every lane pays the same
+	 * script, each in its own asset (lightningd/sym_lanes.h). */
+	if (tal_count(fc->sym_lanes)) {
+		struct command_result *ret = lanes_find(cmd, fc, funding_psbt,
+							&funding_txout_num);
+		if (ret)
+			return ret;
+	} else for (size_t i = 0; i < funding_psbt->num_outputs; i++) {
 		if (memeq(funding_psbt->outputs[i].script,
 			  funding_psbt->outputs[i].script_len,
 			  fc->funding_scriptpubkey,
@@ -1353,11 +1477,16 @@ static struct command_result *json_fundchannel_complete(struct command *cmd,
 
 	/* Set the cmd to this new cmd */
 	peer->uncommitted_channel->fc->cmd = cmd;
-	msg = towire_openingd_funder_complete(NULL,
-					      funding_txid,
-					      *funding_txout_num,
-					      peer->uncommitted_channel->fc->channel_type,
-					      NULL);
+	{
+		u32 *outnums = tal_arr(tmpctx, u32, tal_count(fc->sym_lanes));
+		for (size_t l = 0; l < tal_count(fc->sym_lanes); l++)
+			outnums[l] = fc->sym_lanes[l].outnum;
+		msg = towire_openingd_funder_complete(NULL,
+						      funding_txid,
+						      *funding_txout_num,
+						      peer->uncommitted_channel->fc->channel_type,
+						      NULL, outnums);
+	}
 	subd_send_msg(peer->uncommitted_channel->open_daemon, take(msg));
 	return command_still_pending(cmd);
 }
@@ -1546,6 +1675,7 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 	const u8 *asset = NULL;
 	struct bitcoin_txid *factory_nonce;
 	u32 *factory_slot, *factory_size;
+	struct sym_lane *lanes;
 
 	fc->cmd = cmd;
 	fc->cancels = tal_arr(fc, struct command *, 0);
@@ -1555,6 +1685,7 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 	fc->factory_id = NULL;
 	fc->factory_size = 0;
 	fc->factory = NULL;
+	fc->sym_lanes = NULL;
 
 	if (!param_check(fc->cmd, buffer, params,
 			 p_req("id", param_node_id, &id),
@@ -1570,6 +1701,7 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 			 p_opt("factory_nonce", param_txid, &factory_nonce),
 			 p_opt("factory_slot", param_u32, &factory_slot),
 			 p_opt("factory_size", param_u32, &factory_size),
+			 p_opt("lanes", param_sym_lanes, &lanes),
 			 NULL))
 		return command_param_failed();
 
@@ -1612,6 +1744,31 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 		memcpy(fc->channel_asset, asset, sizeof(fc->channel_asset));
 	else
 		memset(fc->channel_asset, 0, sizeof(fc->channel_asset));
+
+	/* SEQUENTIA: a channel of several assets: the lanes beside its own
+	 * (lightningd/sym_lanes.h), on that channel type alone. */
+	if (lanes) {
+		const char *why = sym_lanes_check(tmpctx, lanes,
+						  fc->channel_asset);
+		if (why)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "lanes: %s", why);
+		if (fc->factory_id)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "A factory slot holds one asset");
+		if (!ctype)
+			ctype = channel_type_seq_symmetric_lanes(cmd);
+		else if (!channel_type_has(ctype, OPT_SEQ_SYMMETRIC_LANES))
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "Lanes need the channel type of"
+					    " several assets");
+		/* Its states cannot be routed through as one asset. */
+		*announce_channel = false;
+		fc->sym_lanes = tal_steal(fc, lanes);
+	} else if (ctype && channel_type_has(ctype, OPT_SEQ_SYMMETRIC_LANES))
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "The channel type of several assets needs"
+				    " lanes");
 
 	if (ctype) {
 		fc->channel_type = tal_steal(fc, ctype);
@@ -1815,7 +1972,8 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 			reserve,
 			fc->channel_type,
 			fc->channel_asset,
-			fc->factory_id);
+			fc->factory_id,
+			fc->sym_lanes);
 
 	if (!topology_synced(cmd->ld->topology)) {
 		struct fundchannel_start_info *info

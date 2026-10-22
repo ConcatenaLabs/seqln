@@ -10,6 +10,7 @@
 #include <common/derive_basepoints.h>
 #include <common/features.h>
 #include <common/fee_states.h>
+#include <common/sym_lanes.h>
 #include <common/sym_state.h>
 #include <wire/peer_wire.h>
 
@@ -79,6 +80,13 @@ msgdata,channeld_init,pbases,penalty_base,num_penalty_bases
 msgdata,channeld_init,num_inflights,u16,
 msgdata,channeld_init,inflights,inflight,num_inflights
 msgdata,channeld_init,scid_alias,short_channel_id,
+# SEQUENTIA: a channel of several assets (common/sym_lanes.h): its other
+# lanes, our balance in each, the swap in flight and the one we asked for.
+msgdata,channeld_init,num_sym_lanes,u16,
+msgdata,channeld_init,sym_lanes,sym_lane,num_sym_lanes
+msgdata,channeld_init,sym_lane_local_msat,amount_msat,num_sym_lanes
+msgdata,channeld_init,sym_swap,?sym_swap,
+msgdata,channeld_init,sym_swap_req,?sym_swap,
 
 # channeld->lightningd: successfully negotated reestablishment.
 msgtype,channeld_reestablished,1101
@@ -103,6 +111,8 @@ msgdata,channeld_offer_htlc,extra_tlvs_len,u16,
 msgdata,channeld_offer_htlc,extra_tlvs,u8,extra_tlvs_len
 # SEQUENTIA: the lock point of a point-locked HTLC (common/point_lock.h).
 msgdata,channeld_offer_htlc,lock_point,?pubkey,
+# SEQUENTIA: its lane (common/sym_lanes.h), 0 on a channel of one asset.
+msgdata,channeld_offer_htlc,lane,u16,
 
 # Reply; synchronous since IDs have to increment.
 msgtype,channeld_offer_htlc_reply,1104
@@ -165,6 +175,8 @@ msgdata,channeld_sending_commitsig,changed,changed_htlc,num_changed
 # SEQUENTIA: a symmetric channel's (common/sym_scripts.h): the peer's state
 # this commitment_signed signs, with our update signature.
 msgdata,channeld_sending_commitsig,sym_remote,?sym_state,
+# SEQUENTIA: the swap in flight (common/sym_lanes.h), as this leaves it.
+msgdata,channeld_sending_commitsig,sym_swap,?sym_swap,
 
 
 # Wait for reply, to make sure it's on disk before we send commit.
@@ -204,6 +216,8 @@ msgdata,channeld_got_commitsig,htlc_infos,got_commitsig_htlc_info,num_htlc_infos
 # SEQUENTIA: a symmetric channel's: our new state, with both update
 # signatures.
 msgdata,channeld_got_commitsig,sym_local,?sym_state,
+# SEQUENTIA: the swap in flight (common/sym_lanes.h), as this leaves it.
+msgdata,channeld_got_commitsig,sym_swap,?sym_swap,
 subtype,commitsig
 subtypedata,commitsig,tx,bitcoin_tx,
 subtypedata,commitsig,commit_signature,bitcoin_signature,
@@ -262,6 +276,8 @@ msgdata,channeld_got_revoke,wt_blobs,watchtower_blob,num_wt_blobs
 # SEQUENTIA: a symmetric channel's: the peer's state that replaces the one it
 # revoked, now with both update signatures.
 msgdata,channeld_got_revoke,sym_remote,?sym_state,
+# SEQUENTIA: the swap in flight (common/sym_lanes.h), as this leaves it.
+msgdata,channeld_got_revoke,sym_swap,?sym_swap,
 # Wait for reply, to make sure it's on disk before we continue
 # (eg. if we sent another commitment_signed, that would implicitly ack).
 msgtype,channeld_got_revoke_reply,1122
@@ -452,3 +468,21 @@ msgdata,channeld_credit_note,credit,u64,
 msgdata,channeld_credit_note,payment_hash,sha256,
 msgdata,channeld_credit_note,sig,bip340sig,
 msgdata,channeld_credit_note,preimage,?preimage,
+
+# SEQUENTIA: swaps between the lanes of a channel of several assets
+# (common/sym_lanes.h).  We ask for one: @swap is the swap as the peer will
+# send it (its owner the peer), which channeld then takes in a commitment
+# until @expiry, and asks for it with SEQ_SWAP_REQUEST_MSG.
+msgtype,channeld_sym_swap_request,1050
+msgdata,channeld_sym_swap_request,swap,sym_swap,
+msgdata,channeld_sym_swap_request,expiry,u32,
+msgtype,channeld_sym_swap_request_reply,1150
+msgdata,channeld_sym_swap_request_reply,err,?wirestring,
+# We take the peer's: @swap is ours to send (its owner us).
+msgtype,channeld_sym_swap_accept,1051
+msgdata,channeld_sym_swap_accept,swap,sym_swap,
+msgtype,channeld_sym_swap_accept_reply,1151
+msgdata,channeld_sym_swap_accept_reply,err,?wirestring,
+# Our request is refused or expired: take no swap for it.
+msgtype,channeld_sym_swap_cancel,1052
+msgdata,channeld_sym_swap_cancel,id,u64,

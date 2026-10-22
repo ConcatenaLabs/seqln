@@ -23,6 +23,7 @@
 #include <lightningd/notification.h>
 #include <lightningd/peer_fd.h>
 #include <lightningd/peer_htlcs.h>
+#include <lightningd/sym_lanes.h>
 #include <unistd.h>
 
 struct stfu_result
@@ -1434,6 +1435,17 @@ static void peer_got_shutdown(struct channel *channel, const u8 *msg)
 		return;
 	}
 
+	/* SEQUENTIA: a channel of several assets has no mutual close: one of
+	 * its own funding output would leave the other lanes to a settlement
+	 * that pays it again (lightningd/sym_lanes.h).  It goes to chain. */
+	if (channel_is_sym_lanes(channel)) {
+		channel_fail_permanent(channel, REASON_REMOTE,
+				       "Peer asked to close a channel of"
+				       " several assets: closing it"
+				       " unilaterally");
+		return;
+	}
+
 	/* BOLT #2:
 	 * A receiving node:
 	 *...
@@ -1824,7 +1836,12 @@ static unsigned channel_msg(struct subd *sd, const u8 *msg, const int *fds)
 	case WIRE_CHANNELD_DEV_QUIESCE:
 	case WIRE_CHANNELD_GOT_INFLIGHT:
 	case WIRE_CHANNELD_DEV_PEER_SHACHAIN:
+	case WIRE_CHANNELD_SYM_SWAP_REQUEST:
+	case WIRE_CHANNELD_SYM_SWAP_ACCEPT:
+	case WIRE_CHANNELD_SYM_SWAP_CANCEL:
 		/* Replies go to requests. */
+	case WIRE_CHANNELD_SYM_SWAP_REQUEST_REPLY:
+	case WIRE_CHANNELD_SYM_SWAP_ACCEPT_REPLY:
 	case WIRE_CHANNELD_OFFER_HTLC_REPLY:
 	case WIRE_CHANNELD_DEV_REENABLE_COMMIT_REPLY:
 	case WIRE_CHANNELD_DEV_MEMLEAK_REPLY:
@@ -1881,6 +1898,9 @@ bool peer_start_channeld(struct channel *channel,
 	u32 feerate_splice, min_feerate, max_feerate, curr_blockheight;
 	struct channel_inflight *inflight;
 	struct inflight **inflights;
+	struct sym_lane *lanes;
+	struct amount_msat *lane_ours;
+	struct sym_swap *lane_swap, *lane_req;
 	struct bitcoin_txid txid;
 
 	hsmfd = hsm_get_client_fd(ld, &channel->peer->id,
@@ -2064,6 +2084,10 @@ bool peer_start_channeld(struct channel *channel,
 	our_config = channel->our_config;
 	our_config.max_dust_htlc_exposure_msat = channel_dust_cap(ld, channel);
 
+	/* SEQUENTIA: a channel of several assets (lightningd/sym_lanes.h). */
+	sym_lanes_init_args(tmpctx, channel, &lanes, &lane_ours, &lane_swap,
+			    &lane_req);
+
 	initmsg = towire_channeld_init(tmpctx,
 				       chainparams,
 				       ld->our_features,
@@ -2126,7 +2150,8 @@ bool peer_start_channeld(struct channel *channel,
 						   pbases),
 				       cast_const2(const struct inflight **,
 						   inflights),
-				       *channel->alias[LOCAL]);
+				       *channel->alias[LOCAL],
+				       lanes, lane_ours, lane_swap, lane_req);
 
 	/* We don't expect a response: we are triggered by funding_depth_cb. */
 	subd_send_msg(channel->owner, take(initmsg));

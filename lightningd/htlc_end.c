@@ -159,6 +159,7 @@ struct htlc_in *new_htlc_in(const tal_t *ctx,
 	hin->we_filled = NULL;
 	hin->payload = NULL;
 	hin->lock_point = NULL;
+	hin->lane = 0;
 	hin->point_add = NULL;
 
 	hin->received_time = clock_time();
@@ -306,6 +307,7 @@ struct htlc_out *new_htlc_out(const tal_t *ctx,
 
 	hout->path_key = tal_dup_or_null(hout, struct pubkey, path_key);
 	hout->lock_point = tal_dup_or_null(hout, struct pubkey, lock_point);
+	hout->lane = 0;
 
 	if (extra_tlvs)
 		hout->extra_tlvs = tlv_field_arr_dup(hout, extra_tlvs);

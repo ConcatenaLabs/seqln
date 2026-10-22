@@ -4,6 +4,7 @@
 #include <common/coin_mvt.h>
 #include <common/derive_basepoints.h>
 #include <common/htlc_wire.h>
+#include <common/sym_lanes.h>
 #include <common/sym_state.h>
 #include <common/wallet.h>
 
@@ -115,6 +116,9 @@ msgdata,onchaind_add_utxo,blockheight,u32,
 msgdata,onchaind_add_utxo,len,u16,
 msgdata,onchaind_add_utxo,scriptpubkey,u8,len
 msgdata,onchaind_add_utxo,csv_lock,u32,
+# SEQUENTIA: its asset; a channel of several assets settles each lane in its
+# own (common/sym_lanes.h).
+msgdata,onchaind_add_utxo,asset,byte,33
 
 # master -> onchaind: do you have a memleak?
 msgtype,onchaind_dev_memleak,5033
@@ -303,6 +307,9 @@ msgdata,onchaind_sym_init,remote_pending,?sym_state,
 msgtype,onchaind_sym_anchor,5054
 msgdata,onchaind_sym_anchor,anchor,bitcoin_outpoint,
 msgdata,onchaind_sym_anchor,factory,bool,
+# A channel of several assets (common/sym_lanes.h): its other lanes.
+msgdata,onchaind_sym_anchor,num_lanes,u16,
+msgdata,onchaind_sym_anchor,lanes,sym_lane,num_lanes
 
 # Spend a symmetric channel's output whose input 0 needs no signature of
 # ours: an update (both update signatures in the witness) or a settle (none).
@@ -320,3 +327,22 @@ msgdata,onchaind_spend_sym,outs,sym_state,
 msgdata,onchaind_spend_sym,sequence,u32,
 msgdata,onchaind_spend_sym,minblock,u32,
 msgdata,onchaind_spend_sym,deadline,u32,
+
+# SEQUENTIA: the settle of a channel of several assets (common/sym_lanes.h):
+# one transaction spending every lane's state output, input 0 first and the
+# others after it, each with its own asset (33 bytes each, in input order)
+# and the same witness; otherwise as onchaind_spend_sym.
+msgtype,onchaind_spend_sym_lanes,5056
+msgdata,onchaind_spend_sym_lanes,num_inputs,u16,
+msgdata,onchaind_spend_sym_lanes,outpoints,bitcoin_outpoint,num_inputs
+msgdata,onchaind_spend_sym_lanes,amounts,amount_sat,num_inputs
+msgdata,onchaind_spend_sym_lanes,assets_len,u16,
+msgdata,onchaind_spend_sym_lanes,assets,u8,assets_len
+msgdata,onchaind_spend_sym_lanes,spent_scriptpubkey_len,u16,
+msgdata,onchaind_spend_sym_lanes,spent_scriptpubkey,u8,spent_scriptpubkey_len
+msgdata,onchaind_spend_sym_lanes,num_witness,u16,
+msgdata,onchaind_spend_sym_lanes,witness,onchain_witness_element,num_witness
+msgdata,onchaind_spend_sym_lanes,outs,sym_state,
+msgdata,onchaind_spend_sym_lanes,sequence,u32,
+msgdata,onchaind_spend_sym_lanes,minblock,u32,
+msgdata,onchaind_spend_sym_lanes,deadline,u32,
