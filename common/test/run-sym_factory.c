@@ -11,6 +11,7 @@
 #include <bitcoin/tapscript.h>
 #include <ccan/str/hex/hex.h>
 #include <common/amount.h>
+#include <common/pseudorand.h>
 #include <common/setup.h>
 #include <common/sym_factory.h>
 #include <common/sym_scripts.h>

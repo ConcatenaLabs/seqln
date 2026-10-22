@@ -13,6 +13,7 @@
 #include <common/key_derive.h>
 #include <common/keyset.h>
 #include <common/point_lock.h>
+#include <common/pseudorand.h>
 #include <common/setup.h>
 #include <common/tcov_scripts.h>
 #include <common/utils.h>
