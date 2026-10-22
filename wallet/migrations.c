@@ -1151,6 +1151,18 @@ static const struct db_migration dbmigrations[] = {
 	 ", PRIMARY KEY (channel_id, credit)"
 	 ");"), NULL,
      SQL("DROP TABLE credit_notes"), NULL},
+    /* Symmetric channels (lightningd/symmetric.h): our kickoff signature,
+     * our latest state and the peer's latest, each with both update
+     * signatures, and the peer's newest, with ours (common/sym_state.h). */
+    {SQL("CREATE TABLE channel_sym ("
+	 "  channel_id BIGINT REFERENCES channels(id) ON DELETE CASCADE"
+	 ", kickoff_sig BLOB"
+	 ", local_state BLOB"
+	 ", remote_state BLOB"
+	 ", remote_pending BLOB"
+	 ", PRIMARY KEY (channel_id)"
+	 ");"), NULL,
+     SQL("DROP TABLE channel_sym"), NULL},
 };
 
 const struct db_migration *get_db_migrations(size_t *num)

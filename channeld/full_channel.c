@@ -15,6 +15,7 @@
 #include <common/memleak.h>
 #include <common/point_lock.h>
 #include <common/status.h>
+#include <common/sym_channel.h>
 #include <inttypes.h>
 #include <stdio.h>
   /* Needs to be at end, since it doesn't include its own hdrs */
@@ -398,6 +399,28 @@ struct bitcoin_tx **channel_txs(const tal_t *ctx,
 	}
 
 	txs = tal_arr(ctx, struct bitcoin_tx *, 1);
+	/* SEQUENTIA: a symmetric channel's commitment is its kickoff, the
+	 * same for both sides and every state (common/sym_scripts.h): the
+	 * states are signed by update signatures (channeld/sym_channeld.c),
+	 * and there are no HTLC transactions. */
+	if (channel_has(channel, OPT_SEQ_SYMMETRIC)) {
+		struct sym_channel sc;
+
+		sym_channel_of(channel, &sc);
+		txs[0] = sym_kickoff_tx(txs, chainparams, funding, funding_sats,
+					*funding_wscript, &sc);
+		*htlcmap = tal_arrz(ctx, const struct htlc *,
+				    txs[0]->wtx->num_outputs);
+		if (direct_outputs)
+			direct_outputs[LOCAL] = direct_outputs[REMOTE] = NULL;
+		*other_anchor_outnum = -1;
+		psbt_input_add_pubkey(txs[0]->psbt, 0,
+				      &funding_pubkeys[side], false);
+		psbt_input_add_pubkey(txs[0]->psbt, 0,
+				      &funding_pubkeys[!side], false);
+		tal_free(committed);
+		return txs;
+	}
 	/* SEQUENTIA: the taproot-covenant type (common/tcov_commit_tx.h). */
 	if (channel_has(channel, OPT_SEQ_TAPROOT_COVENANT)) {
 		txs[0] = tcov_channel_commit_tx(txs, funding, funding_sats,

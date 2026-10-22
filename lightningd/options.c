@@ -962,6 +962,7 @@ static void dev_register_opts(struct lightningd *ld)
 static const struct config testnet_config = {
 	/* 6 blocks to catch cheating attempts. */
 	.locktime_blocks = 6,
+	.symmetric_delay = 6,
 
 	/* BOLT #4:
 	 * ## `max_htlc_cltv` Selection
@@ -1035,6 +1036,7 @@ static const struct config testnet_config = {
 static const struct config mainnet_config = {
 	/* ~one day to catch cheating attempts. */
 	.locktime_blocks = 6 * 24,
+	.symmetric_delay = 72,
 
 	/* BOLT #4:
 	 * ## `max_htlc_cltv` Selection
@@ -1687,6 +1689,18 @@ static void register_opts(struct lightningd *ld)
 			   "With --taproot-covenant-channels, take and offer HTLCs"
 			   " locked to a point rather than a hash, for payments"
 			   " whose every hop takes them (Sequentia networks only)");
+	opt_register_noarg("--symmetric-channels",
+			   opt_set_bool, &ld->config.symmetric_channels,
+			   "Offer symmetric channels: an old state is replaced by the"
+			   " latest one rather than punished, a keyless watcher keeps"
+			   " only the latest state, and every stage of a close pays its"
+			   " fee from an input attached when it is broadcast"
+			   " (Sequentia networks only)");
+	clnopt_witharg("--symmetric-delay", OPT_SHOWINT, opt_set_u32, opt_show_u32,
+		       &ld->config.symmetric_delay,
+		       "Blocks a symmetric channel waits before its latest state"
+		       " settles: what this node asks, and the most it accepts."
+		       " Its HTLCs must live longer than twice this");
 	opt_register_noarg("--invoices-onchain-fallback",
 			   opt_set_bool, &ld->unified_invoices,
 			   "Include an onchain address in invoices and mark them as paid if payment is received on-chain");
@@ -1890,6 +1904,11 @@ void handle_early_opts(struct lightningd *ld, int argc, char *argv[])
 		/* to_self_delay ~1 day (Bitcoin mainnet 144 blocks; 1 day ~=
 		 * 1496 blocks at 58s, spec range 1000-2000). */
 		ld->config.locktime_blocks = 1440;
+		/* A symmetric channel's shared delay holds every output,
+		 * HTLCs included, until it settles, so it is far shorter
+		 * than to_self_delay: ~70 min, with twice it inside the final
+		 * CLTV (180) and the per-hop delta (270). */
+		ld->config.symmetric_delay = 72;
 		/* per-hop routing delta ~4.3h - ample given Sequentia's fast
 		 * certified finality on same-chain hops (spec ~270). */
 		ld->config.cltv_expiry_delta = 270;
@@ -2033,6 +2052,25 @@ void handle_opts(struct lightningd *ld)
 			log_unusual(ld->log, "--credit-channels: needs"
 				    " --taproot-covenant-channels on a"
 				    " Sequentia network");
+	}
+
+	/* SEQUENTIA: the symmetric channel type, on the same chains;
+	 * hsm_control.c withdraws it if the signer cannot sign its states. */
+	if (ld->config.symmetric_channels) {
+		/* A relative lock time counts at most 65535 blocks. */
+		if (ld->config.symmetric_delay == 0
+		    || ld->config.symmetric_delay > 0xFFFF)
+			fatal("--symmetric-delay must be between 1 and 65535"
+			      " blocks");
+		if (chainparams->has_tapscript_introspection)
+			feature_set_or(ld->our_features,
+				       take(feature_set_for_feature(NULL,
+								    OPTIONAL_FEATURE(OPT_SEQ_SYMMETRIC))));
+		else
+			log_unusual(ld->log, "--symmetric-channels:"
+				    " not offered on %s, only on the"
+				    " Sequentia networks",
+				    chainparams->network_name);
 	}
 
 	/* SEQUENTIA: point locks ride on that channel type; hsm_control.c

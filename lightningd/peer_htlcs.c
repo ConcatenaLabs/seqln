@@ -23,6 +23,7 @@
 #include <lightningd/peer_htlcs.h>
 #include <lightningd/plugin_hook.h>
 #include <lightningd/subd.h>
+#include <lightningd/symmetric.h>
 #include <lightningd/watchtower_store.h>
 #include <onchaind/onchaind_wiregen.h>
 
@@ -802,6 +803,19 @@ const u8 *send_htlc_out(const tal_t *ctx,
 			return towire_temporary_channel_failure(ctx,
 								channel_update_for_error(tmpctx, in, out));
 		}
+	}
+
+	/* SEQUENTIA: a symmetric channel resolves an HTLC on chain only
+	 * after its shared delay, possibly twice: an HTLC that expires sooner
+	 * could not be enforced there (lightningd/symmetric.h). */
+	if (channel_type_has(out->type, OPT_SEQ_SYMMETRIC)
+	    && cltv <= get_block_height(out->peer->ld->topology)
+		       + sym_htlc_margin(out)) {
+		log_info(out->log, "Not offering an HTLC expiring at %u on a"
+			 " symmetric channel: it must outlive %u blocks",
+			 cltv, sym_htlc_margin(out));
+		return towire_expiry_too_soon(ctx,
+					      channel_update_for_error(tmpctx, in, out));
 	}
 
 	/* SEQUENTIA: a point lock goes only where the scripts and the peer
@@ -1743,6 +1757,20 @@ static bool peer_accepted_htlc(const tal_t *ctx,
 		goto fail;
 	}
 
+	/* SEQUENTIA: on a symmetric channel an HTLC that expires before the
+	 * channel could settle on chain cannot be enforced
+	 * (lightningd/symmetric.h). */
+	if (channel_type_has(channel->type, OPT_SEQ_SYMMETRIC)
+	    && hin->cltv_expiry <= get_block_height(ld->topology)
+				   + sym_htlc_margin(channel)) {
+		log_info(channel->log, "Rejecting their htlc %"PRIu64
+			 " expiring at %u: a symmetric channel's must outlive"
+			 " %u blocks", id, hin->cltv_expiry,
+			 sym_htlc_margin(channel));
+		*failmsg = towire_expiry_too_soon(ctx, NULL);
+		goto fail;
+	}
+
 	/* BOLT #2:
 	 *
 	 * A fulfilling node:
@@ -2459,6 +2487,7 @@ void peer_sending_commitsig(struct channel *channel, const u8 *msg)
 	/* Watchtower Phase F (kind 6): REMOTE keyset ingredient for the
 	 * remote_htlc_to_us pre-sign off the PEER commitment. */
 	struct pubkey remote_per_commit;
+	struct sym_state *sym_remote;
 
 	if (!fromwire_channeld_sending_commitsig(msg, msg,
 						&commitnum,
@@ -2466,13 +2495,19 @@ void peer_sending_commitsig(struct channel *channel, const u8 *msg)
 						&pbase,
 						&fee_states,
 						&blockheight_states,
-						&changed_htlcs)
+						&changed_htlcs,
+						&sym_remote)
 	    || !fee_states_valid(fee_states, channel->opener)
 	    || !height_states_valid(blockheight_states, channel->opener)) {
 		channel_internal_error(channel, "bad channel_sending_commitsig %s",
 				       tal_hex(channel, msg));
 		return;
 	}
+
+	/* SEQUENTIA: a symmetric channel: the peer's newest state, with our
+	 * signature, before channeld sends it (lightningd/symmetric.h). */
+	if (sym_remote)
+		sym_record_sent(channel, sym_remote);
 
 	for (i = 0; i < tal_count(changed_htlcs); i++) {
 		if (!changed_htlc(channel, changed_htlcs + i)) {
@@ -2675,6 +2710,7 @@ void peer_got_commitsig(struct channel *channel, const u8 *msg)
 	struct got_commitsig_htlc_info *htlc_infos;
 	struct watchtower_blob **sweeps;
 	struct bitcoin_tx *preempt_tx;
+	struct sym_state *sym_local;
 
 	if (!fromwire_channeld_got_commitsig(msg, msg,
 					    &commitnum,
@@ -2689,7 +2725,8 @@ void peer_got_commitsig(struct channel *channel, const u8 *msg)
 					    &tx,
 					    &inflight_commit_sigs,
 					    &local_per_commit,
-					    &htlc_infos)
+					    &htlc_infos,
+					    &sym_local)
 	    || !fee_states_valid(fee_states, channel->opener)
 	    || !height_states_valid(blockheight_states, channel->opener)) {
 		channel_internal_error(channel,
@@ -2717,6 +2754,11 @@ void peer_got_commitsig(struct channel *channel, const u8 *msg)
 	}
 
 	tx->chainparams = chainparams;
+
+	/* SEQUENTIA: a symmetric channel: our new state, whole, before
+	 * channeld revokes the one before (lightningd/symmetric.h). */
+	if (sym_local)
+		sym_record_local(channel, sym_local);
 
 	log_debug(channel->log,
 		  "got commitsig %"PRIu64
@@ -2916,6 +2958,7 @@ void peer_got_revoke(struct channel *channel, const u8 *msg)
 	struct commitment_revocation_payload *payload;
 	struct bitcoin_tx *penalty_tx;
 	struct watchtower_blob **wt_blobs;
+	struct sym_state *sym_remote;
 
 	if (!fromwire_channeld_got_revoke(msg, msg,
 					 &revokenum, &per_commitment_secret,
@@ -2925,7 +2968,8 @@ void peer_got_revoke(struct channel *channel, const u8 *msg)
 					 &changed,
 					 &pbase,
 					 &penalty_tx,
-					 &wt_blobs)
+					 &wt_blobs,
+					 &sym_remote)
 	    || !fee_states_valid(fee_states, channel->opener)
 	    || !height_states_valid(blockheight_states, channel->opener)) {
 		channel_internal_error(channel, "bad fromwire_channeld_got_revoke %s",
@@ -2936,6 +2980,11 @@ void peer_got_revoke(struct channel *channel, const u8 *msg)
 	log_debug(channel->log,
 		  "got revoke %"PRIu64": %zu changed",
 		  revokenum, tal_count(changed));
+
+	/* SEQUENTIA: a symmetric channel: the state that replaces the one
+	 * they revoked, now whole (lightningd/symmetric.h). */
+	if (sym_remote)
+		sym_record_revoked(channel, sym_remote);
 
 	/* Save any immediate failures for after we reply. */
 	badonions = tal_arrz(msg, enum onion_wire, tal_count(changed));
@@ -3191,6 +3240,13 @@ void free_htlcs(struct lightningd *ld, const struct channel *channel)
  */
 static u32 htlc_out_deadline(const struct htlc_out *hout)
 {
+	/* SEQUENTIA: a symmetric channel reaches its HTLC outputs only after
+	 * its kickoff, an update and the shared delay (twice, at worst): it
+	 * starts closing that long before the expiry, so the timeout can be
+	 * claimed when it falls due (lightningd/symmetric.h). */
+	if (channel_type_has(hout->key.channel->type, OPT_SEQ_SYMMETRIC)
+	    && hout->cltv_expiry > sym_htlc_margin(hout->key.channel))
+		return hout->cltv_expiry - sym_htlc_margin(hout->key.channel);
 	return hout->cltv_expiry + 1;
 }
 
@@ -3206,6 +3262,11 @@ static u32 htlc_out_deadline(const struct htlc_out *hout)
 static u32 htlc_in_deadline(const struct lightningd *ld,
 			    const struct htlc_in *hin)
 {
+	/* SEQUENTIA: likewise, so that its preimage claim confirms before
+	 * the offerer's timeout falls due. */
+	if (channel_type_has(hin->key.channel->type, OPT_SEQ_SYMMETRIC)
+	    && hin->cltv_expiry > sym_htlc_margin(hin->key.channel))
+		return hin->cltv_expiry - sym_htlc_margin(hin->key.channel);
 	return hin->cltv_expiry - (ld->config.cltv_expiry_delta + 1)/2;
 }
 

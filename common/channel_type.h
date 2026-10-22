@@ -10,6 +10,8 @@ struct channel_type *channel_type_static_remotekey(const tal_t *ctx);
 struct channel_type *channel_type_anchors_zero_fee_htlc(const tal_t *ctx);
 /* SEQUENTIA: taproot commitment outputs, covenant second stage */
 struct channel_type *channel_type_seq_taproot_covenant(const tal_t *ctx);
+/* SEQUENTIA: the symmetric type, no penalty (common/sym_scripts.h) */
+struct channel_type *channel_type_seq_symmetric(const tal_t *ctx);
 struct channel_type *channel_type_seq_credit(const tal_t *ctx);
 
 /* channel_type variants */

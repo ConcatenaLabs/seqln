@@ -96,6 +96,20 @@ struct channel_type *channel_type_seq_credit(const tal_t *ctx)
 	return type;
 }
 
+/* SEQUENTIA: the symmetric type (common/sym_scripts.h) is its own basic
+ * type: option_static_remotekey's static payment keys, no anchors, no
+ * penalty. */
+struct channel_type *channel_type_seq_symmetric(const tal_t *ctx)
+{
+	struct channel_type *type = new_channel_type(ctx);
+
+	set_feature_bit(&type->features,
+			COMPULSORY_FEATURE(OPT_SEQ_SYMMETRIC));
+	set_feature_bit(&type->features,
+			COMPULSORY_FEATURE(OPT_STATIC_REMOTEKEY));
+	return type;
+}
+
 bool channel_type_has(const struct channel_type *type, int feature)
 {
 	return feature_offered(type->features, feature);
@@ -144,6 +158,7 @@ struct channel_type *channel_type_accept(const tal_t *ctx,
 		OPT_ZEROCONF,
 		OPT_SEQ_TAPROOT_COVENANT,
 		OPT_SEQ_CREDIT,
+		OPT_SEQ_SYMMETRIC,
 	};
 
 	/* BOLT #2:
@@ -184,7 +199,9 @@ struct channel_type *channel_type_accept(const tal_t *ctx,
 	    channel_type_eq(&proposed,
 			    channel_type_seq_taproot_covenant(tmpctx)) ||
 	    channel_type_eq(&proposed,
-			    channel_type_seq_credit(tmpctx))) {
+			    channel_type_seq_credit(tmpctx)) ||
+	    channel_type_eq(&proposed,
+			    channel_type_seq_symmetric(tmpctx))) {
 		/* At this point we know it matches, and maybe has
 		 * a couple of extra options. So let's just reply
 		 * with their proposal. */

@@ -79,7 +79,7 @@ static u8 *test_sync_read(const tal_t *ctx, int fd)
 			out.n = 0;
 
 			return towire_funding_created(ctx, &state->channel_id,
-					&out.txid, out.n, &sig.s);
+					&out.txid, out.n, &sig.s, NULL);
 		}
 		else
 			return create_fuzz_msg(ctx);

@@ -4,6 +4,7 @@
 #include <common/coin_mvt.h>
 #include <common/derive_basepoints.h>
 #include <common/htlc_wire.h>
+#include <common/sym_state.h>
 #include <common/wallet.h>
 
 # Begin!  Here's the onchain tx which spends funding tx, followed by all HTLCs.
@@ -53,6 +54,9 @@ msgdata,onchaind_init,option_anchors_zero_fee_htlc_tx,bool,
 msgdata,onchaind_init,option_seq_taproot_covenant,bool,
 # SEQUENTIA: a credit channel (common/credit_scripts.h); the opener provides.
 msgdata,onchaind_init,option_seq_credit,bool,
+# SEQUENTIA: a symmetric channel (common/sym_scripts.h): onchaind_sym_init
+# follows.
+msgdata,onchaind_init,option_seq_symmetric,bool,
 # We need this for BIP125 rule 4
 msgdata,onchaind_init,min_relay_feerate,u32,
 
@@ -278,3 +282,33 @@ msgdata,onchaind_spend_credit_claim,sig,bip340sig,
 msgdata,onchaind_spend_credit_claim,preimage,preimage,
 msgdata,onchaind_spend_credit_claim,holder_scriptpubkey_len,u16,
 msgdata,onchaind_spend_credit_claim,holder_scriptpubkey,u8,holder_scriptpubkey_len
+
+# SEQUENTIA: a symmetric channel (common/sym_scripts.h, lightningd/symmetric.h):
+# right after onchaind_init, the shared delay and the states lightningd holds:
+# ours and the peer's latest, each with both update signatures, and the
+# peer's newest, with ours.
+msgtype,onchaind_sym_init,5052
+# The funding outpoint: SIGHASH_SINGLE|ANYONECANPAY binds the kickoff's
+# funding input to the output at the same index, KO, at whatever index.
+msgdata,onchaind_sym_init,funding,bitcoin_outpoint,
+msgdata,onchaind_sym_init,shared_delay,u16,
+msgdata,onchaind_sym_init,local,?sym_state,
+msgdata,onchaind_sym_init,remote,?sym_state,
+msgdata,onchaind_sym_init,remote_pending,?sym_state,
+
+# Spend a symmetric channel's output whose input 0 needs no signature of
+# ours: an update (both update signatures in the witness) or a settle (none).
+# Outputs 0 .. m-1 are those of `outs`, in the channel's asset; lightningd
+# adds a fee coin in any asset it accepts for fees, rebuilds it each block
+# until the output is spent, and answers with onchaind_spend_created.
+msgtype,onchaind_spend_sym,5053
+msgdata,onchaind_spend_sym,outpoint,bitcoin_outpoint,
+msgdata,onchaind_spend_sym,outpoint_amount,amount_sat,
+msgdata,onchaind_spend_sym,spent_scriptpubkey_len,u16,
+msgdata,onchaind_spend_sym,spent_scriptpubkey,u8,spent_scriptpubkey_len
+msgdata,onchaind_spend_sym,num_witness,u16,
+msgdata,onchaind_spend_sym,witness,onchain_witness_element,num_witness
+msgdata,onchaind_spend_sym,outs,sym_state,
+msgdata,onchaind_spend_sym,sequence,u32,
+msgdata,onchaind_spend_sym,minblock,u32,
+msgdata,onchaind_spend_sym,deadline,u32,

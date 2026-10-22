@@ -204,6 +204,20 @@ struct ext_key *hsm_init(struct lightningd *ld)
 							OPTIONAL_FEATURE(OPT_SEQ_TAPROOT_COVENANT)));
 	}
 
+	/* SEQUENTIA: the symmetric type needs a signer that signs its kickoff,
+	 * its states and its HTLC claims. */
+	if (feature_offered(ld->our_features->bits[INIT_FEATURE],
+			    OPT_SEQ_SYMMETRIC)
+	    && !(hsm_capable(ld, WIRE_HSMD_SIGN_SYM_KICKOFF)
+		 && hsm_capable(ld, WIRE_HSMD_SIGN_SYM_STATE)
+		 && hsm_capable(ld, WIRE_HSMD_SIGN_SYM_HTLC))) {
+		log_unusual(ld->log, "The signer cannot sign symmetric channel"
+			    " states: not offering that channel type");
+		feature_set_sub(ld->our_features,
+				feature_set_for_feature(tmpctx,
+							OPTIONAL_FEATURE(OPT_SEQ_SYMMETRIC)));
+	}
+
 	/* SEQUENTIA: credit channels need that channel type, and a signer
 	 * that learns the notes it holds (hsmd_credit_note): a device that
 	 * did not could sign away a credit it was owed.  Issuing them as a

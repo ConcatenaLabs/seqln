@@ -156,7 +156,8 @@ def test_close_output_asset_migration(node_factory, bitcoind):
     # columns such a database lacks too: each is undone, newest first.
     l2.stop()
     version = query("SELECT version FROM version")[0][0]
-    later = ("DROP TABLE credit_notes",
+    later = ("DROP TABLE channel_sym",
+             "DROP TABLE credit_notes",
              "ALTER TABLE channel_htlcs DROP COLUMN point_add",
              "ALTER TABLE channel_htlcs DROP COLUMN lock_point",
              "ALTER TABLE penalty_htlcs DROP COLUMN stage2_amount",

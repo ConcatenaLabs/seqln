@@ -65,6 +65,13 @@ struct config {
 	/* SEQUENTIA: offer credit channels (--credit-channels). */
 	bool credit_channels;
 
+	/* SEQUENTIA: offer symmetric channels (--symmetric-channels,
+	 * common/sym_scripts.h). */
+	bool symmetric_channels;
+	/* The shared delay a symmetric channel asks for, and the most it
+	 * accepts (--symmetric-delay), blocks. */
+	u32 symmetric_delay;
+
 	/* Do we let the opener set any fee rate they want */
 	bool ignore_fee_limits;
 

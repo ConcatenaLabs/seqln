@@ -105,7 +105,9 @@ COMMON_SRC_NOGEN :=				\
 	common/status_levels.c			\
 	common/status_wire.c			\
 	common/subdaemon.c			\
+	common/sym_channel.c			\
 	common/sym_scripts.c			\
+	common/sym_state.c			\
 	common/tcov_commit_tx.c			\
 	common/tcov_scripts.c			\
 	common/timeout.c			\

@@ -353,6 +353,10 @@ void add_channel_to_dbid_map(struct lightningd *ld,
  * from the open negotiation before channeld is started. */
 static void channel_set_default_asset(struct channel *channel)
 {
+	channel->sym_kickoff_sig = NULL;
+	channel->sym_local = channel->sym_remote = NULL;
+	channel->sym_remote_pending = NULL;
+	channel->sym_dev_stale = NULL;
 	if (chainparams->is_elements && chainparams->fee_asset_tag)
 		memcpy(channel->channel_asset, chainparams->fee_asset_tag,
 		       sizeof(channel->channel_asset));

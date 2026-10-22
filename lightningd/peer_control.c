@@ -36,6 +36,7 @@
 #include <lightningd/peer_fd.h>
 #include <lightningd/peer_htlcs.h>
 #include <lightningd/plugin_hook.h>
+#include <lightningd/symmetric.h>
 #include <lightningd/watchtower_store.h>
 #include <onchaind/onchaind_wiregen.h>
 #include <openingd/dualopend_wiregen.h>
@@ -538,8 +539,15 @@ void drop_to_chain(struct lightningd *ld, struct channel *channel,
 		bool refused = false;
 		struct bitcoin_tx *tx;
 
-		/* We need to drop *every* commitment transaction to chain */
-		if (!cooperative && !list_empty(&channel->inflights)) {
+		/* SEQUENTIA: a symmetric channel goes to chain through its
+		 * kickoff, with a fee coin attached; onchaind then publishes
+		 * our best state over it, and its settlement after the delay
+		 * (lightningd/symmetric.h). */
+		if (!cooperative
+		    && channel_type_has(channel->type, OPT_SEQ_SYMMETRIC)) {
+			if (!sym_broadcast_kickoff(ld, channel, cmd_id))
+				refused = true;
+		} else if (!cooperative && !list_empty(&channel->inflights)) {
 			list_for_each(&channel->inflights, inflight, list) {
 				if (!inflight->last_tx)
 					continue;
@@ -3982,6 +3990,48 @@ static struct command_result *json_dev_fail(struct command *cmd,
 			       "Failing due to dev-fail command");
 	return command_success(cmd, json_stream_success(cmd));
 }
+
+/* SEQUENTIA: freeze the best symmetric state this node holds now; at its
+ * next unilateral close it publishes that one as if it held nothing newer:
+ * a stale state, for tests of whoever replaces it (lightningd/symmetric.h). */
+static struct command_result *json_dev_sym_snapshot(struct command *cmd,
+						    const char *buffer,
+						    const jsmntok_t *obj UNNEEDED,
+						    const jsmntok_t *params)
+{
+	struct channel *channel;
+	const struct sym_state *best;
+	struct json_stream *response;
+	u8 *b;
+	const u8 *cursor;
+	size_t max;
+
+	if (!param(cmd, buffer, params,
+		   p_req("id", param_dev_channel, &channel),
+		   NULL))
+		return command_param_failed();
+	if (!channel_type_has(channel->type, OPT_SEQ_SYMMETRIC))
+		return command_fail(cmd, LIGHTNINGD, "Not a symmetric channel");
+	best = sym_best_state(channel);
+	if (!best)
+		return command_fail(cmd, LIGHTNINGD, "No state held whole yet");
+	b = tal_arr(tmpctx, u8, 0);
+	towire_sym_state(&b, best);
+	cursor = b;
+	max = tal_bytelen(b);
+	tal_free(channel->sym_dev_stale);
+	channel->sym_dev_stale = fromwire_sym_state(channel, &cursor, &max);
+	response = json_stream_success(cmd);
+	json_add_s64(response, "state", best->num);
+	return command_success(cmd, response);
+}
+
+static const struct json_command dev_sym_snapshot_command = {
+	"dev-sym-snapshot",
+	json_dev_sym_snapshot,
+	.dev_only = true,
+};
+AUTODATA(json_command, &dev_sym_snapshot_command);
 
 static const struct json_command dev_fail_command = {
 	"dev-fail",

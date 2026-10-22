@@ -10,14 +10,15 @@ struct funding_signed {
 
 static void *encode(const tal_t *ctx, const struct funding_signed *s)
 {
-	return towire_funding_signed(ctx, &s->channel_id, &s->signature);
+	return towire_funding_signed(ctx, &s->channel_id, &s->signature, NULL);
 }
 
 static struct funding_signed *decode(const tal_t *ctx, const void *p)
 {
 	struct funding_signed *s = tal(ctx, struct funding_signed);
+	struct tlv_funding_signed_tlvs *tlvs;
 
-	if (fromwire_funding_signed(p, &s->channel_id, &s->signature))
+	if (fromwire_funding_signed(s, p, &s->channel_id, &s->signature, &tlvs))
 		return s;
 	return tal_free(s);
 }

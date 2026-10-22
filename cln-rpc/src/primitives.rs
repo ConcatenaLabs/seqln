@@ -77,6 +77,8 @@ pub enum ChannelTypeName {
     SEQ_TAPROOT_COVENANT_EVEN = 6,
     #[serde(rename = "seq_credit/even")]
     SEQ_CREDIT_EVEN = 7,
+    #[serde(rename = "seq_symmetric/even")]
+    SEQ_SYMMETRIC_EVEN = 8,
 }
 
 #[derive(Copy, Clone, Serialize, Deserialize, Debug)]
@@ -505,6 +507,7 @@ impl From<i32> for ChannelTypeName {
             5 => ChannelTypeName::ANCHORS_EVEN,
             6 => ChannelTypeName::SEQ_TAPROOT_COVENANT_EVEN,
             7 => ChannelTypeName::SEQ_CREDIT_EVEN,
+            8 => ChannelTypeName::SEQ_SYMMETRIC_EVEN,
             o => panic!("Unmapped ChannelTypeName {}", o),
         }
     }
@@ -521,6 +524,7 @@ impl From<ChannelTypeName> for i32 {
             ChannelTypeName::ANCHORS_EVEN => 5,
             ChannelTypeName::SEQ_TAPROOT_COVENANT_EVEN => 6,
             ChannelTypeName::SEQ_CREDIT_EVEN => 7,
+            ChannelTypeName::SEQ_SYMMETRIC_EVEN => 8,
         }
     }
 }
@@ -538,6 +542,7 @@ impl Display for ChannelTypeName {
             ChannelTypeName::ANCHORS_EVEN => write!(f, "ANCHORS_EVEN"),
             ChannelTypeName::SEQ_TAPROOT_COVENANT_EVEN => write!(f, "SEQ_TAPROOT_COVENANT_EVEN"),
             ChannelTypeName::SEQ_CREDIT_EVEN => write!(f, "SEQ_CREDIT_EVEN"),
+            ChannelTypeName::SEQ_SYMMETRIC_EVEN => write!(f, "SEQ_SYMMETRIC_EVEN"),
         }
     }
 }

@@ -25,6 +25,7 @@
 #include <lightningd/peer_fd.h>
 #include <lightningd/plugin_hook.h>
 #include <lightningd/subd.h>
+#include <lightningd/symmetric.h>
 #include <openingd/openingd_wiregen.h>
 #include <unistd.h>
 #include <wally_psbt.h>
@@ -394,6 +395,8 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 	struct channel_type *type;
 	bool was_important;
 	u8 channel_asset[33];
+	struct bitcoin_signature *sym_kickoff_sig;
+	struct sym_state *sym_local, *sym_remote;
 
 	/* This is a new channel_info.their_config so set its ID to 0 */
 	channel_info.their_config.id = 0;
@@ -416,7 +419,10 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 					   &fc->uc->our_config.dust_limit,
 					   &remote_upfront_shutdown_script,
 					   &type,
-					   channel_asset)) {
+					   channel_asset,
+					   &sym_kickoff_sig,
+					   &sym_local,
+					   &sym_remote)) {
 		log_broken(fc->uc->log,
 			   "bad OPENING_FUNDER_REPLY %s",
 			   tal_hex(resp, resp));
@@ -442,6 +448,11 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 	/* Before this channel, was peer important? */
 	was_important = peer_any_channel(fc->uc->peer,
 					 channel_important_filter, NULL, NULL);
+
+	/* SEQUENTIA: a symmetric channel asked for the shared delay, as
+	 * openingd did (sym_delay_ok). */
+	if (channel_type_has(type, OPT_SEQ_SYMMETRIC))
+		fc->uc->our_config.to_self_delay = ld->config.symmetric_delay;
 
 	/* Steals fields from uc */
 	channel = wallet_commit_channel(ld, fc->uc,
@@ -471,6 +482,12 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 
 	if (pbase)
 		wallet_penalty_base_add(ld->wallet, channel->dbid, pbase);
+
+	/* SEQUENTIA: a symmetric channel's kickoff signature and first
+	 * states (lightningd/symmetric.h). */
+	if (sym_kickoff_sig)
+		sym_record_opened(channel, sym_kickoff_sig, sym_local,
+				  sym_remote);
 
 	/* This will have made us important, if we weren't before */
 	tell_connectd_peer_importance(channel->peer, was_important);
@@ -508,6 +525,8 @@ static void opening_fundee_finished(struct subd *openingd,
 	struct penalty_base *pbase;
 	struct channel_type *type;
 	u8 channel_asset[33];
+	struct bitcoin_signature *sym_kickoff_sig;
+	struct sym_state *sym_local, *sym_remote;
 
 	log_debug(uc->log, "Got opening_fundee_finish_response");
 
@@ -537,7 +556,10 @@ static void opening_fundee_finished(struct subd *openingd,
 				     &local_upfront_shutdown_script,
 				     &remote_upfront_shutdown_script,
 				     &type,
-				     channel_asset)) {
+				     channel_asset,
+				     &sym_kickoff_sig,
+				     &sym_local,
+				     &sym_remote)) {
 		log_broken(uc->log, "bad OPENING_FUNDEE_REPLY %s",
 			   tal_hex(reply, reply));
 		uncommitted_channel_disconnect(uc, LOG_BROKEN,
@@ -551,6 +573,11 @@ static void opening_fundee_finished(struct subd *openingd,
 
 	/* old_remote_per_commit not valid yet, copy valid one. */
 	channel_info.old_remote_per_commit = channel_info.remote_per_commit;
+
+	/* SEQUENTIA: a symmetric channel asked for the shared delay, as
+	 * openingd did (sym_delay_ok). */
+	if (channel_type_has(type, OPT_SEQ_SYMMETRIC))
+		uc->our_config.to_self_delay = ld->config.symmetric_delay;
 
 	/* Consumes uc */
 	channel = wallet_commit_channel(ld, uc,
@@ -587,6 +614,13 @@ static void opening_fundee_finished(struct subd *openingd,
 
 	if (pbase)
 		wallet_penalty_base_add(ld->wallet, channel->dbid, pbase);
+
+	/* SEQUENTIA: a symmetric channel's kickoff signature and first
+	 * states (lightningd/symmetric.h). */
+	if (sym_kickoff_sig)
+		sym_record_opened(channel, sym_kickoff_sig,
+				  tal_steal(channel, sym_local),
+				  tal_steal(channel, sym_remote));
 
 	/* On to normal operation (frees if it fails!) */
 	if (peer_start_channeld(channel, peer_fd, fwd_msg, false))
@@ -1047,7 +1081,10 @@ bool peer_start_openingd(struct peer *peer, struct peer_fd *peer_fd)
 				   peer->ld->dev_force_tmp_channel_id,
 				   peer->ld->config.allowdustreserve,
 				   peer->ld->dev_any_channel_type,
-				   rate_values, rate_tags);
+				   rate_values, rate_tags,
+				   feature_offered(peer->ld->our_features->bits[INIT_FEATURE],
+						   OPT_SEQ_SYMMETRIC)
+				   ? peer->ld->config.symmetric_delay : 0);
 	subd_send_msg(uc->open_daemon, take(msg));
 	return true;
 }
@@ -1529,6 +1566,12 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 		    && feature_negotiated(cmd->ld->our_features,
 					  peer->their_features, OPT_SEQ_CREDIT))
 			fc->channel_type = channel_type_seq_credit(fc);
+		/* SEQUENTIA: otherwise a symmetric channel, when both offer
+		 * it (common/sym_scripts.h). */
+		else if (feature_negotiated(cmd->ld->our_features,
+					    peer->their_features,
+					    OPT_SEQ_SYMMETRIC))
+			fc->channel_type = channel_type_seq_symmetric(fc);
 	} else if (channel_type_has(fc->channel_type, OPT_SEQ_CREDIT)
 		   && !cmd->ld->credit_issuer)
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,

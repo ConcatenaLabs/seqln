@@ -634,6 +634,47 @@ msgdata,hsmd_credit_note,preimage,?preimage,
 
 msgtype,hsmd_credit_note_reply,167
 
+# SEQUENTIA: the symmetric channel type (common/sym_scripts.h).
+# Our funding key's signature of the kickoff's funding input,
+# SIGHASH_SINGLE|SIGHASH_ANYONECANPAY: it covers only the funding input and
+# output 0 (KO, the funding's whole value), so a fee input and its change can
+# be added when it is broadcast.  Answered by hsmd_sign_tx_reply.
+msgtype,hsmd_sign_sym_kickoff,69
+msgdata,hsmd_sign_sym_kickoff,tx,bitcoin_tx,
+msgdata,hsmd_sign_sym_kickoff,remote_funding_key,pubkey,
+
+#include <common/sym_state.h>
+# Our update key's (the delayed payment basepoint's) BIP340 signature of a
+# state: SHA256(tag || n || P || R), where the tag binds the chain and the
+# funding outpoint and P commits to the state's settlement.  state.owner says
+# whose commitment it is (LOCAL: ours) and htlcs lists every HTLC it carries,
+# trimmed ones included, as for hsmd_sign_remote_commitment_tx: a signer that
+# holds a balance checks what the settlement pays it before it signs.
+msgtype,hsmd_sign_sym_state,70
+msgdata,hsmd_sign_sym_state,funding,bitcoin_outpoint,
+msgdata,hsmd_sign_sym_state,we_opened,bool,
+msgdata,hsmd_sign_sym_state,remote_update_key,pubkey,
+msgdata,hsmd_sign_sym_state,channel_asset,byte,33
+msgdata,hsmd_sign_sym_state,shared_delay,u16,
+msgdata,hsmd_sign_sym_state,state,sym_state,
+msgdata,hsmd_sign_sym_state,num_htlcs,u16,
+msgdata,hsmd_sign_sym_state,htlcs,hsm_htlc,num_htlcs
+
+msgtype,hsmd_sign_sym_state_reply,170
+msgdata,hsmd_sign_sym_state_reply,sig,bip340sig,
+
+# An HTLC output of a symmetric channel's settlement, by the leaf that pays
+# us (the SUCCESS of one we received, the TIMEOUT of one we offered): our
+# HTLC basepoint's key, untweaked (there is no revocation).  Answered by
+# hsmd_sign_tcov_reply.
+msgtype,hsmd_sign_sym_htlc,71
+msgdata,hsmd_sign_sym_htlc,tx,bitcoin_tx,
+msgdata,hsmd_sign_sym_htlc,input,u32,
+msgdata,hsmd_sign_sym_htlc,leaf_len,u16,
+msgdata,hsmd_sign_sym_htlc,leaf,u8,leaf_len
+msgdata,hsmd_sign_sym_htlc,peerid,node_id,
+msgdata,hsmd_sign_sym_htlc,channel_dbid,u64,
+
 # The provider's own output on the holder's commitment, by its PROVIDER leaf
 # after the holder's delay: our payment basepoint's key (the static key).
 # Answered by hsmd_sign_tcov_reply.

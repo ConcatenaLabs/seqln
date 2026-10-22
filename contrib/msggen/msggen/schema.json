@@ -14357,7 +14357,8 @@
                     "scid_alias/even",
                     "zeroconf/even",
                     "seq_taproot_covenant/even",
-                    "seq_credit/even"
+                    "seq_credit/even",
+                    "seq_symmetric/even"
                   ],
                   "description": [
                     "Name of feature bit."
@@ -14835,7 +14836,8 @@
                     "scid_alias/even",
                     "zeroconf/even",
                     "seq_taproot_covenant/even",
-                    "seq_credit/even"
+                    "seq_credit/even",
+                    "seq_symmetric/even"
                   ],
                   "description": [
                     "Name of feature bit."
@@ -19602,7 +19604,8 @@
                           "scid_alias/even",
                           "zeroconf/even",
                           "seq_taproot_covenant/even",
-                          "seq_credit/even"
+                          "seq_credit/even",
+                          "seq_symmetric/even"
                         ],
                         "description": [
                           "Name of feature bit."
@@ -25153,7 +25156,8 @@
                           "scid_alias/even",
                           "zeroconf/even",
                           "seq_taproot_covenant/even",
-                          "seq_credit/even"
+                          "seq_credit/even",
+                          "seq_symmetric/even"
                         ],
                         "description": [
                           "Name of feature bit."
@@ -28559,7 +28563,8 @@
                           "scid_alias/even",
                           "zeroconf/even",
                           "seq_taproot_covenant/even",
-                          "seq_credit/even"
+                          "seq_credit/even",
+                          "seq_symmetric/even"
                         ],
                         "description": [
                           "Name of feature bit."
@@ -29595,7 +29600,8 @@
                     "scid_alias/even",
                     "zeroconf/even",
                     "seq_taproot_covenant/even",
-                    "seq_credit/even"
+                    "seq_credit/even",
+                    "seq_symmetric/even"
                   ],
                   "description": [
                     "Name of feature bit."
@@ -29906,7 +29912,8 @@
                     "scid_alias/even",
                     "zeroconf/even",
                     "seq_taproot_covenant/even",
-                    "seq_credit/even"
+                    "seq_credit/even",
+                    "seq_symmetric/even"
                   ],
                   "description": [
                     "Name of feature bit."
@@ -30247,7 +30254,8 @@
                     "scid_alias/even",
                     "zeroconf/even",
                     "seq_taproot_covenant/even",
-                    "seq_credit/even"
+                    "seq_credit/even",
+                    "seq_symmetric/even"
                   ],
                   "description": [
                     "Name of feature bit."

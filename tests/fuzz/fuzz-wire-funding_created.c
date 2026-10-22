@@ -15,16 +15,17 @@ static void *encode(const tal_t *ctx, const struct funding_created *s)
 {
 	return towire_funding_created(ctx, &s->temporary_channel_id,
 				      &s->funding_txid, s->funding_output_index,
-				      &s->signature);
+				      &s->signature, NULL);
 }
 
 static struct funding_created *decode(const tal_t *ctx, const void *p)
 {
 	struct funding_created *s = tal(ctx, struct funding_created);
+	struct tlv_funding_created_tlvs *tlvs;
 
-	if (fromwire_funding_created(p, &s->temporary_channel_id,
+	if (fromwire_funding_created(s, p, &s->temporary_channel_id,
 				     &s->funding_txid, &s->funding_output_index,
-				     &s->signature))
+				     &s->signature, &tlvs))
 		return s;
 	return tal_free(s);
 }
