@@ -160,6 +160,11 @@ description.
   source on a server and never copy source or binaries onto one.
 - Upstream files should stay diffable against upstream. Prefer new files and runtime-gated call
   sites over sprinkling edits through upstream code.
+- **A new wire field goes in its extraction patch as well as its CSV.** `make check-wire-format`
+  (part of CI's Check source; it needs the BOLT repository at `BOLTDIR`) rebuilds
+  `wire/peer_wire.csv` and `wire/onion_wire.csv` from the BOLTs and the `wire/extracted_*.patch`
+  files, in name order, and fails on any difference. The fork's own fields are in
+  `wire/extracted_peer_90_sequentia.patch` and `wire/extracted_onion_90_sequentia.patch`.
 
 <!-- BEGIN SHARED AGENT CONVENTIONS: identical in every Sequentia repo. Change it in all of them together. -->
 ## Working with git and GitHub here

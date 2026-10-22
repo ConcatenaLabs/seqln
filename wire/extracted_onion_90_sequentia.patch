@@ -1,0 +1,15 @@
+SEQUENTIA: the fork's own wire fields (doc/sequentia-fork.md), applied after
+the BOLTs' own and upstream's patches so check-wire-format keeps them.
+--- wire/onion_wire.csv
++++ -
+@@ -16,6 +16,10 @@ tlvtype,payload,payment_metadata,16
+ tlvdata,payload,payment_metadata,payment_metadata,byte,...
+ tlvtype,payload,total_amount_msat,18
+ tlvdata,payload,total_amount_msat,total_msat,tu64,
++tlvtype,payload,seq_point_tweak,174174
++tlvdata,payload,seq_point_tweak,tweak,secret,
++tlvtype,payload,seq_point_payment_hash,174176
++tlvdata,payload,seq_point_payment_hash,payment_hash,sha256,
+ subtype,blinded_path
+ subtypedata,blinded_path,first_node_id,sciddir_or_pubkey,
+ subtypedata,blinded_path,first_path_key,point,

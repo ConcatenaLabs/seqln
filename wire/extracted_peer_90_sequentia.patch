@@ -1,0 +1,63 @@
+SEQUENTIA: the fork's own wire fields (doc/sequentia-fork.md), applied after
+the BOLTs' own and upstream's patches so check-wire-format keeps them.
+--- wire/peer_wire.csv
++++ -
+@@ -123,6 +123,8 @@ tlvtype,open_channel_tlvs,upfront_shutdown_script,0
+ tlvdata,open_channel_tlvs,upfront_shutdown_script,shutdown_scriptpubkey,byte,...
+ tlvtype,open_channel_tlvs,channel_type,1
+ tlvdata,open_channel_tlvs,channel_type,type,byte,...
++tlvtype,open_channel_tlvs,asset_id,3
++tlvdata,open_channel_tlvs,asset_id,asset,byte,...
+ msgtype,accept_channel,33
+ msgdata,accept_channel,temporary_channel_id,byte,32
+ msgdata,accept_channel,dust_limit_satoshis,u64,
+@@ -148,9 +150,18 @@ msgdata,funding_created,temporary_channel_id,byte,32
+ msgdata,funding_created,funding_txid,sha256,
+ msgdata,funding_created,funding_output_index,u16,
+ msgdata,funding_created,signature,signature,
++msgdata,funding_created,tlvs,funding_created_tlvs,
++# SEQUENTIA: on a symmetric channel (common/sym_scripts.h) `signature` signs
++# the kickoff, SIGHASH_SINGLE|SIGHASH_ANYONECANPAY, and sym_sig is the
++# sender's update signature on the receiver's first state.
++tlvtype,funding_created_tlvs,sym_sig,48041
++tlvdata,funding_created_tlvs,sym_sig,sig,bip340sig,
+ msgtype,funding_signed,35
+ msgdata,funding_signed,channel_id,channel_id,
+ msgdata,funding_signed,signature,signature,
++msgdata,funding_signed,tlvs,funding_signed_tlvs,
++tlvtype,funding_signed_tlvs,sym_sig,48041
++tlvdata,funding_signed_tlvs,sym_sig,sig,bip340sig,
+ msgtype,channel_ready,36
+ msgdata,channel_ready,channel_id,channel_id,
+ msgdata,channel_ready,second_per_commitment_point,point,
+@@ -282,6 +293,8 @@ msgdata,update_add_htlc,cltv_expiry,u32,
+ msgdata,update_add_htlc,onion_routing_packet,byte,1366
+ tlvtype,update_add_htlc_tlvs,blinded_path,0
+ tlvdata,update_add_htlc_tlvs,blinded_path,path_key,point,
++tlvtype,update_add_htlc_tlvs,seq_point_lock,174174
++tlvdata,update_add_htlc_tlvs,seq_point_lock,lock_point,point,
+ msgtype,update_fulfill_htlc,130
+ msgdata,update_fulfill_htlc,channel_id,channel_id,
+ msgdata,update_fulfill_htlc,id,u64,
+@@ -310,10 +323,21 @@ msgdata,commitment_signed,htlc_signature,signature,num_htlcs
+ msgdata,commitment_signed,splice_channel_id,commitment_signed_tlvs,
+ tlvtype,commitment_signed_tlvs,splice_info,1
+ tlvdata,commitment_signed_tlvs,splice_info,funding_txid,sha256,
++# SEQUENTIA: a symmetric channel's update signature on the receiver's new
++# state; `signature` signs the kickoff again, and there are no HTLC
++# signatures.
++tlvtype,commitment_signed_tlvs,sym_sig,48041
++tlvdata,commitment_signed_tlvs,sym_sig,sig,bip340sig,
+ msgtype,revoke_and_ack,133
+ msgdata,revoke_and_ack,channel_id,channel_id,
+ msgdata,revoke_and_ack,per_commitment_secret,byte,32
+ msgdata,revoke_and_ack,next_per_commitment_point,point,
++msgdata,revoke_and_ack,tlvs,revoke_and_ack_tlvs,
++# SEQUENTIA: on a symmetric channel, the sender's update signature on its own
++# state that replaces the one it revokes, so the receiver holds that state
++# whole: whoever revokes a state hands over a newer one.
++tlvtype,revoke_and_ack_tlvs,sym_sig,48041
++tlvdata,revoke_and_ack_tlvs,sym_sig,sig,bip340sig,
+ msgtype,update_fee,134
+ msgdata,update_fee,channel_id,channel_id,
+ msgdata,update_fee,feerate_per_kw,u32,
