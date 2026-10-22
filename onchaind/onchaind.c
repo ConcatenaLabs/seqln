@@ -856,9 +856,17 @@ static bool onchain_witness_element_matches(const struct onchain_witness_element
 					    const struct wally_tx_input *input)
 {
 	const struct wally_tx_witness_stack *stack = input->witness;
-	if (stack->num_items != tal_count(welements))
+	size_t n = stack->num_items;
+
+	/* SEQUENTIA: a taproot spend of ours whose witness holds no signature
+	 * over it (a credit claim, a symmetric update or settle) can be mined
+	 * with an annex anybody appended (bitcoin/tapscript.h): it is still
+	 * ours.  A segwit v0 witness never has one more item than we gave it. */
+	if (n == tal_count(welements) + 1 && tap_witness_items(stack) == n - 1)
+		n--;
+	if (n != tal_count(welements))
 		return false;
-	for (size_t i = 0; i < stack->num_items; i++) {
+	for (size_t i = 0; i < n; i++) {
 		/* Don't compare signatures: they can change with
 		 * other details */
 		if (welements[i]->is_signature)

@@ -324,6 +324,12 @@ feerate its deadline needs, replacing the one in the mempool when the new fee is
   node back from being away can be asked to spend an output the peer already took, in the
   commitment's own block, say. lightningd remembers the outputs it saw spent with no spend of its
   own under way and builds no spend of one, so a spend that can never be mined holds no fee coin.
+- A witness may end in a BIP341 annex (an item starting 0x50 after at least one other). The
+  chain accepts it and relay policy does not, so only a block producer mines one. A spender signs
+  over its annex, and anybody can append one to a witness that holds no signature over the spend
+  (a credit claim, a REVOKE, a symmetric update or settle). onchaind reads every taproot witness
+  past it (`tap_witness_items()` in `bitcoin/tapscript.h`): the preimage of the peer's SUCCESS
+  claim, and its own spends, which it still recognises with an annex appended.
 
 **Signers.** hsmd signs the spends with four messages (`hsmd/hsmd_wire.csv`):
 `hsmd_sign_tcov_delayed_to_us` (DELAY), `hsmd_sign_tcov_local_htlc` (a covenant leaf),
