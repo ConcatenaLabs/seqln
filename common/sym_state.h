@@ -15,6 +15,9 @@ struct sym_tree;
 struct sym_state_out {
 	struct amount_sat amount;
 	u8 *spk;
+	/* Its asset (0x01 || 32-byte id), or NULL: the channel's.  Only a
+	 * channel that holds several assets names one. */
+	u8 *asset;
 };
 
 struct sym_state {
@@ -50,6 +53,9 @@ bool sym_state_signed(const struct sym_state *st, enum side opener,
 /* The total its settlement pays. */
 struct amount_sat sym_state_total(const struct sym_state *st);
 
+/* A state whose outputs all leave their asset to the channel encodes as it
+ * always has; one that names an asset sets 0x80 in the owner byte and
+ * follows each output with whether it names one, and the 33 bytes. */
 void towire_sym_state(u8 **pptr, const struct sym_state *st);
 struct sym_state *fromwire_sym_state(const tal_t *ctx,
 				     const u8 **pptr, size_t *max);

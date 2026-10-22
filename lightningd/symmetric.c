@@ -291,7 +291,9 @@ static struct wally_psbt *sym_psbt_base(const tal_t *ctx,
 				      asset);
 	for (size_t i = 0; i < tal_count(ss->outs); i++)
 		psbt_append_output_asset(psbt, ss->outs[i].spk,
-					 ss->outs[i].amount, asset);
+					 ss->outs[i].amount,
+					 ss->outs[i].asset ? ss->outs[i].asset
+					 : asset);
 	return psbt;
 }
 
@@ -573,6 +575,9 @@ void sym_spend_start(struct channel *channel,
 	for (size_t i = 0; i < tal_count(outs); i++) {
 		ss->outs[i].amount = outs[i].amount;
 		ss->outs[i].spk = tal_dup_talarr(ss->outs, u8, outs[i].spk);
+		ss->outs[i].asset = outs[i].asset
+			? tal_dup_arr(ss->outs, u8, outs[i].asset, 33, 0)
+			: NULL;
 	}
 	ss->sequence = sequence;
 	ss->minblock = minblock;
@@ -605,7 +610,7 @@ bool sym_broadcast_kickoff(struct lightningd *ld, struct channel *channel,
 	}
 	sym_channel_from(channel, &sc);
 	sym_kickoff_tree(tmpctx, &sc, &ko);
-	outs = tal_arr(tmpctx, struct sym_state_out, 1);
+	outs = tal_arrz(tmpctx, struct sym_state_out, 1);
 	outs[0].amount = channel->funding_sats;
 	outs[0].spk = sym_tree_spk(outs, &ko);
 	wscript = bitcoin_redeem_2of2(tmpctx, &channel->local_funding_pubkey,

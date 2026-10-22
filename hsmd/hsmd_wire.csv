@@ -663,6 +663,30 @@ msgdata,hsmd_sign_sym_state,htlcs,hsm_htlc,num_htlcs
 msgtype,hsmd_sign_sym_state_reply,170
 msgdata,hsmd_sign_sym_state_reply,sig,bip340sig,
 
+# The same signature for a channel that holds several assets, one funding
+# output per asset: lane 0 is channel_asset at the channel's funding value,
+# and each further lane its asset and value.  Each settlement output names
+# its asset, or leaves it to lane 0's; the signer refuses a state that pays
+# an asset outside the lanes or any lane other than its whole value.
+msgtype,hsmd_sign_sym_lanes_state,75
+msgdata,hsmd_sign_sym_lanes_state,funding,bitcoin_outpoint,
+msgdata,hsmd_sign_sym_lanes_state,we_opened,bool,
+msgdata,hsmd_sign_sym_lanes_state,remote_update_key,pubkey,
+msgdata,hsmd_sign_sym_lanes_state,channel_asset,byte,33
+msgdata,hsmd_sign_sym_lanes_state,funding_sats,amount_sat,
+msgdata,hsmd_sign_sym_lanes_state,shared_delay,u16,
+msgdata,hsmd_sign_sym_lanes_state,num_lanes,u16,
+msgdata,hsmd_sign_sym_lanes_state,lane_sats,amount_sat,num_lanes
+# 33 bytes per lane, in lane order.
+msgdata,hsmd_sign_sym_lanes_state,lane_assets_len,u16,
+msgdata,hsmd_sign_sym_lanes_state,lane_assets,byte,lane_assets_len
+msgdata,hsmd_sign_sym_lanes_state,state,sym_state,
+msgdata,hsmd_sign_sym_lanes_state,num_htlcs,u16,
+msgdata,hsmd_sign_sym_lanes_state,htlcs,hsm_htlc,num_htlcs
+
+msgtype,hsmd_sign_sym_lanes_state_reply,175
+msgdata,hsmd_sign_sym_lanes_state_reply,sig,bip340sig,
+
 # An HTLC output of a symmetric channel's settlement, by the leaf that pays
 # us (the SUCCESS of one we received, the TIMEOUT of one we offered): our
 # HTLC basepoint's key, untweaked (there is no revocation).  Answered by

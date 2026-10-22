@@ -229,7 +229,8 @@ void sym_settle_digest(const struct sym_channel *sc,
 		struct sha256_ctx pctx;
 		struct sha256 ph;
 
-		sha256_update(&sctx, sc->asset + 1, 32);
+		sha256_update(&sctx, (outs[i].asset ? outs[i].asset
+				      : sc->asset) + 1, 32);
 		sha256_update(&sctx, &one, 1);
 		sha256_update(&sctx, &v, sizeof(v));
 		sha256_update(&sctx, &one, 1);
@@ -762,6 +763,7 @@ struct sym_output *sym_settlement(const tal_t *ctx,
 		o.kind = SYM_OUT_HTLC;
 		o.side = owner;
 		o.amount = amt;
+		o.asset = NULL;
 		o.spk = tap_tree2_scriptpubkey(outs, &tree);
 		o.htlc = htlcs[i].handle;
 		o.cltv_expiry = htlcs[i].cltv_expiry;
@@ -800,6 +802,7 @@ struct sym_output *sym_settlement(const tal_t *ctx,
 		o.kind = SYM_OUT_BALANCE;
 		o.side = s;
 		o.amount = node[s];
+		o.asset = NULL;
 		o.spk = scriptpubkey_p2wpkh(outs, &payment_basepoint[s]);
 		o.htlc = NULL;
 		o.cltv_expiry = 0;

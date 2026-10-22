@@ -203,7 +203,7 @@ static bool publish_update(struct channel *channel)
 	witness = sym_update_witness(NULL, sig_op, sig_acc, &tree, ko.upd,
 				     sym_tree_control_block(tmpctx, &ko,
 							    SYM_LEAF_UPD));
-	outs = tal_arr(tmpctx, struct sym_state_out, 1);
+	outs = tal_arrz(tmpctx, struct sym_state_out, 1);
 	outs[0].amount = channel->funding_sats;
 	outs[0].spk = sym_tree_spk(outs, &tree);
 	log_info(channel->log, "Publishing state %"PRId64" over this factory"
@@ -372,7 +372,7 @@ bool sym_factory_close(struct lightningd *ld, struct channel *channel)
 	/* The split first: no signature, every slot's KO, a fee coin. */
 	if (!sym_factory_value(f->slots, &total))
 		abort();
-	outs = tal_arr(tmpctx, struct sym_state_out, tal_count(f->slots));
+	outs = tal_arrz(tmpctx, struct sym_state_out, tal_count(f->slots));
 	for (size_t i = 0; i < tal_count(f->slots); i++) {
 		outs[i].amount = f->slots[i].amount;
 		outs[i].spk = sym_factory_ko_spk(outs, f, i);
