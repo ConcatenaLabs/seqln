@@ -13,6 +13,7 @@
 #include <bitcoin/tx.h>
 #include <ccan/str/hex/hex.h>
 #include <common/amount.h>
+#include <common/pseudorand.h>
 #include <common/setup.h>
 #include <common/sym_scripts.h>
 #include <common/utils.h>
