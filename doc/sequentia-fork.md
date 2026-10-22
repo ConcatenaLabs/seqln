@@ -319,6 +319,11 @@ feerate its deadline needs, replacing the one in the mempool when the new fee is
   D the cheater's claims create, by the key path, signed with the revocation key. When a tower got there first
   with REVOKE, onchaind adds the output it paid the victim to the wallet.
 - No coin in an accepted asset covers a claim's fee: lightningd logs it and tries again.
+- The output a spend is for is spent on chain, by that spend or another: lightningd stops
+  rebuilding it and releases its fee coins. onchaind hears of a spend after lightningd does, so a
+  node back from being away can be asked to spend an output the peer already took, in the
+  commitment's own block, say. lightningd remembers the outputs it saw spent with no spend of its
+  own under way and builds no spend of one, so a spend that can never be mined holds no fee coin.
 
 **Signers.** hsmd signs the spends with four messages (`hsmd/hsmd_wire.csv`):
 `hsmd_sign_tcov_delayed_to_us` (DELAY), `hsmd_sign_tcov_local_htlc` (a covenant leaf),
@@ -1045,7 +1050,8 @@ the taproot-covenant channel type (section 5b): chosen only when both peers offe
 both ways, an HTLC in flight at a force-close claimed by its covenant past its CLTV with the fee
 from a coin in another asset and claimed with its preimage, the peer's claims on the closer's
 commitment by either leaf, a revoked commitment punished by the victim and, while the victim is
-offline, by `speculad`, and a keyless node whose device signs the commitments, the claim and its
+offline, by `speculad`, a node back from being away that builds no claim of an HTLC output the
+peer took in the commitment's own block, and a keyless node whose device signs the commitments, the claim and its
 fee coin, and the sweeps, refusing nothing (`test_taproot_covenant.py`), and point-locked HTLCs
 (section 5c): a payment over two hops whose every HTLC is locked to its own point, none of them
 the invoice's point or hash, settled after the forwarder restarts mid-payment, with a

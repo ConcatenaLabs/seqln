@@ -231,6 +231,9 @@ struct channel {
 	 * under way: onchaind may still propose one (it learns of a spend
 	 * after lightningd does), which must not start. */
 	struct bitcoin_outpoint *sym_spent_seen;
+	/* The same for the spends lightningd builds for taproot-covenant,
+	 * credit and symmetric-HTLC outputs (onchain_control.c, tcov_spend). */
+	struct bitcoin_outpoint *tcov_spent_seen;
 
 	/* Watch we have on funding output. */
 	struct txowatch *funding_spend_watch;

@@ -278,7 +278,7 @@ out:
 	}
 }
 
-static void tcov_note_spent(const struct channel *channel,
+static void tcov_note_spent(struct channel *channel,
 			    const struct bitcoin_outpoint *out);
 
 /**
@@ -1789,13 +1789,60 @@ static void tcov_spend_track(struct tcov_spend *ts)
 	tal_add_destructor(ts, destroy_tcov_spend);
 }
 
-static void tcov_note_spent(const struct channel *channel,
+/* The fee coins a spend that will never be mined reserved are free again,
+ * for the next spend that needs one.  (If it was mined, they are spent.) */
+static void tcov_release_coins(struct tcov_spend *ts)
+{
+	struct lightningd *ld = ts->channel->peer->ld;
+
+	for (size_t i = 0; i < tal_count(ts->coins); i++) {
+		struct utxo *u = wallet_utxo_get(tmpctx, ld->wallet,
+						 &ts->coins[i]);
+		if (u && u->status == OUTPUT_STATE_RESERVED)
+			wallet_unreserve_utxo(ld->wallet, u,
+					      get_block_height(ld->topology),
+					      u->reserved_til);
+	}
+	ts->coins = tal_free(ts->coins);
+}
+
+static bool tcov_seen_spent(const struct channel *channel,
 			    const struct bitcoin_outpoint *out)
 {
+	for (size_t i = 0; i < tal_count(channel->tcov_spent_seen); i++)
+		if (bitcoin_outpoint_eq(&channel->tcov_spent_seen[i], out))
+			return true;
+	return false;
+}
+
+/* An output of the channel is spent on chain: a spend of ours of it stops
+ * and frees its fee coins, and one onchaind proposes later never starts.
+ * onchaind hears of a spend after lightningd does: a node coming back to a
+ * commitment whose output the peer spent in the same block (or the next)
+ * is asked to spend that output before its onchaind learns it is gone. */
+static void tcov_note_spent(struct channel *channel,
+			    const struct bitcoin_outpoint *out)
+{
+	bool ours = false;
+
 	for (size_t i = 0; i < tal_count(tcov_spends); i++) {
 		if (tcov_spends[i]->channel == channel
-		    && bitcoin_outpoint_eq(&tcov_spends[i]->out, out))
-			tcov_spends[i]->spent = true;
+		    && bitcoin_outpoint_eq(&tcov_spends[i]->out, out)) {
+			ours = true;
+			if (!tcov_spends[i]->spent) {
+				tcov_spends[i]->spent = true;
+				tcov_release_coins(tcov_spends[i]);
+			}
+		}
+	}
+	if (!ours
+	    && (channel_has(channel, OPT_SEQ_TAPROOT_COVENANT)
+		|| channel_has(channel, OPT_SEQ_SYMMETRIC))
+	    && !tcov_seen_spent(channel, out)) {
+		if (!channel->tcov_spent_seen)
+			channel->tcov_spent_seen
+				= tal_arr(channel, struct bitcoin_outpoint, 0);
+		tal_arr_expand(&channel->tcov_spent_seen, *out);
 	}
 }
 
@@ -2346,6 +2393,7 @@ static void handle_onchaind_spend_tcov(struct channel *channel,
 	u8 signer, deadline;
 	u64 htlc_id;
 	struct bitcoin_tx *tx;
+	bool already_spent;
 	struct onchain_witness_element **welements;
 	u8 **wit;
 
@@ -2397,7 +2445,15 @@ static void handle_onchaind_spend_tcov(struct channel *channel,
 		break;
 	}
 
-	tx = tcov_build(ts, ts, tcov_feerate(ts));
+	/* Already spent on chain: onchaind proposed it before it heard. */
+	already_spent = tcov_seen_spent(channel, &ts->out);
+	if (already_spent) {
+		log_debug(channel->log, "tcov spend of %s: already spent on"
+			  " chain, not attempted",
+			  fmt_bitcoin_outpoint(tmpctx, &ts->out));
+		tx = NULL;
+	} else
+		tx = tcov_build(ts, ts, tcov_feerate(ts));
 
 	/* Elements to recognise our spend by: the signature changes with
 	 * every rebuild, the rest does not. */
@@ -2421,6 +2477,10 @@ static void handle_onchaind_spend_tcov(struct channel *channel,
 				cast_const2(const struct onchain_witness_element **,
 					    welements))));
 
+	if (already_spent) {
+		tal_free(ts);
+		return;
+	}
 	if (!tx) {
 		/* Nothing to pay its fee with yet: try again later. */
 		notleak(new_reltimer(ld->timers, ts, time_from_sec(10),
@@ -2478,6 +2538,7 @@ static void handle_onchaind_spend_credit_claim(struct channel *channel,
 	struct bitcoin_tx *tx;
 	struct onchain_witness_element **welements;
 	u8 **wit;
+	bool already_spent;
 
 	ts->coins = NULL;
 	ts->channel = channel;
@@ -2510,7 +2571,14 @@ static void handle_onchaind_spend_credit_claim(struct channel *channel,
 	/* The provider sweeps after its delay: be in well before. */
 	ts->deadline_block = get_block_height(ld->topology) + 2;
 
-	tx = tcov_build(ts, ts, tcov_feerate(ts));
+	already_spent = tcov_seen_spent(channel, &ts->out);
+	if (already_spent) {
+		log_debug(channel->log, "credit claim of %s: already spent on"
+			  " chain, not attempted",
+			  fmt_bitcoin_outpoint(tmpctx, &ts->out));
+		tx = NULL;
+	} else
+		tx = tcov_build(ts, ts, tcov_feerate(ts));
 
 	/* Every element is fixed: none is a signature of ours. */
 	wit = credit_claim_witness(tmpctx, ts);
@@ -2525,6 +2593,10 @@ static void handle_onchaind_spend_credit_claim(struct channel *channel,
 		      take(towire_onchaind_spend_created(NULL, true,
 				cast_const2(const struct onchain_witness_element **,
 					    welements))));
+	if (already_spent) {
+		tal_free(ts);
+		return;
+	}
 	if (!tx) {
 		notleak(new_reltimer(ld->timers, ts, time_from_sec(10),
 				     tcov_retry, ts));
@@ -2790,6 +2862,10 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 				   channel_has(channel, OPT_SEQ_SYMMETRIC),
 				  feerate_min(ld, NULL));
 	subd_send_msg(channel->owner, take(msg));
+
+	/* SEQUENTIA: onchaind starts afresh (a restart, a reorg): the spends
+	 * it replays are noted again. */
+	channel->tcov_spent_seen = tal_free(channel->tcov_spent_seen);
 
 	/* SEQUENTIA: a symmetric channel's states (lightningd/symmetric.h);
 	 * its kickoff, which spent the funding, is broadcast no more. */
