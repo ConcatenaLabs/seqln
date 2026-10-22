@@ -3,8 +3,8 @@
 #include <bitcoin/chainparams.h>
 #include <bitcoin/feerate.h>
 #include <bitcoin/script.h>
-#include <common/psbt_keypath.h>
 #include <common/presign_templates.h>
+#include <common/psbt_keypath.h>
 #include <common/status.h>
 #include <common/utils.h>
 #include <wally_bip32.h>

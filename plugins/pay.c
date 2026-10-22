@@ -1,7 +1,7 @@
 #include "config.h"
-#include <ccan/mem/mem.h>
 #include <ccan/array_size/array_size.h>
 #include <ccan/cast/cast.h>
+#include <ccan/mem/mem.h>
 #include <ccan/str/hex/hex.h>
 #include <ccan/tal/str/str.h>
 #include <common/bolt12_merkle.h>

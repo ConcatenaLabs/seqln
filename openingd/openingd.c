@@ -8,7 +8,6 @@
  * commit to the database once openingd succeeds.
  */
 #include "config.h"
-#include <inttypes.h>
 #include <bitcoin/script.h>
 #include <ccan/array_size/array_size.h>
 #include <ccan/breakpoint/breakpoint.h>
@@ -27,6 +26,7 @@
 #include <common/sym_channel.h>
 #include <common/wire_error.h>
 #include <hsmd/hsmd_wiregen.h>
+#include <inttypes.h>
 #include <openingd/common.h>
 #include <openingd/openingd_wiregen.h>
 #include <wire/peer_wire.h>

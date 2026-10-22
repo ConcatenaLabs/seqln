@@ -1,11 +1,10 @@
 #include "config.h"
-#include <bitcoin/tx.h>
 #include <ccan/array_size/array_size.h>
 #include <ccan/noerr/noerr.h>
 #include <ccan/read_write_all/read_write_all.h>
+#include <ccan/str/str.h>
 #include <ccan/tal/grab_file/grab_file.h>
 #include <ccan/tal/path/path.h>
-#include <ccan/str/str.h>
 #include <ccan/tal/str/str.h>
 #include <channeld/channeld_wiregen.h>
 #include <common/sym_state.h>

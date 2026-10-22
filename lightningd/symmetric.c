@@ -8,8 +8,6 @@
 #include <common/amount.h>
 #include <common/bip32.h>
 #include <common/memleak.h>
-#include <common/sym_scripts.h>
-#include <common/sym_state.h>
 #include <common/timeout.h>
 #include <hsmd/hsm_utxo.h>
 #include <hsmd/hsmd_wiregen.h>

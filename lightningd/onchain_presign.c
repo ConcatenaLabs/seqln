@@ -1,12 +1,12 @@
 #include "config.h"
 #include <bitcoin/locktime.h>
+#include <bitcoin/preimage.h>
 #include <bitcoin/script.h>
 #include <bitcoin/tx.h>
 #include <ccan/tal/tal.h>
 #include <channeld/channeld_wiregen.h>
 #include <common/amount.h>
 #include <common/fee_states.h>
-#include <bitcoin/preimage.h>
 #include <common/htlc_tx.h>
 #include <common/keyset.h>
 #include <common/penalty_base.h>
@@ -15,8 +15,8 @@
 #include <hsmd/hsmd_wiregen.h>
 #include <inttypes.h>
 #include <lightningd/channel.h>
-#include <lightningd/htlc_end.h>
 #include <lightningd/hsm_control.h>
+#include <lightningd/htlc_end.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/log.h>
 #include <lightningd/onchain_presign.h>
