@@ -131,6 +131,7 @@ bool hsmd_check_client_capabilities(struct hsmd_client *client,
 	case WIRE_HSMD_CREDIT_NOTE:
 	case WIRE_HSMD_SIGN_SYM_KICKOFF:
 	case WIRE_HSMD_SIGN_SYM_STATE:
+	case WIRE_HSMD_SIGN_SYM_LANES_STATE:
 		return (client->capabilities & HSM_PERM_SIGN_REMOTE_TX) != 0;
 
 	case WIRE_HSMD_SIGN_MUTUAL_CLOSE_TX:
@@ -232,6 +233,7 @@ bool hsmd_check_client_capabilities(struct hsmd_client *client,
 	case WIRE_HSMD_SIGN_CREDIT_NOTE_REPLY:
 	case WIRE_HSMD_CREDIT_NOTE_REPLY:
 	case WIRE_HSMD_SIGN_SYM_STATE_REPLY:
+	case WIRE_HSMD_SIGN_SYM_LANES_STATE_REPLY:
 	case WIRE_HSMD_SIGN_ANY_CANNOUNCEMENT_REPLY:
 		break;
 	}
@@ -2540,6 +2542,14 @@ static u8 *handle_sign_sym_state(struct hsmd_client *c, const u8 *msg_in)
 		return hsmd_status_malformed_request(c, msg_in);
 	if (tal_count(st->outs) == 0 || st->num < 0)
 		return hsmd_status_bad_request_fmt(c, msg_in, "empty state");
+	/* A state that names assets is a lanes channel's: it comes with its
+	 * lanes (hsmd_sign_sym_lanes_state), or not at all. */
+	for (size_t i = 0; i < tal_count(st->outs); i++)
+		if (st->outs[i].asset)
+			return hsmd_status_bad_request_fmt(c, msg_in,
+							   "a state that names"
+							   " assets needs its"
+							   " lanes");
 
 	get_channel_seed(&c->id, c->dbid, &channel_seed);
 	if (!derive_delayed_payment_basepoint(&channel_seed, &our_key,
@@ -2554,6 +2564,106 @@ static u8 *handle_sign_sym_state(struct hsmd_client *c, const u8 *msg_in)
 	sym_upd_msg(&sc, &tree, &msg);
 	tap_sign(&msg, &privkey, &sig);
 	return towire_hsmd_sign_sym_state_reply(NULL, &sig);
+}
+
+/* A state of a channel that holds several assets: lane 0 the channel's
+ * asset at its funding value, and each further lane its own.  The
+ * settlement must pay each lane's asset exactly that lane's value, and no
+ * other asset: what a state leaves of a lane, or pays outside the lanes,
+ * the publisher of its settlement would take. */
+static u8 *handle_sign_sym_lanes_state(struct hsmd_client *c, const u8 *msg_in)
+{
+	struct bitcoin_outpoint funding;
+	bool we_opened;
+	struct pubkey remote_update_key;
+	u8 asset[33], *lane_assets;
+	struct amount_sat funding_sats, *lane_sats, *paid;
+	u16 delay;
+	struct sym_state *st;
+	struct hsm_htlc *htlcs;
+	struct secret channel_seed;
+	struct pubkey our_key;
+	struct privkey privkey;
+	struct sym_channel sc;
+	struct sym_tree tree;
+	struct sha256 msg;
+	struct bip340sig sig;
+	size_t nlanes;
+
+	if (!fromwire_hsmd_sign_sym_lanes_state(tmpctx, msg_in, &funding,
+						&we_opened, &remote_update_key,
+						asset, &funding_sats, &delay,
+						&lane_sats, &lane_assets, &st,
+						&htlcs))
+		return hsmd_status_malformed_request(c, msg_in);
+	nlanes = tal_count(lane_sats);
+	if (tal_bytelen(lane_assets) != nlanes * 33)
+		return hsmd_status_bad_request_fmt(c, msg_in,
+						   "%zu lanes, %zu bytes of"
+						   " assets", nlanes,
+						   tal_bytelen(lane_assets));
+	if (tal_count(st->outs) == 0 || st->num < 0)
+		return hsmd_status_bad_request_fmt(c, msg_in, "empty state");
+
+	/* What the settlement pays each lane: [0] the channel's asset. */
+	paid = tal_arrz(tmpctx, struct amount_sat, nlanes + 1);
+	for (size_t i = 0; i < tal_count(st->outs); i++) {
+		const u8 *a = st->outs[i].asset ? st->outs[i].asset : asset;
+		size_t l;
+
+		if (memeq(a, 33, asset, 33))
+			l = 0;
+		else {
+			for (l = 1; l <= nlanes; l++)
+				if (memeq(a, 33, lane_assets + (l - 1) * 33, 33))
+					break;
+			if (l > nlanes)
+				return hsmd_status_bad_request_fmt(c, msg_in,
+								   "output %zu"
+								   " is in no"
+								   " lane", i);
+		}
+		if (!amount_sat_add(&paid[l], paid[l], st->outs[i].amount))
+			return hsmd_status_bad_request_fmt(c, msg_in,
+							   "overflow");
+	}
+	if (!amount_sat_eq(paid[0], funding_sats))
+		return hsmd_status_bad_request_fmt(c, msg_in,
+						   "the state pays %s of the"
+						   " channel's %s",
+						   fmt_amount_sat(tmpctx, paid[0]),
+						   fmt_amount_sat(tmpctx,
+								  funding_sats));
+	for (size_t l = 1; l <= nlanes; l++) {
+		if (lane_assets[(l - 1) * 33] != 0x01
+		    || memeq(lane_assets + (l - 1) * 33, 33, asset, 33))
+			return hsmd_status_bad_request_fmt(c, msg_in,
+							   "lane %zu's asset",
+							   l);
+		if (!amount_sat_eq(paid[l], lane_sats[l - 1]))
+			return hsmd_status_bad_request_fmt(c, msg_in,
+							   "the state pays %s"
+							   " of lane %zu's %s",
+							   fmt_amount_sat(tmpctx,
+									  paid[l]),
+							   l,
+							   fmt_amount_sat(tmpctx,
+									  lane_sats[l - 1]));
+	}
+
+	get_channel_seed(&c->id, c->dbid, &channel_seed);
+	if (!derive_delayed_payment_basepoint(&channel_seed, &our_key,
+					      &privkey.secret))
+		return hsmd_status_bad_request_fmt(c, msg_in,
+						   "cannot derive the update key");
+	sym_channel_init(&sc, &chainparams->genesis_blockhash, &funding,
+			 we_opened ? &our_key : &remote_update_key,
+			 we_opened ? &remote_update_key : &our_key,
+			 asset, delay);
+	sym_state_tree_of(tmpctx, &sc, st, &tree);
+	sym_upd_msg(&sc, &tree, &msg);
+	tap_sign(&msg, &privkey, &sig);
+	return towire_hsmd_sign_sym_lanes_state_reply(NULL, &sig);
 }
 
 /* A settlement HTLC output, by the leaf that pays us: our HTLC basepoint's
@@ -2725,6 +2835,8 @@ u8 *hsmd_handle_client_message(const tal_t *ctx, struct hsmd_client *client,
 		return handle_sign_sym_kickoff(client, msg);
 	case WIRE_HSMD_SIGN_SYM_STATE:
 		return handle_sign_sym_state(client, msg);
+	case WIRE_HSMD_SIGN_SYM_LANES_STATE:
+		return handle_sign_sym_lanes_state(client, msg);
 	case WIRE_HSMD_SIGN_SYM_HTLC:
 		return handle_sign_sym_htlc(client, msg);
 
@@ -2774,6 +2886,7 @@ u8 *hsmd_handle_client_message(const tal_t *ctx, struct hsmd_client *client,
 	case WIRE_HSMD_SIGN_CREDIT_NOTE_REPLY:
 	case WIRE_HSMD_CREDIT_NOTE_REPLY:
 	case WIRE_HSMD_SIGN_SYM_STATE_REPLY:
+	case WIRE_HSMD_SIGN_SYM_LANES_STATE_REPLY:
 	case WIRE_HSMD_SIGN_ANY_CANNOUNCEMENT_REPLY:
 		break;
 	}
@@ -2876,6 +2989,7 @@ u8 *hsmd_init(const u8 *secret_data, size_t secret_len, const u64 hsmd_version,
 		WIRE_HSMD_SIGN_SYM_KICKOFF,
 		WIRE_HSMD_SIGN_SYM_STATE,
 		WIRE_HSMD_SIGN_SYM_HTLC,
+		WIRE_HSMD_SIGN_SYM_LANES_STATE,
 	};
 	u32 *caps;
 
