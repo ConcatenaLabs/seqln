@@ -2482,6 +2482,7 @@ static struct commitsig_info *handle_peer_commit_sig(struct peer *peer,
 	struct secret *old_secret;
 	struct pubkey next_point;
 	struct sym_state *sym_local = NULL;
+	struct commitsig *commitsig;
 
 	/* SEQUENTIA: a symmetric channel: their update signature on our new
 	 * state, then ours, which a validating signer gives only for a state
@@ -2525,8 +2526,6 @@ static struct commitsig_info *handle_peer_commit_sig(struct peer *peer,
 			      tal_hex(tmpctx, msg2));
 
 validated:
-
-	struct commitsig *commitsig;
 	commitsig = tal(tmpctx, struct commitsig);
 	commitsig->tx = clone_bitcoin_tx(tmpctx, txs[0]);
 	commitsig->commit_signature = commit_sig;
