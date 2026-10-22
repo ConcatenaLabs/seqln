@@ -23,10 +23,16 @@ owns nothing about how Lightning is built on top of them.
 **Clone with `--recurse-submodules`.** `external/libwally-core` is pinned to a Sequentia fork,
 because Sequentia adds a one-byte `nDenomination` to `CAssetIssuance` and stock libwally
 under-reads issuance inputs by exactly that byte. A node built against stock libwally **crashes**
-when it syncs a block containing an issuance, and signs taproot script paths with Bitcoin's leaf
-version, which fails on the chain. A clone without submodules produces a build that looks fine
-and fails in production. `make` does not rebuild libwally when only its sources change: after
-the submodule moves, run `make external-clean` once.
+when it syncs a block containing an issuance, signs a transaction that issues over a signature
+hash the chain does not compute, builds an issuance without a token that the chain refuses, and
+signs taproot script paths with Bitcoin's leaf version, which fails on the chain. A clone
+without submodules produces a build that looks fine and fails in production. `make` does not
+rebuild libwally when only its sources change: after the submodule moves, run
+`make external-clean` once. To move it yourself, check out the new commit and
+`git add external/libwally-core` before you build: `make` deletes a submodule that is not at
+the commit the index records and checks that commit out again (`tools/refresh-submodules.sh`),
+so an unstaged move, and any edit inside the submodule, is undone and the build compiles the
+old sources.
 
 ```sh
 git clone --recurse-submodules -b sequentia-stable \
