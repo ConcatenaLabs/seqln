@@ -93,7 +93,7 @@ struct bitcoin_tx *tcov_commit_tx(const tal_t *ctx,
 	cltvs = tal_arr(tmpctx, u32, tx->wtx->outputs_allocation_len);
 
 	n = 0;
-	/* BOLT 3's order of addition: offered HTLCs, received HTLCs,
+	/* The order of addition BOLT 3 gives: offered HTLCs, received HTLCs,
 	 * to_local, to_remote; permute_outputs sorts them afterwards. */
 	for (int pass = 0; pass < 2; pass++) {
 		for (size_t i = 0; i < tal_count(htlcs); i++) {
