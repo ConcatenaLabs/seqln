@@ -1,5 +1,6 @@
 #include "config.h"
 #include "../amount.c"
+#include <ccan/array_size/array_size.h>
 #include <common/pseudorand.h>
 #include <common/setup.h>
 #include <stdio.h>
@@ -252,6 +253,15 @@ static void test_amount_div(void)
 		assert((satp)->satoshis == val);			\
 	} while (0)
 
+/* xorshift64: enough randomness for comparing two arithmetic paths. */
+static u64 xs(u64 *state)
+{
+	*state ^= *state << 13;
+	*state ^= *state >> 7;
+	*state ^= *state << 17;
+	return *state;
+}
+
 int main(int argc, char *argv[])
 {
 	struct amount_msat msat;
@@ -486,6 +496,38 @@ int main(int argc, char *argv[])
 		for (size_t w = 1; w < 2000; w += 13)
 			assert(amount_tx_fee(rate, w).satoshis * 1000
 			       >= (u64)rate * w);
+
+	/* The exchange-rate arithmetic: the portable path a 32-bit build
+	 * takes agrees with 128-bit integers, edges and random values. */
+	{
+		const u64 edge[] = { 0, 1, 2, 3, 99999999, 100000000, 100000001,
+				     0xFFFFFFFF, 0x100000000ULL, 0x123456789ABCDEFULL,
+				     UINT64_MAX / 2, UINT64_MAX - 1, UINT64_MAX };
+		for (size_t i = 0; i < ARRAY_SIZE(edge); i++)
+			for (size_t j = 0; j < ARRAY_SIZE(edge); j++)
+				for (size_t k = 0; k < ARRAY_SIZE(edge); k++)
+					for (size_t d = 1; d < ARRAY_SIZE(edge); d++)
+						assert(u64_mul_add_div_portable(edge[i], edge[j], edge[k], edge[d])
+						       == u64_mul_add_div(edge[i], edge[j], edge[k], edge[d]));
+		u64 st = 0x9E3779B97F4A7C15ULL;
+		for (size_t n = 0; n < 1000000; n++) {
+			u64 a = xs(&st), b = xs(&st);
+			u64 add = xs(&st), div = xs(&st) | 1;
+			/* Small factors too, where the quotient fits. */
+			if (n & 1) {
+				a >>= xs(&st) % 64;
+				b >>= xs(&st) % 64;
+			}
+			assert(u64_mul_add_div_portable(a, b, add, div)
+			       == u64_mul_add_div(a, b, add, div));
+		}
+		/* Values the fee code depends on: at twice par a fee halves,
+		 * rounded up; at half par it doubles. */
+		assert(feerate_in_asset(253, 2 * EXCHANGE_RATE_SCALE) == 127);
+		assert(feerate_in_asset(253, EXCHANGE_RATE_SCALE / 2) == 506);
+		assert(feerate_in_asset(UINT32_MAX, 1) == UINT32_MAX);
+		assert(amount_sat_in_asset(AMOUNT_SAT(5546), 2 * EXCHANGE_RATE_SCALE).satoshis == 2773);
+	}
 
 	common_shutdown();
 }
