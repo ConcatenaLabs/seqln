@@ -13,16 +13,17 @@ static void *encode(const tal_t *ctx, const struct revoke_and_ack *s)
 {
 	return towire_revoke_and_ack(ctx, &s->channel_id,
 				     &s->per_commitment_secret,
-				     &s->next_per_commitment_point);
+				     &s->next_per_commitment_point, NULL);
 }
 
 static struct revoke_and_ack *decode(const tal_t *ctx, const void *p)
 {
 	struct revoke_and_ack *s = tal(ctx, struct revoke_and_ack);
+	struct tlv_revoke_and_ack_tlvs *tlvs;
 
-	if (fromwire_revoke_and_ack(p, &s->channel_id,
+	if (fromwire_revoke_and_ack(s, p, &s->channel_id,
 				    &s->per_commitment_secret,
-				    &s->next_per_commitment_point))
+				    &s->next_per_commitment_point, &tlvs))
 		return s;
 	return tal_free(s);
 }

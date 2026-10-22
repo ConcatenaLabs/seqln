@@ -8,6 +8,7 @@ CHANNELD_HEADERS :=			\
 	channeld/commit_tx.h			\
 	channeld/full_channel.h			\
 	channeld/full_channel_error.h		\
+	channeld/sym_channeld.h			\
 	channeld/tcov_channel.h			\
 	channeld/watchtower.h
 
@@ -17,6 +18,7 @@ CHANNELD_SRC := channeld/channeld.c	\
 	channeld/splice.c			\
 	channeld/inflight.c			\
 	channeld/channeld_wiregen.c		\
+	channeld/sym_channeld.c			\
 	channeld/tcov_channel.c			\
 	channeld/watchtower.c
 

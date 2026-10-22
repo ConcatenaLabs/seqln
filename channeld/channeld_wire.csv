@@ -10,6 +10,7 @@
 #include <common/derive_basepoints.h>
 #include <common/features.h>
 #include <common/fee_states.h>
+#include <common/sym_state.h>
 #include <wire/peer_wire.h>
 
 # Begin!  (passes gossipd-client fd)
@@ -161,6 +162,9 @@ msgdata,channeld_sending_commitsig,blockheight_states,height_states,
 # SENT_ADD_COMMIT, SENT_REMOVE_ACK_COMMIT, SENT_ADD_ACK_COMMIT, SENT_REMOVE_COMMIT
 msgdata,channeld_sending_commitsig,num_changed,u16,
 msgdata,channeld_sending_commitsig,changed,changed_htlc,num_changed
+# SEQUENTIA: a symmetric channel's (common/sym_scripts.h): the peer's state
+# this commitment_signed signs, with our update signature.
+msgdata,channeld_sending_commitsig,sym_remote,?sym_state,
 
 
 # Wait for reply, to make sure it's on disk before we send commit.
@@ -197,6 +201,9 @@ msgdata,channeld_got_commitsig,inflight_commitsigs,commitsig,num_inflight_commit
 msgdata,channeld_got_commitsig,local_per_commit,pubkey,
 msgdata,channeld_got_commitsig,num_htlc_infos,u16,
 msgdata,channeld_got_commitsig,htlc_infos,got_commitsig_htlc_info,num_htlc_infos
+# SEQUENTIA: a symmetric channel's: our new state, with both update
+# signatures.
+msgdata,channeld_got_commitsig,sym_local,?sym_state,
 subtype,commitsig
 subtypedata,commitsig,tx,bitcoin_tx,
 subtypedata,commitsig,commit_signature,bitcoin_signature,
@@ -252,6 +259,9 @@ msgdata,channeld_got_revoke,penalty_tx,?bitcoin_tx,
 # replying (Justice-Before-Advance).
 msgdata,channeld_got_revoke,num_wt_blobs,u16,
 msgdata,channeld_got_revoke,wt_blobs,watchtower_blob,num_wt_blobs
+# SEQUENTIA: a symmetric channel's: the peer's state that replaces the one it
+# revoked, now with both update signatures.
+msgdata,channeld_got_revoke,sym_remote,?sym_state,
 # Wait for reply, to make sure it's on disk before we continue
 # (eg. if we sent another commitment_signed, that would implicitly ack).
 msgtype,channeld_got_revoke_reply,1122

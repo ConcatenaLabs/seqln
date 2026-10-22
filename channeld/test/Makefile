@@ -31,6 +31,9 @@ channeld/test/run-full_channel:			\
 	common/pseudorand.o			\
 	common/randbytes.o			\
 	common/setup.o				\
+	common/sym_channel.o			\
+	common/sym_scripts.o			\
+	common/sym_state.o			\
 	common/tcov_commit_tx.o			\
 	common/tcov_scripts.o			\
 	common/utils.o				\

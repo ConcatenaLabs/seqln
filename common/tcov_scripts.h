@@ -75,6 +75,9 @@ enum tcov_spend_signer {
 	 * output on the holder's commitment, by its PROVIDER leaf
 	 * (common/credit_scripts.h). */
 	TCOV_SIGN_PAYMENT = 4,
+	/* SEQUENTIA: our HTLC basepoint's key, untweaked: an HTLC output of
+	 * a symmetric channel's settlement (common/sym_scripts.h). */
+	TCOV_SIGN_SYM_HTLC = 5,
 };
 
 /* When the spend must be mined by. */

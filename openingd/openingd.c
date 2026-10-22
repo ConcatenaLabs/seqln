@@ -24,6 +24,7 @@
 #include <common/read_peer_msg.h>
 #include <common/status.h>
 #include <common/subdaemon.h>
+#include <common/sym_channel.h>
 #include <common/wire_error.h>
 #include <hsmd/hsmd_wiregen.h>
 #include <openingd/common.h>
@@ -59,6 +60,10 @@ struct state {
 
 	/* Limits on what remote config we accept. */
 	u32 max_to_self_delay;
+
+	/* SEQUENTIA: a symmetric channel's shared delay: what we ask, and the
+	 * most we accept (common/sym_scripts.h). */
+	u16 symmetric_delay;
 
 	/* These are the points lightningd told us to use when accepting or
 	 * opening a channel. */
@@ -102,6 +107,11 @@ struct state {
 	 * the structure has room for HTLCs, those routines are channeld-specific
 	 * as initial channels never have HTLCs. */
 	struct channel *channel;
+
+	/* SEQUENTIA: a symmetric channel's kickoff signature and first
+	 * states (common/sym_scripts.h). */
+	struct bitcoin_signature *sym_kickoff_sig;
+	struct sym_state *sym_local, *sym_remote;
 
 	/* Channel type we agreed on (even before channel populated) */
 	struct channel_type *channel_type;
@@ -329,6 +339,30 @@ static void set_remote_upfront_shutdown(struct state *state,
 
 /* We start the 'open a channel' negotation with the supplied peer, but
  * stop when we get to the part where we need the funding txid */
+/* SEQUENTIA: a symmetric channel waits one shared delay, the larger of the
+ * two to_self_delays, before any state settles, and its HTLCs wait with it:
+ * we ask our --symmetric-delay, and refuse a longer one from the peer. */
+static bool sym_delay_ok(struct state *state, bool check_theirs)
+{
+	if (!channel_type_has(state->channel_type, OPT_SEQ_SYMMETRIC))
+		return true;
+	if (state->symmetric_delay == 0) {
+		negotiation_failed(state, "Symmetric channels are not offered"
+				   " here");
+		return false;
+	}
+	state->localconf.to_self_delay = state->symmetric_delay;
+	if (check_theirs
+	    && state->remoteconf.to_self_delay > state->symmetric_delay) {
+		negotiation_failed(state, "Their shared delay %u exceeds the"
+				   " %u blocks we take on a symmetric channel",
+				   state->remoteconf.to_self_delay,
+				   state->symmetric_delay);
+		return false;
+	}
+	return true;
+}
+
 static u8 *funder_channel_start(struct state *state, u8 channel_flags,
 				u32 nonanchor_feerate, u32 anchor_feerate,
 				const struct channel_type *ctype TAKES)
@@ -387,6 +421,10 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags,
 	} else {
 		state->feerate_per_kw = nonanchor_feerate;
 	}
+
+	/* SEQUENTIA: a symmetric channel asks for the shared delay. */
+	if (!sym_delay_ok(state, false))
+		return NULL;
 
 	/* If they use the same settings as us, would we fail?  If so, do that now. */
 	if (!check_config_bounds(tmpctx, state->funding_sats,
@@ -580,6 +618,9 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags,
 		return NULL;
 	}
 
+	if (!sym_delay_ok(state, true))
+		return NULL;
+
 	if (!check_config_bounds(tmpctx, state->funding_sats,
 				 state->feerate_per_kw,
 				 state->max_to_self_delay,
@@ -629,6 +670,74 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags,
 						  state->channel_type);
 }
 
+/* SEQUENTIA: a symmetric channel (common/sym_scripts.h): our funding key's
+ * kickoff signature, and our update signature on a state. */
+static void sym_sign_kickoff(const struct channel *channel,
+			     const struct bitcoin_tx *kickoff,
+			     struct bitcoin_signature *sig)
+{
+	u8 *msg = towire_hsmd_sign_sym_kickoff(NULL, kickoff,
+					       &channel->funding_pubkey[REMOTE]);
+	wire_sync_write(HSM_FD, take(msg));
+	msg = wire_sync_read(tmpctx, HSM_FD);
+	if (!fromwire_hsmd_sign_tx_reply(msg, sig))
+		status_failed(STATUS_FAIL_HSM_IO, "Bad sign_sym_kickoff reply %s",
+			      tal_hex(tmpctx, msg));
+}
+
+static void sym_sign_state(const struct channel *channel,
+			   struct sym_state *st)
+{
+	u8 *msg = towire_hsmd_sign_sym_state(NULL, &channel->funding,
+					     channel->opener == LOCAL,
+					     &channel->basepoints[REMOTE].delayed_payment,
+					     channel->channel_asset,
+					     sym_shared_delay(channel), st,
+					     NULL);
+	wire_sync_write(HSM_FD, take(msg));
+	msg = wire_sync_read(tmpctx, HSM_FD);
+	if (!fromwire_hsmd_sign_sym_state_reply(msg, &st->sig[LOCAL]))
+		status_failed(STATUS_FAIL_HSM_IO, "Bad sign_sym_state reply %s",
+			      tal_hex(tmpctx, msg));
+	st->has_sig[LOCAL] = true;
+}
+
+/* The peer's first state, signed by us; NULL if it cannot be paid. */
+static struct sym_state *sym_first_remote(struct state *state)
+{
+	const char *err;
+	struct sym_state *st = sym_channel_state(state, state->channel, REMOTE,
+						 0, NULL, &err);
+	if (!st)
+		return NULL;
+	sym_sign_state(state->channel, st);
+	return st;
+}
+
+/* Our first state, with the peer's signature checked and ours added. */
+static void sym_first_local(struct state *state, const struct bip340sig *theirs)
+{
+	const char *err;
+
+	if (!theirs)
+		peer_failed_err(state->pps, &state->channel_id,
+				"Symmetric channel: no update signature");
+	state->sym_local = sym_channel_state(state, state->channel, LOCAL, 0,
+					     NULL, &err);
+	if (!state->sym_local)
+		peer_failed_err(state->pps, &state->channel_id,
+				"Symmetric channel: first state: %s", err);
+	if (!sym_channel_check_sig(state->channel, state->sym_local, REMOTE,
+				   theirs))
+		peer_failed_err(state->pps, &state->channel_id,
+				"Bad update signature %s on state %"PRId64,
+				fmt_bip340sig(tmpctx, theirs),
+				state->sym_local->num);
+	state->sym_local->sig[REMOTE] = *theirs;
+	state->sym_local->has_sig[REMOTE] = true;
+	sym_sign_state(state->channel, state->sym_local);
+}
+
 static bool funder_finalize_channel_setup(struct state *state,
 					  struct amount_msat local_msat,
 					  struct bitcoin_signature *sig,
@@ -637,6 +746,7 @@ static bool funder_finalize_channel_setup(struct state *state,
 {
 	u8 *msg;
 	struct channel_id id_in;
+	struct tlv_funding_signed_tlvs *fs_tlvs;
 	const u8 *wscript;
 	struct channel_id cid;
 	char *err_reason;
@@ -735,6 +845,32 @@ static bool funder_finalize_channel_setup(struct state *state,
 	else
 		*pbase = NULL;
 
+	/* SEQUENTIA: a symmetric channel: we sign the kickoff and their first
+	 * state; no penalty base, as nothing is ever punished. */
+	if (channel_has(state->channel, OPT_SEQ_SYMMETRIC)) {
+		struct tlv_funding_created_tlvs *fc_tlvs
+			= tlv_funding_created_tlvs_new(tmpctx);
+
+		*pbase = tal_free(*pbase);
+		sym_sign_kickoff(state->channel, *tx, sig);
+		state->sym_kickoff_sig = tal_dup(state, struct bitcoin_signature,
+						 sig);
+		state->sym_remote = sym_first_remote(state);
+		if (!state->sym_remote) {
+			negotiation_failed(state, "Could not build their first"
+					   " state");
+			goto fail;
+		}
+		fc_tlvs->sym_sig = tal_dup(fc_tlvs, struct bip340sig,
+					   &state->sym_remote->sig[LOCAL]);
+		msg = towire_funding_created(state, &state->channel_id,
+					     &state->funding.txid,
+					     state->funding.n,
+					     &sig->s, fc_tlvs);
+		peer_write(state->pps, msg);
+		goto wait_funding_signed;
+	}
+
 	/* We ask the HSM to sign their commitment transaction for us: it knows
 	 * our funding key, it just needs the remote funding key to create the
 	 * witness script.  It also needs the amount of the funding output,
@@ -771,8 +907,10 @@ static bool funder_finalize_channel_setup(struct state *state,
 	msg = towire_funding_created(state, &state->channel_id,
 				     &state->funding.txid,
 				     state->funding.n,
-				     &sig->s);
+				     &sig->s, NULL);
 	peer_write(state->pps, msg);
+
+wait_funding_signed:
 
 	/* BOLT #2:
 	 *
@@ -794,7 +932,10 @@ static bool funder_finalize_channel_setup(struct state *state,
 		goto fail;
 
 	sig->sighash_type = SIGHASH_ALL;
-	if (!fromwire_funding_signed(msg, &id_in, &sig->s))
+	/* SEQUENTIA: a symmetric channel's commitment is its kickoff. */
+	if (channel_has(state->channel, OPT_SEQ_SYMMETRIC))
+		sig->sighash_type = SIGHASH_SINGLE | SIGHASH_ANYONECANPAY;
+	if (!fromwire_funding_signed(tmpctx, msg, &id_in, &sig->s, &fs_tlvs))
 		peer_failed_err(state->pps, &state->channel_id,
 				"Parsing funding_signed: %s", tal_hex(msg, msg));
 	/* BOLT #2:
@@ -847,7 +988,13 @@ static bool funder_finalize_channel_setup(struct state *state,
 		goto fail;
 	}
 
-	validate_initial_commitment_signature(HSM_FD, *tx, sig);
+	/* SEQUENTIA: a symmetric channel: their update signature on our
+	 * first state, then ours (a signer that holds a balance checks the
+	 * state there). */
+	if (channel_has(state->channel, OPT_SEQ_SYMMETRIC))
+		sym_first_local(state, fs_tlvs->sym_sig);
+	else
+		validate_initial_commitment_signature(HSM_FD, *tx, sig);
 
 	if (!check_tx_sig(*tx, 0, NULL, wscript, &state->their_funding_pubkey, sig)) {
 		peer_failed_err(state->pps, &state->channel_id,
@@ -920,7 +1067,10 @@ static u8 *funder_channel_complete(struct state *state)
 					   state->localconf.dust_limit,
 					   state->upfront_shutdown_script[REMOTE],
 					   state->channel_type,
-					   state->channel_asset);
+					   state->channel_asset,
+					   state->sym_kickoff_sig,
+					   state->sym_local,
+					   state->sym_remote);
 }
 
 /*~ The peer sent us an `open_channel`, that means we're the fundee. */
@@ -941,6 +1091,7 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	struct penalty_base *pbase;
 	struct tlv_accept_channel_tlvs *accept_tlvs;
 	struct tlv_open_channel_tlvs *open_tlvs;
+	struct tlv_funding_created_tlvs *fc_tlvs;
 	struct amount_sat *reserve;
 
 	/* BOLT #2:
@@ -1159,6 +1310,9 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 		return NULL;
 	}
 
+	if (!sym_delay_ok(state, true))
+		return NULL;
+
 	/* These checks are the same whether we're opener or accepter... */
 	if (!check_config_bounds(tmpctx, state->funding_sats,
 				 state->feerate_per_kw,
@@ -1270,12 +1424,15 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	/* The message should be "funding_created" which tells us what funding
 	 * tx they generated; the sighash type is implied, so we set it here. */
 	theirsig.sighash_type = SIGHASH_ALL;
-	if (!fromwire_funding_created(msg, &id_in,
+	if (!fromwire_funding_created(tmpctx, msg, &id_in,
 				      &state->funding.txid,
 				      &funding_txout,
-				      &theirsig.s))
+				      &theirsig.s, &fc_tlvs))
 		peer_failed_err(state->pps, &state->channel_id,
 			    "Parsing funding_created");
+	/* SEQUENTIA: a symmetric channel's commitment is its kickoff. */
+	if (channel_type_has(state->channel_type, OPT_SEQ_SYMMETRIC))
+		theirsig.sighash_type = SIGHASH_SINGLE | SIGHASH_ANYONECANPAY;
 	/* We only allow 16 bits for this on the wire. */
 	state->funding.n = funding_txout;
 
@@ -1363,7 +1520,11 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 		return NULL;
 	}
 
-	validate_initial_commitment_signature(HSM_FD, local_commit, &theirsig);
+	if (channel_has(state->channel, OPT_SEQ_SYMMETRIC))
+		sym_first_local(state, fc_tlvs->sym_sig);
+	else
+		validate_initial_commitment_signature(HSM_FD, local_commit,
+						      &theirsig);
 
 	if (!check_tx_sig(local_commit, 0, NULL, wscript, &their_funding_pubkey,
 			  &theirsig)) {
@@ -1420,6 +1581,29 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 		return NULL;
 	}
 
+	/* SEQUENTIA: a symmetric channel: we sign the kickoff and their
+	 * first state. */
+	if (channel_has(state->channel, OPT_SEQ_SYMMETRIC)) {
+		struct tlv_funding_signed_tlvs *fs_tlvs
+			= tlv_funding_signed_tlvs_new(tmpctx);
+
+		sym_sign_kickoff(state->channel, remote_commit, &sig);
+		state->sym_kickoff_sig = tal_dup(state, struct bitcoin_signature,
+						 &sig);
+		state->sym_remote = sym_first_remote(state);
+		if (!state->sym_remote) {
+			negotiation_failed(state, "Could not build their first"
+					   " state");
+			return NULL;
+		}
+		fs_tlvs->sym_sig = tal_dup(fs_tlvs, struct bip340sig,
+					   &state->sym_remote->sig[LOCAL]);
+		msg = towire_funding_signed(state, &state->channel_id, &sig.s,
+					    fs_tlvs);
+		pbase = NULL;
+		goto reply;
+	}
+
 	/* Make HSM sign it */
 	u32 feerate = 0; // unused since there are no htlcs
 	u64 commit_num = 0;
@@ -1442,7 +1626,7 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	/* We don't send this ourselves: channeld does, because master needs
 	 * to save state to disk before doing so. */
 	assert(sig.sighash_type == SIGHASH_ALL);
-	msg = towire_funding_signed(state, &state->channel_id, &sig.s);
+	msg = towire_funding_signed(state, &state->channel_id, &sig.s, NULL);
 
 	if (direct_outputs[LOCAL] != NULL)
 		pbase = penalty_base_new(tmpctx, 0, remote_commit,
@@ -1450,6 +1634,7 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	else
 		pbase = NULL;
 
+reply:
 	return towire_openingd_fundee(state,
 				     &state->remoteconf,
 				     local_commit,
@@ -1472,7 +1657,10 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 				     state->upfront_shutdown_script[LOCAL],
 				     state->upfront_shutdown_script[REMOTE],
 				     state->channel_type,
-				     state->channel_asset);
+				     state->channel_asset,
+				     state->sym_kickoff_sig,
+				     state->sym_local,
+				     state->sym_remote);
 }
 
 /*~ Standard "peer sent a message, handle it" demuxer.  Though it really only
@@ -1633,7 +1821,8 @@ int main(int argc, char *argv[])
 				    &state->allowdustreserve,
 				    &state->dev_accept_any_channel_type,
 				    &state->asset_rate_values,
-				    &state->asset_rate_tags))
+				    &state->asset_rate_tags,
+				    &state->symmetric_delay))
 		master_badmsg(WIRE_OPENINGD_INIT, msg);
 	if (tal_bytelen(state->asset_rate_tags)
 	    != tal_count(state->asset_rate_values) * sizeof(state->channel_asset))
@@ -1655,6 +1844,8 @@ int main(int argc, char *argv[])
 	 * handle_peer_gossip_or_error compares this. */
 	memset(&state->channel_id, 0, sizeof(state->channel_id));
 	state->channel = NULL;
+	state->sym_kickoff_sig = NULL;
+	state->sym_local = state->sym_remote = NULL;
 
 	/* Default this to zero, we only ever look at the local */
 	state->remoteconf.max_dust_htlc_exposure_msat = AMOUNT_MSAT(0);

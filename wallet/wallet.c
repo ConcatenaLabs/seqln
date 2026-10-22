@@ -11,6 +11,7 @@
 #include <common/mkdatastorekey.h>
 #include <common/onionreply.h>
 #include <common/randbytes.h>
+#include <common/sym_state.h>
 #include <common/trace.h>
 #include <db/bindings.h>
 #include <db/common.h>
@@ -25,6 +26,7 @@
 #include <lightningd/notification.h>
 #include <lightningd/peer_htlcs.h>
 #include <lightningd/runes.h>
+#include <lightningd/symmetric.h>
 #include <onchaind/onchaind_wiregen.h>
 #include <wallet/datastore.h>
 #include <wallet/invoices.h>
@@ -2257,6 +2259,16 @@ static struct channel *wallet_stmt2channel(struct wallet *w, struct db_stmt *stm
 		return NULL;
 	}
 
+	/* SEQUENTIA: a symmetric channel's states, and the sighash of the
+	 * peer's kickoff signature, which is not SIGHASH_ALL.  last_tx is the
+	 * kickoff until a mutual close replaces it. */
+	if (channel_type_has(chan->type, OPT_SEQ_SYMMETRIC)) {
+		wallet_sym_load(w, chan);
+		if (chan->last_tx && sym_is_kickoff(chan, chan->last_tx))
+			chan->last_sig.sighash_type
+				= SIGHASH_SINGLE | SIGHASH_ANYONECANPAY;
+	}
+
 	return chan;
 }
 
@@ -3537,6 +3549,89 @@ static struct credit_note *stmt2credit_note(const tal_t *ctx,
 	memcpy(n->sig.u8, db_col_blob(stmt, "signature"), sizeof(n->sig.u8));
 	n->preimage = db_col_optional(n, stmt, "preimage", preimage);
 	return n;
+}
+
+static u8 *sym_state_blob(const tal_t *ctx, const struct sym_state *st)
+{
+	u8 *b = tal_arr(ctx, u8, 0);
+	towire_sym_state(&b, st);
+	return b;
+}
+
+void wallet_sym_save(struct wallet *w, const struct channel *channel)
+{
+	struct db_stmt *stmt;
+
+	stmt = db_prepare_v2(w->db, SQL("DELETE FROM channel_sym"
+					" WHERE channel_id = ?;"));
+	db_bind_u64(stmt, channel->dbid);
+	db_exec_prepared_v2(take(stmt));
+
+	stmt = db_prepare_v2(w->db, SQL("INSERT INTO channel_sym ("
+					"  channel_id, kickoff_sig, local_state,"
+					"  remote_state, remote_pending)"
+					" VALUES (?, ?, ?, ?, ?);"));
+	db_bind_u64(stmt, channel->dbid);
+	if (channel->sym_kickoff_sig)
+		db_bind_signature(stmt, &channel->sym_kickoff_sig->s);
+	else
+		db_bind_null(stmt);
+	if (channel->sym_local)
+		db_bind_talarr(stmt, sym_state_blob(tmpctx, channel->sym_local));
+	else
+		db_bind_null(stmt);
+	if (channel->sym_remote)
+		db_bind_talarr(stmt, sym_state_blob(tmpctx, channel->sym_remote));
+	else
+		db_bind_null(stmt);
+	if (channel->sym_remote_pending)
+		db_bind_talarr(stmt, sym_state_blob(tmpctx,
+						    channel->sym_remote_pending));
+	else
+		db_bind_null(stmt);
+	db_exec_prepared_v2(take(stmt));
+}
+
+static struct sym_state *sym_state_col(const tal_t *ctx, struct db_stmt *stmt,
+				       const char *colname)
+{
+	const u8 *b;
+	size_t max;
+
+	if (db_col_is_null(stmt, colname))
+		return NULL;
+	b = db_col_arr(tmpctx, stmt, colname, u8);
+	max = tal_bytelen(b);
+	return fromwire_sym_state(ctx, &b, &max);
+}
+
+void wallet_sym_load(struct wallet *w, struct channel *channel)
+{
+	struct db_stmt *stmt;
+
+	stmt = db_prepare_v2(w->db, SQL("SELECT kickoff_sig, local_state,"
+					" remote_state, remote_pending"
+					" FROM channel_sym"
+					" WHERE channel_id = ?;"));
+	db_bind_u64(stmt, channel->dbid);
+	db_query_prepared(stmt);
+	if (!db_step(stmt)) {
+		tal_free(stmt);
+		return;
+	}
+	if (!db_col_is_null(stmt, "kickoff_sig")) {
+		channel->sym_kickoff_sig = tal(channel, struct bitcoin_signature);
+		db_col_signature(stmt, "kickoff_sig",
+				 &channel->sym_kickoff_sig->s);
+		channel->sym_kickoff_sig->sighash_type
+			= SIGHASH_SINGLE | SIGHASH_ANYONECANPAY;
+	} else
+		db_col_ignore(stmt, "kickoff_sig");
+	channel->sym_local = sym_state_col(channel, stmt, "local_state");
+	channel->sym_remote = sym_state_col(channel, stmt, "remote_state");
+	channel->sym_remote_pending = sym_state_col(channel, stmt,
+						    "remote_pending");
+	tal_free(stmt);
 }
 
 void wallet_credit_note_save(struct wallet *w, u64 chan_dbid, bool issued,

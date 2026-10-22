@@ -6,6 +6,7 @@
 #include <common/channel_type.h>
 #include <common/derive_basepoints.h>
 #include <common/features.h>
+#include <common/sym_state.h>
 
 msgtype,openingd_init,6000
 # Which network are we configured for?
@@ -36,6 +37,9 @@ msgdata,openingd_init,num_asset_rates,u16,
 msgdata,openingd_init,asset_rate_values,u64,num_asset_rates
 msgdata,openingd_init,asset_rate_tags_len,u16,
 msgdata,openingd_init,asset_rate_tags,u8,asset_rate_tags_len
+# SEQUENTIA: the shared delay this node asks of a symmetric channel, and the
+# most it accepts (--symmetric-delay); 0 off Sequentia.
+msgdata,openingd_init,symmetric_delay,u16,
 
 # Openingd->master: they offered channel, should we continue?
 msgtype,openingd_got_offer,6005
@@ -85,6 +89,12 @@ msgdata,openingd_funder_reply,shutdown_len,u16,
 msgdata,openingd_funder_reply,shutdown_scriptpubkey,u8,shutdown_len
 msgdata,openingd_funder_reply,channel_type,channel_type,
 msgdata,openingd_funder_reply,channel_asset,byte,33
+# SEQUENTIA: a symmetric channel's (common/sym_scripts.h): our kickoff
+# signature (first_commit_sig is the peer's), our state 0 with both update
+# signatures and the peer's with ours.
+msgdata,openingd_funder_reply,sym_kickoff_sig,?bitcoin_signature,
+msgdata,openingd_funder_reply,sym_local,?sym_state,
+msgdata,openingd_funder_reply,sym_remote,?sym_state,
 
 # master->openingd: start channel establishment for a funding tx
 msgtype,openingd_funder_start,6002
@@ -152,6 +162,9 @@ msgdata,openingd_fundee,remote_shutdown_len,u16,
 msgdata,openingd_fundee,remote_shutdown_scriptpubkey,u8,remote_shutdown_len
 msgdata,openingd_fundee,channel_type,channel_type,
 msgdata,openingd_fundee,channel_asset,byte,33
+msgdata,openingd_fundee,sym_kickoff_sig,?bitcoin_signature,
+msgdata,openingd_fundee,sym_local,?sym_state,
+msgdata,openingd_fundee,sym_remote,?sym_state,
 
 # master -> openingd: do you have a memleak?
 msgtype,openingd_dev_memleak,6033

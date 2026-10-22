@@ -215,6 +215,19 @@ struct channel {
 	 * (fine for existing policy-asset channels). */
 	u8 channel_asset[33];
 
+	/* SEQUENTIA: a symmetric channel's (common/sym_scripts.h,
+	 * lightningd/symmetric.h): our kickoff signature (the peer's is
+	 * last_sig, on last_tx, the kickoff), our latest state and the peer's
+	 * latest, each with both update signatures, and the peer's newest,
+	 * which we signed and it has not countersigned yet (it can broadcast
+	 * that one: we keep its settlement).  NULL on other types. */
+	struct bitcoin_signature *sym_kickoff_sig;
+	struct sym_state *sym_local, *sym_remote, *sym_remote_pending;
+	/* --developer: the state dev-sym-snapshot froze, which this node
+	 * then closes with as though it held nothing newer (a stale state,
+	 * for tests). */
+	struct sym_state *sym_dev_stale;
+
 	/* Watch we have on funding output. */
 	struct txowatch *funding_spend_watch;
 

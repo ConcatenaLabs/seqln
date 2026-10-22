@@ -47,6 +47,12 @@ enum tx_type {
 	CREDIT_CLAIM,
 	CREDIT_SWEEP_TO_THEM,
 
+	/* SEQUENTIA: a symmetric channel (common/sym_scripts.h): an update
+	 * moving a state output (or KO) into a newer state, and the
+	 * settlement of a state after the shared delay. */
+	SYM_UPDATE,
+	SYM_SETTLE,
+
 	/* Amount too small, we're just spending it to close UTXO */
 	IGNORING_TINY_PAYMENT,
 
@@ -89,6 +95,9 @@ enum output_type {
 	 * credit). */
 	CREDIT_OUTPUT_TO_US,
 	CREDIT_OUTPUT_TO_THEM,
+
+	/* SEQUENTIA: a symmetric channel's KO, or the output of a state. */
+	SYM_STATE_OUTPUT,
 };
 
 

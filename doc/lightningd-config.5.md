@@ -493,6 +493,26 @@ credit channels when its *hsmd* can sign notes, and accepts them when its
 *hsmd* can hold them (a device signer holds, and never provides); it logs
 why when it can do neither.
 
+* **symmetric-channels**
+
+  Offer, and prefer when the peer offers it too, the symmetric channel
+type (feature bit 178/179): an old state is replaced by a newer one
+rather than punished, so the node keeps only the latest states. A
+unilateral close is a kickoff, an update into the latest state and its
+settlement after the shared delay, and each attaches its fee when it is
+broadcast, in any asset the node accepts for fees. Only on the Sequentia
+networks and only when *hsmd* can sign the type's kickoff, states and
+HTLC claims; elsewhere the option offers nothing and logs why.
+
+* **symmetric-delay**=*BLOCKS*
+
+  The shared delay a symmetric channel asks for, and the longest this node
+accepts from a peer: a state settles that many blocks after the update
+that published it. Every output waits, HTLCs included, so an HTLC on such
+a channel must outlive twice this delay and 12 blocks more; the node
+refuses one that would not, and goes on chain that long before an HTLC
+expires. The default is 72 blocks on the Sequentia networks.
+
 * (deprecated in v23.05) **max-locktime-blocks**=*BLOCKS*
 
   The longest our funds can be delayed (ie. the longest

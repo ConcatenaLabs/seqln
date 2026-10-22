@@ -131,6 +131,7 @@ enum ChannelTypeName {
   anchors_even = 5;
   seq_taproot_covenant_even = 6;
   seq_credit_even = 7;
+  seq_symmetric_even = 8;
 }
 
 enum AutocleanSubsystem {

@@ -842,6 +842,11 @@ void wallet_htlc_save_in(struct wallet *wallet,
  *
  * See comment for wallet_htlc_save_in.
  */
+/* SEQUENTIA: a symmetric channel's kickoff signature and latest states
+ * (lightningd/symmetric.h). */
+void wallet_sym_save(struct wallet *w, const struct channel *channel);
+void wallet_sym_load(struct wallet *w, struct channel *channel);
+
 /* SEQUENTIA: credit notes (lightningd/credit.h). */
 struct credit_note;
 /* Save @n for channel @chan_dbid, or add its preimage to the one saved. */

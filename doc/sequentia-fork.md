@@ -548,44 +548,113 @@ Files: `common/credit_scripts.{c,h}`, `bitcoin/tapscript.{c,h}`, `common/tcov_co
 Tests: `tests/sequentia/test_credit.py`, `common/test/run-credit_scripts.c` and the signer's
 `cargo test` (section 10).
 
-## 5e. Symmetric channel scripts (`common/sym_scripts.h`)
+## 5e. Symmetric channels (`option_seq_symmetric`)
 
-The scripts and transactions of a symmetric channel, in which an old state is replaced by a
-newer one rather than punished, so only the latest state need be kept. The funding output
-is the usual 2-of-2 P2WSH. A unilateral close takes three transactions, each paying its fee
-from an input attached when it is broadcast, in any asset the node accepts:
+A channel type in which an old state is replaced by a newer one rather than punished, so a
+node keeps only the latest states and a stale state costs its publisher only fees. Offered on
+chains with `has_tapscript_introspection` (section 1), like the taproot-covenant type, and kept
+out of the other types' code paths: their commitments, signatures and on-chain resolution are
+unchanged.
+
+**Enabling it.** Start both peers with `--symmetric-channels` (lightningd-config(5)). The node
+then offers feature bit 178/179 and prefers the channel type `[12, 178]` whenever its peer
+offers it too (a credit provider's channel to a credit holder stays a credit channel);
+`fundchannel channel_type=[12,178]` asks for it explicitly. `listpeerchannels` names it
+`seq_symmetric/even`. lightningd withdraws the feature unless hsmd lists the three messages
+below among its capabilities.
+
+**Transactions** (`common/sym_scripts.h`, which carries every script). The funding output is
+the usual 2-of-2 P2WSH, so opening, gossip and the mutual close are those of every other type.
+A unilateral close takes three transactions, and each pays its fee from an input attached when
+it is broadcast, in any asset the node accepts:
 
 - the **kickoff** spends the funding output into KO, a taproot output with one leaf, UPD(-1).
-  Both funding keys sign it once, `SIGHASH_SINGLE|SIGHASH_ANYONECANPAY`, so anyone can add a
-  fee input and its change, and it is the same transaction whatever the state;
+  Both funding keys sign it once, at open, `SIGHASH_SINGLE|SIGHASH_ANYONECANPAY`, so anyone can
+  add a fee input and its change, and it is the same transaction whatever the state. Those
+  signatures bind the funding input to the output at the same index, KO, at whatever index;
 - an **update** spends KO, or the output of any older state k, by UPD(k), into the output of
   state n > k, of the same value and asset;
 - the **settle** spends state n's output by SETTLE(n) once the shared delay has passed; its
   first outputs are the settlement: each side's balance to P2WPKH of its payment basepoint and
   each HTLC to a taproot output with a SUCCESS leaf (preimage and the receiver's key) and a
-  TIMEOUT leaf (the offerer's key after the expiry).
+  TIMEOUT leaf (the offerer's key after the expiry). Keys are basepoints, untweaked: there is
+  no revocation.
 
 A state output is `tr(H, {UPD(n), R(n)})` with H the NUMS point, where R(n) is the SETTLE leaf,
-or a branch over SETTLE and a Simplicity leaf: the state output is a mixed tree, so a Simplicity
-settle path can join it without changing UPD, its signatures or the watcher. UPD(k) takes two
-BIP340 signatures through `OP_CHECKSIGFROMSTACK` over
-`SHA256(tag || n || P || R)`: the new state number (8 bytes, in the witness), the program P
-of the output at the input's own index, and R, which the witness publishes. The tag folds in
-the chain's genesis hash and the funding outpoint. One signature from each side therefore
-covers the update and, through P, the settlement; it spends any older state output of the
-channel whatever its txid, and leaves every other input and output free for the fee. A
-watcher rebuilds any old state output from the n and R its update published and the channel's
-constants, so it stores nothing per old state. SETTLE needs no signature: it hashes the
-asset, value and script hash of each of its outputs and compares the digest. The settlement's
-values add up to the state output's value. An HTLC below the dust limit stays with the side
-that offered it, a balance below it goes to the other side, and the outputs are sorted so that
-both sides build the same list. Every key in a leaf is a 32-byte script constant.
+or a branch over SETTLE and a Simplicity leaf: the state output is a mixed tree, so another
+leaf can join it without changing UPD, its signatures or the watcher. UPD(k) takes two BIP340
+signatures through `OP_CHECKSIGFROMSTACK` over `SHA256(tag || n || P || R)`: the new state
+number (8 bytes, in the witness), the program P of the output at the input's own index, and R,
+which the witness publishes. The tag folds in the chain's genesis hash and the funding
+outpoint, so a signature replays neither to another chain nor to another channel whose keys
+are the same. One signature from each side therefore covers the update and, through P, the
+settlement; it spends any older state output of the channel whatever its txid, and leaves
+every other input and output free for the fee. SETTLE needs no signature: it hashes the asset,
+value and script hash of each of its outputs and compares the digest. The settlement's values
+add up to the state output's value. An HTLC below the dust limit (the larger of the two
+sides') stays with the side that offered it, a balance below it goes to the other side, what
+msat rounding leaves goes to the opener, and the outputs are sorted so that both sides build
+the same list. Every key in a leaf is a 32-byte script constant.
 
-The header carries every script. `common/test/run-sym_scripts.c` checks the scripts, trees,
-messages, signatures and the kickoff's signature hash against vectors from the Sequentia node's
-test framework, whose builders were spent on a Sequentia chain with each negative case
-(an older update over a newer one, a settle before its delay, a settlement moved by one atom,
-a 33-byte key) forced into a block.
+**States and signatures.** Each commitment is a state: commitment i of the opener is state 2i,
+of the accepter 2i + 1, so each side's own states only ever grow. Each side's update key is its
+delayed payment basepoint, which this type uses for nothing else. On the wire, in TLV 48041
+(`wire/peer_wire.csv`):
+
+- `funding_created` and `funding_signed` carry the kickoff signature in `signature` and the
+  sender's update signature on the receiver's first state in `sym_sig`;
+- `commitment_signed` carries the kickoff signature again, no HTLC signatures, and the
+  sender's update signature on the receiver's new state;
+- `revoke_and_ack` carries the sender's update signature on its own state that replaces the
+  one it revokes. Whoever revokes a state thus hands the other a newer one whole, so a node
+  cheated with any state it saw revoked always holds one numbered above it.
+
+lightningd keeps three states of each channel (`lightningd/symmetric.h`, table `channel_sym`):
+its own latest and the peer's latest, each with both signatures, and the peer's newest, which
+it signed and the peer has not countersigned yet: the peer can broadcast that one, so its
+settlement is kept. The shared delay is the larger of the two `to_self_delay`s: a node asks
+`--symmetric-delay` (72 blocks on the Sequentia networks) and refuses a peer that asks more.
+
+**On chain.** A unilateral close broadcasts the kickoff with a fee coin. onchaind
+(`handle_symmetric_close`) then publishes over KO the best state the node holds whole, and over
+any older state that reaches the chain, whoever published it; once a state the node knows has
+stood for the delay, it publishes its settlement. lightningd builds each of these with a fee coin
+in the channel's asset if the node accepts it for fees and holds enough, else in the accepted
+asset whose coins are worth most to it, rebuilds it each block at a rising fee until its input
+is spent, and releases the coins of a spend that lost to another. The settlement's own balance
+output goes to the wallet; an HTLC the node offered is taken back by its TIMEOUT leaf after its
+expiry, one it received by its SUCCESS leaf once the preimage is known, and the preimage of one
+the peer claims is passed upstream. The update and the settle need no key.
+
+**Delays.** Every output waits for the settlement, HTLCs included, and a peer that withheld its
+last acknowledgement can publish the state it holds just before the delay runs out, restarting
+it once. So an HTLC on a symmetric channel must outlive twice the shared delay and 12 blocks
+more: lightningd refuses to offer or accept one that would not, and goes on chain that long
+before an HTLC expires (`sym_htlc_margin()`). Forwarding over a symmetric channel therefore
+needs that doubled delay inside the route's lock times.
+
+**Signers.** hsmd signs the type with three messages (`hsmd/hsmd_wire.csv`):
+`hsmd_sign_sym_kickoff` (the funding key, `SIGHASH_SINGLE|SIGHASH_ANYONECANPAY`, answered by
+`hsmd_sign_tx_reply`), `hsmd_sign_sym_state` (the update key over a state's message, with the
+state's settlement and every HTLC it carries, so a signer that holds a balance can check what
+the state pays it) and `hsmd_sign_sym_htlc` (the HTLC basepoint over a settlement HTLC's
+claim). The fee coins of every stage are signed with `hsmd_sign_htlc_tx_mingle`.
+
+**Developers.** `dev-sym-snapshot id` freezes the best state a node holds; its next unilateral
+close then publishes that one as though it held nothing newer, which is how the tests make a
+stale state.
+
+Files: `common/sym_scripts.{c,h}`, `common/sym_state.{c,h}`, `common/sym_channel.{c,h}`,
+`channeld/sym_channeld.{c,h}`, `lightningd/symmetric.{c,h}`, and the symmetric branches of
+`openingd/openingd.c`, `channeld/channeld.c`, `channeld/full_channel.c`,
+`common/initial_channel.c`, `onchaind/onchaind.c`, `lightningd/onchain_control.c`,
+`lightningd/opening_control.c`, `lightningd/peer_htlcs.c`, `lightningd/peer_control.c`,
+`hsmd/libhsmd.c` and `wallet/wallet.c`. Tests: `common/test/run-sym_scripts.c` checks the
+scripts, trees, messages, signatures and the kickoff's signature hash against vectors from the
+Sequentia node's test framework, whose builders were spent on a Sequentia chain with each
+negative case (an older update over a newer one, a settle before its delay, a settlement moved
+by one atom, a 33-byte key) forced into a block; `tests/sequentia/test_symmetric.py` (section
+10).
 
 ## 6. Asset-aware gossip, routing, payments
 
@@ -854,6 +923,7 @@ The Specula design note is not yet published in this repository; the header comm
 | `channeld`, `onchaind`, `lightningd/onchain_control.c`, `hsmd`, `speculad` | Taproot-covenant channel type: taproot commitments, covenant HTLC claims with the fee attached at claim time, keyless tower template (section 5b) |
 | `channeld`, `onchaind`, `lightningd/peer_htlcs.c`, `plugins/pay.c` | Point-locked HTLCs: the lock in the SUCCESS leaves, forwarding with a per-hop tweak, the payee's invoice point, `pay`'s choice of lock (section 5c) |
 | `channeld`, `closingd`, `onchaind`, `lightningd/credit.c`, `hsmd`, `contrib/credit-seq/`, `contrib/seqln-signer/` | Provider-signed credit: the CLAIM leaf on the provider's balance output, notes issued and held, the floor, the close and the claim (section 5d) |
+| `openingd`, `channeld`, `onchaind`, `lightningd/symmetric.c`, `hsmd` | Symmetric channels: the kickoff, update signatures per state, the replacement of older states and the settlement on chain, each with a fee coin (section 5e) |
 
 ## 9. libwally dependency
 
@@ -980,7 +1050,14 @@ delay; a mutual close paying the holder the note; a provider that forgets its no
 without them the holder will not sign, and whose own commitment the holder claims from; the same
 provider's HTLC below the note refused by the holder's channeld; and a keyless holder whose device
 is stopped while it is paid twice, then returns, learns the latest note and signs the claim's fee
-coin, refusing nothing (`test_credit.py`). They need `sequentiad`, `sequentia-cli`
+coin, refusing nothing (`test_credit.py`), and the symmetric channel type (section 5e): chosen
+only when both peers offer it, paid over both ways; a unilateral close while the peer is away
+whose kickoff, update and settlement each take their fee from a coin in another asset, and pay
+each side its balance; a stale state, published and mined by a peer that kept it while the
+other was away, replaced by the latest one when that side returns within the delay, and the
+latest split settled; HTLCs in flight claimed from the settlement by their SUCCESS leaf with the
+preimage, and by their TIMEOUT leaf after the expiry; and a mutual close
+(`test_symmetric.py`). They need `sequentiad`, `sequentia-cli`
 and a Bitcoin Core `bitcoind` on `PATH`, and the keyless tests need the device signer built
 (`cargo build --release` in `contrib/seqln-signer`, or `SEQLN_SIGNER=/path/to/seqln-signer`).
 The test plugins run under the `python3` on `PATH`, which needs the `pyln` packages, so the

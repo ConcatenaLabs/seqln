@@ -27,6 +27,7 @@
 #include <lightningd/onchain_control.h>
 #include <lightningd/peer_htlcs.h>
 #include <lightningd/subd.h>
+#include <lightningd/symmetric.h>
 #include <onchaind/onchaind_wiregen.h>
 #include <wallet/txfilter.h>
 #include <wallet/wallet.h>
@@ -297,6 +298,7 @@ static void onchain_txo_spent(struct channel *channel, const struct bitcoin_tx *
 
 	bitcoin_tx_input_get_outpoint(tx, input_num, &spent);
 	tcov_note_spent(channel, &spent);
+	sym_note_spent(channel, &spent);
 
 	/* Reply will need this if we want to unwatch */
 	txid = tal(NULL, struct bitcoin_txid);
@@ -1833,6 +1835,9 @@ static bool tcov_sign_input0(const struct tcov_spend *ts,
 		msg = towire_hsmd_sign_tcov_payment_to_us(NULL, tx, 0,
 							  ts->leaf, id, dbid);
 		break;
+	case TCOV_SIGN_SYM_HTLC:
+		msg = towire_hsmd_sign_sym_htlc(NULL, tx, 0, ts->leaf, id, dbid);
+		break;
 	default:
 		return false;
 	}
@@ -2429,6 +2434,40 @@ static void handle_onchaind_spend_tcov(struct channel *channel,
 		     ts->minblock, NULL, tcov_rebroadcast, take(ts));
 }
 
+/* SEQUENTIA: an update or a settle of a symmetric channel
+ * (lightningd/symmetric.h): input 0's witness is whole, outputs 0 .. m-1
+ * are given; we add the fee coin. */
+static void handle_onchaind_spend_sym(struct channel *channel, const u8 *msg)
+{
+	struct bitcoin_outpoint out;
+	struct amount_sat amount;
+	u8 *spent_spk;
+	struct onchain_witness_element **welements;
+	struct sym_state *outs;
+	u32 sequence, minblock, deadline;
+	u8 **wit;
+
+	if (!fromwire_onchaind_spend_sym(tmpctx, msg, &out, &amount,
+					 &spent_spk, &welements, &outs,
+					 &sequence, &minblock, &deadline)) {
+		channel_internal_error(channel, "Invalid onchaind_spend_sym %s",
+				       tal_hex(tmpctx, msg));
+		return;
+	}
+	wit = tal_arr(tmpctx, u8 *, tal_count(welements));
+	for (size_t i = 0; i < tal_count(welements); i++)
+		wit[i] = welements[i]->witness;
+
+	/* onchaind recognises our spend by its witness: nothing in it
+	 * changes when we rebuild it at another fee. */
+	subd_send_msg(channel->owner,
+		      take(towire_onchaind_spend_created(NULL, true,
+				cast_const2(const struct onchain_witness_element **,
+					    welements))));
+	sym_spend_start(channel, &out, amount, spent_spk, wit, outs->outs,
+			sequence, minblock, deadline);
+}
+
 /* SEQUENTIA: claim a credit output with the note we hold
  * (common/credit_scripts.h). */
 static void handle_onchaind_spend_credit_claim(struct channel *channel,
@@ -2574,7 +2613,12 @@ static unsigned int onchain_msg(struct subd *sd, const u8 *msg, const int *fds U
 		handle_onchaind_spend_credit_claim(sd->channel, msg);
 		break;
 
+	case WIRE_ONCHAIND_SPEND_SYM:
+		handle_onchaind_spend_sym(sd->channel, msg);
+		break;
+
 	/* We send these, not receive them */
+	case WIRE_ONCHAIND_SYM_INIT:
 	case WIRE_ONCHAIND_INIT:
 	case WIRE_ONCHAIND_SPENT:
 	case WIRE_ONCHAIND_DEPTH:
@@ -2743,8 +2787,31 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 				   channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX),
 				   channel_has(channel, OPT_SEQ_TAPROOT_COVENANT),
 				   channel_has(channel, OPT_SEQ_CREDIT),
+				   channel_has(channel, OPT_SEQ_SYMMETRIC),
 				  feerate_min(ld, NULL));
 	subd_send_msg(channel->owner, take(msg));
+
+	/* SEQUENTIA: a symmetric channel's states (lightningd/symmetric.h);
+	 * its kickoff, which spent the funding, is broadcast no more. */
+	if (channel_has(channel, OPT_SEQ_SYMMETRIC)) {
+		sym_note_spent(channel, &channel->funding);
+		if (channel->sym_dev_stale)
+			log_unusual(channel->log, "dev-sym-snapshot: closing"
+				    " with state %"PRId64" as if it were our"
+				    " latest", channel->sym_dev_stale->num);
+		subd_send_msg(channel->owner,
+			      take(towire_onchaind_sym_init(NULL,
+							    &channel->funding,
+							    sym_channel_delay(channel),
+							    channel->sym_dev_stale
+							    ? channel->sym_dev_stale
+							    : channel->sym_local,
+							    channel->sym_dev_stale
+							    ? NULL : channel->sym_remote,
+							    channel->sym_dev_stale
+							    ? NULL
+							    : channel->sym_remote_pending)));
+	}
 
 	/* If we're replaying, we just watch this */
 	if (channel->onchaind_replay_watches) {

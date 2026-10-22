@@ -150,9 +150,18 @@ msgdata,funding_created,temporary_channel_id,byte,32
 msgdata,funding_created,funding_txid,sha256,
 msgdata,funding_created,funding_output_index,u16,
 msgdata,funding_created,signature,signature,
+msgdata,funding_created,tlvs,funding_created_tlvs,
+# SEQUENTIA: on a symmetric channel (common/sym_scripts.h) `signature` signs
+# the kickoff, SIGHASH_SINGLE|SIGHASH_ANYONECANPAY, and sym_sig is the
+# sender's update signature on the receiver's first state.
+tlvtype,funding_created_tlvs,sym_sig,48041
+tlvdata,funding_created_tlvs,sym_sig,sig,bip340sig,
 msgtype,funding_signed,35
 msgdata,funding_signed,channel_id,channel_id,
 msgdata,funding_signed,signature,signature,
+msgdata,funding_signed,tlvs,funding_signed_tlvs,
+tlvtype,funding_signed_tlvs,sym_sig,48041
+tlvdata,funding_signed_tlvs,sym_sig,sig,bip340sig,
 msgtype,channel_ready,36
 msgdata,channel_ready,channel_id,channel_id,
 msgdata,channel_ready,second_per_commitment_point,point,
@@ -314,10 +323,21 @@ msgdata,commitment_signed,htlc_signature,signature,num_htlcs
 msgdata,commitment_signed,splice_channel_id,commitment_signed_tlvs,
 tlvtype,commitment_signed_tlvs,splice_info,1
 tlvdata,commitment_signed_tlvs,splice_info,funding_txid,sha256,
+# SEQUENTIA: a symmetric channel's update signature on the receiver's new
+# state; `signature` signs the kickoff again, and there are no HTLC
+# signatures.
+tlvtype,commitment_signed_tlvs,sym_sig,48041
+tlvdata,commitment_signed_tlvs,sym_sig,sig,bip340sig,
 msgtype,revoke_and_ack,133
 msgdata,revoke_and_ack,channel_id,channel_id,
 msgdata,revoke_and_ack,per_commitment_secret,byte,32
 msgdata,revoke_and_ack,next_per_commitment_point,point,
+msgdata,revoke_and_ack,tlvs,revoke_and_ack_tlvs,
+# SEQUENTIA: on a symmetric channel, the sender's update signature on its own
+# state that replaces the one it revokes, so the receiver holds that state
+# whole: whoever revokes a state hands over a newer one.
+tlvtype,revoke_and_ack_tlvs,sym_sig,48041
+tlvdata,revoke_and_ack_tlvs,sym_sig,sig,bip340sig,
 msgtype,update_fee,134
 msgdata,update_fee,channel_id,channel_id,
 msgdata,update_fee,feerate_per_kw,u32,

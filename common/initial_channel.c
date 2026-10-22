@@ -8,6 +8,7 @@
 #include <common/initial_channel.h>
 #include <common/initial_commit_tx.h>
 #include <common/keyset.h>
+#include <common/sym_channel.h>
 #include <common/tcov_commit_tx.h>
 
 struct channel *new_initial_channel(const tal_t *ctx,
@@ -118,6 +119,17 @@ struct bitcoin_tx *initial_channel_tx(const tal_t *ctx,
 			   &keyset)) {
 		*err_reason = "Cannot derive keyset";
 		return NULL;
+	}
+
+	/* SEQUENTIA: a symmetric channel's commitment is its kickoff, the
+	 * same for both sides and every state (common/sym_scripts.h); the
+	 * states themselves are signed by update signatures. */
+	if (channel_has(channel, OPT_SEQ_SYMMETRIC)) {
+		const u8 *ws;
+		init_tx = sym_channel_kickoff(ctx, channel, &ws);
+		if (direct_outputs)
+			direct_outputs[LOCAL] = direct_outputs[REMOTE] = NULL;
+		goto add_pubkeys;
 	}
 
 	/* SEQUENTIA: the taproot-covenant type (common/tcov_commit_tx.h)
@@ -288,6 +300,10 @@ struct channel_type *channel_desired_type(const tal_t *ctx,
 	if (channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX))
 		return channel_type_anchors_zero_fee_htlc(ctx);
 
+	/* SEQUENTIA: nor the symmetric type, whose states no other type
+	 * has. */
+	if (channel_has(channel, OPT_SEQ_SYMMETRIC))
+		return channel_type_seq_symmetric(ctx);
 	/* SEQUENTIA: nor the taproot-covenant type, whose outputs no other
 	 * type can read. */
 	if (channel_has(channel, OPT_SEQ_CREDIT))

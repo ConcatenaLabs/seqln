@@ -16,6 +16,8 @@
 #include <common/point_lock.h>
 #include <common/status.h>
 #include <common/subdaemon.h>
+#include <common/sym_scripts.h>
+#include <common/sym_state.h>
 #include <common/tcov_scripts.h>
 #include <hsmd/hsmd_wiregen.h>
 #include <inttypes.h>
@@ -93,6 +95,18 @@ struct credit_note_held {
 };
 static struct credit_note_held *credit_note;
 
+/* SEQUENTIA: a symmetric channel (common/sym_scripts.h): its constants,
+ * the states lightningd holds, the best of them we hold whole, who opened
+ * it, each side's basepoints and the HTLCs it may carry. */
+static bool option_seq_symmetric;
+static struct sym_channel sym_sc;
+static const struct sym_state *sym_local, *sym_remote, *sym_remote_pending;
+static const struct sym_state *sym_best;
+static enum side sym_opener;
+static struct basepoints sym_basepoints[NUM_SIDES];
+static struct htlcs_info *sym_htlcs;
+static struct bitcoin_outpoint sym_funding;
+
 /* Asset-aware channels: the asset this channel is denominated in (33-byte
  * version+tag); the policy asset for an ordinary channel. All resolution/HTLC
  * txs we build (or the amounts we read off the commitment tx) are in it. */
@@ -150,6 +164,12 @@ struct tracked_output {
 	/* SEQUENTIA: a credit output's B, the constant its CLAIM leaf counts
 	 * what was paid from (common/credit_scripts.h). */
 	struct amount_sat credit_b;
+
+	/* SEQUENTIA: a symmetric channel's state output: its state number
+	 * (-1 for KO), the R its update published, and its script. */
+	s64 sym_num;
+	struct sha256 sym_rest;
+	u8 *sym_spk;
 };
 
 /* SEQUENTIA: the provider-signed credit, near the end of this file. */
@@ -180,6 +200,14 @@ static void tcov_claim_with_preimage(struct tracked_output *out,
 				     const struct preimage *preimage);
 static bool tcov_revoke_leaf_paid_us(const struct tx_parts *tx_parts,
 				     size_t input_num, u32 tx_blockheight);
+
+/* SEQUENTIA: the symmetric channel type, near the end of this file. */
+static void sym_state_spent(struct tracked_output ***outs,
+			    struct tracked_output *out,
+			    const struct tx_parts *tx, u32 input_num,
+			    u32 tx_blockheight);
+static void sym_claim_with_preimage(struct tracked_output *out,
+				    const struct preimage *preimage);
 
 static const char *tx_type_name(enum tx_type tx_type)
 {
@@ -694,6 +722,9 @@ new_tracked_output(struct tracked_output ***outs,
 					       remote_htlc_sig);
 	out->tcov_tree = NULL;
 	out->credit_b = AMOUNT_SAT(0);
+	out->sym_num = 0;
+	memset(&out->sym_rest, 0, sizeof(out->sym_rest));
+	out->sym_spk = NULL;
 
 	tal_arr_expand(outs, out);
 
@@ -1291,6 +1322,13 @@ static bool output_spent(struct tracked_output ***outs,
 		if (out->resolved)
 			continue;
 
+		/* SEQUENTIA: a symmetric channel's state output. */
+		if (out->output_type == SYM_STATE_OUTPUT) {
+			sym_state_spent(outs, out, tx_parts, input_num,
+					tx_blockheight);
+			continue;
+		}
+
 		/* Was this our resolution? */
 		if (resolved_by_proposal(out, tx_parts)) {
 			/* SEQUENTIA: our credit claim: what it paid us, and
@@ -1378,7 +1416,8 @@ static bool output_spent(struct tracked_output ***outs,
 			 *     - MUST extract the payment preimage from the HTLC-success transaction input
 			 *     witness.
 			 */
-			if (option_seq_taproot_covenant)
+			if (option_seq_taproot_covenant
+			    || option_seq_symmetric)
 				tcov_extract_preimage(out, tx_parts,
 						      &htlc_outpoint);
 			else
@@ -1454,6 +1493,7 @@ static bool output_spent(struct tracked_output ***outs,
 			break;
 
 		/* Um, we don't track these! */
+		case SYM_STATE_OUTPUT:
 		case OUTPUT_TO_THEM:
 		case DELAYED_OUTPUT_TO_THEM:
 		case ELEMENTS_FEE:
@@ -1653,6 +1693,11 @@ static void handle_preimage(struct tracked_output **outs,
 			tcov_claim_with_preimage(outs[i], preimage);
 			continue;
 		}
+		/* SEQUENTIA: a symmetric channel's settlement HTLC. */
+		if (option_seq_symmetric) {
+			sym_claim_with_preimage(outs[i], preimage);
+			continue;
+		}
 
 		/* BOLT #5:
 		 *
@@ -1719,6 +1764,11 @@ static void memleak_remove_globals(struct htable *memtable, const tal_t *topctx)
 	memleak_ptr(memtable, topctx);
 	memleak_scan_obj(memtable, missing_htlc_msgs);
 	memleak_scan_obj(memtable, queued_msgs);
+	/* SEQUENTIA: a symmetric channel's states and HTLCs. */
+	memleak_scan_obj(memtable, sym_local);
+	memleak_scan_obj(memtable, sym_remote);
+	memleak_scan_obj(memtable, sym_remote_pending);
+	memleak_scan_obj(memtable, sym_htlcs);
 }
 
 static void handle_dev_memleak(struct tracked_output ***outs, const u8 *msg)
@@ -1851,6 +1901,8 @@ static void wait_for_resolved(struct tracked_output **outs)
 		case WIRE_ONCHAIND_SPEND_HTLC_EXPIRED:
 		case WIRE_ONCHAIND_SPEND_TCOV:
 		case WIRE_ONCHAIND_SPEND_CREDIT_CLAIM:
+		case WIRE_ONCHAIND_SYM_INIT:
+		case WIRE_ONCHAIND_SPEND_SYM:
 			break;
 		}
 		master_badmsg(-1, msg);
@@ -4224,6 +4276,333 @@ static void handle_unilateral_tcov(const struct tx_parts *tx,
 	wait_for_resolved(outs);
 }
 
+/*~ SEQUENTIA: the symmetric channel type (common/sym_scripts.h).
+ *
+ * The funding output is spent by the kickoff, whose output 0, KO, any state
+ * can spend.  We publish the best state we hold whole over KO, and over any
+ * older state anybody else publishes, and the settlement of whichever state
+ * stays on chain once the shared delay has passed.  None of that needs a
+ * key: the update signatures are stored and SETTLE takes none.  The
+ * settlement's own outputs are resolved as the taproot-covenant type's are:
+ * our balance goes to the wallet, our HTLCs time out, and theirs we claim
+ * with the preimage. */
+static void sym_track_state(struct tracked_output ***outs,
+			    const struct bitcoin_outpoint *outpoint,
+			    u32 tx_blockheight, struct amount_sat amt,
+			    s64 num, const struct sha256 *rest,
+			    enum tx_type tx_type);
+
+/* The state we know by number (ours, theirs, their newest), or NULL. */
+static const struct sym_state *sym_known(s64 num)
+{
+	const struct sym_state *cands[] = { sym_local, sym_remote,
+					    sym_remote_pending };
+
+	for (size_t i = 0; i < ARRAY_SIZE(cands); i++)
+		if (cands[i] && cands[i]->num == num)
+			return cands[i];
+	return NULL;
+}
+
+static struct onchain_witness_element **sym_welements(const tal_t *ctx,
+						       u8 **wit)
+{
+	struct onchain_witness_element **w
+		= tal_arr(ctx, struct onchain_witness_element *, tal_count(wit));
+	for (size_t i = 0; i < tal_count(wit); i++) {
+		w[i] = tal(w, struct onchain_witness_element);
+		w[i]->is_signature = false;
+		w[i]->witness = tal_dup_talarr(w[i], u8, wit[i]);
+	}
+	return w;
+}
+
+/* Ask lightningd to spend @out with @wit into @st's outputs. */
+static void sym_propose(struct tracked_output *out, u8 **wit,
+			const struct sym_state *outs, u32 sequence,
+			u32 minblock, u32 deadline, enum tx_type tx_type)
+{
+	const u8 *msg;
+
+	msg = towire_onchaind_spend_sym(NULL, &out->outpoint, out->sat,
+					out->sym_spk,
+					cast_const2(const struct onchain_witness_element **,
+						    sym_welements(tmpctx, wit)),
+					outs, sequence, minblock, deadline);
+	propose_resolution_to_master(out, take(msg), minblock, tx_type);
+}
+
+/* What to do with a state output (KO: num -1): replace it by our best state
+ * if that is newer, else settle it once the delay has passed if we know its
+ * settlement, else leave it to whoever holds it. */
+static void sym_resolve_state(struct tracked_output *out)
+{
+	const struct bip340sig *sig_op, *sig_acc;
+	struct sym_tree tree, prev;
+	u8 *prev_leaf, *prev_cb, *spk;
+	const struct sym_state *st;
+
+	if (sym_best && sym_best->num > out->sym_num
+	    && sym_state_signed(sym_best, sym_opener, &sig_op, &sig_acc)) {
+		struct sym_state *o;
+
+		if (out->sym_num == -1) {
+			sym_kickoff_tree(tmpctx, &sym_sc, &prev);
+			prev_leaf = prev.upd;
+			prev_cb = sym_tree_control_block(tmpctx, &prev,
+							 SYM_LEAF_UPD);
+		} else
+			sym_rebuild_state(tmpctx, &sym_sc, out->sym_num,
+					  &out->sym_rest, &spk, &prev_leaf,
+					  &prev_cb);
+		sym_state_tree_of(tmpctx, &sym_sc, sym_best, &tree);
+		o = sym_state_new(tmpctx, LOCAL, 0, sym_best->num, NULL);
+		o->outs = tal_arr(o, struct sym_state_out, 1);
+		o->outs[0].amount = out->sat;
+		o->outs[0].spk = sym_tree_spk(o->outs, &tree);
+		status_info("Replacing state %"PRId64" by our state %"PRId64,
+			    out->sym_num, sym_best->num);
+		sym_propose(out, sym_update_witness(tmpctx, sig_op, sig_acc,
+						    &tree, prev_leaf, prev_cb),
+			    o, SYM_SEQUENCE, out->tx_blockheight + 1,
+			    out->tx_blockheight + 2, SYM_UPDATE);
+		return;
+	}
+
+	st = out->sym_num >= 0 ? sym_known(out->sym_num) : NULL;
+	if (st) {
+		sym_state_tree_of(tmpctx, &sym_sc, st, &tree);
+		spk = sym_tree_spk(tmpctx, &tree);
+		if (memeq(spk, tal_bytelen(spk), out->sym_spk,
+			  tal_bytelen(out->sym_spk))) {
+			status_info("Settling state %"PRId64" after %u blocks",
+				    st->num, sym_sc.delay);
+			sym_propose(out, sym_settle_witness(tmpctx, &tree), st,
+				    sym_sc.delay,
+				    rel_blockheight(out, sym_sc.delay),
+				    rel_blockheight(out, sym_sc.delay) + 6,
+				    SYM_SETTLE);
+			return;
+		}
+	}
+	status_unusual("State %"PRId64" is on chain and we do not know its"
+		       " settlement: its holder settles it", out->sym_num);
+	propose_ignore(out, out->tx_blockheight + 100000, SYM_SETTLE);
+}
+
+static void sym_track_state(struct tracked_output ***outs,
+			    const struct bitcoin_outpoint *outpoint,
+			    u32 tx_blockheight, struct amount_sat amt,
+			    s64 num, const struct sha256 *rest,
+			    enum tx_type tx_type)
+{
+	struct tracked_output *out;
+	struct sym_tree tree;
+
+	out = new_tracked_output(outs, outpoint, tx_blockheight, tx_type, amt,
+				 SYM_STATE_OUTPUT, NULL, NULL, NULL);
+	out->sym_num = num;
+	if (num == -1) {
+		sym_kickoff_tree(tmpctx, &sym_sc, &tree);
+		out->sym_spk = sym_tree_spk(out, &tree);
+	} else {
+		u8 *spk, *leaf, *cb;
+		out->sym_rest = *rest;
+		sym_rebuild_state(tmpctx, &sym_sc, num, rest, &spk, &leaf, &cb);
+		out->sym_spk = tal_steal(out, spk);
+	}
+	sym_resolve_state(out);
+}
+
+/* The settlement of a state: our balance to the wallet, the HTLCs as on a
+ * taproot-covenant commitment's (common/sym_scripts.h). */
+static void sym_settled(struct tracked_output ***outs,
+			const struct tx_parts *tx, u32 tx_blockheight)
+{
+	const u8 *ours = scriptpubkey_p2wpkh(tmpctx,
+					     &sym_basepoints[LOCAL].payment);
+	u8 **unmatched = tal_arr(tmpctx, u8 *, tal_count(sym_htlcs->htlcs));
+	static const u8 marker;
+
+	onchain_annotate_txin(&tx->txid, 0, TX_CHANNEL_UNILATERAL);
+	for (size_t i = 0; i < tal_count(unmatched); i++)
+		unmatched[i] = (u8 *)&marker;
+
+	for (size_t i = 0; i < tal_count(tx->outputs); i++) {
+		struct amount_asset asset;
+		struct bitcoin_outpoint outpoint;
+		struct tracked_output *out;
+		struct amount_sat amt;
+		size_t h;
+
+		if (!tx->outputs[i] || tx->outputs[i]->script_len == 0)
+			continue;
+		asset = wally_tx_output_get_amount(tx->outputs[i]);
+		if (!amount_asset_is(&asset, channel_asset))
+			continue;
+		amt = amount_sat(asset.value);
+		outpoint.txid = tx->txid;
+		outpoint.n = i;
+
+		if (wally_tx_output_scripteq(tx->outputs[i], ours)) {
+			out = new_tracked_output(outs, &outpoint, tx_blockheight,
+						 SYM_SETTLE, amt, OUTPUT_TO_US,
+						 NULL, NULL, NULL);
+			ignore_output(out);
+			tell_wallet_to_remote(tx, &outpoint, tx_blockheight,
+					      ours, NULL, true, 1);
+			continue;
+		}
+		for (h = 0; h < tal_count(sym_htlcs->htlcs); h++) {
+			const struct htlc_stub *s = &sym_htlcs->htlcs[h];
+			struct tap_tree2 tree;
+
+			if (!unmatched[h] || s->has_lock_point)
+				continue;
+			sym_htlc_tree(tmpctx, &sym_basepoints[s->owner].htlc,
+				      &sym_basepoints[!s->owner].htlc,
+				      &s->ripemd, s->cltv_expiry, &tree);
+			if (!wally_tx_output_scripteq(tx->outputs[i],
+						      tap_tree2_scriptpubkey(tmpctx,
+									     &tree)))
+				continue;
+			unmatched[h] = NULL;
+			out = new_tracked_output(outs, &outpoint,
+						 tx_blockheight, SYM_SETTLE,
+						 amt,
+						 s->owner == LOCAL
+						 ? OUR_HTLC : THEIR_HTLC,
+						 s, NULL, NULL);
+			out->tcov_tree = keep_tree(out, &tree);
+			if (s->owner == LOCAL)
+				/* Ours: its TIMEOUT leaf, after its CLTV. */
+				tcov_propose(out, TCOV_SIGN_SYM_HTLC,
+					     SYM_HTLC_LEAF_TIMEOUT, NULL, NULL,
+					     s->cltv_expiry, 0xFFFFFFFE,
+					     s->cltv_expiry + 1,
+					     TCOV_DEADLINE_HTLC_OUT,
+					     OUR_HTLC_TIMEOUT_TO_US);
+			else
+				/* Theirs: claimed once we hold the preimage
+				 * (handle_preimage), else theirs after its
+				 * CLTV. */
+				propose_ignore(out, s->cltv_expiry,
+					       THEIR_HTLC_TIMEOUT_TO_THEM);
+			break;
+		}
+	}
+	note_missing_htlcs(unmatched, sym_htlcs);
+}
+
+/* @out, a state output, was spent by input @input_num of @tx. */
+static void sym_state_spent(struct tracked_output ***outs,
+			    struct tracked_output *out,
+			    const struct tx_parts *tx, u32 input_num,
+			    u32 tx_blockheight)
+{
+	const struct wally_tx_witness_stack *wit = tx->inputs[input_num]->witness;
+	u8 **items;
+	s64 num;
+	struct sha256 rest;
+	struct bitcoin_outpoint next;
+	struct amount_asset asset;
+
+	if (!resolved_by_proposal(out, tx))
+		resolved_by_other(out, &tx->txid,
+				  wit && wit->num_items == 2
+				  ? SYM_SETTLE : SYM_UPDATE);
+	if (!wit) {
+		status_broken("State %"PRId64" spent by %s without a witness",
+			      out->sym_num, fmt_bitcoin_txid(tmpctx, &tx->txid));
+		return;
+	}
+
+	/* A settle: leaf and control block. */
+	if (wit->num_items == 2) {
+		status_info("State %"PRId64" settled by %s", out->sym_num,
+			    fmt_bitcoin_txid(tmpctx, &tx->txid));
+		sym_settled(outs, tx, tx_blockheight);
+		return;
+	}
+
+	items = tal_arr(tmpctx, u8 *, wit->num_items);
+	for (size_t i = 0; i < wit->num_items; i++)
+		items[i] = tal_dup_arr(items, u8, wit->items[i].witness,
+				       wit->items[i].witness_len, 0);
+	if (!sym_parse_update_witness((const u8 **)items, &num, &rest)) {
+		status_broken("State %"PRId64" spent by %s, neither an update"
+			      " nor a settle", out->sym_num,
+			      fmt_bitcoin_txid(tmpctx, &tx->txid));
+		return;
+	}
+
+	/* UPD pays the next state at the input's own index. */
+	next.txid = tx->txid;
+	next.n = input_num;
+	if (input_num >= tal_count(tx->outputs) || !tx->outputs[input_num]) {
+		status_broken("Update %s has no output %u",
+			      fmt_bitcoin_txid(tmpctx, &tx->txid), input_num);
+		return;
+	}
+	asset = wally_tx_output_get_amount(tx->outputs[input_num]);
+	status_info("State %"PRId64" replaced by state %"PRId64" (%s)",
+		    out->sym_num, num, fmt_bitcoin_txid(tmpctx, &tx->txid));
+	sym_track_state(outs, &next, tx_blockheight, amount_sat(asset.value),
+			num, &rest, SYM_UPDATE);
+}
+
+/* Their HTLC, whose preimage we now hold: its SUCCESS leaf, to our wallet. */
+static void sym_claim_with_preimage(struct tracked_output *out,
+				    const struct preimage *preimage)
+{
+	tcov_propose(out, TCOV_SIGN_SYM_HTLC, SYM_HTLC_LEAF_SUCCESS, preimage,
+		     NULL, 0, 0xFFFFFFFF, out->tx_blockheight + 1,
+		     TCOV_DEADLINE_HTLC_IN, THEIR_HTLC_FULFILL_TO_US);
+}
+
+static void handle_symmetric_close(const struct tx_parts *tx,
+				   u32 tx_blockheight,
+				   struct tracked_output **outs)
+{
+	struct amount_asset asset;
+	struct bitcoin_outpoint ko;
+
+	/* Kept for the settlement, which comes later: a copy, so nothing
+	 * init_reply re-sorted is left behind. */
+	{
+		struct htlcs_info *hi = init_reply(tmpctx, "Tracking a symmetric"
+						   " channel's close");
+		sym_htlcs = tal(NULL, struct htlcs_info);
+		sym_htlcs->htlcs = tal_dup_talarr(sym_htlcs, struct htlc_stub,
+						  hi->htlcs);
+		sym_htlcs->tell_if_missing = tal_dup_talarr(sym_htlcs, bool,
+							    hi->tell_if_missing);
+		sym_htlcs->tell_immediately = tal_dup_talarr(sym_htlcs, bool,
+							     hi->tell_immediately);
+	}
+	onchain_annotate_txin(&tx->txid, 0, TX_CHANNEL_UNILATERAL);
+	resolved_by_other(outs[0], &tx->txid, SYM_UPDATE);
+
+	/* KO is the output at the funding input's index. */
+	ko.txid = tx->txid;
+	ko.n = 0;
+	for (size_t i = 0; i < tal_count(tx->inputs); i++)
+		if (tx->inputs[i]
+		    && wally_tx_input_spends(tx->inputs[i], &sym_funding))
+			ko.n = i;
+	if (ko.n >= tal_count(tx->outputs) || !tx->outputs[ko.n])
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Kickoff %s has no output %u",
+			      fmt_bitcoin_txid(tmpctx, &tx->txid), ko.n);
+	asset = wally_tx_output_get_amount(tx->outputs[ko.n]);
+	status_info("Kickoff %s: our best state is %"PRId64,
+		    fmt_bitcoin_txid(tmpctx, &tx->txid),
+		    sym_best ? sym_best->num : (s64)-1);
+	sym_track_state(&outs, &ko, tx_blockheight, amount_sat(asset.value),
+			-1, NULL, SYM_UPDATE);
+	wait_for_resolved(outs);
+}
+
 int main(int argc, char *argv[])
 {
 	setup_locale();
@@ -4283,8 +4662,37 @@ int main(int argc, char *argv[])
 				   &option_anchors_zero_fee_htlc_tx,
 				   &option_seq_taproot_covenant,
 				   &option_seq_credit,
+				   &option_seq_symmetric,
 				   &min_relay_feerate)) {
 		master_badmsg(WIRE_ONCHAIND_INIT, msg);
+	}
+
+	/* SEQUENTIA: a symmetric channel's states follow. */
+	if (option_seq_symmetric) {
+		u16 delay;
+		struct sym_state *l, *r, *rp;
+
+		msg = wire_sync_read(tmpctx, REQ_FD);
+		if (!fromwire_onchaind_sym_init(ctx, msg, &sym_funding, &delay,
+						&l, &r, &rp))
+			master_badmsg(WIRE_ONCHAIND_SYM_INIT, msg);
+		sym_channel_init(&sym_sc, &chainparams->genesis_blockhash,
+				 &sym_funding,
+				 &basepoints[opener].delayed_payment,
+				 &basepoints[!opener].delayed_payment,
+				 channel_asset, delay);
+		sym_local = l;
+		sym_remote = r;
+		sym_remote_pending = rp;
+		sym_opener = opener;
+		sym_basepoints[LOCAL] = basepoints[LOCAL];
+		sym_basepoints[REMOTE] = basepoints[REMOTE];
+		sym_best = NULL;
+		if (l && l->has_sig[LOCAL] && l->has_sig[REMOTE])
+			sym_best = l;
+		if (r && r->has_sig[LOCAL] && r->has_sig[REMOTE]
+		    && (!sym_best || r->num > sym_best->num))
+			sym_best = r;
 	}
 
 	/* We need to keep tx around, but there's only one: not really a leak */
@@ -4293,6 +4701,9 @@ int main(int argc, char *argv[])
 	outs = tal_arr(ctx, struct tracked_output *, 0);
 	wally_tx_input_get_txid(tx->inputs[0], &funding.txid);
 	funding.n = tx->inputs[0]->index;
+	/* SEQUENTIA: a kickoff may spend the funding at any input. */
+	if (option_seq_symmetric)
+		funding = sym_funding;
 
 	/* SEQUENTIA: a credit channel's leaves (common/credit_scripts.h): the
 	 * opener provides. */
@@ -4347,6 +4758,9 @@ int main(int argc, char *argv[])
 		record_mutual_close(tx, scriptpubkey[REMOTE],
 				    tx_blockheight);
 		handle_mutual_close(outs, tx);
+	} else if (option_seq_symmetric) {
+		/* SEQUENTIA: the kickoff of a symmetric channel. */
+		handle_symmetric_close(tx, tx_blockheight, outs);
 	} else {
 		/* BOLT #5:
 		 *

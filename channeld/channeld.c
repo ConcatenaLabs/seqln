@@ -20,6 +20,7 @@
 #include <channeld/channeld_wiregen.h>
 #include <channeld/full_channel.h>
 #include <channeld/splice.h>
+#include <channeld/sym_channeld.h>
 #include <channeld/tcov_channel.h>
 #include <channeld/watchtower.h>
 #include <common/billboard.h>
@@ -39,6 +40,7 @@
 #include <common/read_peer_msg.h>
 #include <common/status.h>
 #include <common/subdaemon.h>
+#include <common/sym_channel.h>
 #include <common/timeout.h>
 #include <common/utils.h>
 #include <common/wire_error.h>
@@ -189,6 +191,12 @@ struct peer {
 
 	/* Penalty bases for this channel / peer. */
 	struct penalty_base **pbases;
+
+	/* SEQUENTIA: a symmetric channel's (common/sym_scripts.h): our kickoff
+	 * signature, sent in every commitment_signed, and the peer's state we
+	 * signed last, until its revoke_and_ack hands us its signature on it. */
+	struct bitcoin_signature *sym_kickoff_sig;
+	struct sym_state *sym_remote_pending;
 
 	/* We allow a 'tx-sigs' message between reconnect + channel_ready */
 	bool tx_sigs_allowed;
@@ -889,7 +897,8 @@ static u8 *sending_commitsig_msg(const tal_t *ctx,
 				 struct penalty_base *pbase,
 				 const struct fee_states *fee_states,
 				 const struct height_states *blockheight_states,
-				 const struct htlc **changed_htlcs)
+				 const struct htlc **changed_htlcs,
+				 const struct sym_state *sym_remote)
 {
 	struct changed_htlc *changed;
 	u8 *msg;
@@ -900,7 +909,8 @@ static u8 *sending_commitsig_msg(const tal_t *ctx,
 	msg = towire_channeld_sending_commitsig(ctx, remote_commit_index,
 						remote_per_commit,
 						pbase, fee_states,
-						blockheight_states, changed);
+						blockheight_states, changed,
+						sym_remote);
 	return msg;
 }
 
@@ -1295,6 +1305,42 @@ static u8 *send_commit_part(const tal_t *ctx,
 		cs_tlv->splice_info = tal_dup(cs_tlv, struct bitcoin_txid, &funding->txid);
 	}
 
+	/* SEQUENTIA: a symmetric channel: `signature` is our kickoff
+	 * signature again, there are no HTLC signatures, and our update
+	 * signature on their new state rides in sym_sig. */
+	if (channel_has(peer->channel, OPT_SEQ_SYMMETRIC)) {
+		struct sym_state *st = sym_channeld_state(peer, peer->channel,
+							  REMOTE, remote_index);
+
+		sym_channeld_sign(peer->channel, st,
+				  collect_htlcs(tmpctx, peer->channel, REMOTE));
+		status_debug("Symmetric state %"PRId64" for their commitment"
+			     " %"PRIu64": %zu outputs",
+			     st->num, remote_index, tal_count(st->outs));
+		tal_free(peer->sym_remote_pending);
+		peer->sym_remote_pending = st;
+		cs_tlv->sym_sig = tal_dup(cs_tlv, struct bip340sig,
+					  &st->sig[LOCAL]);
+		*anchor = NULL;
+		if (peer->dev_disable_commit) {
+			(*peer->dev_disable_commit)--;
+			if (*peer->dev_disable_commit == 0)
+				status_unusual("dev-disable-commit-after: disabling");
+		}
+		if (notify_master) {
+			msg = sending_commitsig_msg(NULL, remote_index,
+						    remote_per_commit, NULL,
+						    peer->channel->fee_states,
+						    peer->channel->blockheight_states,
+						    changed_htlcs, st);
+			master_wait_sync_reply(tmpctx, peer, take(msg),
+					       WIRE_CHANNELD_SENDING_COMMITSIG_REPLY);
+		}
+		return towire_commitment_signed(ctx, &peer->channel_id,
+						&peer->sym_kickoff_sig->s,
+						NULL, cs_tlv);
+	}
+
 	txs = channel_txs(tmpctx, funding, funding_sats, &htlc_map,
 			  direct_outputs, &funding_wscript,
 			  peer->channel, remote_per_commit,
@@ -1406,7 +1452,7 @@ save_penalty_base:
 					    pbase,
 					    peer->channel->fee_states,
 					    peer->channel->blockheight_states,
-					    changed_htlcs);
+					    changed_htlcs, NULL);
 		/* Message is empty; receiving it is the point. */
 		master_wait_sync_reply(tmpctx, peer, take(msg),
 				       WIRE_CHANNELD_SENDING_COMMITSIG_REPLY);
@@ -1755,9 +1801,11 @@ static void revoke_commitment(u64 index, struct secret *old_secret, struct pubke
 
 /* revoke_index == current index - 1 (usually; not for retransmission) */
 static u8 *make_revocation_msg(const struct peer *peer, u64 revoke_index,
-			       struct pubkey *point)
+			       struct pubkey *point,
+			       const struct bip340sig *sym_sig)
 {
 	struct secret old_commit_secret;
+	struct tlv_revoke_and_ack_tlvs *tlvs = NULL;
 
 	/* Now that the master has persisted the new commitment advance the HSMD
 	 * and fetch the revocation secret for the old one.
@@ -1768,8 +1816,14 @@ static u8 *make_revocation_msg(const struct peer *peer, u64 revoke_index,
 	 */
 	revoke_commitment(revoke_index, &old_commit_secret, point);
 
+	/* SEQUENTIA: a symmetric channel: our update signature on the state
+	 * that replaces the one we revoke, so they hold it whole. */
+	if (sym_sig) {
+		tlvs = tlv_revoke_and_ack_tlvs_new(tmpctx);
+		tlvs->sym_sig = tal_dup(tlvs, struct bip340sig, sym_sig);
+	}
 	return towire_revoke_and_ack(peer, &peer->channel_id, &old_commit_secret,
-				     point);
+				     point, tlvs);
 }
 
 /* Convert changed htlcs into parts which lightningd expects. */
@@ -1840,7 +1894,8 @@ static void send_revocation(struct peer *peer,
 			     * htlc_sigs) so keyless lightningd can pre-sign the
 			     * honest-close CLASS-B sweeps. */
 			    const struct pubkey *local_per_commit,
-			    const struct got_commitsig_htlc_info *htlc_infos)
+			    const struct got_commitsig_htlc_info *htlc_infos,
+			    const struct sym_state *sym_local)
 {
 	struct changed_htlc *changed;
 	struct fulfilled_htlc *fulfilled;
@@ -1884,14 +1939,16 @@ static void send_revocation(struct peer *peer,
 					       committx,
 					       splice_commitsigs,
 					       local_per_commit,
-					       htlc_infos);
+					       htlc_infos,
+					       sym_local);
 	master_wait_sync_reply(tmpctx, peer, take(msg_for_master),
 			       WIRE_CHANNELD_GOT_COMMITSIG_REPLY);
 
 	/* Now that the master has persisted the new commitment advance the HSMD
 	 * and fetch the revocation secret for the old one. */
 	msg = make_revocation_msg(peer, peer->next_index[LOCAL]-2,
-				  &peer->next_local_per_commit);
+				  &peer->next_local_per_commit,
+				  sym_local ? &sym_local->sig[LOCAL] : NULL);
 
 	/* Now we can finally send revoke_and_ack to peer */
 	peer_write(peer->pps, take(msg));
@@ -2276,6 +2333,13 @@ static struct commitsig_info *handle_peer_commit_sig(struct peer *peer,
 
 	/* SIGHASH_ALL is implied. */
 	commit_sig.sighash_type = SIGHASH_ALL;
+	/* SEQUENTIA: a symmetric channel's commitment is its kickoff. */
+	if (channel_has(peer->channel, OPT_SEQ_SYMMETRIC)) {
+		commit_sig.sighash_type = SIGHASH_SINGLE | SIGHASH_ANYONECANPAY;
+		if (commit_index)
+			peer_failed_err(peer->pps, &peer->channel_id,
+					"A symmetric channel does not splice");
+	}
 	htlc_sigs = unraw_sigs(tmpctx, raw_sigs,
 			       channel_has_anchors(peer->channel));
 
@@ -2410,6 +2474,34 @@ static struct commitsig_info *handle_peer_commit_sig(struct peer *peer,
 					 "error");
 	}
 
+	struct secret *old_secret;
+	struct pubkey next_point;
+	struct sym_state *sym_local = NULL;
+
+	/* SEQUENTIA: a symmetric channel: their update signature on our new
+	 * state, then ours, which a validating signer gives only for a state
+	 * that pays it what it is owed. */
+	if (channel_has(peer->channel, OPT_SEQ_SYMMETRIC)) {
+		if (!cs_tlv->sym_sig)
+			peer_failed_warn(peer->pps, &peer->channel_id,
+					 "commit_sig without an update signature");
+		sym_local = sym_channeld_state(tmpctx, peer->channel, LOCAL,
+					       local_index);
+		if (!sym_channel_check_sig(peer->channel, sym_local, REMOTE,
+					   cs_tlv->sym_sig))
+			peer_failed_warn(peer->pps, &peer->channel_id,
+					 "Bad update signature %s on state"
+					 " %"PRId64" (commitment %"PRIu64")",
+					 fmt_bip340sig(tmpctx, cs_tlv->sym_sig),
+					 sym_local->num, local_index);
+		sym_local->sig[REMOTE] = *cs_tlv->sym_sig;
+		sym_local->has_sig[REMOTE] = true;
+		sym_channeld_sign(peer->channel, sym_local,
+				  collect_htlcs(tmpctx, peer->channel, LOCAL));
+		old_secret = NULL;
+		goto validated;
+	}
+
 	/* As of HSM_VERSION 5 returned old_secret is always NULL (revoke returns it instead) */
 	htlcs = collect_htlcs(NULL, peer->channel, LOCAL);
 	tell_hsm_point_locks(peer->channel, LOCAL);
@@ -2422,12 +2514,12 @@ static struct commitsig_info *handle_peer_commit_sig(struct peer *peer,
 						  htlc_sigs);
 	tal_free(htlcs);
 	msg2 = hsm_req(tmpctx, take(msg2));
-	struct secret *old_secret;
-	struct pubkey next_point;
 	if (!fromwire_hsmd_validate_commitment_tx_reply(tmpctx, msg2, &old_secret, &next_point))
 		status_failed(STATUS_FAIL_HSM_IO,
 			      "Reading validate_commitment_tx reply: %s",
 			      tal_hex(tmpctx, msg2));
+
+validated:
 
 	struct commitsig *commitsig;
 	commitsig = tal(tmpctx, struct commitsig);
@@ -2513,7 +2605,7 @@ static struct commitsig_info *handle_peer_commit_sig(struct peer *peer,
 
 	send_revocation(peer, &commit_sig, htlc_sigs, changed_htlcs, txs[0],
 			old_secret, &next_point, commitsigs,
-			local_per_commit, htlc_infos);
+			local_per_commit, htlc_infos, sym_local);
 
 	tal_steal(tmpctx, result);
 	tal_free(commitsigs);
@@ -2724,7 +2816,8 @@ static u8 *got_revoke_msg(struct peer *peer, u64 revoke_num,
 			  const struct pubkey *next_per_commit_point,
 			  const struct htlc **changed_htlcs,
 			  const struct fee_states *fee_states,
-			  const struct height_states *blockheight_states)
+			  const struct height_states *blockheight_states,
+			  const struct sym_state *sym_remote)
 {
 	u8 *msg;
 	struct penalty_base *pbase;
@@ -2786,7 +2879,8 @@ static u8 *got_revoke_msg(struct peer *peer, u64 revoke_num,
 					blockheight_states, changed,
 					pbase, ptx,
 					cast_const2(const struct watchtower_blob **,
-						    wt_blobs));
+						    wt_blobs),
+					sym_remote);
 	tal_free(ptx);
 	return msg;
 }
@@ -2799,9 +2893,11 @@ static void handle_peer_revoke_and_ack(struct peer *peer, const u8 *msg)
 	const u8 *revocation_msg;
 	struct pubkey per_commit_point, next_per_commit;
 	const struct htlc **changed_htlcs = tal_arr(msg, const struct htlc *, 0);
+	struct tlv_revoke_and_ack_tlvs *tlvs;
+	struct sym_state *sym_remote = NULL;
 
-	if (!fromwire_revoke_and_ack(msg, &channel_id, &old_commit_secret,
-				     &next_per_commit)) {
+	if (!fromwire_revoke_and_ack(tmpctx, msg, &channel_id, &old_commit_secret,
+				     &next_per_commit, &tlvs)) {
 		peer_failed_warn(peer->pps, &peer->channel_id,
 				 "Bad revoke_and_ack %s", tal_hex(msg, msg));
 	}
@@ -2845,6 +2941,38 @@ static void handle_peer_revoke_and_ack(struct peer *peer, const u8 *msg)
 				fmt_pubkey(msg, &peer->old_remote_per_commit));
 	}
 
+	/* SEQUENTIA: a symmetric channel: their signature on the state that
+	 * replaces the one they revoke, the one we signed last (rebuilt if we
+	 * restarted since), before this revocation moves anything. */
+	if (channel_has(peer->channel, OPT_SEQ_SYMMETRIC)) {
+		u64 idx = peer->next_index[REMOTE] - 1;
+
+		if (peer->sym_remote_pending
+		    && peer->sym_remote_pending->commit_num == idx)
+			sym_remote = tal_steal(tmpctx, peer->sym_remote_pending);
+		else {
+			sym_remote = sym_channeld_state(tmpctx, peer->channel,
+							REMOTE, idx);
+			sym_channeld_sign(peer->channel, sym_remote,
+					  collect_htlcs(tmpctx, peer->channel,
+							REMOTE));
+		}
+		peer->sym_remote_pending = NULL;
+		if (!tlvs->sym_sig)
+			peer_failed_err(peer->pps, &peer->channel_id,
+					"revoke_and_ack without an update"
+					" signature");
+		if (!sym_channel_check_sig(peer->channel, sym_remote, REMOTE,
+					   tlvs->sym_sig))
+			peer_failed_err(peer->pps, &peer->channel_id,
+					"Bad update signature %s on their state"
+					" %"PRId64,
+					fmt_bip340sig(tmpctx, tlvs->sym_sig),
+					sym_remote->num);
+		sym_remote->sig[REMOTE] = *tlvs->sym_sig;
+		sym_remote->has_sig[REMOTE] = true;
+	}
+
 	/* We start timer even if this returns false: we might have delayed
 	 * commit because we were waiting for this! */
 	if (channel_rcvd_revoke_and_ack(peer->channel, &changed_htlcs))
@@ -2857,7 +2985,8 @@ static void handle_peer_revoke_and_ack(struct peer *peer, const u8 *msg)
 			     &old_commit_secret, &next_per_commit,
 			     changed_htlcs,
 			     peer->channel->fee_states,
-			     peer->channel->blockheight_states);
+			     peer->channel->blockheight_states,
+			     sym_remote);
 	master_wait_sync_reply(tmpctx, peer, take(msg),
 			       WIRE_CHANNELD_GOT_REVOKE_REPLY);
 
@@ -5501,7 +5630,21 @@ static void resend_revoke(struct peer *peer)
 {
 	struct pubkey point;
 	/* Current commit is peer->next_index[LOCAL]-1, revoke prior */
-	u8 *msg = make_revocation_msg(peer, peer->next_index[LOCAL]-2, &point);
+	struct bip340sig *sym_sig = NULL;
+	u8 *msg;
+
+	/* SEQUENTIA: a symmetric channel: our signature on the state that
+	 * replaces it, again (deterministic). */
+	if (channel_has(peer->channel, OPT_SEQ_SYMMETRIC)) {
+		struct sym_state *st
+			= sym_channeld_state(tmpctx, peer->channel, LOCAL,
+					     peer->next_index[LOCAL] - 1);
+		sym_channeld_sign(peer->channel, st,
+				  collect_htlcs(tmpctx, peer->channel, LOCAL));
+		sym_sig = &st->sig[LOCAL];
+	}
+	msg = make_revocation_msg(peer, peer->next_index[LOCAL]-2, &point,
+				  sym_sig);
 	peer_write(peer->pps, take(msg));
 }
 
@@ -7334,6 +7477,15 @@ static void init_channel(struct peer *peer)
 			status_failed(STATUS_FAIL_HSM_IO,
 				      "Bad setup_channel_reply %s",
 				      tal_hex(tmpctx, reply));
+	}
+
+	/* SEQUENTIA: a symmetric channel sends our kickoff signature in each
+	 * commitment_signed: it is the same for every state. */
+	peer->sym_remote_pending = NULL;
+	peer->sym_kickoff_sig = NULL;
+	if (channel_has(peer->channel, OPT_SEQ_SYMMETRIC)) {
+		peer->sym_kickoff_sig = tal(peer, struct bitcoin_signature);
+		sym_channeld_kickoff_sig(peer->channel, peer->sym_kickoff_sig);
 	}
 
 	/* Default desired feerate is the feerate we set for them last. */

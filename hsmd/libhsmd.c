@@ -15,6 +15,8 @@
 #include <common/lease_rates.h>
 #include <common/memleak.h>
 #include <common/status.h>
+#include <common/sym_scripts.h>
+#include <common/sym_state.h>
 #include <common/utils.h>
 #include <hsmd/libhsmd.h>
 #include <hsmd/permissions.h>
@@ -127,6 +129,8 @@ bool hsmd_check_client_capabilities(struct hsmd_client *client,
 	case WIRE_HSMD_VALIDATE_REVOCATION:
 	case WIRE_HSMD_TCOV_HTLC_LOCKS:
 	case WIRE_HSMD_CREDIT_NOTE:
+	case WIRE_HSMD_SIGN_SYM_KICKOFF:
+	case WIRE_HSMD_SIGN_SYM_STATE:
 		return (client->capabilities & HSM_PERM_SIGN_REMOTE_TX) != 0;
 
 	case WIRE_HSMD_SIGN_MUTUAL_CLOSE_TX:
@@ -177,6 +181,7 @@ bool hsmd_check_client_capabilities(struct hsmd_client *client,
 	case WIRE_HSMD_SIGN_TCOV_PENALTY:
 	case WIRE_HSMD_SIGN_TCOV_PAYMENT_TO_US:
 	case WIRE_HSMD_SIGN_CREDIT_NOTE:
+	case WIRE_HSMD_SIGN_SYM_HTLC:
 		return (client->capabilities & HSM_PERM_MASTER) != 0;
 
 	/*~ These are messages sent by the HSM so we should never receive them. */
@@ -226,6 +231,7 @@ bool hsmd_check_client_capabilities(struct hsmd_client *client,
 	case WIRE_HSMD_TCOV_HTLC_LOCKS_REPLY:
 	case WIRE_HSMD_SIGN_CREDIT_NOTE_REPLY:
 	case WIRE_HSMD_CREDIT_NOTE_REPLY:
+	case WIRE_HSMD_SIGN_SYM_STATE_REPLY:
 	case WIRE_HSMD_SIGN_ANY_CANNOUNCEMENT_REPLY:
 		break;
 	}
@@ -2475,6 +2481,103 @@ static u8 *handle_sign_tcov_penalty(struct hsmd_client *c, const u8 *msg_in)
 			 &privkey);
 }
 
+/*~ SEQUENTIA: the symmetric channel type (common/sym_scripts.h).  The
+ * kickoff is the one transaction our funding key signs while the channel is
+ * open, besides a mutual close: SIGHASH_SINGLE|SIGHASH_ANYONECANPAY, so a
+ * fee input can join it at broadcast.  A signer that holds a balance (the
+ * Rust device) checks that it is the channel's own kickoff first. */
+static u8 *handle_sign_sym_kickoff(struct hsmd_client *c, const u8 *msg_in)
+{
+	struct pubkey remote_funding_pubkey, local_funding_pubkey;
+	struct secret channel_seed;
+	struct bitcoin_tx *tx;
+	struct bitcoin_signature sig;
+	struct secrets secrets;
+	const u8 *funding_wscript;
+
+	if (!fromwire_hsmd_sign_sym_kickoff(tmpctx, msg_in, &tx,
+					    &remote_funding_pubkey))
+		return hsmd_status_malformed_request(c, msg_in);
+	tx->chainparams = c->chainparams ? c->chainparams : chainparams;
+	if (tx->wtx->num_inputs != 1 || tx->wtx->num_outputs < 1)
+		return hsmd_status_bad_request_fmt(c, msg_in,
+						   "a kickoff has one input");
+
+	get_channel_seed(&c->id, c->dbid, &channel_seed);
+	derive_basepoints(&channel_seed, &local_funding_pubkey, NULL,
+			  &secrets, NULL);
+	funding_wscript = bitcoin_redeem_2of2(tmpctx, &local_funding_pubkey,
+					      &remote_funding_pubkey);
+	sign_tx_input(tx, 0, NULL, funding_wscript, &secrets.funding_privkey,
+		      &local_funding_pubkey,
+		      SIGHASH_SINGLE | SIGHASH_ANYONECANPAY, &sig);
+	return towire_hsmd_sign_tx_reply(NULL, &sig);
+}
+
+/* A state's update signature: by our delayed payment basepoint's key, which
+ * this type uses for nothing else.  The message binds the chain, the
+ * channel and the state's settlement; this signer checks nothing more. */
+static u8 *handle_sign_sym_state(struct hsmd_client *c, const u8 *msg_in)
+{
+	struct bitcoin_outpoint funding;
+	bool we_opened;
+	struct pubkey remote_update_key;
+	u8 asset[33];
+	u16 delay;
+	struct sym_state *st;
+	struct hsm_htlc *htlcs;
+	struct secret channel_seed;
+	struct pubkey our_key;
+	struct privkey privkey;
+	struct sym_channel sc;
+	struct sym_tree tree;
+	struct sha256 msg;
+	struct bip340sig sig;
+
+	if (!fromwire_hsmd_sign_sym_state(tmpctx, msg_in, &funding, &we_opened,
+					  &remote_update_key, asset, &delay,
+					  &st, &htlcs))
+		return hsmd_status_malformed_request(c, msg_in);
+	if (tal_count(st->outs) == 0 || st->num < 0)
+		return hsmd_status_bad_request_fmt(c, msg_in, "empty state");
+
+	get_channel_seed(&c->id, c->dbid, &channel_seed);
+	if (!derive_delayed_payment_basepoint(&channel_seed, &our_key,
+					      &privkey.secret))
+		return hsmd_status_bad_request_fmt(c, msg_in,
+						   "cannot derive the update key");
+	sym_channel_init(&sc, &chainparams->genesis_blockhash, &funding,
+			 we_opened ? &our_key : &remote_update_key,
+			 we_opened ? &remote_update_key : &our_key,
+			 asset, delay);
+	sym_state_tree_of(tmpctx, &sc, st, &tree);
+	sym_upd_msg(&sc, &tree, &msg);
+	tap_sign(&msg, &privkey, &sig);
+	return towire_hsmd_sign_sym_state_reply(NULL, &sig);
+}
+
+/* A settlement HTLC output, by the leaf that pays us: our HTLC basepoint's
+ * key, untweaked. */
+static u8 *handle_sign_sym_htlc(struct hsmd_client *c, const u8 *msg_in)
+{
+	u64 dbid;
+	struct bitcoin_tx *tx;
+	u8 *leaf;
+	u32 input_num;
+	struct node_id peer_id;
+	struct secret channel_seed;
+	struct privkey privkey;
+
+	if (!fromwire_hsmd_sign_sym_htlc(tmpctx, msg_in, &tx, &input_num,
+					 &leaf, &peer_id, &dbid))
+		return hsmd_status_malformed_request(c, msg_in);
+	get_channel_seed(&peer_id, dbid, &channel_seed);
+	if (!derive_htlc_basepoint(&channel_seed, NULL, &privkey.secret))
+		return hsmd_status_bad_request_fmt(c, msg_in,
+						   "cannot derive the HTLC key");
+	return tcov_sign(c, msg_in, tx, input_num, leaf, NULL, &privkey);
+}
+
 u8 *hsmd_handle_client_message(const tal_t *ctx, struct hsmd_client *client,
 			       const u8 *msg)
 {
@@ -2618,6 +2721,12 @@ u8 *hsmd_handle_client_message(const tal_t *ctx, struct hsmd_client *client,
 		return handle_credit_note(client, msg);
 	case WIRE_HSMD_SIGN_TCOV_PAYMENT_TO_US:
 		return handle_sign_tcov_payment_to_us(client, msg);
+	case WIRE_HSMD_SIGN_SYM_KICKOFF:
+		return handle_sign_sym_kickoff(client, msg);
+	case WIRE_HSMD_SIGN_SYM_STATE:
+		return handle_sign_sym_state(client, msg);
+	case WIRE_HSMD_SIGN_SYM_HTLC:
+		return handle_sign_sym_htlc(client, msg);
 
 	case WIRE_HSMD_DEV_MEMLEAK:
 	case WIRE_HSMD_ECDH_RESP:
@@ -2664,6 +2773,7 @@ u8 *hsmd_handle_client_message(const tal_t *ctx, struct hsmd_client *client,
 	case WIRE_HSMD_SIGN_TCOV_REPLY:
 	case WIRE_HSMD_SIGN_CREDIT_NOTE_REPLY:
 	case WIRE_HSMD_CREDIT_NOTE_REPLY:
+	case WIRE_HSMD_SIGN_SYM_STATE_REPLY:
 	case WIRE_HSMD_SIGN_ANY_CANNOUNCEMENT_REPLY:
 		break;
 	}
@@ -2763,6 +2873,9 @@ u8 *hsmd_init(const u8 *secret_data, size_t secret_len, const u64 hsmd_version,
 		WIRE_HSMD_SIGN_CREDIT_NOTE,
 		WIRE_HSMD_CREDIT_NOTE,
 		WIRE_HSMD_SIGN_TCOV_PAYMENT_TO_US,
+		WIRE_HSMD_SIGN_SYM_KICKOFF,
+		WIRE_HSMD_SIGN_SYM_STATE,
+		WIRE_HSMD_SIGN_SYM_HTLC,
 	};
 	u32 *caps;
 

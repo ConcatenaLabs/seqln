@@ -45,6 +45,7 @@ LIGHTNINGD_SRC :=				\
 	lightningd/routehint.c			\
 	lightningd/runes.c			\
 	lightningd/subd.c			\
+	lightningd/symmetric.c			\
 	lightningd/wait.c			\
 	lightningd/watch.c			\
 	lightningd/watchtower_store.c

@@ -174,4 +174,9 @@ struct feature_set *feature_set_dup(const tal_t *ctx,
  * credit notes, the other holds them. */
 #define OPT_SEQ_CREDIT				176
 
+/* SEQUENTIA: the symmetric channel type (common/sym_scripts.h): an old state
+ * is replaced by a newer one, never punished.  Offered with
+ * --symmetric-channels where the chain has tapscript introspection. */
+#define OPT_SEQ_SYMMETRIC			178
+
 #endif /* LIGHTNING_COMMON_FEATURES_H */

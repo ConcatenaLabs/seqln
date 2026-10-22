@@ -70,7 +70,7 @@ generate-bolt-csv-patch: bolt-precheck
 # tlvs_n1 and n2 are used for test vectors, thus not referenced: expose them
 # for testing and to prevent compile error about them being unused.
 # This will be easier if test vectors are moved to separate files.
-wire/peer_wiregen.h_args := --include='common/channel_id.h' --include='bitcoin/tx.h' --include='bitcoin/preimage.h' --include='bitcoin/short_channel_id.h' --include='common/node_id.h' --include='common/bigsize.h' --include='bitcoin/block.h' --include='bitcoin/privkey.h' -s --expose-tlv-type=tlv_n1 --expose-tlv-type=tlv_n2
+wire/peer_wiregen.h_args := --include='common/channel_id.h' --include='bitcoin/tx.h' --include='bitcoin/preimage.h' --include='bitcoin/short_channel_id.h' --include='common/node_id.h' --include='common/bigsize.h' --include='bitcoin/block.h' --include='bitcoin/privkey.h' --include='bitcoin/signature.h' -s --expose-tlv-type=tlv_n1 --expose-tlv-type=tlv_n2
 
 wire/peer_wiregen.c_args := -s --expose-tlv-type=tlv_n1 --expose-tlv-type=tlv_n2
 
@@ -100,7 +100,7 @@ wire/bolt12_exp_wiregen.c_args := $(wire/bolt12_wiregen.c_args)
 wire/bolt12_exp_printgen.h_args := $(wire/bolt12_printgen.h_args)
 wire/bolt12_exp_printgen.c_args := $(wire/bolt12_printgen.c_args)
 
-wire/peer_wiregen.h_args := --include='common/channel_id.h' --include='bitcoin/tx.h' --include='bitcoin/preimage.h' --include='bitcoin/short_channel_id.h' --include='common/node_id.h' --include='common/bigsize.h' --include='bitcoin/block.h' --include='bitcoin/privkey.h' -s --expose-tlv-type=tlv_n1 --expose-tlv-type=tlv_n2
+wire/peer_wiregen.h_args := --include='common/channel_id.h' --include='bitcoin/tx.h' --include='bitcoin/preimage.h' --include='bitcoin/short_channel_id.h' --include='common/node_id.h' --include='common/bigsize.h' --include='bitcoin/block.h' --include='bitcoin/privkey.h' --include='bitcoin/signature.h' -s --expose-tlv-type=tlv_n1 --expose-tlv-type=tlv_n2
 
 wire/channel_type_wiregen.h_args := -s
 wire/channel_type_wiregen.c_args := $(wire/channel_type_wiregen.h_args)
