@@ -12,7 +12,10 @@ validate_live_blocks.py). Three checks:
   2. walk mechanics on live data: forcing the tip "uncertified" returns tip-1
   3. synthetic uncertified suffix: top 3 blocks uncertified -> frontier == tip-3
 """
-import json, os, subprocess, sys
+import json
+import os
+import subprocess
+import sys
 
 ELEMCLI = os.environ.get("ELEMCLI", "sequentia-cli")
 RPC = ["-chain=test"]
@@ -23,12 +26,15 @@ for flag, var in (("-rpcconnect=", "SEQ_RPC_HOST"), ("-rpcport=", "SEQ_RPC_PORT"
 
 LOOKBACK = 144  # must match SEQUENTIA_CERT_LOOKBACK in bcli.c
 
+
 def cli(*args):
     return subprocess.run([ELEMCLI, *RPC, *args], capture_output=True,
                           text=True, timeout=30).stdout.strip()
 
+
 def real_certified(h, hsh):
     return json.loads(cli("getblockheader", hsh))["poscertified"]
+
 
 def frontier(tip, tip_hash, is_cert):
     """Exact mirror of sequentia_certified_frontier()."""
@@ -42,6 +48,7 @@ def frontier(tip, tip_hash, is_cert):
             return h
         back += 1
     return tip  # fail-open (committee stalled)
+
 
 def main():
     info = json.loads(cli("getblockchaininfo"))
@@ -73,6 +80,7 @@ def main():
 
     print("\nPASS" if ok else "\nFAIL")
     sys.exit(0 if ok else 1)
+
 
 if __name__ == "__main__":
     main()

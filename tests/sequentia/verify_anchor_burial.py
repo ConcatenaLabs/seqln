@@ -10,7 +10,10 @@ to tail truncation until then, and an SCID must never be invalidated.
 
 Point at a node via ELEMCLI + SEQ_RPC_{HOST,PORT,USER,PASS}.
 """
-import json, os, subprocess, sys
+import json
+import os
+import subprocess
+import sys
 
 ELEMCLI = os.environ.get("ELEMCLI", "sequentia-cli")
 RPC = ["-chain=test"]
@@ -19,9 +22,11 @@ for flag, var in (("-rpcconnect=", "SEQ_RPC_HOST"), ("-rpcport=", "SEQ_RPC_PORT"
     if os.environ.get(var):
         RPC.append(flag + os.environ[var])
 
+
 def cli(*a):
     return subprocess.run([ELEMCLI, *RPC, *a], capture_output=True,
                           text=True, timeout=30).stdout.strip()
+
 
 def main():
     tip = int(cli("getblockcount"))
@@ -101,12 +106,13 @@ def main():
         edge = max(cand)
         r5 = "ok" if buried_walk(edge, 2) and not buried_walk(edge + 1, 2) else "FAIL"
         ok &= buried_walk(edge, 2) and not buried_walk(edge + 1, 2)
-        print(f"  [5] k=2 boundary at height {edge} (buried) / {edge+1} (not)     {r5}")
+        print(f"  [5] k=2 boundary at height {edge} (buried) / {edge + 1} (not)     {r5}")
     else:
         print(f"  [5] k=2 boundary: SKIP (anchor span {span} < 2 in window)")
 
     print("\nPASS" if ok else "\nFAIL")
     sys.exit(0 if ok else 1)
+
 
 if __name__ == "__main__":
     main()

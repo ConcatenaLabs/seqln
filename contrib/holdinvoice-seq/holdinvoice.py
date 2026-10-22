@@ -38,6 +38,8 @@ import importlib.util
 # eagerly imports gossmap -> pyln.spec -> pyln.proto -> coincurve (a compiled
 # dep not installed here). plugin.py + lightning.py are stdlib-only, so we load
 # them directly with stub parent packages.
+
+
 def _find_pyln_client_dir():
     import os
     # Search upward from this file for a CLN tree's contrib/pyln-client, then
@@ -65,6 +67,7 @@ def _load_pyln_plugin():
     sys.modules["pyln.client.plugin"] = mod
     spec.loader.exec_module(mod)
     return mod.Plugin
+
 
 Plugin = _load_pyln_plugin()
 

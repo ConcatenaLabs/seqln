@@ -64,8 +64,8 @@ def test_keyless_trimmed_payments_keep_the_balance(node_factory, bitcoind, direc
     device, l1, l2, asset = channel_pair(node_factory, bitcoind, directory, CHEAP, opener)
     try:
         for i, (payer, payee, atoms) in enumerate([(l1, l2, 4_000), (l2, l1, 3_000),
-                                                    (l1, l2, 50_000), (l1, l2, 1_000),
-                                                    (l2, l1, 20_000), (l2, l1, 2_500)]):
+                                                   (l1, l2, 50_000), (l1, l2, 1_000),
+                                                   (l2, l1, 20_000), (l2, l1, 2_500)]):
             inv = payee.rpc.invoice(atoms * 1000, 'p{}'.format(i), 'p')['bolt11']
             assert payer.rpc.pay(inv)['status'] == 'complete'
             wait_for(lambda: settled(l1, l2))
