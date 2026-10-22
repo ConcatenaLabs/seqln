@@ -992,15 +992,23 @@ static struct command_result *json_pay(struct command *cmd,
 			    "Invalid bolt11:"
 			    " sets feature var_onion with no secret");
 		/* SEQUENTIA: a payee that takes point locks, paid by a node
-		 * that offers them: lock the payment to its point
-		 * (common/point_lock.h), as one part, falling back to the
-		 * hash lock if no route takes point locks. */
+		 * that offers them and has a channel whose type carries
+		 * them: lock the payment to its point (common/point_lock.h),
+		 * as one part, falling back to the hash lock if no route
+		 * takes point locks. */
 		if (b11->payment_point
 		    && feature_offered(b11->features, OPT_SEQ_POINT_LOCKS)
 		    && feature_offered(plugin_feature_set(cmd->plugin)
 				       ->bits[INIT_FEATURE],
 				       OPT_SEQ_POINT_LOCKS)
-		    && !node_id_eq(&my_id, p->pay_destination)) {
+		    && !node_id_eq(&my_id, p->pay_destination))
+			p->point_lock_chans
+				= payment_point_lock_channels(p, cmd);
+		if (p->point_lock_chans && !tal_count(p->point_lock_chans))
+			paymod_log(p, LOG_INFORM,
+				   "Paying by hash lock, not point lock:"
+				   " no channel of ours carries point locks");
+		if (p->point_lock_chans && tal_count(p->point_lock_chans)) {
 			do
 				randbytes(&p->point_c, sizeof(p->point_c));
 			while (!point_lock_tweak(b11->payment_point,

@@ -115,7 +115,9 @@ struct payment *payment_new(tal_t *ctx, struct command *cmd,
 	p->asset = parent ? parent->asset : NULL;
 	/* SEQUENTIA: point locks live on the root payment. */
 	p->point_lock = NULL;
-	p->point_lock_sent = false;
+	p->point_lock_chans = NULL;
+	p->point_lock_refused = tal_arr(p, struct short_channel_id_dir, 0);
+	p->point_locked = false;
 	p->point_lock_routing = false;
 
 	/* Copy over the relevant pieces of information. */
@@ -693,17 +695,75 @@ static bool payment_point_lock_hop_ok(const struct gossmap *gossmap,
 	return gossmap_node_get_feature(gossmap, n, OPT_SEQ_POINT_LOCKS) != -1;
 }
 
-/* The payment falls back to its hash lock, unless an attempt already went
- * out point-locked. */
+/* Can a point-locked HTLC go over channel @scidd, which leaves node @from?
+ * Not over a channel a node refused one on; and from us, only over one of
+ * our channels whose type carries one. */
+static bool payment_point_lock_chan_ok(struct payment *p,
+				       const struct node_id *from,
+				       const struct short_channel_id_dir *scidd)
+{
+	const struct payment *root = payment_root(p);
+
+	for (size_t i = 0; i < tal_count(root->point_lock_refused); i++)
+		if (short_channel_id_dir_eq(&root->point_lock_refused[i],
+					    scidd))
+			return false;
+	if (!root->point_lock_chans || !node_id_eq(from, p->local_id))
+		return true;
+	for (size_t i = 0; i < tal_count(root->point_lock_chans); i++)
+		if (short_channel_id_eq(root->point_lock_chans[i], scidd->scid))
+			return true;
+	return false;
+}
+
+/* A node refused a point-locked HTLC on @scid in @direction. */
+static void payment_point_lock_refused(struct payment *p,
+				       struct short_channel_id scid,
+				       int direction)
+{
+	struct short_channel_id_dir scidd = { .scid = scid,
+					      .dir = direction };
+
+	paymod_log(p, LOG_INFORM, "Channel %s took no point lock",
+		   fmt_short_channel_id_dir(tmpctx, &scidd));
+	tal_arr_expand(&payment_root(p)->point_lock_refused, scidd);
+}
+
+/* Has an attempt under @p gone out point-locked, with no failure back?
+ * lightningd answers waitsendpay with one of these codes only once the
+ * attempt's HTLC has failed (and the answer's "status" can still read
+ * "pending" then: it is the payment's in memory, not yet updated). */
+static bool payment_point_lock_pending(const struct payment *p)
+{
+	if (p->point_locked
+	    && !(p->result
+		 && (p->result->state == PAYMENT_FAILED
+		     || p->result->code == PAY_TRY_OTHER_ROUTE
+		     || p->result->code == PAY_DESTINATION_PERM_FAIL
+		     || p->result->code == PAY_UNPARSEABLE_ONION)))
+		return true;
+	for (size_t i = 0; i < tal_count(p->children); i++)
+		if (payment_point_lock_pending(p->children[i]))
+			return true;
+	return false;
+}
+
+/* The payment falls back to its hash lock, unless a point-locked attempt
+ * is still out: every one that went out has failed back, so nothing is
+ * locked to the point any more, and an HTLC under the invoice's hash
+ * cannot pay the payee a second time. */
 static bool payment_point_lock_fallback(struct payment *p, const char *why)
 {
 	struct payment *root = payment_root(p);
 
-	if (!root->point_lock || root->point_lock_sent)
+	if (!root->point_lock || payment_point_lock_pending(root))
 		return false;
 	paymod_log(p, LOG_INFORM,
 		   "Paying by hash lock, not point lock: %s", why);
 	root->point_lock = tal_free(root->point_lock);
+	/* lightningd has no payment under the invoice's hash yet: the first
+	 * attempt under it carries the invoice. */
+	root->invstring_used = false;
 	return true;
 }
 
@@ -741,12 +801,23 @@ static bool payment_route_check(const struct gossmap *gossmap,
 		return false;
 
 	/* SEQUENTIA: a point-locked payment goes only through nodes that
-	 * take point locks (the payee says so in its invoice). */
-	if (payment_root(p)->point_lock && payment_root(p)->point_lock_routing
-	    && !payment_point_lock_hop_ok(gossmap,
-					  gossmap_nth_node(gossmap, c, !dir),
-					  p))
-		return false;
+	 * take point locks (the payee says so in its invoice), and over
+	 * channels that carry them. */
+	if (payment_root(p)->point_lock && payment_root(p)->point_lock_routing) {
+		struct node_id from;
+		struct short_channel_id_dir pscidd;
+
+		if (!payment_point_lock_hop_ok(gossmap,
+					       gossmap_nth_node(gossmap, c, !dir),
+					       p))
+			return false;
+		gossmap_node_get_id(gossmap, gossmap_nth_node(gossmap, c, dir),
+				    &from);
+		pscidd.scid = gossmap_chan_scid(gossmap, c);
+		pscidd.dir = dir;
+		if (!payment_point_lock_chan_ok(p, &from, &pscidd))
+			return false;
+	}
 
 	if (dst_is_excluded(gossmap, c, dir, p->temp_exclusion))
 		return false;
@@ -955,9 +1026,10 @@ static struct command_result *payment_getroute(struct payment *p)
 			 p->getroute->riskfactorppm / 1000000.0, p->getroute->max_hops,
 			 p, &errstr);
 	payment_root(p)->point_lock_routing = false;
-	/* SEQUENTIA: no route whose every node takes point locks: the
-	 * payment goes by its hash lock, if nothing went out yet. */
-	if (!p->route
+	/* SEQUENTIA: no route whose every node and channel takes point
+	 * locks: the payment tries its next route hint, if it has one
+	 * (failroute_retry), and otherwise goes by its hash lock. */
+	if (!p->route && !p->failroute_retry
 	    && payment_point_lock_fallback(p, "no route through nodes that"
 					   " all take point locks"))
 		p->route = route(p, gossmap, src, dst, p->getroute->amount,
@@ -1512,10 +1584,19 @@ handle_intermediate_failure(struct command *cmd,
 	case WIRE_MPP_TIMEOUT:
 		goto strange_error;
 
+	case WIRE_REQUIRED_CHANNEL_FEATURE_MISSING:
+		/* SEQUENTIA: refused because the HTLC was point-locked and
+		 * the channel's type takes none.  It still carries hash
+		 * locks: route point locks around it, but keep it. */
+		if (p->point_locked) {
+			payment_point_lock_refused(p, errchan->scid,
+						   errchan->direction);
+			goto error;
+		}
+		/* Fall thru */
 	case WIRE_PERMANENT_CHANNEL_FAILURE:
 	case WIRE_CHANNEL_DISABLED:
 	case WIRE_UNKNOWN_NEXT_PEER:
-	case WIRE_REQUIRED_CHANNEL_FEATURE_MISSING:
 		/* All of these result in the channel being marked as disabled. */
 		channel_hints_update(root, errchan->scid, errchan->direction,
 				     false, false, NULL, errchan->capacity,
@@ -1805,6 +1886,33 @@ payment_waitsendpay_finished(struct command *cmd,
 	return payment_addgossip_success(cmd, NULL, NULL, NULL, p);
 }
 
+/* SEQUENTIA: lightningd refused to send a point-locked attempt on our
+ * first channel (its type, or its peer, takes no point lock): nothing went
+ * out, so route the next attempt around that channel. */
+static struct command_result *payment_sendonion_failure(struct command *cmd,
+							const char *method,
+							const char *buffer,
+							const jsmntok_t *toks,
+							struct payment *p)
+{
+	if (p->point_locked) {
+		const jsmntok_t *data = json_get_member(buffer, toks, "data");
+		const jsmntok_t *fc = data ? json_get_member(buffer, data,
+							     "failcode")
+					   : NULL;
+		u32 failcode;
+
+		p->point_locked = false;
+		if (fc && json_to_u32(buffer, fc, &failcode)
+		    && failcode == WIRE_REQUIRED_CHANNEL_FEATURE_MISSING) {
+			payment_point_lock_refused(p, p->route[0].scid,
+						   p->route[0].direction);
+			p->failroute_retry = true;
+		}
+	}
+	return payment_rpc_failure(cmd, method, buffer, toks, p);
+}
+
 static struct command_result *payment_sendonion_success(struct command *cmd,
 							const char *method,
 							const char *buffer,
@@ -1848,7 +1956,7 @@ static struct command_result *payment_createonion_success(struct command *cmd,
 
 	req = jsonrpc_request_start(payment_cmd(p), "sendonion",
 				    payment_sendonion_success,
-				    payment_rpc_failure, p);
+				    payment_sendonion_failure, p);
 	json_add_hex_talarr(req->js, "onion", p->createonion_response->onion);
 
 	json_object_start(req->js, "first_hop");
@@ -1862,7 +1970,7 @@ static struct command_result *payment_createonion_success(struct command *cmd,
 	json_add_amount_msat(req->js, "amount_msat", p->our_amount);
 	if (root->point_lock) {
 		json_add_pubkey(req->js, "lock_point", &root->point_lock0);
-		root->point_lock_sent = true;
+		p->point_locked = true;
 	}
 
 	json_array_start(req->js, "shared_secrets");
@@ -2036,21 +2144,9 @@ static struct command_result *payment_compute_onion_payloads(struct payment *p)
 	p->step = PAYMENT_STEP_ONION_PAYLOAD;
 	hopcount = tal_count(p->route);
 
-	/* Now that we are about to fix the route parameters by
-	 * encoding them in an onion is the right time to update the
-	 * channel hints. */
-	if (!payment_chanhints_apply_route(p)) {
-		/* We can still end up with a failed channel_hints
-		 * update, either because a plugin changed the route,
-		 * or because a modifier was not synchronous, allowing
-		 * for multiple concurrent routes being built. If that
-		 * is the case, discard this route and retry. */
-		payment_set_step(p, PAYMENT_STEP_RETRY_GETROUTE);
-		return payment_continue(p);
-	}
-
 	/* SEQUENTIA: a point-locked attempt needs every node on its route
-	 * (route hints included) to take point locks. */
+	 * (route hints included) to take point locks, and every channel to
+	 * carry them.  Checked before the channel hints take this route. */
 	if (root->point_lock && !root->blindedpath) {
 		const char *bad = NULL;
 		struct gossmap *gossmap = get_gossmap(p);
@@ -2063,9 +2159,41 @@ static struct command_result *payment_compute_onion_payloads(struct payment *p)
 					      fmt_node_id(tmpctx,
 							  &p->route[i].node_id));
 		}
+		for (size_t i = 0; i < hopcount && !bad; i++) {
+			struct short_channel_id_dir scidd = {
+				.scid = p->route[i].scid,
+				.dir = p->route[i].direction };
+			if (!payment_point_lock_chan_ok(
+				p, i ? &p->route[i - 1].node_id : p->local_id,
+				&scidd))
+				bad = tal_fmt(tmpctx, "channel %s carries no"
+					      " point locks",
+					      fmt_short_channel_id(tmpctx,
+								   scidd.scid));
+		}
 		put_gossmap(p);
+		/* Another route hint may lead to the payee over channels
+		 * that carry point locks: try it first (a failed attempt
+		 * with no route moves on to the next hint). */
+		if (bad && p->failroute_retry) {
+			p->route = tal_free(p->route);
+			return payment_fail(p, "%s", bad);
+		}
 		if (bad && !payment_point_lock_fallback(p, bad))
 			return payment_fail(p, "%s", bad);
+	}
+
+	/* Now that we are about to fix the route parameters by
+	 * encoding them in an onion is the right time to update the
+	 * channel hints. */
+	if (!payment_chanhints_apply_route(p)) {
+		/* We can still end up with a failed channel_hints
+		 * update, either because a plugin changed the route,
+		 * or because a modifier was not synchronous, allowing
+		 * for multiple concurrent routes being built. If that
+		 * is the case, discard this route and retry. */
+		payment_set_step(p, PAYMENT_STEP_RETRY_GETROUTE);
+		return payment_continue(p);
 	}
 
 	/* Now compute the payload we're about to pass to `createonion` */
@@ -4203,6 +4331,58 @@ static bool listpeerchannels_asset(const char *buf, const jsmntok_t *chan,
 	for (size_t i = 0; i < sizeof(id); i++)
 		tag[1 + i] = id[sizeof(id) - 1 - i];
 	return true;
+}
+
+static void point_lock_add_scid(struct short_channel_id **scids,
+				const char *buf, const jsmntok_t *tok)
+{
+	struct short_channel_id scid;
+
+	if (tok && json_to_short_channel_id(buf, tok, &scid))
+		tal_arr_expand(scids, scid);
+}
+
+struct short_channel_id *payment_point_lock_channels(const tal_t *ctx,
+						     struct command *cmd)
+{
+	const char *buf;
+	const jsmntok_t *result, *chans, *t;
+	struct short_channel_id *scids = tal_arr(ctx, struct short_channel_id, 0);
+	size_t i;
+
+	result = jsonrpc_request_sync(tmpctx, cmd, "listpeerchannels",
+				      NULL, &buf);
+	chans = json_get_member(buf, result, "channels");
+	json_for_each_arr(i, t, chans) {
+		const jsmntok_t *ctype = json_get_member(buf, t, "channel_type");
+		const jsmntok_t *bits = ctype ? json_get_member(buf, ctype, "bits")
+					      : NULL;
+		const jsmntok_t *alias = json_get_member(buf, t, "alias");
+		const jsmntok_t *b;
+		bool covenant = false;
+		size_t j;
+
+		if (!bits)
+			continue;
+		json_for_each_arr(j, b, bits) {
+			u32 bit;
+			if (json_to_u32(buf, b, &bit)
+			    && (bit == OPT_SEQ_TAPROOT_COVENANT
+				|| bit == OPT_SEQ_TAPROOT_COVENANT + 1))
+				covenant = true;
+		}
+		if (!covenant)
+			continue;
+		point_lock_add_scid(&scids, buf,
+				    json_get_member(buf, t, "short_channel_id"));
+		if (alias) {
+			point_lock_add_scid(&scids, buf,
+					    json_get_member(buf, alias, "local"));
+			point_lock_add_scid(&scids, buf,
+					    json_get_member(buf, alias, "remote"));
+		}
+	}
+	return scids;
 }
 
 const u8 *payment_default_asset(const tal_t *ctx, struct command *cmd,
