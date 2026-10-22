@@ -665,8 +665,10 @@ update-doc-examples:
 check-doc-examples: update-doc-examples
 	git diff --exit-code HEAD
 
+# Only the files extract-bolt-csv writes: other targets of check-source may be
+# regenerating files (msggen, the gRPC stubs) at the same moment under -j.
 check-wire-format: extract-bolt-csv
-	git diff --exit-code HEAD
+	git diff --exit-code HEAD -- wire/peer_wire.csv wire/onion_wire.csv wire/bolt12_wire.csv
 
 # This should NOT compile things!
 check-source: check-makefile check-whitespace check-spelling check-python-flake8 check-includes check-shellcheck check-setup_locale check-tmpctx check-discouraged-functions check-amount-access check-bad-sprintf check-wire-format check-source-bolt
