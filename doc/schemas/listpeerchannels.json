@@ -1012,6 +1012,7 @@
               ]
             },
             "seq_factory": {
+              "added": "v26.06",
               "type": "object",
               "additionalProperties": false,
               "required": [

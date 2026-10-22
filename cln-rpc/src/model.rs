@@ -2601,6 +2601,12 @@ pub mod requests {
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub close_to: Option<String>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub factory_nonce: Option<String>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub factory_size: Option<u32>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub factory_slot: Option<u32>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub feerate: Option<Feerate>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub mindepth: Option<u32>,
@@ -3168,6 +3174,8 @@ pub mod requests {
 	pub struct MultifundchannelRequest {
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub commitment_feerate: Option<Feerate>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub factory: Option<bool>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub feerate: Option<Feerate>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
@@ -7847,6 +7855,19 @@ pub mod responses {
 	}
 
 	#[derive(Clone, Debug, Deserialize, Serialize)]
+	pub struct ListpeerchannelsChannelsSeqFactory {
+	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub ko_outnum: Option<u32>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub ko_txid: Option<String>,
+	    pub factory_outnum: u32,
+	    pub factory_txid: String,
+	    pub nonce: String,
+	    pub size: u32,
+	    pub slot: u32,
+	}
+
+	#[derive(Clone, Debug, Deserialize, Serialize)]
 	pub struct ListpeerchannelsChannelsUpdatesRemote {
 	    pub cltv_expiry_delta: u32,
 	    pub fee_base_msat: Amount,
@@ -8081,6 +8102,8 @@ pub mod responses {
 	    pub reestablished: Option<bool>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub scratch_txid: Option<String>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub seq_factory: Option<ListpeerchannelsChannelsSeqFactory>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub short_channel_id: Option<ShortChannelId>,
 	    #[serde(skip_serializing_if = "Option::is_none")]

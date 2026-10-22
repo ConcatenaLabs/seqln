@@ -83,18 +83,21 @@
         ]
       },
       "factory_nonce": {
+        "added": "v26.06",
         "type": "txid",
         "description": [
           "On a Sequentia network, open this channel as a slot of the factory with this 32-byte nonce (with *factory_slot* and *factory_size*). The channel's funding is then its id in the factory, (*factory_nonce*, *factory_slot*), and *scriptpubkey* is the output the factory pays the channel when it splits. **multifundchannel** with *factory* sets all three."
         ]
       },
       "factory_slot": {
+        "added": "v26.06",
         "type": "u32",
         "description": [
           "The channel's slot in the factory, below *factory_size*."
         ]
       },
       "factory_size": {
+        "added": "v26.06",
         "type": "u32",
         "description": [
           "How many channels the factory opens, at least two."

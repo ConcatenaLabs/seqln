@@ -971,6 +971,18 @@ def listpeerchannels_channels_inflight2py(m):
     })
 
 
+def listpeerchannels_channels_seq_factory2py(m):
+    return remove_default({
+        "factory_outnum": m.factory_outnum,  # PrimitiveField in generate_composite
+        "factory_txid": hexlify(m.factory_txid),  # PrimitiveField in generate_composite
+        "ko_outnum": m.ko_outnum,  # PrimitiveField in generate_composite
+        "ko_txid": hexlify(m.ko_txid),  # PrimitiveField in generate_composite
+        "nonce": hexlify(m.nonce),  # PrimitiveField in generate_composite
+        "size": m.size,  # PrimitiveField in generate_composite
+        "slot": m.slot,  # PrimitiveField in generate_composite
+    })
+
+
 def listpeerchannels_channels_state_changes2py(m):
     return remove_default({
         "cause": str(m.cause),  # EnumField in generate_composite

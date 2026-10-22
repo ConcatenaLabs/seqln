@@ -328,7 +328,7 @@ def test_factory_keyless_watcher(node_factory, bitcoind, directory):
     from test_watchtower import Speculad, fee_wallet
     victim = {'watchtower-store': 'on'}
     hub, members, gold, silv, ftxid = factory(node_factory, bitcoind,
-                                               opts=[{}, {}, victim, {}, {}])
+                                              opts=[{}, {}, victim, {}, {}])
     m0, m1, m2, m3 = members
     pay(hub, m1, 5_000_000_000, gold)
     stale = hub.rpc.call('dev-sym-snapshot', {'id': m1.info['id']})['state']
