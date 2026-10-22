@@ -475,8 +475,11 @@ opened by the scalar whose multiple of the generator the point is. Every
 hop of such a payment sees a different point, so no two hops can tell they
 carry the same payment. Invoices then carry the payment point of their
 preimage (field `t`), and `pay` locks a payment to it when every node on
-its route takes point locks, and to the invoice's hash otherwise. A node
-whose signer cannot take them (a device signer) offers none, and logs why.
+its route takes point locks and every channel carries them (only
+taproot-covenant channels do), and to the invoice's hash otherwise. A node
+can take this option while some of its channels are of an older type:
+payments over those go by hash. A node whose signer cannot take them (a
+device signer) offers none, and logs why.
 
 * **credit-channels**
 

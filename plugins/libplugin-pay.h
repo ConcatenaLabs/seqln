@@ -160,13 +160,21 @@ struct payment {
 	 * point-locked, NULL once it is (or always was) hash-locked.  Every
 	 * attempt locks its first HTLC to L0 = T + c*G (lightningd keys the
 	 * payment on point_hash0, L0's x); the scalar that comes back, minus
-	 * c, is the invoice's preimage.  point_lock_sent: an attempt went out
-	 * point-locked, so the payment can no longer fall back to the hash. */
+	 * c, is the invoice's preimage. */
 	struct pubkey *point_lock;
 	struct secret point_c;
 	struct pubkey point_lock0;
 	struct sha256 point_hash0;
-	bool point_lock_sent;
+	/* Our channels whose type carries a point-locked HTLC (their scids
+	 * and aliases): a point-locked attempt leaves by one of them. */
+	struct short_channel_id *point_lock_chans;
+	/* Channels a node refused a point-locked HTLC on (gossip does not say
+	 * a channel's type): point-locked attempts route around them. */
+	struct short_channel_id_dir *point_lock_refused;
+	/* On an attempt: its HTLC went out point-locked.  While one such
+	 * attempt has no failure back, the payment does not fall back to the
+	 * hash. */
+	bool point_locked;
 	/* Set while payment_getroute routes a point-locked payment: only
 	 * then does routing skip nodes that take no point locks (a modifier
 	 * asking whether a node is reachable at all must not skip them). */
@@ -508,6 +516,11 @@ int libplugin_pay_poll(struct pollfd *fds, nfds_t nfds, int timeout);
 
 void
 paymod_log(struct payment *p, enum log_level l, const char *fmt, ...);
+
+/* SEQUENTIA: the scids and aliases of this node's channels whose type
+ * carries a point-locked HTLC (option_seq_taproot_covenant). */
+struct short_channel_id *payment_point_lock_channels(const tal_t *ctx,
+						     struct command *cmd);
 
 /* Sequentia: the asset (33-byte tag) of this node's usable channels when
  * they all hold one.  NULL with *why set when they hold several, or none:

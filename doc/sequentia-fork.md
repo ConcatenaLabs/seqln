@@ -391,12 +391,21 @@ forwarding hop is told d in its onion and offers the next HTLC locked to L + d*G
 is told r = c + the sum of the d's and the invoice's payment hash, and opens its HTLC with
 p + r. Going back, each hop takes its d off the scalar it learns, so the payer receives
 p + c and keeps p: the invoice's preimage, the proof of payment. `pay` locks a payment to the
-point when the invoice has one and offers the feature, the paying node offers it too, and a
-route exists whose every node announces it; it then routes only through such nodes and sends
-in one part. Otherwise, or if no such route exists before any part has been sent, it pays by
-the invoice's hash (logging "Paying by hash lock, not point lock"). A node that announces
-point locks but has no taproot-covenant channel to the next hop fails the HTLC with
-`required_channel_feature_missing`, and `pay` routes around it.
+point when the invoice has one and offers the feature, the paying node offers it too and has a
+channel of the taproot-covenant type, and a route exists whose every node announces the
+feature; it then routes only through such nodes, leaves only by one of its own taproot-covenant
+channels (it reads their types from `listpeerchannels`), and sends in one part. Gossip does not
+say a channel's type, so a channel further along may still be of an older type: a node that
+announces point locks fails a point-locked HTLC it would forward on such a channel with
+`required_channel_feature_missing` ("Attempt to send a point-locked HTLC on a channel that takes
+none"), and `pay` then routes point locks around that channel without disabling it ("Channel
+<scid>/<dir> took no point lock"), trying the invoice's other route hints first. When no route
+is left whose every node and channel takes point locks, and no point-locked attempt is still
+out (each one that went out has failed back, so nothing is locked to the point and an HTLC
+under the hash cannot pay the payee twice), it pays by the invoice's hash over any route
+(logging "Paying by hash lock, not point lock"). So a payment from a node with no
+taproot-covenant channel never sends a point-locked HTLC, and one whose older channel lies
+further along sends one attempt that fails back before the hash-locked one.
 
 **State.** `channel_htlcs` holds each HTLC's `lock_point`, and for an incoming one
 `point_add`: what the node adds to the scalar it learns to open that HTLC (the payee's r,
@@ -917,7 +926,12 @@ fee coin, and the sweeps, refusing nothing (`test_taproot_covenant.py`), and poi
 (section 5c): a payment over two hops whose every HTLC is locked to its own point, none of them
 the invoice's point or hash, settled after the forwarder restarts mid-payment, with a
 hash-locked payment beside it to a payee that takes no point locks; a point invoice paid by its
-hash through a hop that takes none; and a point-locked HTLC claimed on chain with its scalar,
+hash through a hop that takes none; a point invoice paid by its hash, by `pay` and by `xpay`,
+over a channel of an older type between two nodes that both take point locks, with nothing
+point-locked sent; a point-locked payment that takes the dearer route over taproot-covenant
+channels rather than the cheaper one whose first channel is older; a route whose second channel
+is older, refused there and paid by hash over the same channels; and a point-locked HTLC claimed
+on chain with its scalar,
 which the forwarder reads from the witness to settle the payment upstream
 (`test_point_locks.py`), and the provider-signed credit (section 5d): two invoices of the
 provider paid for the holder, a cumulative note for each, a forged note refused, the provider's

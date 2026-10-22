@@ -25,6 +25,9 @@ pytestmark = pytest.mark.skipif(TEST_NETWORK != 'sequentia-regtest',
                                 reason='needs TEST_NETWORK=sequentia-regtest')
 
 PAR = 10**8
+# The type of a channel opened before taproot-covenant channels existed: it
+# carries no point lock, whatever its two nodes offer.
+OLDER = [12]
 POINT = {**tc.TCOV, **tc.SHORT, 'point-locks': None}
 NOPOINT = {**tc.TCOV, **tc.SHORT}
 POINT_BIT = 174
@@ -38,11 +41,13 @@ def x_of(point_hex):
     return point_hex[2:]
 
 
-def connect_channel(bitcoind, a, b, asset, atoms):
+def connect_channel(bitcoind, a, b, asset, atoms, channel_type=None):
     """a opens an announced channel of `atoms` to b."""
     a.rpc.connect(b.info['id'], 'localhost', b.port)
-    res = a.rpc.call('fundchannel', {'id': b.info['id'], 'amount': atoms,
-                                     'asset': asset, 'announce': True})
+    args = {'id': b.info['id'], 'amount': atoms, 'asset': asset, 'announce': True}
+    if channel_type is not None:
+        args['channel_type'] = channel_type
+    res = a.rpc.call('fundchannel', args)
     bitcoind.generate_block(1, wait_for_mempool=res['txid'])
     for x, y in ((a, b), (b, a)):
         wait_for(lambda: only_one(x.rpc.listpeerchannels(y.info['id'])['channels'])['state']
@@ -188,6 +193,135 @@ def test_point_lock_falls_back_through_a_hop_without(node_factory, bitcoind, exe
     assert sha256(bytes.fromhex(res['payment_preimage'])) == dec['payment_hash']
     l1.daemon.wait_for_log('Paying by hash lock, not point lock: no route through nodes'
                            ' that all take point locks')
+
+
+def sendpays(node):
+    """Every attempt node sent: a point-locked one is recorded under the
+    x coordinate of its first lock, not under the invoice's hash."""
+    return node.rpc.listsendpays()['payments']
+
+
+def test_point_lock_over_an_older_channel_pays_by_hash(node_factory, bitcoind, executor):
+    """l1 and l2 both take point locks, but their channel is of an older
+    type, which carries none: l1 pays l2's point invoice by its hash, and
+    nothing point-locked is ever sent."""
+    gold = gold_market(bitcoind)
+    l1, l2 = node_factory.get_nodes(2, opts=[POINT, {**POINT, 'plugin': tc.HOLD}])
+    tc.fund_node(bitcoind, l1, gold, 10 * PAR)
+    chan = connect_channel(bitcoind, l1, l2, gold, 2 * PAR, channel_type=OLDER)
+    assert chan['channel_type']['names'] == ['static_remotekey/even']
+    announce(bitcoind, [l1, l2], 1)
+    inv = l2.rpc.call('invoice', {'amount_msat': 500_000_000, 'label': 'old',
+                                  'description': 'older channel', 'asset': gold})
+    dec = l1.rpc.decode(inv['bolt11'])
+    assert 'payment_point' in dec
+    fut = executor.submit(l1.rpc.pay, inv['bolt11'])
+    l2.daemon.wait_for_log('Calling invoice_payment hook')
+    h = htlc_of(l2, l1)
+    assert 'lock_point' not in h and h['payment_hash'] == dec['payment_hash']
+    unhold(l2)
+    res = fut.result(TIMEOUT)
+    assert res['status'] == 'complete'
+    assert sha256(bytes.fromhex(res['payment_preimage'])) == dec['payment_hash']
+    l1.daemon.wait_for_log('Paying by hash lock, not point lock: no channel of'
+                           ' ours carries point locks')
+    attempts = sendpays(l1)
+    print("attempts:", json.dumps([(a['payment_hash'], a['status']) for a in attempts]))
+    assert [a['payment_hash'] for a in attempts] == [dec['payment_hash']]
+    assert not l1.daemon.is_in_log('point-locked HTLC on a channel that takes none')
+
+    # xpay has no point locks: it pays a point invoice by its hash.
+    l2.daemon.wait_for_log("Resolved invoice 'old'")
+    os.remove(os.path.join(l2.daemon.lightning_dir, TEST_NETWORK, 'unhold'))
+    inv2 = l2.rpc.call('invoice', {'amount_msat': 300_000_000, 'label': 'old-x',
+                                   'description': 'xpay', 'asset': gold})
+    dec2 = l1.rpc.decode(inv2['bolt11'])
+    assert 'payment_point' in dec2
+    fut = executor.submit(l1.rpc.xpay, inv2['bolt11'])
+    l2.daemon.wait_for_log('Calling invoice_payment hook')
+    h = htlc_of(l2, l1)
+    assert 'lock_point' not in h and h['payment_hash'] == dec2['payment_hash']
+    unhold(l2)
+    res = fut.result(TIMEOUT)
+    assert sha256(bytes.fromhex(res['payment_preimage'])) == dec2['payment_hash']
+
+
+def test_point_lock_routes_over_covenant_channels_only(node_factory, bitcoind, executor):
+    """l1 reaches l3 through l2 over an older channel, the cheaper route,
+    and through l4 over a covenant channel: the point-locked payment goes
+    through l4, every HTLC locked to its own point, and nothing touches the
+    older channel."""
+    gold = gold_market(bitcoind)
+    l1, l2, l3, l4 = node_factory.get_nodes(4, opts=[
+        POINT, POINT, {**POINT, 'plugin': tc.HOLD}, POINT])
+    for n in (l1, l2, l4):
+        tc.fund_node(bitcoind, n, gold, 10 * PAR)
+    old = connect_channel(bitcoind, l1, l2, gold, 2 * PAR, channel_type=OLDER)
+    cov = connect_channel(bitcoind, l1, l4, gold, 2 * PAR)
+    connect_channel(bitcoind, l2, l3, gold, 2 * PAR)
+    via4 = connect_channel(bitcoind, l4, l3, gold, 2 * PAR)
+    assert 'seq_taproot_covenant/even' not in old['channel_type']['names']
+    assert 'seq_taproot_covenant/even' in cov['channel_type']['names']
+    l4.rpc.setchannel(via4['short_channel_id'], feebase=1000, feeppm=2000)
+    announce(bitcoind, [l1, l2, l3, l4], 4)
+    wait_for(lambda: [c['fee_per_millionth'] for c in
+                      l1.rpc.listchannels(via4['short_channel_id'])['channels']
+                      if c['source'] == l4.info['id']] == [2000])
+
+    inv = l3.rpc.call('invoice', {'amount_msat': 500_000_000, 'label': 'cov',
+                                  'description': 'covenant route', 'asset': gold})
+    dec = l1.rpc.decode(inv['bolt11'])
+    fut = executor.submit(l1.rpc.pay, inv['bolt11'])
+    l3.daemon.wait_for_log('Calling invoice_payment hook')
+    h = htlc_of(l3, l4)
+    assert 'lock_point' in h and h['lock_point'] != dec['payment_point']
+    assert h['payment_hash'] != dec['payment_hash']
+    assert only_one(l1.rpc.listpeerchannels(l2.info['id'])['channels'])['htlcs'] == []
+    unhold(l3)
+    res = fut.result(TIMEOUT)
+    assert res['status'] == 'complete'
+    assert sha256(bytes.fromhex(res['payment_preimage'])) == dec['payment_hash']
+    attempts = sendpays(l1)
+    print("attempts:", json.dumps([(a['payment_hash'], a['status']) for a in attempts]))
+    assert len(attempts) == 1 and attempts[0]['status'] == 'complete'
+    assert not l1.daemon.is_in_log('Paying by hash lock')
+
+
+def test_point_lock_mixed_route_falls_back(node_factory, bitcoind, executor):
+    """l1 -> l2 is a covenant channel, l2 -> l3 an older one, all three
+    taking point locks.  Gossip does not say a channel's type, so l1 sends
+    point-locked; l2 refuses to forward it on the older channel; l1 routes
+    point locks around that channel, finds no other route, and, the
+    point-locked attempt having failed back, pays by the invoice's hash over
+    the same two channels."""
+    gold = gold_market(bitcoind)
+    l1, l2, l3 = node_factory.get_nodes(3, opts=[POINT, POINT,
+                                                 {**POINT, 'plugin': tc.HOLD}])
+    tc.fund_node(bitcoind, l1, gold, 10 * PAR)
+    tc.fund_node(bitcoind, l2, gold, 10 * PAR)
+    connect_channel(bitcoind, l1, l2, gold, 2 * PAR)
+    old = connect_channel(bitcoind, l2, l3, gold, 2 * PAR, channel_type=OLDER)
+    announce(bitcoind, [l1, l2, l3], 2)
+    inv = l3.rpc.call('invoice', {'amount_msat': 500_000_000, 'label': 'mix',
+                                  'description': 'mixed route', 'asset': gold})
+    dec = l1.rpc.decode(inv['bolt11'])
+    fut = executor.submit(l1.rpc.pay, inv['bolt11'])
+    l3.daemon.wait_for_log('Calling invoice_payment hook')
+    b_in, b_out = htlc_of(l2, l1), htlc_of(l2, l3)
+    assert 'lock_point' not in b_in and 'lock_point' not in b_out
+    assert b_in['payment_hash'] == b_out['payment_hash'] == dec['payment_hash']
+    unhold(l3)
+    res = fut.result(TIMEOUT)
+    assert res['status'] == 'complete'
+    assert sha256(bytes.fromhex(res['payment_preimage'])) == dec['payment_hash']
+    l2.daemon.wait_for_log('Attempt to send a point-locked HTLC on a channel'
+                           ' that takes none')
+    l1.daemon.wait_for_log('Channel {}/[01] took no point lock'.format(old['short_channel_id']))
+    l1.daemon.wait_for_log('Paying by hash lock, not point lock: ')
+    attempts = sendpays(l1)
+    print("attempts:", json.dumps([(a['payment_hash'], a['status']) for a in attempts]))
+    assert [(a['payment_hash'] == dec['payment_hash'], a['status']) for a in attempts] \
+        == [(False, 'failed'), (True, 'complete')]
 
 
 def test_point_lock_claimed_on_chain(node_factory, bitcoind, executor):
