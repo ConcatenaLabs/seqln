@@ -19,9 +19,37 @@ int test_main(int argc, char *argv[]);
 u64 commit_number_obscurer(const struct pubkey *opener_payment_basepoint UNNEEDED,
 			   const struct pubkey *accepter_payment_basepoint UNNEEDED)
 { fprintf(stderr, "commit_number_obscurer called!\n"); abort(); }
+/* Generated stub for credit_params_init */
+bool credit_params_init(const tal_t *ctx UNNEEDED,
+			const struct channel_id *cid UNNEEDED,
+			const struct pubkey *provider_funding_key UNNEEDED,
+			const struct pubkey *holder_payment_basepoint UNNEEDED,
+			struct credit_params *params UNNEEDED)
+{ fprintf(stderr, "credit_params_init called!\n"); abort(); }
+/* Generated stub for credit_to_local_tree */
+void credit_to_local_tree(const tal_t *ctx UNNEEDED,
+			  const struct keyset *keyset UNNEEDED,
+			  const struct pubkey *per_commitment_point UNNEEDED,
+			  u16 to_self_delay UNNEEDED,
+			  const struct credit_params *params UNNEEDED,
+			  struct amount_sat value UNNEEDED,
+			  struct tap_tree2 *tree UNNEEDED)
+{ fprintf(stderr, "credit_to_local_tree called!\n"); abort(); }
+/* Generated stub for credit_to_remote_tree */
+void credit_to_remote_tree(const tal_t *ctx UNNEEDED,
+			   const struct pubkey *provider_payment_key UNNEEDED,
+			   u16 delay UNNEEDED,
+			   const struct credit_params *params UNNEEDED,
+			   struct amount_sat value UNNEEDED,
+			   struct tap_tree2 *tree UNNEEDED)
+{ fprintf(stderr, "credit_to_remote_tree called!\n"); abort(); }
 /* Generated stub for daemon_shutdown */
 void daemon_shutdown(void)
 { fprintf(stderr, "daemon_shutdown called!\n"); abort(); }
+/* Generated stub for derive_channel_id */
+void derive_channel_id(struct channel_id *channel_id UNNEEDED,
+		       const struct bitcoin_outpoint *outpoint UNNEEDED)
+{ fprintf(stderr, "derive_channel_id called!\n"); abort(); }
 /* Generated stub for derive_keyset */
 bool derive_keyset(const struct pubkey *per_commitment_point UNNEEDED,
 		   const struct basepoints *self UNNEEDED,
@@ -55,6 +83,10 @@ void fromwire_shachain(const u8 **cursor UNNEEDED, size_t *max UNNEEDED,
 /* Generated stub for fromwire_side */
 enum side fromwire_side(const u8 **cursor UNNEEDED, size_t *max UNNEEDED)
 { fprintf(stderr, "fromwire_side called!\n"); abort(); }
+/* Generated stub for fromwire_sym_state */
+struct sym_state *fromwire_sym_state(const tal_t *ctx UNNEEDED,
+				     const u8 **pptr UNNEEDED, size_t *max UNNEEDED)
+{ fprintf(stderr, "fromwire_sym_state called!\n"); abort(); }
 /* Generated stub for fromwire_wallet_tx_type */
 enum wallet_tx_type fromwire_wallet_tx_type(const u8 **cursor UNNEEDED, size_t *max UNNEEDED)
 { fprintf(stderr, "fromwire_wallet_tx_type called!\n"); abort(); }
@@ -83,7 +115,8 @@ struct bitcoin_tx *htlc_success_tx(const tal_t *ctx UNNEEDED,
 				   u32 feerate_per_kw UNNEEDED,
 				   const struct keyset *keyset UNNEEDED,
 				   bool option_anchor_outputs UNNEEDED,
-				   bool option_anchors_zero_fee_htlc_tx UNNEEDED)
+				   bool option_anchors_zero_fee_htlc_tx UNNEEDED,
+				   const u8 *channel_asset UNNEEDED)
 { fprintf(stderr, "htlc_success_tx called!\n"); abort(); }
 /* Generated stub for master_badmsg */
 void master_badmsg(u32 type_expected UNNEEDED, const u8 *msg)
@@ -172,6 +205,16 @@ void *notleak_(void *ptr UNNEEDED, bool plus_children UNNEEDED)
 /* Generated stub for peer_billboard */
 void peer_billboard(bool perm UNNEEDED, const char *fmt UNNEEDED, ...)
 { fprintf(stderr, "peer_billboard called!\n"); abort(); }
+/* Generated stub for point_lock_opens */
+bool point_lock_opens(const struct pubkey *lock UNNEEDED, const struct preimage *s UNNEEDED)
+{ fprintf(stderr, "point_lock_opens called!\n"); abort(); }
+/* Generated stub for point_lock_payment_hash */
+void point_lock_payment_hash(const struct pubkey *lock UNNEEDED,
+			     struct sha256 *payment_hash UNNEEDED)
+{ fprintf(stderr, "point_lock_payment_hash called!\n"); abort(); }
+/* Generated stub for point_lock_point_of */
+bool point_lock_point_of(const struct preimage *s UNNEEDED, struct pubkey *point UNNEEDED)
+{ fprintf(stderr, "point_lock_point_of called!\n"); abort(); }
 /* Generated stub for randbytes_ */
 void randbytes_(void *bytes UNNEEDED, size_t num_bytes UNNEEDED, u64 *offset UNNEEDED)
 { fprintf(stderr, "randbytes_ called!\n"); abort(); }
@@ -193,6 +236,95 @@ void status_setup_sync(int fd UNNEEDED)
 /* Generated stub for subdaemon_setup */
 bool subdaemon_setup(int argc UNNEEDED, char *argv[])
 { fprintf(stderr, "subdaemon_setup called!\n"); abort(); }
+/* Generated stub for sym_channel_init */
+void sym_channel_init(struct sym_channel *sc UNNEEDED,
+		      const struct bitcoin_blkid *genesis UNNEEDED,
+		      const struct bitcoin_outpoint *funding UNNEEDED,
+		      const struct pubkey *opener_upd_key UNNEEDED,
+		      const struct pubkey *accepter_upd_key UNNEEDED,
+		      const u8 *asset_tag UNNEEDED, u16 delay UNNEEDED)
+{ fprintf(stderr, "sym_channel_init called!\n"); abort(); }
+/* Generated stub for sym_htlc_tree */
+void sym_htlc_tree(const tal_t *ctx UNNEEDED,
+		   const struct pubkey *offerer_key UNNEEDED,
+		   const struct pubkey *receiver_key UNNEEDED,
+		   const struct ripemd160 *payment_ripemd UNNEEDED,
+		   u32 cltv_expiry UNNEEDED, struct tap_tree2 *tree UNNEEDED)
+{ fprintf(stderr, "sym_htlc_tree called!\n"); abort(); }
+/* Generated stub for sym_kickoff_tree */
+void sym_kickoff_tree(const tal_t *ctx UNNEEDED, const struct sym_channel *sc UNNEEDED,
+		      struct sym_tree *tree UNNEEDED)
+{ fprintf(stderr, "sym_kickoff_tree called!\n"); abort(); }
+/* Generated stub for sym_parse_update_witness */
+bool sym_parse_update_witness(const u8 **wit UNNEEDED, s64 *n UNNEEDED, struct sha256 *rest UNNEEDED)
+{ fprintf(stderr, "sym_parse_update_witness called!\n"); abort(); }
+/* Generated stub for sym_rebuild_state */
+void sym_rebuild_state(const tal_t *ctx UNNEEDED, const struct sym_channel *sc UNNEEDED, s64 k UNNEEDED,
+		       const struct sha256 *rest UNNEEDED, u8 **spk UNNEEDED, u8 **upd_leaf UNNEEDED,
+		       u8 **upd_cb UNNEEDED)
+{ fprintf(stderr, "sym_rebuild_state called!\n"); abort(); }
+/* Generated stub for sym_settle_witness */
+u8 **sym_settle_witness(const tal_t *ctx UNNEEDED, const struct sym_tree *tree UNNEEDED)
+{ fprintf(stderr, "sym_settle_witness called!\n"); abort(); }
+/* Generated stub for sym_state_new */
+struct sym_state *sym_state_new(const tal_t *ctx UNNEEDED, enum side owner UNNEEDED,
+				u64 commit_num UNNEEDED, s64 num UNNEEDED,
+				const struct sym_output *outs UNNEEDED)
+{ fprintf(stderr, "sym_state_new called!\n"); abort(); }
+/* Generated stub for sym_state_signed */
+bool sym_state_signed(const struct sym_state *st UNNEEDED, enum side opener UNNEEDED,
+		      const struct bip340sig **sig_opener UNNEEDED,
+		      const struct bip340sig **sig_accepter UNNEEDED)
+{ fprintf(stderr, "sym_state_signed called!\n"); abort(); }
+/* Generated stub for sym_state_tree_of */
+void sym_state_tree_of(const tal_t *ctx UNNEEDED, const struct sym_channel *sc UNNEEDED,
+		       const struct sym_state *st UNNEEDED, struct sym_tree *tree UNNEEDED)
+{ fprintf(stderr, "sym_state_tree_of called!\n"); abort(); }
+/* Generated stub for sym_tree_control_block */
+u8 *sym_tree_control_block(const tal_t *ctx UNNEEDED, const struct sym_tree *tree UNNEEDED,
+			   int leaf UNNEEDED)
+{ fprintf(stderr, "sym_tree_control_block called!\n"); abort(); }
+/* Generated stub for sym_tree_spk */
+u8 *sym_tree_spk(const tal_t *ctx UNNEEDED, const struct sym_tree *tree UNNEEDED)
+{ fprintf(stderr, "sym_tree_spk called!\n"); abort(); }
+/* Generated stub for sym_update_witness */
+u8 **sym_update_witness(const tal_t *ctx UNNEEDED,
+			const struct bip340sig *sig_opener UNNEEDED,
+			const struct bip340sig *sig_accepter UNNEEDED,
+			const struct sym_tree *tree UNNEEDED,
+			const u8 *prev_leaf UNNEEDED, const u8 *prev_cb UNNEEDED)
+{ fprintf(stderr, "sym_update_witness called!\n"); abort(); }
+/* Generated stub for tcov_offered_htlc_tree */
+void tcov_offered_htlc_tree(const tal_t *ctx UNNEEDED,
+			    const struct keyset *keyset UNNEEDED,
+			    const struct pubkey *per_commitment_point UNNEEDED,
+			    u16 to_self_delay UNNEEDED,
+			    const u8 *asset_tag UNNEEDED,
+			    const struct ripemd160 *payment_ripemd UNNEEDED,
+			    const struct pubkey *lock_point UNNEEDED,
+			    u32 cltv_expiry UNNEEDED,
+			    struct amount_sat htlc_sats UNNEEDED,
+			    struct tap_tree2 *tree UNNEEDED)
+{ fprintf(stderr, "tcov_offered_htlc_tree called!\n"); abort(); }
+/* Generated stub for tcov_received_htlc_tree */
+void tcov_received_htlc_tree(const tal_t *ctx UNNEEDED,
+			     const struct keyset *keyset UNNEEDED,
+			     const struct pubkey *per_commitment_point UNNEEDED,
+			     u16 to_self_delay UNNEEDED,
+			     const u8 *asset_tag UNNEEDED,
+			     const struct ripemd160 *payment_ripemd UNNEEDED,
+			     const struct pubkey *lock_point UNNEEDED,
+			     u32 cltv_expiry UNNEEDED,
+			     struct amount_sat htlc_sats UNNEEDED,
+			     struct tap_tree2 *tree UNNEEDED)
+{ fprintf(stderr, "tcov_received_htlc_tree called!\n"); abort(); }
+/* Generated stub for tcov_to_local_tree */
+void tcov_to_local_tree(const tal_t *ctx UNNEEDED,
+			const struct keyset *keyset UNNEEDED,
+			const struct pubkey *per_commitment_point UNNEEDED,
+			u16 to_self_delay UNNEEDED,
+			struct tap_tree2 *tree UNNEEDED)
+{ fprintf(stderr, "tcov_to_local_tree called!\n"); abort(); }
 /* Generated stub for to_self_wscript */
 u8 *to_self_wscript(const tal_t *ctx UNNEEDED,
 		    u16 to_self_delay UNNEEDED,
@@ -217,6 +349,9 @@ void towire_shachain(u8 **pptr UNNEEDED, const struct shachain *shachain UNNEEDE
 /* Generated stub for towire_side */
 void towire_side(u8 **pptr UNNEEDED, const enum side side UNNEEDED)
 { fprintf(stderr, "towire_side called!\n"); abort(); }
+/* Generated stub for towire_sym_state */
+void towire_sym_state(u8 **pptr UNNEEDED, const struct sym_state *st UNNEEDED)
+{ fprintf(stderr, "towire_sym_state called!\n"); abort(); }
 /* Generated stub for towire_wallet_tx_type */
 void towire_wallet_tx_type(u8 **pptr UNNEEDED, const enum wallet_tx_type type UNNEEDED)
 { fprintf(stderr, "towire_wallet_tx_type called!\n"); abort(); }
@@ -272,7 +407,8 @@ struct bitcoin_tx *htlc_timeout_tx(const tal_t *ctx,
 				   u32 feerate_per_kw UNNEEDED,
 				   const struct keyset *keyset UNNEEDED,
 				   bool option_anchor_outputs,
-				   bool option_anchors_zero_fee_htlc_tx)
+				   bool option_anchors_zero_fee_htlc_tx,
+				   const u8 *channel_asset UNNEEDED)
 {
  	struct bitcoin_tx *tx;
 	struct amount_sat in_amount;
