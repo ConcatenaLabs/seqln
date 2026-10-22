@@ -169,6 +169,7 @@ common/test/run-jsonrpc_io: common/json_parse_simple.o
 check-units: $(COMMON_TEST_PROGRAMS:%=unittest/%)
 
 common/test/run-tcov_scripts: wire/fromwire.o wire/towire.o
+common/test/run-tcov_annex: wire/fromwire.o wire/towire.o
 common/test/run-sym_scripts: wire/fromwire.o wire/towire.o
 common/test/run-point_lock: wire/fromwire.o wire/towire.o
 common/test/run-credit_scripts: wire/fromwire.o wire/towire.o
