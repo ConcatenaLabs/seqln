@@ -539,6 +539,45 @@ Files: `common/credit_scripts.{c,h}`, `bitcoin/tapscript.{c,h}`, `common/tcov_co
 Tests: `tests/sequentia/test_credit.py`, `common/test/run-credit_scripts.c` and the signer's
 `cargo test` (section 10).
 
+## 5e. Symmetric channel scripts (`common/sym_scripts.h`)
+
+The scripts and transactions of a symmetric channel, in which an old state is replaced by a
+newer one rather than punished, so only the latest state need be kept. The funding output
+is the usual 2-of-2 P2WSH. A unilateral close takes three transactions, each paying its fee
+from an input attached when it is broadcast, in any asset the node accepts:
+
+- the **kickoff** spends the funding output into KO, a taproot output with one leaf, UPD(-1).
+  Both funding keys sign it once, `SIGHASH_SINGLE|SIGHASH_ANYONECANPAY`, so anyone can add a
+  fee input and its change, and it is the same transaction whatever the state;
+- an **update** spends KO, or the output of any older state k, by UPD(k), into the output of
+  state n > k, of the same value and asset;
+- the **settle** spends state n's output by SETTLE(n) once the shared delay has passed; its
+  first outputs are the settlement: each side's balance to P2WPKH of its payment basepoint and
+  each HTLC to a taproot output with a SUCCESS leaf (preimage and the receiver's key) and a
+  TIMEOUT leaf (the offerer's key after the expiry).
+
+A state output is `tr(H, {UPD(n), R(n)})` with H the NUMS point, where R(n) is the SETTLE leaf,
+or a branch over SETTLE and a Simplicity leaf: the state output is a mixed tree, so a Simplicity
+settle path can join it without changing UPD, its signatures or the watcher. UPD(k) takes two
+BIP340 signatures through `OP_CHECKSIGFROMSTACK` over
+`SHA256(tag || n || P || R)`: the new state number (8 bytes, in the witness), the program P
+of the output at the input's own index, and R, which the witness publishes. The tag folds in
+the chain's genesis hash and the funding outpoint. One signature from each side therefore
+covers the update and, through P, the settlement; it spends any older state output of the
+channel whatever its txid, and leaves every other input and output free for the fee. A
+watcher rebuilds any old state output from the n and R its update published and the channel's
+constants, so it stores nothing per old state. SETTLE needs no signature: it hashes the
+asset, value and script hash of each of its outputs and compares the digest. The settlement's
+values add up to the state output's value. An HTLC below the dust limit stays with the side
+that offered it, a balance below it goes to the other side, and the outputs are sorted so that
+both sides build the same list. Every key in a leaf is a 32-byte script constant.
+
+The header carries every script. `common/test/run-sym_scripts.c` checks the scripts, trees,
+messages, signatures and the kickoff's signature hash against vectors from the Sequentia node's
+test framework, whose builders were spent on a Sequentia chain with each negative case
+(an older update over a newer one, a settle before its delay, a settlement moved by one atom,
+a 33-byte key) forced into a block.
+
 ## 6. Asset-aware gossip, routing, payments
 
 - How route finding learns a channel's asset. The channel announcement and the channel update are

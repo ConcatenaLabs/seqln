@@ -37,18 +37,24 @@ static void tagged_init(struct sha256_ctx *sctx, const char *tag)
 	sha256_update(sctx, &taghash, sizeof(taghash));
 }
 
-void tap_leaf_hash(const u8 *script, struct sha256 *hash)
+void tap_leaf_hash_version(u8 version, const u8 *script, size_t script_len,
+			   struct sha256 *hash)
 {
 	struct sha256_ctx sctx;
-	u8 version = TAPSCRIPT_LEAF_VERSION_ELEMENTS;
 	u8 len[VARINT_MAX_LEN];
-	size_t lenlen = varint_put(len, tal_bytelen(script));
+	size_t lenlen = varint_put(len, script_len);
 
 	tagged_init(&sctx, "TapLeaf/elements");
 	sha256_update(&sctx, &version, 1);
 	sha256_update(&sctx, len, lenlen);
-	sha256_update(&sctx, script, tal_bytelen(script));
+	sha256_update(&sctx, script, script_len);
 	sha256_done(&sctx, hash);
+}
+
+void tap_leaf_hash(const u8 *script, struct sha256 *hash)
+{
+	tap_leaf_hash_version(TAPSCRIPT_LEAF_VERSION_ELEMENTS, script,
+			      tal_bytelen(script), hash);
 }
 
 void tap_branch_hash(const struct sha256 *a, const struct sha256 *b,
