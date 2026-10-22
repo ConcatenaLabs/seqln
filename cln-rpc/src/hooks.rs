@@ -110,6 +110,8 @@ pub mod events{
 
     #[derive(Clone, Debug, Deserialize, Serialize)]
     pub struct InvoicePaymentHookPayment {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub asset: Option<String>,
         pub label: String,
         pub msat: Amount,
         pub preimage: Secret,
@@ -238,6 +240,8 @@ pub mod events{
 
     #[derive(Clone, Debug, Deserialize, Serialize)]
     pub struct HtlcAcceptedHtlc {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub asset: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub extra_tlvs: Option<String>,
         pub amount_msat: Amount,

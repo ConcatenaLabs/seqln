@@ -115,6 +115,7 @@
         ]
       },
       "asset": {
+        "added": "v26.06",
         "type": "hex",
         "description": [
           "On a Sequentia network, the 32-byte display id of the asset to pay in: *amount_msat* is in thousandths of its atoms, and only channels in it are used, so no route mixes assets. The default is the asset of this node's channels when they all hold one; a node with channels in several assets must name it. An asset none of this node's channels can send is refused before any HTLC is offered. The payee records the payment in an invoice that names the asset it arrived in."

@@ -656,6 +656,8 @@ pub mod requests {
 	#[derive(Clone, Debug, Deserialize, Serialize)]
 	pub struct AddpsbtoutputRequest {
 	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub asset: Option<String>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub destination: Option<String>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub initialpsbt: Option<String>,
@@ -934,6 +936,8 @@ pub mod requests {
 	}
 	#[derive(Clone, Debug, Deserialize, Serialize)]
 	pub struct CreateonionHops {
+	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub assocdata: Option<String>,
 	    pub payload: String,
 	    pub pubkey: PublicKey,
 	}
@@ -1190,6 +1194,10 @@ pub mod requests {
 	#[derive(Clone, Debug, Deserialize, Serialize)]
 	pub struct InvoiceRequest {
 	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub allow_unfunded: Option<bool>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub asset: Option<String>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub cltv: Option<u32>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub deschashonly: Option<bool>,
@@ -1413,6 +1421,8 @@ pub mod requests {
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub localinvreqid: Option<Sha256>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub lock_point: Option<PublicKey>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub partid: Option<u16>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub total_amount_msat: Option<Amount>,
@@ -1589,6 +1599,9 @@ pub mod requests {
 	    #[deprecated]
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub amount_msat: Option<Amount>,
+	    #[deprecated]
+	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub asset: Option<String>,
 	    #[deprecated]
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub description: Option<String>,
@@ -1801,6 +1814,8 @@ pub mod requests {
 	#[derive(Clone, Debug, Deserialize, Serialize)]
 	pub struct WithdrawRequest {
 	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub asset: Option<String>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub feerate: Option<Feerate>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub minconf: Option<u16>,
@@ -1830,6 +1845,9 @@ pub mod requests {
 	#[deprecated = "deprecated since CLN v26.06"]
 	#[derive(Clone, Debug, Deserialize, Serialize)]
 	pub struct KeysendRequest {
+	    #[deprecated]
+	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub asset: Option<String>,
 	    #[deprecated]
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub exemptfee: Option<Amount>,
@@ -1879,6 +1897,8 @@ pub mod requests {
 	}
 	#[derive(Clone, Debug, Deserialize, Serialize)]
 	pub struct FundpsbtRequest {
+	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub asset: Option<String>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub excess_as_change: Option<bool>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
@@ -1966,6 +1986,8 @@ pub mod requests {
 	#[derive(Clone, Debug, Deserialize, Serialize)]
 	pub struct UtxopsbtRequest {
 	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub asset: Option<String>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub excess_as_change: Option<bool>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub locktime: Option<u32>,
@@ -2024,6 +2046,8 @@ pub mod requests {
 	}
 	#[derive(Clone, Debug, Deserialize, Serialize)]
 	pub struct TxprepareRequest {
+	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub asset: Option<String>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub feerate: Option<Feerate>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
@@ -2526,6 +2550,8 @@ pub mod requests {
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub announce: Option<bool>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub asset: Option<String>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub close_to: Option<String>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub compact_lease: Option<String>,
@@ -2570,6 +2596,8 @@ pub mod requests {
 	pub struct FundchannelStartRequest {
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub announce: Option<bool>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub asset: Option<String>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub close_to: Option<String>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
@@ -2762,6 +2790,9 @@ pub mod requests {
 	#[deprecated = "deprecated since CLN v26.06"]
 	#[derive(Clone, Debug, Deserialize, Serialize)]
 	pub struct GetrouteRequest {
+	    #[deprecated]
+	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub asset: Option<String>,
 	    #[deprecated]
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub cltv: Option<u32>,
@@ -3115,6 +3146,8 @@ pub mod requests {
 	pub struct MultifundchannelDestinations {
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub announce: Option<bool>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub asset: Option<String>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub close_to: Option<String>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
@@ -5748,6 +5781,8 @@ pub mod responses {
 	#[derive(Clone, Debug, Deserialize, Serialize)]
 	pub struct ListfundsChannels {
 	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub asset: Option<String>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub short_channel_id: Option<ShortChannelId>,
 	    // Path `ListFunds.channels[].state`
 	    pub state: ChannelState,
@@ -5801,6 +5836,8 @@ pub mod responses {
 	pub struct ListfundsOutputs {
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub address: Option<String>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub asset: Option<String>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub blockheight: Option<u32>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
@@ -5909,6 +5946,8 @@ pub mod responses {
 
 	#[derive(Clone, Debug, Deserialize, Serialize)]
 	pub struct ListchannelsChannels {
+	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub asset: Option<String>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub htlc_maximum_msat: Option<Amount>,
 	    pub active: bool,
@@ -6527,6 +6566,8 @@ pub mod responses {
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub amount_received_msat: Option<Amount>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub asset: Option<String>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub bolt11: Option<String>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub bolt12: Option<String>,
@@ -6868,6 +6909,8 @@ pub mod responses {
 	    pub amount_msat: Option<Amount>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub amount_received_msat: Option<Amount>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub asset: Option<String>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub bolt11: Option<String>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
@@ -7334,6 +7377,8 @@ pub mod responses {
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub amount_received_msat: Option<Amount>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub asset: Option<String>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub bolt11: Option<String>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub bolt12: Option<String>,
@@ -7410,6 +7455,8 @@ pub mod responses {
 	    pub amount_msat: Option<Amount>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub amount_received_msat: Option<Amount>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub asset: Option<String>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub bolt11: Option<String>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
@@ -7859,6 +7906,8 @@ pub mod responses {
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub local_trimmed: Option<bool>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub lock_point: Option<PublicKey>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub status: Option<String>,
 	    // Path `ListPeerChannels.channels[].htlcs[].direction`
 	    pub direction: ListpeerchannelsChannelsHtlcsDirection,
@@ -7944,6 +7993,8 @@ pub mod responses {
 	pub struct ListpeerchannelsChannels {
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub alias: Option<ListpeerchannelsChannelsAlias>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub channel_asset: Option<String>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub channel_id: Option<Sha256>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
@@ -8462,6 +8513,8 @@ pub mod responses {
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub amount_msat: Option<Amount>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub asset: Option<String>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub created_at: Option<u64>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub currency: Option<String>,
@@ -8548,6 +8601,8 @@ pub mod responses {
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub payment_metadata: Option<String>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub payment_point: Option<PublicKey>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub payment_secret: Option<Secret>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub proof_note: Option<String>,
@@ -8613,6 +8668,8 @@ pub mod responses {
 	    pub warning_missing_offer_description: Option<String>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub warning_missing_offer_issuer_id: Option<String>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub warning_network: Option<String>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub warning_rune_invalid_utf8: Option<String>,
 	    #[serde(skip_serializing_if = "Option::is_none")]

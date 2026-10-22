@@ -85,6 +85,7 @@
         ]
       },
       "asset": {
+        "added": "v26.06",
         "type": "hex",
         "description": [
           "On an asset-aware chain, the 32-byte display id of the asset the *utxos* hold, each of them; *satoshi* is then in that asset's atoms, and change and fee are in the same asset. Without it, the asset the *utxos* hold, which must be one asset."

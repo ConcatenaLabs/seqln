@@ -11529,6 +11529,7 @@
             ]
           },
           "asset": {
+            "added": "v26.06",
             "type": "hex",
             "description": [
               "On an asset-aware chain, the 32-byte display id of the asset this invoice is to be paid in, if it names one."
@@ -14275,6 +14276,7 @@
             }
           },
           "asset": {
+            "added": "v26.06",
             "type": "hex",
             "description": [
               "On an asset-aware chain, the 32-byte display id of the asset to fund the channel in; *amount* is then in that asset's atoms, and the funding transaction pays its fee in the same asset. The default is the chain's policy asset."
@@ -14757,6 +14759,7 @@
             }
           },
           "asset": {
+            "added": "v26.06",
             "type": "hex",
             "description": [
               "On an asset-aware chain, the 32-byte display id of the asset the channel is funded in; *amount* is then in that asset's atoms. The default is the chain's policy asset."
@@ -15363,6 +15366,7 @@
             ]
           },
           "asset": {
+            "added": "v26.06",
             "type": "hex",
             "description": [
               "On an asset-aware chain, the 32-byte display id of the asset to select inputs in; *satoshi* is then in that asset's atoms, and change and fee are in the same asset. The default is the chain's policy asset."
@@ -16398,6 +16402,7 @@
             "default": "20"
           },
           "asset": {
+            "added": "v26.06",
             "type": "hex",
             "description": [
               "On an asset-aware chain, the 32-byte display id of an asset: only channels in that asset are used. On a Sequentia network the default is the asset of this node's channels when they all hold one; a node with channels in several assets, or a route from another node, must name it."
@@ -17404,12 +17409,14 @@
             "default": "False"
           },
           "asset": {
+            "added": "v26.06",
             "type": "hex",
             "description": [
               "On an asset-aware chain, the 32-byte display id of the asset the invoice is to be paid in: an HTLC arriving on a channel in any other asset is refused. On a Sequentia network the invoice carries it in its `a` field, under its signature, and a payer reads it from there. The default is the asset of this node's channels when they all hold one; a node with channels in several assets, or none, must name it."
             ]
           },
           "allow_unfunded": {
+            "added": "v26.06",
             "type": "boolean",
             "description": [
               "On a Sequentia network, make the invoice even though this node holds no channel in its *asset* (one opening counts), for a caller that will have one by the time it is paid. Without it, such an invoice is refused, since nothing could pay it."
@@ -17833,6 +17840,7 @@
             ]
           },
           "asset": {
+            "added": "v26.06",
             "type": "hex",
             "description": [
               "On a Sequentia network, the 32-byte display id of the asset to pay in: *amount_msat* is in thousandths of its atoms, and only channels in it are used, so no route mixes assets. The default is the asset of this node's channels when they all hold one; a node with channels in several assets must name it. An asset none of this node's channels can send is refused before any HTLC is offered. The payee records the payment in an invoice that names the asset it arrived in."
@@ -30646,6 +30654,7 @@
             ]
           },
           "asset": {
+            "added": "v26.06",
             "type": "hex",
             "description": [
               "On an asset-aware chain, the 32-byte display id of the asset to pay in: only channels in that asset are used, and the invoice amount is read in its atoms. On a Sequentia network a BOLT11 invoice names its asset (its `a` field) and the payment is in that asset: `asset` may repeat it, and a different one is refused. For a BOLT12 invoice, which names none, the default is the asset of this node's channels when they all hold one; a node with channels in several assets must name it. A payment in an asset this node has no open channel in is refused before any HTLC is offered, naming the asset and the channels looked at."
@@ -33070,6 +33079,7 @@
             "added": "v25.05"
           },
           "lock_point": {
+            "added": "v26.06",
             "type": "pubkey",
             "description": [
               "On a Sequentia network, lock the first HTLC to this point rather than to a hash (a point lock, needing a taproot-covenant channel whose peer takes point locks): *payment_hash* must be the point's x coordinate, and the payment is complete with the scalar that opens it."
@@ -36415,6 +36425,7 @@
             }
           },
           "asset": {
+            "added": "v26.06",
             "type": "hex",
             "description": [
               "On an asset-aware chain, the 32-byte display id of the asset the outputs are in; their amounts are then in that asset's atoms, and change and fee are in the same asset. Without it, the asset of the inputs: the chain's policy asset, or the asset of the *utxos* given."
@@ -36953,6 +36964,7 @@
             ]
           },
           "asset": {
+            "added": "v26.06",
             "type": "hex",
             "description": [
               "On an asset-aware chain, the 32-byte display id of the asset the *utxos* hold, each of them; *satoshi* is then in that asset's atoms, and change and fee are in the same asset. Without it, the asset the *utxos* hold, which must be one asset."
@@ -38076,6 +38088,7 @@
             ]
           },
           "asset": {
+            "added": "v26.06",
             "type": "hex",
             "description": [
               "On an asset-aware chain, the 32-byte display id of the asset this invoice is to be paid in, if it names one."
@@ -38454,6 +38467,7 @@
             ]
           },
           "asset": {
+            "added": "v26.06",
             "type": "hex",
             "description": [
               "On an asset-aware chain, the 32-byte display id of the asset this invoice is to be paid in, if it names one."
@@ -38949,6 +38963,7 @@
             }
           },
           "asset": {
+            "added": "v26.06",
             "type": "hex",
             "description": [
               "On an asset-aware chain, the 32-byte display id of the asset to withdraw; *satoshi* is then in that asset's atoms, and change and fee are in the same asset. Without it, the asset of the inputs: the chain's policy asset, or the asset of the *utxos* given."

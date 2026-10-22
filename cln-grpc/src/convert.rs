@@ -124,6 +124,7 @@ impl From<responses::ListfundsChannels> for pb::ListfundsChannels {
     fn from(c: responses::ListfundsChannels) -> Self {
         Self {
             amount_msat: Some(c.amount_msat.into()), // Rule #2 for type msat
+            asset: c.asset.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
             channel_id: <Sha256 as AsRef<[u8]>>::as_ref(&c.channel_id).to_vec(), // Rule #2 for type hash
             connected: c.connected, // Rule #2 for type boolean
             funding_output: c.funding_output, // Rule #2 for type u32
@@ -142,6 +143,7 @@ impl From<responses::ListfundsOutputs> for pb::ListfundsOutputs {
         Self {
             address: c.address, // Rule #2 for type string?
             amount_msat: Some(c.amount_msat.into()), // Rule #2 for type msat
+            asset: c.asset.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
             blockheight: c.blockheight, // Rule #2 for type u32?
             output: c.output, // Rule #2 for type u32
             redeemscript: c.redeemscript.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
@@ -197,6 +199,7 @@ impl From<responses::ListchannelsChannels> for pb::ListchannelsChannels {
         Self {
             active: c.active, // Rule #2 for type boolean
             amount_msat: Some(c.amount_msat.into()), // Rule #2 for type msat
+            asset: c.asset.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
             base_fee_millisatoshi: c.base_fee_millisatoshi, // Rule #2 for type u32
             channel_flags: c.channel_flags.into(), // Rule #2 for type u8
             delay: c.delay, // Rule #2 for type u32
@@ -582,6 +585,7 @@ impl From<responses::DelinvoiceResponse> for pb::DelinvoiceResponse {
         Self {
             amount_msat: c.amount_msat.map(|f| f.into()), // Rule #2 for type msat?
             amount_received_msat: c.amount_received_msat.map(|f| f.into()), // Rule #2 for type msat?
+            asset: c.asset.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
             bolt11: c.bolt11, // Rule #2 for type string?
             bolt12: c.bolt12, // Rule #2 for type string?
             created_index: c.created_index, // Rule #2 for type u64
@@ -772,6 +776,7 @@ impl From<responses::ListinvoicesInvoices> for pb::ListinvoicesInvoices {
         Self {
             amount_msat: c.amount_msat.map(|f| f.into()), // Rule #2 for type msat?
             amount_received_msat: c.amount_received_msat.map(|f| f.into()), // Rule #2 for type msat?
+            asset: c.asset.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
             bolt11: c.bolt11, // Rule #2 for type string?
             bolt12: c.bolt12, // Rule #2 for type string?
             created_index: c.created_index, // Rule #2 for type u64
@@ -1011,6 +1016,7 @@ impl From<responses::WaitanyinvoiceResponse> for pb::WaitanyinvoiceResponse {
         Self {
             amount_msat: c.amount_msat.map(|f| f.into()), // Rule #2 for type msat?
             amount_received_msat: c.amount_received_msat.map(|f| f.into()), // Rule #2 for type msat?
+            asset: c.asset.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
             bolt11: c.bolt11, // Rule #2 for type string?
             bolt12: c.bolt12, // Rule #2 for type string?
             created_index: c.created_index, // Rule #2 for type u64
@@ -1044,6 +1050,7 @@ impl From<responses::WaitinvoiceResponse> for pb::WaitinvoiceResponse {
         Self {
             amount_msat: c.amount_msat.map(|f| f.into()), // Rule #2 for type msat?
             amount_received_msat: c.amount_received_msat.map(|f| f.into()), // Rule #2 for type msat?
+            asset: c.asset.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
             bolt11: c.bolt11, // Rule #2 for type string?
             bolt12: c.bolt12, // Rule #2 for type string?
             created_index: c.created_index, // Rule #2 for type u64
@@ -1294,6 +1301,7 @@ impl From<responses::ListpeerchannelsChannelsHtlcs> for pb::ListpeerchannelsChan
             expiry: c.expiry, // Rule #2 for type u32
             id: c.id, // Rule #2 for type u64
             local_trimmed: c.local_trimmed, // Rule #2 for type boolean?
+            lock_point: c.lock_point.map(|v| v.serialize().to_vec()), // Rule #2 for type pubkey?
             payment_hash: <Sha256 as AsRef<[u8]>>::as_ref(&c.payment_hash).to_vec(), // Rule #2 for type hash
             state: c.state as i32,
             status: c.status, // Rule #2 for type string?
@@ -1370,6 +1378,7 @@ impl From<responses::ListpeerchannelsChannels> for pb::ListpeerchannelsChannels 
     fn from(c: responses::ListpeerchannelsChannels) -> Self {
         Self {
             alias: c.alias.map(|v| v.into()),
+            channel_asset: c.channel_asset.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
             channel_id: c.channel_id.map(|v| <Sha256 as AsRef<[u8]>>::as_ref(&v).to_vec()), // Rule #2 for type hash?
             channel_type: c.channel_type.map(|v| v.into()),
             close_to: c.close_to.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
@@ -1731,6 +1740,7 @@ impl From<responses::DecodeResponse> for pb::DecodeResponse {
     fn from(c: responses::DecodeResponse) -> Self {
         Self {
             amount_msat: c.amount_msat.map(|f| f.into()), // Rule #2 for type msat?
+            asset: c.asset.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
             created_at: c.created_at, // Rule #2 for type u64?
             currency: c.currency, // Rule #2 for type string?
             currency_minor_unit: c.currency_minor_unit, // Rule #2 for type u32?
@@ -1788,6 +1798,7 @@ impl From<responses::DecodeResponse> for pb::DecodeResponse {
             payee: c.payee.map(|v| v.serialize().to_vec()), // Rule #2 for type pubkey?
             payment_hash: c.payment_hash.map(|v| <Sha256 as AsRef<[u8]>>::as_ref(&v).to_vec()), // Rule #2 for type hash?
             payment_metadata: c.payment_metadata.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
+            payment_point: c.payment_point.map(|v| v.serialize().to_vec()), // Rule #2 for type pubkey?
             payment_secret: c.payment_secret.map(|v| v.to_vec()), // Rule #2 for type secret?
             // Field: Decode.proof_leaf_hashes[]
             proof_leaf_hashes: c.proof_leaf_hashes.map(|arr| arr.into_iter().map(|i| <Sha256 as AsRef<[u8]>>::as_ref(&i).to_vec()).collect()).unwrap_or(vec![]), // Rule #3
@@ -1839,6 +1850,7 @@ impl From<responses::DecodeResponse> for pb::DecodeResponse {
             warning_missing_invreq_payer_id: c.warning_missing_invreq_payer_id, // Rule #2 for type string?
             warning_missing_offer_description: c.warning_missing_offer_description, // Rule #2 for type string?
             warning_missing_offer_issuer_id: c.warning_missing_offer_issuer_id, // Rule #2 for type string?
+            warning_network: c.warning_network, // Rule #2 for type string?
             warning_rune_invalid_utf8: c.warning_rune_invalid_utf8, // Rule #2 for type string?
             warning_unknown_offer_currency: c.warning_unknown_offer_currency, // Rule #2 for type string?
         }
@@ -5086,6 +5098,7 @@ impl From<notifications::DisconnectNotification> for pb::DisconnectNotification 
 impl From<notifications::ForwardEventNotification> for pb::ForwardEventNotification {
     fn from(c: notifications::ForwardEventNotification) -> Self {
         Self {
+            asset: c.asset.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
             failcode: c.failcode, // Rule #2 for type u32?
             failreason: c.failreason, // Rule #2 for type string?
             fee_msat: c.fee_msat.map(|f| f.into()), // Rule #2 for type msat?
@@ -5117,6 +5130,7 @@ impl From<notifications::InvoiceCreationNotification> for pb::InvoiceCreationNot
 impl From<notifications::InvoicePaymentNotification> for pb::InvoicePaymentNotification {
     fn from(c: notifications::InvoicePaymentNotification) -> Self {
         Self {
+            asset: c.asset.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
             label: c.label, // Rule #2 for type string
             msat: Some(c.msat.into()), // Rule #2 for type msat
             outpoint: c.outpoint.map(|o|o.into()), // Rule #2 for type outpoint?
@@ -5412,6 +5426,7 @@ impl From<requests::AddgossipRequest> for pb::AddgossipRequest {
 impl From<requests::AddpsbtoutputRequest> for pb::AddpsbtoutputRequest {
     fn from(c: requests::AddpsbtoutputRequest) -> Self {
         Self {
+            asset: c.asset.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
             destination: c.destination, // Rule #2 for type string?
             initialpsbt: c.initialpsbt, // Rule #2 for type string?
             locktime: c.locktime, // Rule #2 for type u32?
@@ -5516,6 +5531,7 @@ impl From<requests::DatastoreusageRequest> for pb::DatastoreusageRequest {
 impl From<requests::CreateonionHops> for pb::CreateonionHops {
     fn from(c: requests::CreateonionHops) -> Self {
         Self {
+            assocdata: c.assocdata.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
             payload: hex::decode(&c.payload).unwrap(), // Rule #2 for type hex
             pubkey: c.pubkey.serialize().to_vec(), // Rule #2 for type pubkey
         }
@@ -5618,7 +5634,9 @@ impl From<requests::RecoverchannelRequest> for pb::RecoverchannelRequest {
 impl From<requests::InvoiceRequest> for pb::InvoiceRequest {
     fn from(c: requests::InvoiceRequest) -> Self {
         Self {
+            allow_unfunded: c.allow_unfunded, // Rule #2 for type boolean?
             amount_msat: Some(c.amount_msat.into()), // Rule #2 for type msat_or_any
+            asset: c.asset.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
             cltv: c.cltv, // Rule #2 for type u32?
             deschashonly: c.deschashonly, // Rule #2 for type boolean?
             description: c.description, // Rule #2 for type string
@@ -5714,6 +5732,7 @@ impl From<requests::SendonionRequest> for pb::SendonionRequest {
             groupid: c.groupid, // Rule #2 for type u64?
             label: c.label, // Rule #2 for type string?
             localinvreqid: c.localinvreqid.map(|v| <Sha256 as AsRef<[u8]>>::as_ref(&v).to_vec()), // Rule #2 for type hash?
+            lock_point: c.lock_point.map(|v| v.serialize().to_vec()), // Rule #2 for type pubkey?
             onion: hex::decode(&c.onion).unwrap(), // Rule #2 for type hex
             partid: c.partid.map(|v| v.into()), // Rule #2 for type u16?
             payment_hash: <Sha256 as AsRef<[u8]>>::as_ref(&c.payment_hash).to_vec(), // Rule #2 for type hash
@@ -5762,6 +5781,8 @@ impl From<requests::PayRequest> for pb::PayRequest {
         Self {
             #[allow(deprecated)]
             amount_msat: c.amount_msat.map(|f| f.into()), // Rule #2 for type msat?
+            #[allow(deprecated)]
+            asset: c.asset.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
             #[allow(deprecated)]
             bolt11: c.bolt11, // Rule #2 for type string
             #[allow(deprecated)]
@@ -5843,6 +5864,7 @@ impl From<requests::NewaddrRequest> for pb::NewaddrRequest {
 impl From<requests::WithdrawRequest> for pb::WithdrawRequest {
     fn from(c: requests::WithdrawRequest) -> Self {
         Self {
+            asset: c.asset.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
             destination: c.destination, // Rule #2 for type string
             feerate: c.feerate.map(|o|o.into()), // Rule #2 for type feerate?
             minconf: c.minconf.map(|v| v.into()), // Rule #2 for type u16?
@@ -5859,6 +5881,8 @@ impl From<requests::KeysendRequest> for pb::KeysendRequest {
         Self {
             #[allow(deprecated)]
             amount_msat: Some(c.amount_msat.into()), // Rule #2 for type msat
+            #[allow(deprecated)]
+            asset: c.asset.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
             #[allow(deprecated)]
             destination: c.destination.serialize().to_vec(), // Rule #2 for type pubkey
             #[allow(deprecated)]
@@ -5885,6 +5909,7 @@ impl From<requests::KeysendRequest> for pb::KeysendRequest {
 impl From<requests::FundpsbtRequest> for pb::FundpsbtRequest {
     fn from(c: requests::FundpsbtRequest) -> Self {
         Self {
+            asset: c.asset.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
             excess_as_change: c.excess_as_change, // Rule #2 for type boolean?
             feerate: Some(c.feerate.into()), // Rule #2 for type feerate
             locktime: c.locktime, // Rule #2 for type u32?
@@ -5924,6 +5949,7 @@ impl From<requests::SignpsbtRequest> for pb::SignpsbtRequest {
 impl From<requests::UtxopsbtRequest> for pb::UtxopsbtRequest {
     fn from(c: requests::UtxopsbtRequest) -> Self {
         Self {
+            asset: c.asset.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
             excess_as_change: c.excess_as_change, // Rule #2 for type boolean?
             feerate: Some(c.feerate.into()), // Rule #2 for type feerate
             locktime: c.locktime, // Rule #2 for type u32?
@@ -5952,6 +5978,7 @@ impl From<requests::TxdiscardRequest> for pb::TxdiscardRequest {
 impl From<requests::TxprepareRequest> for pb::TxprepareRequest {
     fn from(c: requests::TxprepareRequest) -> Self {
         Self {
+            asset: c.asset.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
             feerate: c.feerate.map(|o|o.into()), // Rule #2 for type feerate?
             minconf: c.minconf, // Rule #2 for type u32?
             // Field: TxPrepare.outputs[]
@@ -6127,6 +6154,7 @@ impl From<requests::FundchannelRequest> for pb::FundchannelRequest {
         Self {
             amount: Some(c.amount.into()), // Rule #2 for type sat_or_all
             announce: c.announce, // Rule #2 for type boolean?
+            asset: c.asset.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
             // Field: FundChannel.channel_type[]
             channel_type: c.channel_type.map(|arr| arr.into_iter().map(|i| i.into()).collect()).unwrap_or(vec![]), // Rule #3
             close_to: c.close_to, // Rule #2 for type string?
@@ -6150,6 +6178,7 @@ impl From<requests::FundchannelStartRequest> for pb::FundchannelStartRequest {
         Self {
             amount: Some(c.amount.into()), // Rule #2 for type sat
             announce: c.announce, // Rule #2 for type boolean?
+            asset: c.asset.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
             // Field: FundChannel_Start.channel_type[]
             channel_type: c.channel_type.map(|arr| arr.into_iter().map(|i| i.into()).collect()).unwrap_or(vec![]), // Rule #3
             close_to: c.close_to, // Rule #2 for type string?
@@ -6201,6 +6230,8 @@ impl From<requests::GetrouteRequest> for pb::GetrouteRequest {
         Self {
             #[allow(deprecated)]
             amount_msat: Some(c.amount_msat.into()), // Rule #2 for type msat
+            #[allow(deprecated)]
+            asset: c.asset.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
             #[allow(deprecated)]
             cltv: c.cltv, // Rule #2 for type u32?
             // Field: GetRoute.exclude[]
@@ -6286,6 +6317,7 @@ impl From<requests::MultifundchannelDestinations> for pb::MultifundchannelDestin
         Self {
             amount: Some(c.amount.into()), // Rule #2 for type sat_or_all
             announce: c.announce, // Rule #2 for type boolean?
+            asset: c.asset.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
             close_to: c.close_to, // Rule #2 for type string?
             compact_lease: c.compact_lease, // Rule #2 for type string?
             id: c.id, // Rule #2 for type string
@@ -7544,6 +7576,7 @@ impl From<pb::AddgossipRequest> for requests::AddgossipRequest {
 impl From<pb::AddpsbtoutputRequest> for requests::AddpsbtoutputRequest {
     fn from(c: pb::AddpsbtoutputRequest) -> Self {
         Self {
+            asset: c.asset.map(|v| hex::encode(v)), // Rule #1 for type hex?
             destination: c.destination, // Rule #1 for type string?
             initialpsbt: c.initialpsbt, // Rule #1 for type string?
             locktime: c.locktime, // Rule #1 for type u32?
@@ -7645,6 +7678,7 @@ impl From<pb::DatastoreusageRequest> for requests::DatastoreusageRequest {
 impl From<pb::CreateonionHops> for requests::CreateonionHops {
     fn from(c: pb::CreateonionHops) -> Self {
         Self {
+            assocdata: c.assocdata.map(|v| hex::encode(v)), // Rule #1 for type hex?
             payload: hex::encode(&c.payload), // Rule #1 for type hex
             pubkey: PublicKey::from_slice(&c.pubkey).unwrap(), // Rule #1 for type pubkey
         }
@@ -7744,7 +7778,9 @@ impl From<pb::RecoverchannelRequest> for requests::RecoverchannelRequest {
 impl From<pb::InvoiceRequest> for requests::InvoiceRequest {
     fn from(c: pb::InvoiceRequest) -> Self {
         Self {
+            allow_unfunded: c.allow_unfunded, // Rule #1 for type boolean?
             amount_msat: c.amount_msat.unwrap().into(), // Rule #1 for type msat_or_any
+            asset: c.asset.map(|v| hex::encode(v)), // Rule #1 for type hex?
             cltv: c.cltv, // Rule #1 for type u32?
             deschashonly: c.deschashonly, // Rule #1 for type boolean?
             description: c.description, // Rule #1 for type string
@@ -7837,6 +7873,7 @@ impl From<pb::SendonionRequest> for requests::SendonionRequest {
             groupid: c.groupid, // Rule #1 for type u64?
             label: c.label, // Rule #1 for type string?
             localinvreqid: c.localinvreqid.map(|v| Sha256::from_slice(&v).unwrap()), // Rule #1 for type hash?
+            lock_point: c.lock_point.map(|v| PublicKey::from_slice(&v).unwrap()), // Rule #1 for type pubkey?
             onion: hex::encode(&c.onion), // Rule #1 for type hex
             partid: c.partid.map(|v| v as u16), // Rule #1 for type u16?
             payment_hash: Sha256::from_slice(&c.payment_hash).unwrap(), // Rule #1 for type hash
@@ -7883,6 +7920,7 @@ impl From<pb::PayRequest> for requests::PayRequest {
     fn from(c: pb::PayRequest) -> Self {
         Self {
             amount_msat: c.amount_msat.map(|a| a.into()), // Rule #1 for type msat?
+            asset: c.asset.map(|v| hex::encode(v)), // Rule #1 for type hex?
             bolt11: c.bolt11, // Rule #1 for type string
             description: c.description, // Rule #1 for type string?
             exclude: Some(c.exclude.into_iter().map(|s| s.into()).collect()), // Rule #4
@@ -7952,6 +7990,7 @@ impl From<pb::NewaddrRequest> for requests::NewaddrRequest {
 impl From<pb::WithdrawRequest> for requests::WithdrawRequest {
     fn from(c: pb::WithdrawRequest) -> Self {
         Self {
+            asset: c.asset.map(|v| hex::encode(v)), // Rule #1 for type hex?
             destination: c.destination, // Rule #1 for type string
             feerate: c.feerate.map(|a| a.into()), // Rule #1 for type feerate?
             minconf: c.minconf.map(|v| v as u16), // Rule #1 for type u16?
@@ -7966,6 +8005,7 @@ impl From<pb::KeysendRequest> for requests::KeysendRequest {
     fn from(c: pb::KeysendRequest) -> Self {
         Self {
             amount_msat: c.amount_msat.unwrap().into(), // Rule #1 for type msat
+            asset: c.asset.map(|v| hex::encode(v)), // Rule #1 for type hex?
             destination: PublicKey::from_slice(&c.destination).unwrap(), // Rule #1 for type pubkey
             exemptfee: c.exemptfee.map(|a| a.into()), // Rule #1 for type msat?
             extratlvs: c.extratlvs.map(|s| s.into()), // Rule #1 for type TlvStream?
@@ -7983,6 +8023,7 @@ impl From<pb::KeysendRequest> for requests::KeysendRequest {
 impl From<pb::FundpsbtRequest> for requests::FundpsbtRequest {
     fn from(c: pb::FundpsbtRequest) -> Self {
         Self {
+            asset: c.asset.map(|v| hex::encode(v)), // Rule #1 for type hex?
             excess_as_change: c.excess_as_change, // Rule #1 for type boolean?
             feerate: c.feerate.unwrap().into(), // Rule #1 for type feerate
             locktime: c.locktime, // Rule #1 for type u32?
@@ -8021,6 +8062,7 @@ impl From<pb::SignpsbtRequest> for requests::SignpsbtRequest {
 impl From<pb::UtxopsbtRequest> for requests::UtxopsbtRequest {
     fn from(c: pb::UtxopsbtRequest) -> Self {
         Self {
+            asset: c.asset.map(|v| hex::encode(v)), // Rule #1 for type hex?
             excess_as_change: c.excess_as_change, // Rule #1 for type boolean?
             feerate: c.feerate.unwrap().into(), // Rule #1 for type feerate
             locktime: c.locktime, // Rule #1 for type u32?
@@ -8048,6 +8090,7 @@ impl From<pb::TxdiscardRequest> for requests::TxdiscardRequest {
 impl From<pb::TxprepareRequest> for requests::TxprepareRequest {
     fn from(c: pb::TxprepareRequest) -> Self {
         Self {
+            asset: c.asset.map(|v| hex::encode(v)), // Rule #1 for type hex?
             feerate: c.feerate.map(|a| a.into()), // Rule #1 for type feerate?
             minconf: c.minconf, // Rule #1 for type u32?
             outputs: c.outputs.into_iter().map(|s| s.into()).collect(), // Rule #4
@@ -8221,6 +8264,7 @@ impl From<pb::FundchannelRequest> for requests::FundchannelRequest {
         Self {
             amount: c.amount.unwrap().into(), // Rule #1 for type sat_or_all
             announce: c.announce, // Rule #1 for type boolean?
+            asset: c.asset.map(|v| hex::encode(v)), // Rule #1 for type hex?
             channel_type: Some(c.channel_type.into_iter().map(|s| s).collect()), // Rule #4
             close_to: c.close_to, // Rule #1 for type string?
             compact_lease: c.compact_lease, // Rule #1 for type string?
@@ -8242,6 +8286,7 @@ impl From<pb::FundchannelStartRequest> for requests::FundchannelStartRequest {
         Self {
             amount: c.amount.unwrap().into(), // Rule #1 for type sat
             announce: c.announce, // Rule #1 for type boolean?
+            asset: c.asset.map(|v| hex::encode(v)), // Rule #1 for type hex?
             channel_type: Some(c.channel_type.into_iter().map(|s| s).collect()), // Rule #4
             close_to: c.close_to, // Rule #1 for type string?
             feerate: c.feerate.map(|a| a.into()), // Rule #1 for type feerate?
@@ -8291,6 +8336,7 @@ impl From<pb::GetrouteRequest> for requests::GetrouteRequest {
     fn from(c: pb::GetrouteRequest) -> Self {
         Self {
             amount_msat: c.amount_msat.unwrap().into(), // Rule #1 for type msat
+            asset: c.asset.map(|v| hex::encode(v)), // Rule #1 for type hex?
             cltv: c.cltv, // Rule #1 for type u32?
             exclude: Some(c.exclude.into_iter().map(|s| s.into()).collect()), // Rule #4
             fromid: c.fromid.map(|v| PublicKey::from_slice(&v).unwrap()), // Rule #1 for type pubkey?
@@ -8369,6 +8415,7 @@ impl From<pb::MultifundchannelDestinations> for requests::MultifundchannelDestin
         Self {
             amount: c.amount.unwrap().into(), // Rule #1 for type sat_or_all
             announce: c.announce, // Rule #1 for type boolean?
+            asset: c.asset.map(|v| hex::encode(v)), // Rule #1 for type hex?
             close_to: c.close_to, // Rule #1 for type string?
             compact_lease: c.compact_lease, // Rule #1 for type string?
             id: c.id, // Rule #1 for type string

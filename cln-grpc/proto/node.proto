@@ -316,6 +316,7 @@ message ListfundsChannels {
 	ChannelState state = 7;
 	optional string short_channel_id = 8;
 	bytes channel_id = 9;
+	optional bytes asset = 10;
 }
 
 message ListfundsOutputs {
@@ -336,6 +337,7 @@ message ListfundsOutputs {
 	optional uint32 blockheight = 8;
 	bool reserved = 9;
 	optional uint32 reserved_to_block = 10;
+	optional bytes asset = 11;
 }
 
 message SendpayRequest {
@@ -415,6 +417,7 @@ message ListchannelsChannels {
 	optional Amount htlc_maximum_msat = 14;
 	bytes features = 15;
 	uint32 direction = 16;
+	optional bytes asset = 17;
 }
 
 message AddgossipRequest {
@@ -429,6 +432,7 @@ message AddpsbtoutputRequest {
 	optional uint32 locktime = 2;
 	optional string initialpsbt = 3;
 	optional string destination = 4;
+	optional bytes asset = 5;
 }
 
 message AddpsbtoutputResponse {
@@ -704,6 +708,7 @@ message CreateonionResponse {
 message CreateonionHops {
 	bytes pubkey = 1;
 	bytes payload = 2;
+	optional bytes assocdata = 3;
 }
 
 message DeldatastoreRequest {
@@ -753,6 +758,7 @@ message DelinvoiceResponse {
 	optional Amount amount_received_msat = 15;
 	optional uint64 paid_at = 16;
 	optional bytes payment_preimage = 17;
+	optional bytes asset = 18;
 }
 
 message DevforgetchannelRequest {
@@ -825,6 +831,8 @@ message InvoiceRequest {
 	repeated string exposeprivatechannels = 8;
 	optional bool deschashonly = 9;
 	AmountOrAny amount_msat = 10;
+	optional bool allow_unfunded = 11;
+	optional bytes asset = 12;
 }
 
 message InvoiceResponse {
@@ -947,6 +955,7 @@ message ListinvoicesInvoices {
 	uint64 created_index = 16;
 	optional uint64 updated_index = 17;
 	optional ListinvoicesInvoicesPaidOutpoint paid_outpoint = 18;
+	optional bytes asset = 19;
 }
 
 message ListinvoicesInvoicesPaidOutpoint {
@@ -968,6 +977,7 @@ message SendonionRequest {
 	optional bytes localinvreqid = 13;
 	optional string description = 14;
 	optional Amount total_amount_msat = 15;
+	optional bytes lock_point = 16;
 }
 
 message SendonionResponse {
@@ -1103,6 +1113,7 @@ message PayRequest {
 	optional Amount amount_msat = 13 [deprecated = true];
 	optional bytes localinvreqid = 14 [deprecated = true];
 	optional Amount partial_msat = 15 [deprecated = true];
+	optional bytes asset = 16 [deprecated = true];
 }
 
 message PayResponse {
@@ -1190,6 +1201,7 @@ message WaitanyinvoiceResponse {
 	uint64 created_index = 13;
 	optional uint64 updated_index = 14;
 	optional WaitanyinvoicePaidOutpoint paid_outpoint = 15;
+	optional bytes asset = 16;
 }
 
 message WaitanyinvoicePaidOutpoint {
@@ -1222,6 +1234,7 @@ message WaitinvoiceResponse {
 	uint64 created_index = 13;
 	optional uint64 updated_index = 14;
 	optional WaitinvoicePaidOutpoint paid_outpoint = 15;
+	optional bytes asset = 16;
 }
 
 message WaitinvoicePaidOutpoint {
@@ -1280,6 +1293,7 @@ message WithdrawRequest {
 	optional uint32 minconf = 3;
 	repeated Outpoint utxos = 4;
 	optional Feerate feerate = 5;
+	optional bytes asset = 6;
 }
 
 message WithdrawResponse {
@@ -1299,6 +1313,7 @@ message KeysendRequest {
 	optional TlvStream extratlvs = 9 [deprecated = true];
 	Amount amount_msat = 10 [deprecated = true];
 	optional Amount maxfee = 11 [deprecated = true];
+	optional bytes asset = 12 [deprecated = true];
 }
 
 message KeysendResponse {
@@ -1328,6 +1343,7 @@ message FundpsbtRequest {
 	optional bool excess_as_change = 8;
 	optional bool nonwrapped = 9;
 	optional bool opening_anchor_channel = 10;
+	optional bytes asset = 11;
 }
 
 message FundpsbtResponse {
@@ -1377,6 +1393,7 @@ message UtxopsbtRequest {
 	optional bool reservedok = 8;
 	optional bool excess_as_change = 9;
 	optional bool opening_anchor_channel = 10;
+	optional bytes asset = 11;
 }
 
 message UtxopsbtResponse {
@@ -1410,6 +1427,7 @@ message TxprepareRequest {
 	optional uint32 minconf = 3;
 	repeated Outpoint utxos = 4;
 	repeated OutputDesc outputs = 5;
+	optional bytes asset = 6;
 }
 
 message TxprepareResponse {
@@ -1500,6 +1518,7 @@ message ListpeerchannelsChannels {
 	optional Amount their_max_htlc_value_in_flight_msat = 61;
 	optional Amount our_max_htlc_value_in_flight_msat = 62;
 	repeated string features = 63;
+	optional bytes channel_asset = 64;
 }
 
 message ListpeerchannelsChannelsAlias {
@@ -1541,6 +1560,7 @@ message ListpeerchannelsChannelsHtlcs {
 	optional bool local_trimmed = 6;
 	optional string status = 7;
 	HtlcState state = 8;
+	optional bytes lock_point = 9;
 }
 
 message ListpeerchannelsChannelsInflight {
@@ -1759,6 +1779,9 @@ message DecodeResponse {
 	optional string proof_note = 97;
 	optional string proof_signature = 98;
 	repeated DecodeUnknownPayerProofTlvs unknown_payer_proof_tlvs = 99;
+	optional bytes asset = 100;
+	optional bytes payment_point = 101;
+	optional string warning_network = 102;
 }
 
 message DecodeExtra {
@@ -2141,6 +2164,7 @@ message FundchannelRequest {
 	optional uint32 mindepth = 12;
 	optional Amount reserve = 13;
 	repeated uint32 channel_type = 14;
+	optional bytes asset = 15;
 }
 
 message FundchannelResponse {
@@ -2168,6 +2192,7 @@ message FundchannelStartRequest {
 	optional uint32 mindepth = 7;
 	optional Amount reserve = 8;
 	repeated uint32 channel_type = 9;
+	optional bytes asset = 10;
 }
 
 message FundchannelStartResponse {
@@ -2285,6 +2310,7 @@ message GetrouteRequest {
 	repeated string exclude = 7 [deprecated = true];
 	optional uint32 maxhops = 8 [deprecated = true];
 	Amount amount_msat = 9 [deprecated = true];
+	optional bytes asset = 10 [deprecated = true];
 }
 
 message GetrouteResponse {
@@ -2503,6 +2529,7 @@ message MultifundchannelDestinations {
 	optional string compact_lease = 7;
 	optional uint32 mindepth = 8;
 	optional Amount reserve = 9;
+	optional bytes asset = 10;
 }
 
 message MultifundchannelChannelIds {
@@ -4780,6 +4807,7 @@ message ForwardEventNotification {
 	optional ForwardEventStyle style = 10;
 	double received_time = 11;
 	optional double resolved_time = 12;
+	optional bytes asset = 13;
 }
 
 message StreamInvoiceCreationRequest {
@@ -4799,6 +4827,7 @@ message InvoicePaymentNotification {
 	bytes preimage = 2;
 	optional Outpoint outpoint = 3;
 	string label = 4;
+	optional bytes asset = 5;
 }
 
 message StreamLogRequest {

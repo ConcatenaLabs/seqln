@@ -104,6 +104,7 @@
         ]
       },
       "asset": {
+        "added": "v26.06",
         "type": "hex",
         "description": [
           "On an asset-aware chain, the 32-byte display id of the asset this invoice is to be paid in, if it names one."
