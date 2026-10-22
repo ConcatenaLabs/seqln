@@ -51,7 +51,7 @@ struct config {
 	 * "auto" keeps it on a node whose hsmd is a signer proxy and off on
 	 * one holding its own keys; "on" / "off" force it.  Resolved into
 	 * watchtower_store_on once the options are read. */
-	const char *watchtower_store;
+	char *watchtower_store;
 	bool watchtower_store_on;
 
 	/* SEQUENTIA: offer the taproot-covenant channel type
