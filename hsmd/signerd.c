@@ -343,7 +343,7 @@ int main(int argc, char *argv[])
 	for (;;) {
 		bool is_main;
 		struct node_id id;
-		u64 dbid, capabilities;
+		u64 dbid = 0, capabilities = 0;
 		u8 *msg, *reply;
 
 		clean_tmpctx();
