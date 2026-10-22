@@ -303,7 +303,7 @@ int main(int argc, char *argv[])
 	assert(sym_state_num(0, true) == 0 && sym_state_num(0, false) == 1);
 	assert(sym_state_num(5, true) == 10 && sym_state_num(5, false) == 11);
 	sym_tree_program(&st, prog);
-	check_bytes("state 7 program", prog, 32, V_STATE7_SPK + 4);
+	check_bytes("state 7 program", prog, 32, &V_STATE7_SPK[4]);
 
 	/* The settle clock (design M): the same channel, its funding
 	 * issuing the marker. */
