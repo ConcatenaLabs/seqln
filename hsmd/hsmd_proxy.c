@@ -707,10 +707,10 @@ static void load_priming(void)
 	 * already be primeable.  The file only exists for a listen-mode node, so
 	 * loading it unconditionally is a no-op everywhere else. */
 	path = priming_path(tmpctx);
-	raw = grab_file(tmpctx, path);
+	raw = grab_file_str(tmpctx, path);
 	if (!raw)
 		return;
-	/* grab_file NUL-terminates; the real payload is one byte shorter. */
+	/* grab_file_str NUL-terminates; the real payload is one byte shorter. */
 	left = tal_bytelen(raw) - 1;
 	p = raw;
 	if (!take_bytes(&p, &left, &ver, 1) || ver != PRIMING_FILE_VERSION) {
