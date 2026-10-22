@@ -68,8 +68,9 @@ void sym_spend_start(struct channel *channel,
 		     const struct sym_state_out *outs,
 		     u32 sequence, u32 minblock, u32 deadline);
 
-/* The output a spend in progress spends is spent on chain. */
-void sym_note_spent(const struct channel *channel,
+/* An output of the channel is spent on chain: a spend of ours of it stops
+ * and frees its fee coins, and one onchaind proposes later never starts. */
+void sym_note_spent(struct channel *channel,
 		    const struct bitcoin_outpoint *out);
 
 #endif /* LIGHTNING_LIGHTNINGD_SYMMETRIC_H */

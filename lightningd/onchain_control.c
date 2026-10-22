@@ -2794,6 +2794,9 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 	/* SEQUENTIA: a symmetric channel's states (lightningd/symmetric.h);
 	 * its kickoff, which spent the funding, is broadcast no more. */
 	if (channel_has(channel, OPT_SEQ_SYMMETRIC)) {
+		/* onchaind starts afresh (a restart, a reorg): the spends it
+		 * replays are noted again. */
+		channel->sym_spent_seen = tal_free(channel->sym_spent_seen);
 		sym_note_spent(channel, &channel->funding);
 		if (channel->sym_dev_stale)
 			log_unusual(channel->log, "dev-sym-snapshot: closing"
