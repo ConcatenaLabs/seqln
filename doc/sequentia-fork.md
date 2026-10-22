@@ -656,6 +656,35 @@ mutual close, once the peer's update signature on it verifies. It claims a settl
 by its own leaf, to its own scripts, and signs a stage's fee coins when the outputs before them
 carry exactly the value of the channel output they spend.
 
+**The settle clock's scripts** (`sym_channel_set_clock`, for `option_seq_symmetric_clock`, bits
+180/181). They move the shared delay off the state output, so a late update no longer restarts
+it. The funding transaction issues one atom of a fresh asset, the marker, whose id derives from
+the issuing input (`sym_marker_id`), into a seed output beside the usual 2-of-2 funding output.
+
+- The seed is `tr(H, {KICK, RETIRE})`. KICK needs no signature: the input before it must be the
+  funding output (its program and the capacity in the channel asset), and the output at its own
+  index the clock, carrying the capacity. RETIRE takes both update keys, so a mutual close can
+  take the marker.
+- The kickoff spends the funding output at index j and the seed at j+1, into KO holding the
+  marker at j and the clock at j+1.
+- **The pairing is crossed.** The funding keys sign `SIGHASH_SINGLE|SIGHASH_ANYONECANPAY` over
+  output j, KO with the marker, so the funding output cannot be spent without the one marker
+  atom, and KICK binds the clock, so the clock is born at kickoff. Signing the funding over the
+  clock instead would let either party move the funds into the clock alone, early, and once it
+  matured kick off, update to a stale state and settle, all in one block.
+- UPD gains `<500000001> OP_CHECKLOCKTIMEVERIFY OP_DROP`, so every update's lock time is a time
+  at or past that floor, and the state number stays in the witness.
+- SETTLE takes no signature and no delay: the marker stays where it is (the output at its own
+  index keeps its script, asset and value), and outputs 1 to m are the settlement.
+- The clock, `tr(H, CLOCK)`, waits the delay, needs lock time 0, and needs the marker in the input
+  before it. No update can spend it, and it pays only beside the marker, whose one lock-time-0
+  path is SETTLE.
+
+The scripts cannot see the funding's issuance, so the accepter must check that the funding
+issued exactly one atom, with no reissuance token, into the seed: a spare atom would take the
+clock. The block proof of every refusal is in the hand-back's evidence; the vectors are
+`common/test/sym_m_vectors.h`.
+
 **Developers.** `dev-sym-snapshot id` freezes the best state a node holds; its next unilateral
 close then publishes that one as though it held nothing newer, which is how the tests make a
 stale state.
