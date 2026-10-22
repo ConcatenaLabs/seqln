@@ -11,6 +11,7 @@
 #include <common/json_channel_type.h>
 #include <common/json_command.h>
 #include <common/memleak.h>
+#include <common/sym_factory.h>
 #include <connectd/connectd_wiregen.h>
 #include <errno.h>
 #include <hsmd/permissions.h>
@@ -25,6 +26,7 @@
 #include <lightningd/peer_fd.h>
 #include <lightningd/plugin_hook.h>
 #include <lightningd/subd.h>
+#include <lightningd/sym_factory.h>
 #include <lightningd/symmetric.h>
 #include <openingd/openingd_wiregen.h>
 #include <unistd.h>
@@ -477,6 +479,11 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 		goto cleanup;
 	}
 
+	/* SEQUENTIA: a factory channel's factory, before its output is
+	 * watched (lightningd/sym_factory.h). */
+	if (fc->factory)
+		sym_factory_attach(channel, fc->factory);
+
 	/* Watch for funding confirms */
 	channel_watch_funding(ld, channel);
 
@@ -527,6 +534,7 @@ static void opening_fundee_finished(struct subd *openingd,
 	u8 channel_asset[33];
 	struct bitcoin_signature *sym_kickoff_sig;
 	struct sym_state *sym_local, *sym_remote;
+	struct sym_factory *factory;
 
 	log_debug(uc->log, "Got opening_fundee_finish_response");
 
@@ -559,7 +567,8 @@ static void opening_fundee_finished(struct subd *openingd,
 				     channel_asset,
 				     &sym_kickoff_sig,
 				     &sym_local,
-				     &sym_remote)) {
+				     &sym_remote,
+				     &factory)) {
 		log_broken(uc->log, "bad OPENING_FUNDEE_REPLY %s",
 			   tal_hex(reply, reply));
 		uncommitted_channel_disconnect(uc, LOG_BROKEN,
@@ -578,6 +587,30 @@ static void opening_fundee_finished(struct subd *openingd,
 	 * openingd did (sym_delay_ok). */
 	if (channel_type_has(type, OPT_SEQ_SYMMETRIC))
 		uc->our_config.to_self_delay = ld->config.symmetric_delay;
+
+	/* SEQUENTIA: a factory's nonce stands where a funding txid would: we
+	 * take none that is the funding txid of a channel of ours, so a tag
+	 * we sign under is never another channel's. */
+	if (factory) {
+		struct peer_node_id_map_iter it;
+		struct peer *p;
+		struct channel *c;
+
+		for (p = peer_node_id_map_first(ld->peers, &it); p;
+		     p = peer_node_id_map_next(ld->peers, &it)) {
+			list_for_each(&p->channels, c, list) {
+				if (channel_is_sym_factory(c)
+				    || !bitcoin_txid_eq(&c->funding.txid,
+							&factory->nonce))
+					continue;
+				uncommitted_channel_disconnect(uc, LOG_UNUSUAL,
+							       "Factory nonce is"
+							       " a funding txid"
+							       " of ours");
+				goto failed;
+			}
+		}
+	}
 
 	/* Consumes uc */
 	channel = wallet_commit_channel(ld, uc,
@@ -605,6 +638,10 @@ static void opening_fundee_finished(struct subd *openingd,
 	log_debug(channel->log, "Watching funding tx %s",
 		  fmt_bitcoin_txid(reply,
 				 &channel->funding.txid));
+
+	/* SEQUENTIA: a factory channel's factory (lightningd/sym_factory.h). */
+	if (factory)
+		sym_factory_attach(channel, take(tal_steal(NULL, factory)));
 
 	channel_watch_funding(ld, channel);
 
@@ -1089,6 +1126,90 @@ bool peer_start_openingd(struct peer *peer, struct peer_fd *peer_fd)
 	return true;
 }
 
+/* SEQUENTIA: a factory slot's fundchannel_complete: every slot of the
+ * factory must have started here, the PSBT must pay F (common/sym_factory.h)
+ * once, in the channel's asset and for the factory's whole value. */
+static struct command_result *factory_find(struct command *cmd,
+					   struct funding_channel *fc,
+					   const struct wally_psbt *psbt,
+					   struct sym_factory **factory)
+{
+	struct sym_factory *f = tal(cmd, struct sym_factory);
+	struct peer_node_id_map_iter it;
+	struct peer *p;
+	struct amount_sat total;
+	u8 *spk;
+	bool found = false;
+
+	f->nonce = fc->factory_id->txid;
+	f->slot = fc->factory_id->n;
+	memcpy(f->asset, fc->channel_asset, sizeof(f->asset));
+	f->slots = tal_arrz(f, struct sym_factory_slot, fc->factory_size);
+	for (size_t i = 0; i < fc->factory_size; i++)
+		f->slots[i].amount = AMOUNT_SAT(0);
+
+	for (p = peer_node_id_map_first(cmd->ld->peers, &it); p;
+	     p = peer_node_id_map_next(cmd->ld->peers, &it)) {
+		const struct funding_channel *o;
+		u32 slot;
+
+		if (!p->uncommitted_channel || !p->uncommitted_channel->fc)
+			continue;
+		o = p->uncommitted_channel->fc;
+		if (!o->factory_id || !o->inflight
+		    || !bitcoin_txid_eq(&o->factory_id->txid,
+					&fc->factory_id->txid))
+			continue;
+		slot = o->factory_id->n;
+		if (o->factory_size != fc->factory_size
+		    || memcmp(o->channel_asset, fc->channel_asset,
+			      sizeof(fc->channel_asset)) != 0
+		    || tal_bytelen(o->funding_scriptpubkey)
+		       != BITCOIN_SCRIPTPUBKEY_P2TR_LEN
+		    || !amount_sat_eq(f->slots[slot].amount, AMOUNT_SAT(0)))
+			return command_fail(cmd, FUNDING_PSBT_INVALID,
+					    "Factory slot %u started twice or"
+					    " differently", slot);
+		memcpy(f->slots[slot].program, o->funding_scriptpubkey + 2, 32);
+		f->slots[slot].amount = o->funding_sats;
+	}
+	for (size_t i = 0; i < fc->factory_size; i++)
+		if (amount_sat_eq(f->slots[i].amount, AMOUNT_SAT(0)))
+			return command_fail(cmd, FUNDING_PSBT_INVALID,
+					    "Factory slot %zu has not started",
+					    i);
+	if (!sym_factory_value(f->slots, &total))
+		return command_fail(cmd, FUNDING_PSBT_INVALID,
+				    "Factory value overflows");
+
+	spk = sym_factory_spk(tmpctx, f->asset, f->slots);
+	for (size_t i = 0; i < psbt->num_outputs; i++) {
+		struct amount_asset a;
+
+		if (!memeq(psbt->outputs[i].script, psbt->outputs[i].script_len,
+			   spk, tal_bytelen(spk)))
+			continue;
+		if (found)
+			return command_fail(cmd, FUNDING_PSBT_INVALID,
+					    "Two outputs pay the factory");
+		a = wally_psbt_output_get_amount(&psbt->outputs[i]);
+		if (!amount_asset_is(&a, f->asset) || a.value != total.satoshis) /* Raw: check */
+			return command_fail(cmd, FUNDING_PSBT_INVALID,
+					    "The factory output must hold %s of"
+					    " the channel's asset",
+					    fmt_amount_sat(tmpctx, total));
+		psbt_txid(NULL, psbt, &f->out.txid, NULL);
+		f->out.n = i;
+		found = true;
+	}
+	if (!found)
+		return command_fail(cmd, FUNDING_PSBT_INVALID,
+				    "No output pays the factory %s",
+				    tal_hex(tmpctx, spk));
+	*factory = f;
+	return NULL;
+}
+
 static struct command_result *json_fundchannel_complete(struct command *cmd,
 							const char *buffer,
 							const jsmntok_t *obj UNNEEDED,
@@ -1134,6 +1255,43 @@ static struct command_result *json_fundchannel_complete(struct command *cmd,
 	/* We only deal with V2 internally */
 	if (!psbt_set_version(funding_psbt, 2)) {
 		return command_fail(cmd, LIGHTNINGD, "Could not set PSBT version.");
+	}
+
+	/* SEQUENTIA: a factory slot is funded by the factory output; the
+	 * channel's funding is its id, (nonce, slot). */
+	if (fc->factory_id) {
+		struct command_result *ret;
+		struct sym_factory *f;
+
+		/* Unsigned non-segwit inputs have malleable txids. */
+		for (size_t i = 0; i < funding_psbt->num_inputs; i++) {
+			struct wally_psbt_input *in = &funding_psbt->inputs[i];
+			if (!in->witness_utxo
+			    && !wally_map_get_integer(&in->psbt_fields,
+						      /* PSBT_IN_FINAL_SCRIPTSIG */ 0x07))
+				return command_fail(cmd, FUNDING_PSBT_INVALID,
+						    "Input %zu is non-segwit and"
+						    " unsigned: txid is unknown"
+						    " until signed", i);
+		}
+		ret = factory_find(cmd, fc, funding_psbt, &f);
+		if (ret)
+			return ret;
+		if (command_check_only(cmd))
+			return command_check_done(cmd);
+		tal_free(fc->factory);
+		fc->factory = tal_steal(fc, f);
+		fc->funding_psbt = tal_steal(fc, funding_psbt);
+		fc->withheld = *withhold;
+		peer->uncommitted_channel->fc->cmd = cmd;
+		msg = towire_openingd_funder_complete(NULL,
+						      &fc->factory_id->txid,
+						      fc->factory_id->n,
+						      fc->channel_type,
+						      fc->factory);
+		subd_send_msg(peer->uncommitted_channel->open_daemon,
+			      take(msg));
+		return command_still_pending(cmd);
 	}
 
 	/* Figure out the correct output, and perform sanity checks. */
@@ -1198,7 +1356,8 @@ static struct command_result *json_fundchannel_complete(struct command *cmd,
 	msg = towire_openingd_funder_complete(NULL,
 					      funding_txid,
 					      *funding_txout_num,
-					      peer->uncommitted_channel->fc->channel_type);
+					      peer->uncommitted_channel->fc->channel_type,
+					      NULL);
 	subd_send_msg(peer->uncommitted_channel->open_daemon, take(msg));
 	return command_still_pending(cmd);
 }
@@ -1385,12 +1544,17 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 	struct channel_id tmp_channel_id;
 	struct channel_type *ctype;
 	const u8 *asset = NULL;
+	struct bitcoin_txid *factory_nonce;
+	u32 *factory_slot, *factory_size;
 
 	fc->cmd = cmd;
 	fc->cancels = tal_arr(fc, struct command *, 0);
 	fc->uc = NULL;
 	fc->inflight = false;
 	fc->funding_scriptpubkey = NULL;
+	fc->factory_id = NULL;
+	fc->factory_size = 0;
+	fc->factory = NULL;
 
 	if (!param_check(fc->cmd, buffer, params,
 			 p_req("id", param_node_id, &id),
@@ -1403,8 +1567,42 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 			 p_opt("reserve", param_sat, &reserve),
 			 p_opt("channel_type", param_channel_type, &ctype),
 			 p_opt("asset", param_asset_tag, &asset),
+			 p_opt("factory_nonce", param_txid, &factory_nonce),
+			 p_opt("factory_slot", param_u32, &factory_slot),
+			 p_opt("factory_size", param_u32, &factory_size),
 			 NULL))
 		return command_param_failed();
+
+	/* SEQUENTIA: a slot of a factory (lightningd/sym_factory.h): all
+	 * three, a factory of at least two, the slot inside it. */
+	if (factory_nonce || factory_slot || factory_size) {
+		if (!factory_nonce || !factory_slot || !factory_size)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "factory_nonce, factory_slot and"
+					    " factory_size go together");
+		if (*factory_size < 2 || *factory_size > 1000
+		    || *factory_slot >= *factory_size)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "Slot %u of a factory of %u",
+					    *factory_slot, *factory_size);
+		fc->factory_id = tal(fc, struct bitcoin_outpoint);
+		fc->factory_id->txid = *factory_nonce;
+		fc->factory_id->n = *factory_slot;
+		fc->factory_size = *factory_size;
+		if (!ctype)
+			ctype = channel_type_seq_symmetric_factory(cmd);
+		else if (!channel_type_has(ctype, OPT_SEQ_SYMMETRIC_FACTORY))
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "A factory slot needs the factory"
+					    " channel type");
+		/* Nobody can route over a channel without an outpoint of
+		 * its own. */
+		*announce_channel = false;
+	} else if (ctype && channel_type_has(ctype, OPT_SEQ_SYMMETRIC_FACTORY))
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "The factory channel type needs"
+				    " factory_nonce, factory_slot and"
+				    " factory_size");
 
 	/* Asset-aware channels: default to the policy asset unless the caller
 	 * asked to denominate this channel in an issued asset. */
@@ -1616,7 +1814,8 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 			fc->channel_flags,
 			reserve,
 			fc->channel_type,
-			fc->channel_asset);
+			fc->channel_asset,
+			fc->factory_id);
 
 	if (!topology_synced(cmd->ld->topology)) {
 		struct fundchannel_start_info *info

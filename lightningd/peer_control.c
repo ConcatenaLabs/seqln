@@ -12,6 +12,7 @@
 #include <common/json_channel_type.h>
 #include <common/json_command.h>
 #include <common/psbt_open.h>
+#include <common/sym_factory.h>
 #include <common/timeout.h>
 #include <common/version.h>
 #include <common/wire_error.h>
@@ -36,6 +37,7 @@
 #include <lightningd/peer_fd.h>
 #include <lightningd/peer_htlcs.h>
 #include <lightningd/plugin_hook.h>
+#include <lightningd/sym_factory.h>
 #include <lightningd/symmetric.h>
 #include <lightningd/watchtower_store.h>
 #include <onchaind/onchaind_wiregen.h>
@@ -484,7 +486,11 @@ void drop_to_chain(struct lightningd *ld, struct channel *channel,
 
 	/* If we're not already (e.g. close before channel fully open),
 	 * make sure we're watching for the funding spend */
-	if (!channel->funding_spend_watch) {
+	if (channel_is_sym_factory(channel)) {
+		/* SEQUENTIA: a factory channel's output is F or its KO. */
+		if (!sym_factory_watching(channel))
+			sym_factory_watch(ld, channel);
+	} else if (!channel->funding_spend_watch) {
 		log_debug(channel->log, "Adding funding_spend_watch");
 		channel->funding_spend_watch = watch_txo(channel,
 							 ld->topology, channel,
@@ -544,7 +550,13 @@ void drop_to_chain(struct lightningd *ld, struct channel *channel,
 		 * kickoff, with a fee coin attached; onchaind then publishes
 		 * our best state over it, and its settlement after the delay
 		 * (lightningd/symmetric.h). */
-		if (!cooperative
+		if (!cooperative && channel_is_sym_factory(channel)) {
+			/* SEQUENTIA: a factory channel splits the factory,
+			 * then publishes its best state over its KO
+			 * (lightningd/sym_factory.h). */
+			if (!sym_factory_close(ld, channel))
+				refused = true;
+		} else if (!cooperative
 		    && channel_type_has(channel->type, OPT_SEQ_SYMMETRIC)) {
 			if (!sym_broadcast_kickoff(ld, channel, cmd_id))
 				refused = true;
@@ -1146,6 +1158,26 @@ static void NON_NULL_ARGS(1, 2, 4, 5) json_add_channel(struct command *cmd,
 			fmt_channel_id(tmpctx, &channel->cid));
 	json_add_txid(response, "funding_txid", &channel->funding.txid);
 	json_add_num(response, "funding_outnum", channel->funding.n);
+
+	/* SEQUENTIA: a factory channel's funding is its id in the factory;
+	 * its output on chain is F, then its KO (lightningd/sym_factory.h). */
+	if (channel_is_sym_factory(channel)) {
+		const struct sym_factory *f = channel->sym_factory;
+
+		json_object_start(response, "seq_factory");
+		json_add_txid(response, "nonce", &f->nonce);
+		json_add_num(response, "slot", f->slot);
+		json_add_num(response, "size", tal_count(f->slots));
+		json_add_txid(response, "factory_txid", &f->out.txid);
+		json_add_num(response, "factory_outnum", f->out.n);
+		if (channel->sym_factory_ko) {
+			json_add_txid(response, "ko_txid",
+				      &channel->sym_factory_ko->txid);
+			json_add_num(response, "ko_outnum",
+				     channel->sym_factory_ko->n);
+		}
+		json_object_end(response);
+	}
 
 	has_valid_inflights = false;
 	if (!list_empty(&channel->inflights)) {
@@ -2648,6 +2680,10 @@ void channel_watch_wrong_funding(struct lightningd *ld, struct channel *channel)
 
 void channel_watch_funding_out(struct lightningd *ld, struct channel *channel)
 {
+	if (channel_is_sym_factory(channel)) {
+		sym_factory_watch(ld, channel);
+		return;
+	}
 	tal_free(channel->funding_spend_watch);
 	channel->funding_spend_watch = watch_txo(channel, ld->topology, channel,
 						 &channel->funding,
@@ -2658,6 +2694,13 @@ void channel_watch_funding(struct lightningd *ld, struct channel *channel)
 {
 	log_debug(channel->log, "Watching for funding txid: %s",
 		  fmt_bitcoin_txid(tmpctx, &channel->funding.txid));
+
+	/* SEQUENTIA: a factory channel's funding is its id in the factory;
+	 * its output is F, then its KO (lightningd/sym_factory.h). */
+	if (channel_is_sym_factory(channel)) {
+		sym_factory_watch(ld, channel);
+		return;
+	}
 
 	/* This is stub channel, we don't watch anything funding. */
 	if (!channel->scid || !is_stub_scid(*channel->scid)) {
@@ -2686,6 +2729,9 @@ void channel_unwatch_funding(struct lightningd *ld, struct channel *channel)
 
 	/* This is stub channel, we don't watch anything! */
 	if (channel->scid && is_stub_scid(*channel->scid))
+		return;
+	/* SEQUENTIA: nor is a factory channel's funding a 2-of-2. */
+	if (channel_is_sym_factory(channel))
 		return;
 
 	unwatch_scriptpubkey(channel, ld->topology,

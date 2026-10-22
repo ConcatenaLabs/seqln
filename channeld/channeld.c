@@ -2371,10 +2371,12 @@ static struct commitsig_info *handle_peer_commit_sig(struct peer *peer,
 			  remote_splice_amnt, &remote_anchor_outnum,
 			  funding_pubkeys);
 
-	/* Set the commit_sig on the commitment tx psbt */
-	if (!psbt_input_set_signature(txs[0]->psbt, 0,
-				      &remote_funding,
-				      &commit_sig))
+	/* Set the commit_sig on the commitment tx psbt (a factory channel's
+	 * is zero, and signs nothing). */
+	if (!channel_has(peer->channel, OPT_SEQ_SYMMETRIC_FACTORY)
+	    && !psbt_input_set_signature(txs[0]->psbt, 0,
+					 &remote_funding,
+					 &commit_sig))
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "Unable to set signature internally");
 
@@ -2395,8 +2397,11 @@ static struct commitsig_info *handle_peer_commit_sig(struct peer *peer,
 	 *      - MUST send a `warning` and close the connection, or send an
 	 *        `error` and fail the channel.
 	 */
-	if (!check_tx_sig(txs[0], 0, NULL, funding_wscript,
-			  &remote_funding, &commit_sig)) {
+	/* SEQUENTIA: a factory channel has no kickoff, so its field is
+	 * zero and signs nothing (common/sym_factory.h). */
+	if (!channel_has(peer->channel, OPT_SEQ_SYMMETRIC_FACTORY)
+	    && !check_tx_sig(txs[0], 0, NULL, funding_wscript,
+			     &remote_funding, &commit_sig)) {
 		dump_htlcs(peer->channel, "receiving commit_sig");
 		peer_failed_warn(peer->pps, &peer->channel_id,
 				 "Bad commit_sig signature %"PRIu64" %s for tx"
@@ -7485,7 +7490,15 @@ static void init_channel(struct peer *peer)
 	peer->sym_kickoff_sig = NULL;
 	if (channel_has(peer->channel, OPT_SEQ_SYMMETRIC)) {
 		peer->sym_kickoff_sig = tal(peer, struct bitcoin_signature);
-		sym_channeld_kickoff_sig(peer->channel, peer->sym_kickoff_sig);
+		/* A factory channel has no kickoff (common/sym_factory.h):
+		 * the field carries zero. */
+		if (channel_has(peer->channel, OPT_SEQ_SYMMETRIC_FACTORY)) {
+			memset(&peer->sym_kickoff_sig->s, 0,
+			       sizeof(peer->sym_kickoff_sig->s));
+			peer->sym_kickoff_sig->sighash_type = SIGHASH_ALL;
+		} else
+			sym_channeld_kickoff_sig(peer->channel,
+						 peer->sym_kickoff_sig);
 	}
 
 	/* Default desired feerate is the feerate we set for them last. */

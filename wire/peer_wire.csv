@@ -156,6 +156,13 @@ msgdata,funding_created,tlvs,funding_created_tlvs,
 # sender's update signature on the receiver's first state.
 tlvtype,funding_created_tlvs,sym_sig,48041
 tlvdata,funding_created_tlvs,sym_sig,sig,bip340sig,
+# SEQUENTIA: on a factory channel (common/sym_factory.h) `funding_txid` and
+# `funding_output_index` are the channel's id in the factory, (nonce, slot);
+# sym_factory is the factory (towire_sym_factory): nonce, slot, asset, the
+# factory output on chain, and each slot's KO program and amount.  There is
+# no kickoff, so `signature` is zero.
+tlvtype,funding_created_tlvs,sym_factory,48043
+tlvdata,funding_created_tlvs,sym_factory,factory,byte,...
 msgtype,funding_signed,35
 msgdata,funding_signed,channel_id,channel_id,
 msgdata,funding_signed,signature,signature,

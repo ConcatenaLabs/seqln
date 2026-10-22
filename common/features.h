@@ -179,4 +179,9 @@ struct feature_set *feature_set_dup(const tal_t *ctx,
  * --symmetric-channels where the chain has tapscript introspection. */
 #define OPT_SEQ_SYMMETRIC			178
 
+/* SEQUENTIA: a symmetric channel opened from a factory (common/sym_factory.h):
+ * one funding output for many channels.  Offered with --symmetric-channels,
+ * beside OPT_SEQ_SYMMETRIC. */
+#define OPT_SEQ_SYMMETRIC_FACTORY		182
+
 #endif /* LIGHTNING_COMMON_FEATURES_H */

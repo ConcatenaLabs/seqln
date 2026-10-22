@@ -234,6 +234,11 @@ struct channel {
 	/* The same for the spends lightningd builds for taproot-covenant,
 	 * credit and symmetric-HTLC outputs (onchain_control.c, tcov_spend). */
 	struct bitcoin_outpoint *tcov_spent_seen;
+	/* A factory channel's factory (common/sym_factory.h), whose id is
+	 * `funding`, and its KO once the split put it on chain: the channel's
+	 * output then, as F was before (lightningd/sym_factory.h). */
+	struct sym_factory *sym_factory;
+	struct bitcoin_outpoint *sym_factory_ko;
 
 	/* Watch we have on funding output. */
 	struct txowatch *funding_spend_watch;

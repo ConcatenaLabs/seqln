@@ -146,7 +146,8 @@
                       "zeroconf/even",
                       "seq_taproot_covenant/even",
                       "seq_credit/even",
-                      "seq_symmetric/even"
+                      "seq_symmetric/even",
+                      "seq_symmetric_factory/even"
                     ],
                     "description": [
                       "Name of feature bit."
@@ -1009,6 +1010,64 @@
               "description": [
                 "On an asset-aware chain, the 32-byte display id of the channel's asset, the policy asset included; the channel's amounts are in that asset's atoms."
               ]
+            },
+            "seq_factory": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "nonce",
+                "slot",
+                "size",
+                "factory_txid",
+                "factory_outnum"
+              ],
+              "description": [
+                "On a Sequentia network, for a channel opened from a factory: *funding_txid* and *funding_outnum* are then the channel's id in the factory, its nonce and slot, and this says where the channel's output is on chain: the factory output until the factory splits, then the channel's own output of the split."
+              ],
+              "properties": {
+                "nonce": {
+                  "type": "txid",
+                  "description": [
+                    "The factory's nonce."
+                  ]
+                },
+                "slot": {
+                  "type": "u32",
+                  "description": [
+                    "The channel's slot in the factory."
+                  ]
+                },
+                "size": {
+                  "type": "u32",
+                  "description": [
+                    "How many channels the factory opened."
+                  ]
+                },
+                "factory_txid": {
+                  "type": "txid",
+                  "description": [
+                    "The transaction holding the factory output."
+                  ]
+                },
+                "factory_outnum": {
+                  "type": "u32",
+                  "description": [
+                    "The factory output's number in it."
+                  ]
+                },
+                "ko_txid": {
+                  "type": "txid",
+                  "description": [
+                    "Once the factory has split: the split, which holds the channel's output."
+                  ]
+                },
+                "ko_outnum": {
+                  "type": "u32",
+                  "description": [
+                    "Once the factory has split: the channel's output in the split, its slot."
+                  ]
+                }
+              }
             }
           },
           "allOf": [
@@ -1130,7 +1189,8 @@
                       "The bitcoin address we will close to (present if close_to_addr is a standardized address)."
                     ]
                   },
-                  "channel_asset": {}
+                  "channel_asset": {},
+                  "seq_factory": {}
                 }
               }
             },
@@ -1230,7 +1290,8 @@
                       "Fee attached to this the current tx."
                     ]
                   },
-                  "channel_asset": {}
+                  "channel_asset": {},
+                  "seq_factory": {}
                 }
               }
             },
@@ -1331,7 +1392,8 @@
                       "0 if we're the lesser node_id, 1 if we're the greater (as used in BOLT #7 channel_update)."
                     ]
                   },
-                  "channel_asset": {}
+                  "channel_asset": {},
+                  "seq_factory": {}
                 }
               }
             },
@@ -1443,7 +1505,8 @@
                       "The minimum feerate for the next funding transaction in per-1000-weight, with `kpw` appended."
                     ]
                   },
-                  "channel_asset": {}
+                  "channel_asset": {},
+                  "seq_factory": {}
                 }
               }
             }

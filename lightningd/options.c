@@ -2062,11 +2062,16 @@ void handle_opts(struct lightningd *ld)
 		    || ld->config.symmetric_delay > 0xFFFF)
 			fatal("--symmetric-delay must be between 1 and 65535"
 			      " blocks");
-		if (chainparams->has_tapscript_introspection)
+		if (chainparams->has_tapscript_introspection) {
 			feature_set_or(ld->our_features,
 				       take(feature_set_for_feature(NULL,
 								    OPTIONAL_FEATURE(OPT_SEQ_SYMMETRIC))));
-		else
+			/* Its channels opened from a factory
+			 * (common/sym_factory.h). */
+			feature_set_or(ld->our_features,
+				       take(feature_set_for_feature(NULL,
+								    OPTIONAL_FEATURE(OPT_SEQ_SYMMETRIC_FACTORY))));
+		} else
 			log_unusual(ld->log, "--symmetric-channels:"
 				    " not offered on %s, only on the"
 				    " Sequentia networks",

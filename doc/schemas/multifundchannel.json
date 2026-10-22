@@ -128,6 +128,13 @@
         "description": [
           "Initial feerate for commitment and HTLC transactions. See *feerate* for valid values."
         ]
+      },
+      "factory": {
+        "type": "boolean",
+        "description": [
+          "On a Sequentia network, open every destination as one slot of a factory: one output, the factory output, funds every channel, destination *i* in slot *i*. Every destination names the same *asset* and its *amount*, and all of them open or none. The channels are symmetric channels (bit 182, `seq_symmetric_factory`), never announced; each closes by splitting the factory and publishing its latest state over its own output, and the others go on."
+        ],
+        "default": "False"
       }
     }
   },
@@ -223,7 +230,8 @@
                       "zeroconf/even",
                       "seq_taproot_covenant/even",
                       "seq_credit/even",
-                      "seq_symmetric/even"
+                      "seq_symmetric/even",
+                      "seq_symmetric_factory/even"
                     ],
                     "description": [
                       "Name of feature bit."

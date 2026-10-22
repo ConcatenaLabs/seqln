@@ -11,6 +11,7 @@
 #include <common/mkdatastorekey.h>
 #include <common/onionreply.h>
 #include <common/randbytes.h>
+#include <common/sym_factory.h>
 #include <common/sym_state.h>
 #include <common/trace.h>
 #include <db/bindings.h>
@@ -2264,6 +2265,8 @@ static struct channel *wallet_stmt2channel(struct wallet *w, struct db_stmt *stm
 	 * kickoff until a mutual close replaces it. */
 	if (channel_type_has(chan->type, OPT_SEQ_SYMMETRIC)) {
 		wallet_sym_load(w, chan);
+		if (channel_type_has(chan->type, OPT_SEQ_SYMMETRIC_FACTORY))
+			wallet_sym_factory_load(w, chan);
 		if (chan->last_tx && sym_is_kickoff(chan, chan->last_tx))
 			chan->last_sig.sighash_type
 				= SIGHASH_SINGLE | SIGHASH_ANYONECANPAY;
@@ -3631,6 +3634,62 @@ void wallet_sym_load(struct wallet *w, struct channel *channel)
 	channel->sym_remote = sym_state_col(channel, stmt, "remote_state");
 	channel->sym_remote_pending = sym_state_col(channel, stmt,
 						    "remote_pending");
+	tal_free(stmt);
+}
+
+void wallet_sym_factory_save(struct wallet *w, const struct channel *channel)
+{
+	struct db_stmt *stmt;
+	u8 *blob = tal_arr(tmpctx, u8, 0);
+
+	towire_sym_factory(&blob, channel->sym_factory);
+	stmt = db_prepare_v2(w->db, SQL("DELETE FROM channel_sym_factory"
+					" WHERE channel_id = ?;"));
+	db_bind_u64(stmt, channel->dbid);
+	db_exec_prepared_v2(take(stmt));
+
+	stmt = db_prepare_v2(w->db, SQL("INSERT INTO channel_sym_factory ("
+					"  channel_id, factory, ko_txid,"
+					"  ko_outnum)"
+					" VALUES (?, ?, ?, ?);"));
+	db_bind_u64(stmt, channel->dbid);
+	db_bind_talarr(stmt, blob);
+	if (channel->sym_factory_ko) {
+		db_bind_txid(stmt, &channel->sym_factory_ko->txid);
+		db_bind_int(stmt, channel->sym_factory_ko->n);
+	} else {
+		db_bind_null(stmt);
+		db_bind_null(stmt);
+	}
+	db_exec_prepared_v2(take(stmt));
+}
+
+void wallet_sym_factory_load(struct wallet *w, struct channel *channel)
+{
+	struct db_stmt *stmt;
+	const u8 *b;
+	size_t max;
+
+	stmt = db_prepare_v2(w->db, SQL("SELECT factory, ko_txid, ko_outnum"
+					" FROM channel_sym_factory"
+					" WHERE channel_id = ?;"));
+	db_bind_u64(stmt, channel->dbid);
+	db_query_prepared(stmt);
+	if (!db_step(stmt)) {
+		tal_free(stmt);
+		return;
+	}
+	b = db_col_arr(tmpctx, stmt, "factory", u8);
+	max = tal_bytelen(b);
+	channel->sym_factory = fromwire_sym_factory(channel, &b, &max);
+	if (!db_col_is_null(stmt, "ko_txid")) {
+		channel->sym_factory_ko = tal(channel, struct bitcoin_outpoint);
+		db_col_txid(stmt, "ko_txid", &channel->sym_factory_ko->txid);
+		channel->sym_factory_ko->n = db_col_int(stmt, "ko_outnum");
+	} else {
+		db_col_ignore(stmt, "ko_txid");
+		db_col_ignore(stmt, "ko_outnum");
+	}
 	tal_free(stmt);
 }
 

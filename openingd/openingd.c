@@ -24,11 +24,13 @@
 #include <common/status.h>
 #include <common/subdaemon.h>
 #include <common/sym_channel.h>
+#include <common/sym_factory.h>
 #include <common/wire_error.h>
 #include <hsmd/hsmd_wiregen.h>
 #include <inttypes.h>
 #include <openingd/common.h>
 #include <openingd/openingd_wiregen.h>
+#include <wally_script.h>
 #include <wire/peer_wire.h>
 #include <wire/wire_sync.h>
 
@@ -112,6 +114,11 @@ struct state {
 	 * states (common/sym_scripts.h). */
 	struct bitcoin_signature *sym_kickoff_sig;
 	struct sym_state *sym_local, *sym_remote;
+
+	/* SEQUENTIA: a factory channel's id, (nonce, slot), which we open, and
+	 * its factory (common/sym_factory.h). */
+	struct bitcoin_outpoint *factory_id;
+	struct sym_factory *factory;
 
 	/* Channel type we agreed on (even before channel populated) */
 	struct channel_type *channel_type;
@@ -335,6 +342,31 @@ static void set_remote_upfront_shutdown(struct state *state,
 
 	if (err)
 		peer_failed_err(state->pps, &state->channel_id, "%s", err);
+}
+
+/* SEQUENTIA: a factory channel's KO program (common/sym_factory.h): UPD(-1)
+ * over the tag of its id, with the opener's and the accepter's update keys
+ * (each side's delayed payment basepoint). */
+static void factory_ko_program(const struct state *state,
+			       const struct bitcoin_outpoint *id,
+			       const struct pubkey *opener_key,
+			       const struct pubkey *accepter_key, u8 program[32])
+{
+	struct sym_channel sc;
+	struct sym_tree ko;
+
+	sym_channel_init(&sc, &chainparams->genesis_blockhash, id, opener_key,
+			 accepter_key, state->channel_asset,
+			 state->localconf.to_self_delay);
+	sym_kickoff_tree(tmpctx, &sc, &ko);
+	sym_tree_program(&ko, program);
+}
+
+/* There is no kickoff to sign: the split takes no signature. */
+static void factory_zero_sig(struct bitcoin_signature *sig)
+{
+	memset(&sig->s, 0, sizeof(sig->s));
+	sig->sighash_type = SIGHASH_ALL;
 }
 
 /* We start the 'open a channel' negotation with the supplied peer, but
@@ -639,6 +671,31 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags,
 						       &state->our_funding_pubkey,
 						       &state->their_funding_pubkey));
 
+	/* SEQUENTIA: a factory channel's slot pays its KO, which the factory
+	 * output commits to (common/sym_factory.h). */
+	if (channel_type_has(state->channel_type, OPT_SEQ_SYMMETRIC_FACTORY)) {
+		u8 program[32];
+
+		if (!state->factory_id) {
+			negotiation_failed(state, "A factory channel needs its"
+					   " factory");
+			return NULL;
+		}
+		factory_ko_program(state, state->factory_id,
+				   &state->our_points.delayed_payment,
+				   &state->their_points.delayed_payment,
+				   program);
+		funding_output_script = tal_arr(tmpctx, u8,
+						BITCOIN_SCRIPTPUBKEY_P2TR_LEN);
+		funding_output_script[0] = OP_1;
+		funding_output_script[1] = 32;
+		memcpy(funding_output_script + 2, program, 32);
+	} else if (state->factory_id) {
+		negotiation_failed(state, "A factory slot needs the factory"
+				   " channel type");
+		return NULL;
+	}
+
 	/* If we have negotiated `option_zeroconf` then we're allowed
 	 * to send `channel_ready` whenever we want. So ignore their
 	 * `minimum_depth` and use ours instead. Otherwise we use the
@@ -852,7 +909,16 @@ static bool funder_finalize_channel_setup(struct state *state,
 			= tlv_funding_created_tlvs_new(tmpctx);
 
 		*pbase = tal_free(*pbase);
-		sym_sign_kickoff(state->channel, *tx, sig);
+		/* A factory channel has no kickoff: the split takes no
+		 * signature.  It sends the factory instead. */
+		if (channel_has(state->channel, OPT_SEQ_SYMMETRIC_FACTORY)) {
+			u8 *blob = tal_arr(tmpctx, u8, 0);
+
+			factory_zero_sig(sig);
+			towire_sym_factory(&blob, state->factory);
+			fc_tlvs->sym_factory = blob;
+		} else
+			sym_sign_kickoff(state->channel, *tx, sig);
 		state->sym_kickoff_sig = tal_dup(state, struct bitcoin_signature,
 						 sig);
 		state->sym_remote = sym_first_remote(state);
@@ -995,6 +1061,15 @@ wait_funding_signed:
 		sym_first_local(state, fs_tlvs->sym_sig);
 	else
 		validate_initial_commitment_signature(HSM_FD, *tx, sig);
+
+	/* SEQUENTIA: a factory channel has no kickoff, so no signature on
+	 * it: theirs is zero, and not kept on the transaction. */
+	if (channel_has(state->channel, OPT_SEQ_SYMMETRIC_FACTORY)) {
+		factory_zero_sig(sig);
+		peer_billboard(false, "Funding channel: opening negotiation"
+			       " succeeded");
+		return true;
+	}
 
 	if (!check_tx_sig(*tx, 0, NULL, wscript, &state->their_funding_pubkey, sig)) {
 		peer_failed_err(state->pps, &state->channel_id,
@@ -1436,6 +1511,48 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	/* We only allow 16 bits for this on the wire. */
 	state->funding.n = funding_txout;
 
+	/* SEQUENTIA: a factory channel: the funding outpoint is its id, and
+	 * the factory must give this slot our KO and our amount
+	 * (common/sym_factory.h). */
+	if (channel_type_has(state->channel_type, OPT_SEQ_SYMMETRIC_FACTORY)) {
+		const u8 *cursor;
+		size_t max;
+		u8 program[32];
+		const char *why;
+
+		if (channel_flags & CHANNEL_FLAGS_ANNOUNCE_CHANNEL)
+			peer_failed_err(state->pps, &state->channel_id,
+					"A factory channel is not announced");
+		if (!fc_tlvs->sym_factory)
+			peer_failed_err(state->pps, &state->channel_id,
+					"funding_created without the factory");
+		cursor = fc_tlvs->sym_factory;
+		max = tal_bytelen(fc_tlvs->sym_factory);
+		state->factory = fromwire_sym_factory(state, &cursor, &max);
+		if (!state->factory || max != 0)
+			peer_failed_err(state->pps, &state->channel_id,
+					"Malformed factory");
+		if (!bitcoin_txid_eq(&state->factory->nonce,
+				     &state->funding.txid)
+		    || state->factory->slot != state->funding.n)
+			peer_failed_err(state->pps, &state->channel_id,
+					"The factory's nonce and slot are not"
+					" the channel's");
+		if (memcmp(state->factory->asset, state->channel_asset,
+			   sizeof(state->channel_asset)) != 0)
+			peer_failed_err(state->pps, &state->channel_id,
+					"The factory is not in the channel's"
+					" asset");
+		factory_ko_program(state, &state->funding,
+				   &theirs.delayed_payment,
+				   &state->our_points.delayed_payment, program);
+		why = sym_factory_check(tmpctx, state->factory, program,
+					state->funding_sats);
+		if (why)
+			peer_failed_err(state->pps, &state->channel_id,
+					"Bad factory: %s", why);
+	}
+
 	/* BOLT #2:
 	 *
 	 * The `temporary_channel_id` MUST be the same as the
@@ -1526,8 +1643,11 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 		validate_initial_commitment_signature(HSM_FD, local_commit,
 						      &theirsig);
 
-	if (!check_tx_sig(local_commit, 0, NULL, wscript, &their_funding_pubkey,
-			  &theirsig)) {
+	/* SEQUENTIA: a factory channel has no kickoff signature. */
+	if (channel_has(state->channel, OPT_SEQ_SYMMETRIC_FACTORY))
+		factory_zero_sig(&theirsig);
+	else if (!check_tx_sig(local_commit, 0, NULL, wscript,
+			       &their_funding_pubkey, &theirsig)) {
 		/* BOLT #1:
 		 *
 		 * - when failure was caused by an invalid signature check:
@@ -1587,7 +1707,10 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 		struct tlv_funding_signed_tlvs *fs_tlvs
 			= tlv_funding_signed_tlvs_new(tmpctx);
 
-		sym_sign_kickoff(state->channel, remote_commit, &sig);
+		if (channel_has(state->channel, OPT_SEQ_SYMMETRIC_FACTORY))
+			factory_zero_sig(&sig);
+		else
+			sym_sign_kickoff(state->channel, remote_commit, &sig);
 		state->sym_kickoff_sig = tal_dup(state, struct bitcoin_signature,
 						 &sig);
 		state->sym_remote = sym_first_remote(state);
@@ -1660,7 +1783,8 @@ reply:
 				     state->channel_asset,
 				     state->sym_kickoff_sig,
 				     state->sym_local,
-				     state->sym_remote);
+				     state->sym_remote,
+				     state->factory);
 }
 
 /*~ Standard "peer sent a message, handle it" demuxer.  Though it really only
@@ -1741,7 +1865,8 @@ static u8 *handle_master_in(struct state *state)
 						    &channel_flags,
 						    &state->reserve,
 						    &ctype,
-						    state->channel_asset))
+						    state->channel_asset,
+						    &state->factory_id))
 			master_badmsg(WIRE_OPENINGD_FUNDER_START, msg);
 		msg = funder_channel_start(state, channel_flags, nonanchor_feerate, anchor_feerate, ctype);
 		tal_free(ctype);
@@ -1754,7 +1879,8 @@ static u8 *handle_master_in(struct state *state)
 		if (!fromwire_openingd_funder_complete(state, msg,
 						       &funding_txid,
 						       &funding_txout,
-						       &state->channel_type))
+						       &state->channel_type,
+						       &state->factory))
 			master_badmsg(WIRE_OPENINGD_FUNDER_COMPLETE, msg);
 		state->funding.txid = funding_txid;
 		state->funding.n = funding_txout;
@@ -1846,6 +1972,8 @@ int main(int argc, char *argv[])
 	state->channel = NULL;
 	state->sym_kickoff_sig = NULL;
 	state->sym_local = state->sym_remote = NULL;
+	state->factory_id = NULL;
+	state->factory = NULL;
 
 	/* Default this to zero, we only ever look at the local */
 	state->remoteconf.max_dust_htlc_exposure_msat = AMOUNT_MSAT(0);

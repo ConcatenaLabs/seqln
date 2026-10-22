@@ -847,6 +847,10 @@ void wallet_htlc_save_in(struct wallet *wallet,
 void wallet_sym_save(struct wallet *w, const struct channel *channel);
 void wallet_sym_load(struct wallet *w, struct channel *channel);
 
+/* A factory channel's factory and KO (lightningd/sym_factory.h). */
+void wallet_sym_factory_save(struct wallet *w, const struct channel *channel);
+void wallet_sym_factory_load(struct wallet *w, struct channel *channel);
+
 /* SEQUENTIA: credit notes (lightningd/credit.h). */
 struct credit_note;
 /* Save @n for channel @chan_dbid, or add its preimage to the one saved. */

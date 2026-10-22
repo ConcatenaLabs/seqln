@@ -1163,6 +1163,16 @@ static const struct db_migration dbmigrations[] = {
 	 ", PRIMARY KEY (channel_id)"
 	 ");"), NULL,
      SQL("DROP TABLE channel_sym"), NULL},
+    /* Factory channels (lightningd/sym_factory.h): the factory, and the
+     * channel's KO once the split put it on chain. */
+    {SQL("CREATE TABLE channel_sym_factory ("
+	 "  channel_id BIGINT REFERENCES channels(id) ON DELETE CASCADE"
+	 ", factory BLOB"
+	 ", ko_txid BLOB"
+	 ", ko_outnum INTEGER"
+	 ", PRIMARY KEY (channel_id)"
+	 ");"), NULL,
+     SQL("DROP TABLE channel_sym_factory"), NULL},
 };
 
 const struct db_migration *get_db_migrations(size_t *num)

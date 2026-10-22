@@ -107,6 +107,10 @@ static enum side sym_opener;
 static struct basepoints sym_basepoints[NUM_SIDES];
 static struct htlcs_info *sym_htlcs;
 static struct bitcoin_outpoint sym_funding;
+/* The output the close spent: the funding, or a factory channel's KO
+ * (lightningd/sym_factory.h), which only an update spends. */
+static struct bitcoin_outpoint sym_anchor;
+static bool sym_factory;
 
 /* Asset-aware channels: the asset this channel is denominated in (33-byte
  * version+tag); the policy asset for an ordinary channel. All resolution/HTLC
@@ -1911,6 +1915,7 @@ static void wait_for_resolved(struct tracked_output **outs)
 		case WIRE_ONCHAIND_SPEND_TCOV:
 		case WIRE_ONCHAIND_SPEND_CREDIT_CLAIM:
 		case WIRE_ONCHAIND_SYM_INIT:
+		case WIRE_ONCHAIND_SYM_ANCHOR:
 		case WIRE_ONCHAIND_SPEND_SYM:
 			break;
 		}
@@ -4595,6 +4600,60 @@ static void handle_symmetric_close(const struct tx_parts *tx,
 	onchain_annotate_txin(&tx->txid, 0, TX_CHANNEL_UNILATERAL);
 	resolved_by_other(outs[0], &tx->txid, SYM_UPDATE);
 
+	/* A factory channel's KO, spent by an update: the state it made is the
+	 * output at the input's index, its number and R in the witness. */
+	if (sym_factory) {
+		for (size_t i = 0; i < tal_count(tx->inputs); i++) {
+			const struct wally_tx_witness_stack *wit;
+			struct bitcoin_outpoint next;
+			struct sha256 rest;
+			u8 **items;
+			s64 num;
+
+			if (!tx->inputs[i]
+			    || !wally_tx_input_spends(tx->inputs[i], &sym_anchor))
+				continue;
+			wit = tx->inputs[i]->witness;
+			items = tal_arr(tmpctx, u8 *, wit ? wit->num_items : 0);
+			for (size_t j = 0; j < tal_count(items); j++)
+				items[j] = tal_dup_arr(items, u8,
+						       wit->items[j].witness,
+						       wit->items[j].witness_len,
+						       0);
+			/* The parser leaves out an annex (BIP341). */
+			if (!sym_parse_update_witness((const u8 **)items, &num,
+						      &rest)
+			    || i >= tal_count(tx->outputs) || !tx->outputs[i]) {
+				status_broken("KO %s spent by %s, not an"
+					      " update: nothing to track",
+					      fmt_bitcoin_outpoint(tmpctx,
+								   &sym_anchor),
+					      fmt_bitcoin_txid(tmpctx,
+							       &tx->txid));
+				wait_for_resolved(outs);
+				return;
+			}
+			next.txid = tx->txid;
+			next.n = i;
+			asset = wally_tx_output_get_amount(tx->outputs[i]);
+			status_info("Factory channel's KO %s replaced by state"
+				    " %"PRId64" (%s); our best state is"
+				    " %"PRId64,
+				    fmt_bitcoin_outpoint(tmpctx, &sym_anchor),
+				    num, fmt_bitcoin_txid(tmpctx, &tx->txid),
+				    sym_best ? sym_best->num : (s64)-1);
+			sym_track_state(&outs, &next, tx_blockheight,
+					amount_sat(asset.value), num, &rest,
+					SYM_UPDATE);
+			wait_for_resolved(outs);
+			return;
+		}
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "%s does not spend the KO %s",
+			      fmt_bitcoin_txid(tmpctx, &tx->txid),
+			      fmt_bitcoin_outpoint(tmpctx, &sym_anchor));
+	}
+
 	/* KO is the output at the funding input's index. */
 	ko.txid = tx->txid;
 	ko.n = 0;
@@ -4705,6 +4764,10 @@ int main(int argc, char *argv[])
 		if (r && r->has_sig[LOCAL] && r->has_sig[REMOTE]
 		    && (!sym_best || r->num > sym_best->num))
 			sym_best = r;
+		msg = wire_sync_read(tmpctx, REQ_FD);
+		if (!fromwire_onchaind_sym_anchor(msg, &sym_anchor,
+						  &sym_factory))
+			master_badmsg(WIRE_ONCHAIND_SYM_ANCHOR, msg);
 	}
 
 	/* We need to keep tx around, but there's only one: not really a leak */
@@ -4713,9 +4776,10 @@ int main(int argc, char *argv[])
 	outs = tal_arr(ctx, struct tracked_output *, 0);
 	wally_tx_input_get_txid(tx->inputs[0], &funding.txid);
 	funding.n = tx->inputs[0]->index;
-	/* SEQUENTIA: a kickoff may spend the funding at any input. */
+	/* SEQUENTIA: a kickoff may spend the funding at any input; a factory
+	 * channel's close spends its KO. */
 	if (option_seq_symmetric)
-		funding = sym_funding;
+		funding = sym_anchor;
 
 	/* SEQUENTIA: a credit channel's leaves (common/credit_scripts.h): the
 	 * opener provides. */
