@@ -109,6 +109,12 @@ def test_tcov_not_negotiated_without_both(node_factory, bitcoind):
 SHORT = {'watchtime-blocks': 12, 'cltv-final': 20, 'cltv-delta': 20,
          'max-dust-htlc-exposure-msat': 10**12}
 HOLD = os.path.join(os.path.dirname(__file__), '..', 'plugins', 'hold_invoice.py')
+# A to_self_delay longer than an HTLC's life (cltv-final), for l1, set by its
+# peer: l1's to_local comes back to its wallet only after a timeout claim of
+# that HTLC is mined.  A node pays a claim's fee from the channel's own asset
+# first whenever it holds some, so a test of a fee coin in another asset
+# needs to_local, in the channel's asset, kept out of the wallet until then.
+LONG = {'watchtime-blocks': 30}
 
 
 def tcov_pair(node_factory, bitcoind, opts=({}, {})):
@@ -207,6 +213,15 @@ def builds_of(node, txid, n):
     return len([ln for ln in node.daemon.logs if pat in ln])
 
 
+def assert_htlc_ends_first(bitcoind, node, peer, commitment, htlc):
+    """The HTLC's timeout claim is due before node's to_local is: the
+    premise of a claim whose fee coin is in another asset."""
+    delay = only_one(node.rpc.listpeerchannels(peer.info['id'])['channels'])['our_to_self_delay']
+    height = bitcoind.rpc.getrawtransaction(commitment, 1)['confirmations']
+    height = bitcoind.rpc.getblockcount() - height + 1
+    assert htlc['expiry'] + 3 < height + delay, (htlc['expiry'], height, delay)
+
+
 def assert_claim_settled(bitcoind, node, txid, n):
     """Once the spend of txid:n is mined, three more blocks build it no more
     (each build asks the signer again and reserves fee coins)."""
@@ -222,7 +237,8 @@ def test_tcov_timeout_claim_fee_in_other_asset(node_factory, bitcoind, executor)
     delayed output D by covenant, with the fee from a SILV coin: l1 holds
     no GOLD outside the channel.  After the delay l1 sweeps D."""
     l1, l2, gold, silv, scid = tcov_pair(node_factory, bitcoind,
-                                         opts=({}, {'plugin': HOLD, 'may_fail': True}))
+                                         opts=({}, {'plugin': HOLD, 'may_fail': True,
+                                                    **LONG}))
     # No GOLD left in l1's wallet: the fee must come from another asset.
     addr = bitcoind.rpc.getnewaddress()
     l1.rpc.call('withdraw', {'destination': addr, 'satoshi': 'all', 'asset': gold})
@@ -240,6 +256,7 @@ def test_tcov_timeout_claim_fee_in_other_asset(node_factory, bitcoind, executor)
     htlc_out = only_one([o['n'] for o in dec['vout']
                          if o['scriptPubKey']['type'] == 'witness_v1_taproot'
                          and int(Decimal(o['value']) * PAR) == msat // 1000])
+    assert_htlc_ends_first(bitcoind, l1, l2, commitment, htlc)
 
     mine_to(bitcoind, htlc['expiry'] + 1)
     wait_spender(bitcoind, commitment, htlc_out)
@@ -258,7 +275,8 @@ def test_tcov_timeout_claim_fee_in_other_asset(node_factory, bitcoind, executor)
     assert len(wit) == 3 and len(wit[0]) == 128
 
     # D, after l1's delay, back to its wallet.
-    sweep, j = wait_spender_after(bitcoind, claim['txid'], 0, 13)
+    sweep, j = wait_spender_after(bitcoind, claim['txid'], 0,
+                                  LONG['watchtime-blocks'] + 1)
     assert sweep['vout'][0]['asset'] == gold
     mine_if_pending(bitcoind, sweep['txid'])
     wait_for(lambda: any(o['txid'] == sweep['txid'] and o['asset'] == gold
@@ -581,7 +599,8 @@ def test_tcov_keyless_device_signs_channel_and_claims(node_factory, bitcoind, ex
     silv = bitcoind.issue_asset(1000)
     bitcoind.set_fee_rates({bitcoind.POLICY_ASSET: PAR, gold: PAR, silv: 2 * PAR})
     device, l1 = kc.keyless_node(node_factory, directory, options={**TCOV, **SHORT})
-    l2 = node_factory.get_node(options={**TCOV, **SHORT, 'plugin': HOLD}, may_fail=True)
+    l2 = node_factory.get_node(options={**TCOV, **SHORT, **LONG, 'plugin': HOLD},
+                               may_fail=True)
     try:
         # All of l1's GOLD goes into the channel: the claim's fee must come
         # from another asset.
@@ -611,6 +630,7 @@ def test_tcov_keyless_device_signs_channel_and_claims(node_factory, bitcoind, ex
         htlc_out = only_one([o['n'] for o in dec['vout']
                              if o['scriptPubKey']['type'] == 'witness_v1_taproot'
                              and int(Decimal(o['value']) * PAR) == msat // 1000])
+        assert_htlc_ends_first(bitcoind, l1, l2, commitment, htlc)
 
         mine_to(bitcoind, htlc['expiry'] + 1)
         wait_spender(bitcoind, commitment, htlc_out)
@@ -628,7 +648,8 @@ def test_tcov_keyless_device_signs_channel_and_claims(node_factory, bitcoind, ex
                              if o['scriptPubKey']['type'] == 'witness_v1_taproot'
                              and o['n'] != htlc_out])
         for txid, n in ((claim['txid'], i), (commitment, to_local)):
-            sweep, _ = wait_spender_after(bitcoind, txid, n, 13)
+            sweep, _ = wait_spender_after(bitcoind, txid, n,
+                                          LONG['watchtime-blocks'] + 1)
             mine_if_pending(bitcoind, sweep['txid'])
             wait_for(lambda: any(o['txid'] == sweep['txid'] and o['asset'] == gold
                                  for o in l1.rpc.listfunds()['outputs']))
