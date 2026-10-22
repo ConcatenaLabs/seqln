@@ -30,8 +30,8 @@ LCLI=$SEQLN_DIR/cli/lightning-cli
 HOLD=$SEQLN_DIR/contrib/holdinvoice-seq/holdinvoice.py
 NET=liquid-regtest
 
-l1() { $LCLI --lightning-dir=$T/ln1 --network=$NET "$@"; }
-l2() { $LCLI --lightning-dir=$T/ln2 --network=$NET "$@"; }
+l1() { $LCLI --lightning-dir="$T/ln1" --network=$NET "$@"; }
+l2() { $LCLI --lightning-dir="$T/ln2" --network=$NET "$@"; }
 cli() { $SCLI "$@"; }
 
 node_conf() { # $1=dir $2=port $3=extra
@@ -60,9 +60,9 @@ EOF
 }
 
 up() {
-	mkdir -p $T/seq
+	mkdir -p "$T/seq"
 	if ! cli ping >/dev/null 2>&1; then
-		$SEQD -chain=$NET -datadir=$T/seq -rpcport=17300 -rpcuser=seq -rpcpassword=seq \
+		$SEQD -chain=$NET -datadir="$T/seq" -rpcport=17300 -rpcuser=seq -rpcpassword=seq \
 			-validatepegin=0 -con_blocksubsidy=5000000000 -blindedaddresses=0 \
 			-con_default_blinded_addresses=0 -txindex=1 -listen=0 -fallbackfee=0.00001 \
 			-daemon
@@ -72,15 +72,15 @@ up() {
 	if [ "$(cli getblockcount)" -lt 101 ]; then
 		cli generatetoaddress 101 "$(cli getnewaddress)" >/dev/null
 	fi
-	node_conf $T/ln1 27171 ""
-	node_conf $T/ln2 27172 "plugin=$HOLD"
+	node_conf "$T/ln1" 27171 ""
+	node_conf "$T/ln2" 27172 "plugin=$HOLD"
 	for i in 1 2; do
-		if ! $LCLI --lightning-dir=$T/ln$i --network=$NET getinfo >/dev/null 2>&1; then
-			setsid -f nohup "$LND" --lightning-dir=$T/ln$i < /dev/null > $T/ln$i/stdout 2>&1
+		if ! $LCLI --lightning-dir="$T/ln$i" --network=$NET getinfo >/dev/null 2>&1; then
+			setsid -f nohup "$LND" --lightning-dir="$T/ln$i" < /dev/null > "$T/ln$i/stdout" 2>&1
 		fi
 	done
 	for i in 1 2; do
-		while ! $LCLI --lightning-dir=$T/ln$i --network=$NET getinfo >/dev/null 2>&1; do sleep 0.3; done
+		while ! $LCLI --lightning-dir="$T/ln$i" --network=$NET getinfo >/dev/null 2>&1; do sleep 0.3; done
 	done
 	echo "ln1 $(l1 getinfo | jq -r .id)  ln2 $(l2 getinfo | jq -r .id)"
 }
@@ -90,25 +90,28 @@ mine() { cli generatetoaddress "${1:-1}" "$(cli getnewaddress)" >/dev/null; }
 fund() {
 	local policy
 	policy=$(cli dumpassetlabels | jq -r .bitcoin)
-	if [ ! -f $T/assets ]; then
+	if [ ! -f "$T/assets" ]; then
 		local gold silv
-		gold=$(cli -named issueasset assetamount=1000 tokenamount=1 blind=false fee_asset=$policy | jq -r .asset)
-		silv=$(cli -named issueasset assetamount=1000 tokenamount=1 blind=false fee_asset=$policy | jq -r .asset)
+		gold=$(cli -named issueasset assetamount=1000 tokenamount=1 blind=false fee_asset="$policy" | jq -r .asset)
+		silv=$(cli -named issueasset assetamount=1000 tokenamount=1 blind=false fee_asset="$policy" | jq -r .asset)
 		mine 1
-		echo "GOLD=$gold" > $T/assets
-		echo "SILV=$silv" >> $T/assets
-		echo "POLICY=$policy" >> $T/assets
+		echo "GOLD=$gold" > "$T/assets"
+		echo "SILV=$silv" >> "$T/assets"
+		echo "POLICY=$policy" >> "$T/assets"
 	fi
-	. $T/assets
+	# shellcheck source=/dev/null
+	. "$T/assets"
 	# The open fee market values no asset by default; a channel funded in an
-	# asset needs that asset accepted for fees.
+	# asset needs that asset accepted for fees.  GOLD, SILV and POLICY come
+	# from $T/assets.
+	# shellcheck disable=SC2153
 	cli setfeeexchangerates "{\"$POLICY\":100000000,\"$GOLD\":100000000,\"$SILV\":100000000}" >/dev/null
 	for i in 1 2; do
 		local a
-		a=$($LCLI --lightning-dir=$T/ln$i --network=$NET newaddr bech32 | jq -r .bech32)
-		cli -named sendtoaddress address=$a amount=10 assetlabel=bitcoin fee_asset_label=bitcoin >/dev/null
-		cli -named sendtoaddress address=$a amount=100 assetlabel=$GOLD fee_asset_label=bitcoin >/dev/null
-		cli -named sendtoaddress address=$a amount=100 assetlabel=$SILV fee_asset_label=bitcoin >/dev/null
+		a=$($LCLI --lightning-dir="$T/ln$i" --network=$NET newaddr bech32 | jq -r .bech32)
+		cli -named sendtoaddress address="$a" amount=10 assetlabel=bitcoin fee_asset_label=bitcoin >/dev/null
+		cli -named sendtoaddress address="$a" amount=100 assetlabel="$GOLD" fee_asset_label=bitcoin >/dev/null
+		cli -named sendtoaddress address="$a" amount=100 assetlabel="$SILV" fee_asset_label=bitcoin >/dev/null
 	done
 	mine 2
 	sleep 3
@@ -116,16 +119,17 @@ fund() {
 	local id2 id1
 	id2=$(l2 getinfo | jq -r .id); id1=$(l1 getinfo | jq -r .id)
 	# GOLD: the maker (ln2) pays the asset in a BUY, so it funds, pushing half.
-	l2 -k fundchannel id=$id1 amount=5000000000 asset=$GOLD push_msat=2500000000000 announce=true >/dev/null
+	l2 -k fundchannel id="$id1" amount=5000000000 asset="$GOLD" push_msat=2500000000000 announce=true >/dev/null
 	mine 1; sleep 2
 	# SILV ("BTC"): the taker (ln1) pays the hold in a BUY, so it funds.
-	l1 -k fundchannel id=$id2 amount=5000000000 asset=$SILV push_msat=2500000000000 announce=true >/dev/null
+	l1 -k fundchannel id="$id2" amount=5000000000 asset="$SILV" push_msat=2500000000000 announce=true >/dev/null
 	mine 6; sleep 2
 	l1 listpeerchannels | jq -r '.channels[] | [.state, .short_channel_id, .channel_asset // "?", .to_us_msat] | @tsv'
 }
 
 env_() {
-	. $T/assets
+	# shellcheck source=/dev/null
+	. "$T/assets"
 	echo "export SEQLN_TAKER_SOCK=$T/ln1/$NET/lightning-rpc"
 	echo "export SEQLN_MAKER_SOCK=$T/ln2/$NET/lightning-rpc"
 	echo "export SEQLN_ASSET_ID=$GOLD"
@@ -145,7 +149,7 @@ fund) fund ;;
 env) env_ ;;
 mine) mine "${2:-1}" ;;
 down) down ;;
-wipe) down; rm -rf $T ;;
+wipe) down; rm -rf "$T" ;;
 l1) shift; l1 "$@" ;;
 l2) shift; l2 "$@" ;;
 cli) shift; cli "$@" ;;
