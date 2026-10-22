@@ -445,9 +445,9 @@ build_remote_htlc_sweep(const tal_t *ctx,
 
 	outpoint.txid = *remote_txid;
 	outpoint.n = h->outnum;
-	/* BOLT #3: nSequence of a remote_htlc_to_us spend is 1 under anchors, 0
-	 * otherwise (matches onchain_control handle_onchaind_spend_fulfill /
-	 * _htlc_expired). */
+	/* As BOLT 3 has it, nSequence of a remote_htlc_to_us spend is 1 under
+	 * anchors, 0 otherwise (matches onchain_control
+	 * handle_onchaind_spend_fulfill / _htlc_expired). */
 	input_sequence = hsm_anchors ? 1 : 0;
 
 	if (h->remote_offered) {

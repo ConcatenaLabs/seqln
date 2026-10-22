@@ -391,7 +391,7 @@ impl Ledger {
 }
 
 // ---------------------------------------------------------------------------
-// BOLT 11: the payment hash and amount of an invoice string.
+// Invoice strings (BOLT 11): the payment hash and amount of one.
 // ---------------------------------------------------------------------------
 
 const CHARSET: &[u8; 32] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";

@@ -98,7 +98,7 @@ int main(int argc, char *argv[])
 				  strlen(V_PER_COMMITMENT_POINT), &pcp));
 	assert(derive_keyset(&pcp, &self, &other, true, &ks));
 
-	/* BOLT 3 keys agree. */
+	/* The BOLT 3 keys agree. */
 	{
 		u8 der[PUBKEY_CMPR_LEN];
 		pubkey_to_der(der, &ks.self_revocation_key);

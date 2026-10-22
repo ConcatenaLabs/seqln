@@ -342,8 +342,9 @@ static bool commit_tx_send_finished(struct channel *channel,
 	return false;
 }
 
-/* BOLT #3: a commitment transaction's locktime carries 0x20 in its upper 8
- * bits, and its one input's sequence 0x80; a mutual close carries neither. */
+/* As BOLT 3 builds it, a commitment transaction's locktime carries 0x20 in
+ * its upper 8 bits, and its one input's sequence 0x80; a mutual close carries
+ * neither. */
 static bool is_commitment_shaped(const struct bitcoin_tx *tx)
 {
 	return (tx->wtx->locktime >> 24) == 0x20

@@ -95,8 +95,8 @@ POLICY_ASSETS = {
 HELD = {}
 STATES = ("waiting", "accepted", "settled", "cancelled")
 
-# BOLT #4: a final node SHOULD wait at least 60 seconds for the rest of a
-# multi-part payment before failing the parts it holds with mpp_timeout.
+# As BOLT 4 has it, a final node SHOULD wait at least 60 seconds for the rest
+# of a multi-part payment before failing the parts it holds with mpp_timeout.
 MPP_TIMEOUT = 60
 
 # Guards HELD's entries: the hook and the RPC methods run on the plugin's

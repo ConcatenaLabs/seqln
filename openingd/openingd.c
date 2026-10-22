@@ -1158,12 +1158,12 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 		value_limits_in_asset(state, rate);
 
 		/* BOLT #2:
-		 * The receiver:
+		 * The sender:
 		 * ...
 		 * - MUST set `dust_limit_satoshis` less than or equal to
 		 *   `channel_reserve_satoshis` from the `open_channel` message.
-		 *
-		 * The opener values the asset at its own rate, so its reserve,
+		 */
+		/* The opener values the asset at its own rate, so its reserve,
 		 * when it is no more than its dust limit, can be a little below
 		 * ours.  Meet it while it is worth at least four fifths of our
 		 * dust limit: the reference dust limit stands that far above
