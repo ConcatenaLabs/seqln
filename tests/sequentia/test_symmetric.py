@@ -331,3 +331,65 @@ def test_sym_mutual_close(node_factory, bitcoind):
     assert gold_out[0] == 20_000_000
     wait_for(lambda: any(o['txid'] == txid and o['asset'] == gold
                          for o in l2.rpc.listfunds()['outputs']))
+
+
+def test_sym_keyless_watcher(node_factory, bitcoind, directory):
+    """l1 keeps an old state, pays l2 most of the channel, and closes with
+    the old one while l2 is offline.  speculad, holding no key and only l2's
+    store (the latest state l2 holds whole), replaces the stale state with
+    the latest, then settles it once the shared delay has passed, each with a
+    fee coin in SILV from its own wallet (the channel is in GOLD).  Back
+    online, l2 finds its balance in its wallet."""
+    from test_watchtower import Speculad, fee_wallet
+    victim = {'watchtower-store': 'on', 'may_reconnect': True}
+    l1, l2, gold, silv, scid = sym_pair(node_factory, bitcoind,
+                                        opts=({'may_reconnect': True}, victim))
+    pay(l1, l2, 10_000_000_000, gold)
+    stale = l1.rpc.call('dev-sym-snapshot', {'id': l2.info['id']})['state']
+    pay(l1, l2, 60_000_000_000, gold)
+    store = os.path.join(l2.daemon.lightning_dir, TEST_NETWORK, 'watchtower')
+    assert any(os.path.exists(os.path.join(store, d, 'sym')) for d in os.listdir(store))
+    ftxid, fout = funding_outpoint(l1, l2)
+
+    l2.stop()
+    wallet = fee_wallet(bitcoind, silv, [(silv, 1)])
+    tower = Speculad(l2, bitcoind, wallet, directory)
+    tower.start()
+    try:
+        l1.rpc.close(scid, unilateraltimeout=1)
+        kickoff, i = mined_spender(bitcoind, ftxid, fout)
+        first, j = mined_spender(bitcoind, kickoff['txid'], i)
+        assert update_n(first, j) == stale
+        print("stale state", stale, "mined:",
+              json.dumps({x: first[x] for x in ('txid', 'vsize')}))
+
+        latest, k = mined_spender(bitcoind, first['txid'], j)
+        n_latest = update_n(latest, k)
+        assert n_latest > stale
+        assert fee_asset_of(latest) == silv
+        print("the tower replaced it by state", n_latest,
+              json.dumps({x: latest[x] for x in ('txid', 'vsize')}))
+
+        settle, _ = mined_spender(bitcoind, latest['txid'], k)
+        assert fee_asset_of(settle) == silv
+        hl = bitcoind.rpc.getrawtransaction(latest['txid'], 1)['blockhash']
+        hs = bitcoind.rpc.getrawtransaction(settle['txid'], 1)['blockhash']
+        waited = bitcoind.rpc.getblock(hs)['height'] - bitcoind.rpc.getblock(hl)['height']
+        assert waited >= DELAY
+        gold_out = sorted(int(Decimal(o['value']) * PAR) for o in settle['vout']
+                          if o.get('asset') == gold)
+        print("the tower settled after", waited, "blocks:",
+              json.dumps({x: settle[x] for x in ('txid', 'vsize')}),
+              "settlement (GOLD atoms):", gold_out)
+        assert gold_out == [30_000_000, 70_000_000]
+    finally:
+        tower.stop()
+        print(tower.output())
+    out = tower.output()
+    assert 'replacing it by state {}'.format(n_latest) in out
+    assert 'broadcast the settlement' in out
+
+    l2.start()
+    wait_for(lambda: any(o['txid'] == settle['txid'] and o['asset'] == gold
+                         and o['amount_msat'] == 70_000_000_000
+                         for o in l2.rpc.listfunds()['outputs']))

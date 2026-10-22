@@ -8,6 +8,7 @@
 #include <ccan/str/str.h>
 #include <ccan/tal/str/str.h>
 #include <channeld/channeld_wiregen.h>
+#include <common/sym_state.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -15,6 +16,7 @@
 #include <lightningd/channel.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/log.h>
+#include <lightningd/symmetric.h>
 #include <lightningd/watchtower_store.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -640,4 +642,40 @@ void wt_store_forget_channel(struct lightningd *ld, u64 channel_dbid)
 			    ld->config_netdir, channel_dbid);
 
 	remove_tree(dir, 3);
+}
+
+/* ---- a symmetric channel's record ------------------------------------------ */
+
+bool wt_store_put_sym(struct lightningd *ld, const struct channel *channel)
+{
+	const struct sym_state *best = sym_best_state(channel);
+	struct sym_channel sc;
+	u8 *buf = tal_arr(tmpctx, u8, 0);
+	char *dir;
+
+	sym_channel_from(channel, &sc);
+	towire_u64(&buf, WT_SYM_VERSION);
+	towire_u64(&buf, channel->dbid);
+	towire_bitcoin_blkid(&buf, &chainparams->genesis_blockhash);
+	towire_bitcoin_outpoint(&buf, &channel->funding);
+	towire_u32(&buf, channel->scid
+		   ? short_channel_id_blocknum(*channel->scid) : 0);
+	towire_amount_sat(&buf, channel->funding_sats);
+	towire_u8_array(&buf, channel->channel_asset,
+			sizeof(channel->channel_asset));
+	towire_u16(&buf, sc.delay);
+	towire_pubkey(&buf, &sc.upd_key[SYM_OPENER]);
+	towire_pubkey(&buf, &sc.upd_key[SYM_ACCEPTER]);
+	towire_bool(&buf, channel->opener == LOCAL);
+	towire_bool(&buf, best != NULL);
+	if (best)
+		towire_sym_state(&buf, best);
+	towire_bool(&buf, channel->sym_remote_pending != NULL);
+	if (channel->sym_remote_pending)
+		towire_sym_state(&buf, channel->sym_remote_pending);
+
+	dir = channel_store_dir(tmpctx, ld, channel, NULL);
+	if (!dir)
+		return false;
+	return write_durable(dir, WT_SYM_FILE, buf, tal_bytelen(buf));
 }

@@ -19,6 +19,7 @@
 #include <lightningd/lightningd.h>
 #include <lightningd/peer_control.h>
 #include <lightningd/symmetric.h>
+#include <lightningd/watchtower_store.h>
 #include <wallet/wallet.h>
 #include <wally_psbt.h>
 
@@ -49,9 +50,17 @@ u32 sym_htlc_margin(const struct channel *channel)
 	return 2 * (u32)sym_channel_delay(channel) + SYM_SLACK;
 }
 
+/* The database, and the watchtower store when the node keeps one: both
+ * before channeld goes on, so a keyless watcher always holds the best state
+ * this node holds. */
 static void sym_save(struct channel *channel)
 {
-	wallet_sym_save(channel->peer->ld->wallet, channel);
+	struct lightningd *ld = channel->peer->ld;
+
+	wallet_sym_save(ld->wallet, channel);
+	if (wt_store_enabled(ld) && !wt_store_put_sym(ld, channel))
+		log_broken(channel->log, "watchtower: failed storing the"
+			   " symmetric channel's record");
 }
 
 void sym_record_opened(struct channel *channel,
