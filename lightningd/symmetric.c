@@ -180,16 +180,39 @@ static void sym_release_coins(struct sym_spend *ss)
 	ss->coins = tal_free(ss->coins);
 }
 
-void sym_note_spent(const struct channel *channel,
+static bool sym_seen_spent(const struct channel *channel,
+			   const struct bitcoin_outpoint *out)
+{
+	for (size_t i = 0; i < tal_count(channel->sym_spent_seen); i++)
+		if (bitcoin_outpoint_eq(&channel->sym_spent_seen[i], out))
+			return true;
+	return false;
+}
+
+void sym_note_spent(struct channel *channel,
 		    const struct bitcoin_outpoint *out)
 {
+	bool ours = false;
+
 	for (size_t i = 0; i < tal_count(sym_spends); i++) {
 		if (sym_spends[i]->channel == channel
-		    && bitcoin_outpoint_eq(&sym_spends[i]->out, out)
-		    && !sym_spends[i]->spent) {
-			sym_spends[i]->spent = true;
-			sym_release_coins(sym_spends[i]);
+		    && bitcoin_outpoint_eq(&sym_spends[i]->out, out)) {
+			ours = true;
+			if (!sym_spends[i]->spent) {
+				sym_spends[i]->spent = true;
+				sym_release_coins(sym_spends[i]);
+			}
 		}
+	}
+	/* No spend of ours under way: onchaind, which hears of this spend
+	 * after us, may yet propose one (over KO, say, when the peer's update
+	 * spent it first), and it must not hold a fee coin forever. */
+	if (!ours && channel_type_has(channel->type, OPT_SEQ_SYMMETRIC)
+	    && !sym_seen_spent(channel, out)) {
+		if (!channel->sym_spent_seen)
+			channel->sym_spent_seen
+				= tal_arr(channel, struct bitcoin_outpoint, 0);
+		tal_arr_expand(&channel->sym_spent_seen, *out);
 	}
 }
 
@@ -515,8 +538,18 @@ void sym_spend_start(struct channel *channel,
 		     const struct sym_state_out *outs,
 		     u32 sequence, u32 minblock, u32 deadline)
 {
-	struct sym_spend *ss = tal(channel, struct sym_spend);
+	struct sym_spend *ss;
 
+	/* Already spent on chain: onchaind proposed it before it heard. */
+	if (sym_seen_spent(channel, out)) {
+		log_debug(channel->log, "symmetric spend of %s: already spent"
+			  " on chain, not attempted",
+			  fmt_bitcoin_outpoint(tmpctx, out));
+		if (taken(witness))
+			tal_free(witness);
+		return;
+	}
+	ss = tal(channel, struct sym_spend);
 	ss->channel = channel;
 	ss->out = *out;
 	ss->out_sats = amount;

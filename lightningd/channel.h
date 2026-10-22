@@ -227,6 +227,10 @@ struct channel {
 	 * then closes with as though it held nothing newer (a stale state,
 	 * for tests). */
 	struct sym_state *sym_dev_stale;
+	/* The channel's outputs seen spent on chain while no spend of ours was
+	 * under way: onchaind may still propose one (it learns of a spend
+	 * after lightningd does), which must not start. */
+	struct bitcoin_outpoint *sym_spent_seen;
 
 	/* Watch we have on funding output. */
 	struct txowatch *funding_spend_watch;

@@ -357,6 +357,7 @@ static void channel_set_default_asset(struct channel *channel)
 	channel->sym_local = channel->sym_remote = NULL;
 	channel->sym_remote_pending = NULL;
 	channel->sym_dev_stale = NULL;
+	channel->sym_spent_seen = NULL;
 	if (chainparams->is_elements && chainparams->fee_asset_tag)
 		memcpy(channel->channel_asset, chainparams->fee_asset_tag,
 		       sizeof(channel->channel_asset));
