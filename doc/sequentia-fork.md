@@ -662,6 +662,15 @@ mutual close, once the peer's update signature on it verifies. It claims a settl
 by its own leaf, to its own scripts, and signs a stage's fee coins when the outputs before them
 carry exactly the value of the channel output they spend.
 
+**Several assets in one channel.** A settlement output may name its own asset
+(`struct sym_state_out.asset`; NULL is the channel's), and SETTLE hashes each output's asset, so
+one state can settle several assets, each funded by its own output. A state that names no asset
+encodes exactly as before; one that names one sets 0x80 in its owner byte and follows each output
+with whether it names one and the 33 bytes (`common/sym_state.h`). hsmd signs such a state only
+through `hsmd_sign_sym_lanes_state`, which lists the channel's lanes, each asset and its funding
+value, and refuses a state that pays any lane other than its whole value or pays an asset outside
+them; `hsmd_sign_sym_state` refuses a state that names an asset.
+
 **The settle clock's scripts** (`sym_channel_set_clock`, for `option_seq_symmetric_clock`, bits
 180/181). They move the shared delay off the state output, so a late update no longer restarts
 it. The funding transaction issues one atom of a fresh asset, the marker, whose id derives from

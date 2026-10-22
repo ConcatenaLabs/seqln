@@ -2289,7 +2289,7 @@ static void defend_sym(const struct spd_sym *s, long tip, bool may_broadcast)
 		sym_state_tree_of(tmpctx, &s->sc, s->best, &tree);
 		witness = sym_update_witness(tmpctx, sig_op, sig_acc, &tree,
 					     prev_leaf, prev_cb);
-		outs = tal_arr(tmpctx, struct sym_state_out, 1);
+		outs = tal_arrz(tmpctx, struct sym_state_out, 1);
 		outs[0].amount = k->cur_sats;
 		outs[0].spk = sym_tree_spk(outs, &tree);
 		sequence = SYM_SEQUENCE;

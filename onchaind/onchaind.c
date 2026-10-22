@@ -4373,7 +4373,7 @@ static void sym_resolve_state(struct tracked_output *out)
 					  &prev_cb);
 		sym_state_tree_of(tmpctx, &sym_sc, sym_best, &tree);
 		o = sym_state_new(tmpctx, LOCAL, 0, sym_best->num, NULL);
-		o->outs = tal_arr(o, struct sym_state_out, 1);
+		o->outs = tal_arrz(o, struct sym_state_out, 1);
 		o->outs[0].amount = out->sat;
 		o->outs[0].spk = sym_tree_spk(o->outs, &tree);
 		status_info("Replacing state %"PRId64" by our state %"PRId64,
