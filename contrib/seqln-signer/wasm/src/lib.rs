@@ -434,6 +434,9 @@ impl Signer {
             // The notes the node holds reach the device again from the
             // channel's next start (HSMD_CREDIT_NOTE).
             credit: None,
+            // Learned from the next setup_channel, which names the channel
+            // type (a symmetric channel's states are refused until then).
+            option_sym: false,
         };
         self.inner
             .arm_channel(arr33(node_id, "node_id")?, dbid, st)

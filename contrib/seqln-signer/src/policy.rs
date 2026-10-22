@@ -213,6 +213,10 @@ pub struct ChannelState {
     /// (HSMD_CREDIT_NOTE). Every commitment must leave the provider's
     /// output able to pay it, and a mutual close must pay it.
     pub credit: Option<CreditNote>,
+    /// `option_seq_symmetric`: the channel's commitments are states of the
+    /// symmetric type (`crate::sym`), signed by update signatures, and
+    /// nothing on it is ever punished.
+    pub option_sym: bool,
 }
 
 /// A credit note: the provider owes the holder `credit` atoms of the
@@ -537,7 +541,7 @@ pub const CHSTORE_MAGIC: [u8; 4] = *b"SQCH";
 /// Versions 1 to 9 still import (the fields they lack unknown); each channel of a store older
 /// than version 6, written by a device that validated nothing, predates
 /// validation.
-pub const CHSTORE_VERSION: u8 = 11;
+pub const CHSTORE_VERSION: u8 = 12;
 
 /// The first store version a validating device wrote.
 pub const CHSTORE_FIRST_VALIDATING: u8 = 6;
@@ -701,6 +705,7 @@ pub fn encode_channel_store(store: &ChannelStore) -> Vec<u8> {
                 }
             }
         }
+        out.push(st.option_sym as u8);
     }
     push_ledger(&mut out, &store.ledger);
     out.extend_from_slice(&(store.close_txids.len() as u16).to_le_bytes());
@@ -873,6 +878,7 @@ pub fn decode_channel_store(bytes: &[u8]) -> Result<DecodedStore, String> {
             limits: None,
             peer_reached_reserve: false,
             option_credit: false,
+            option_sym: false,
             credit: None,
         };
         if version >= 2 {
@@ -961,6 +967,13 @@ pub fn decode_channel_store(bytes: &[u8]) -> Result<DecodedStore, String> {
                 v => return Err(format!("bad credit-note flag {v} in channel-store blob")),
             };
         }
+        if version >= 12 {
+            st.option_sym = match r.u8()? {
+                0 => false,
+                1 => true,
+                v => return Err(format!("bad symmetric flag {v} in channel-store blob")),
+            };
+        }
         out.push(((node_id, dbid), st));
     }
     let ledger = if version >= 5 { r.ledger()? } else { Ledger::default() };
@@ -1014,6 +1027,18 @@ pub fn channel_type_has_credit(features: &[u8]) -> bool {
         (features[features.len() - 1 - byte_from_end] >> (n % 8)) & 1 == 1
     };
     bit(176) || bit(177)
+}
+
+/// Whether a channel_type names the symmetric channel type (bit 178/179).
+pub fn channel_type_has_sym(features: &[u8]) -> bool {
+    let bit = |n: usize| -> bool {
+        let byte_from_end = n / 8;
+        if byte_from_end >= features.len() {
+            return false;
+        }
+        (features[features.len() - 1 - byte_from_end] >> (n % 8)) & 1 == 1
+    };
+    bit(178) || bit(179)
 }
 
 // ---------------------------------------------------------------------------

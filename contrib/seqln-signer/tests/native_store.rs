@@ -149,6 +149,7 @@ fn channel(k: &Kernel) -> ChannelState {
         peer_reached_reserve: false,
         option_credit: false,
         credit: None,
+        option_sym: false,
     }
 }
 

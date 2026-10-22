@@ -645,7 +645,16 @@ needs that doubled delay inside the route's lock times.
 `hsmd_sign_tx_reply`), `hsmd_sign_sym_state` (the update key over a state's message, with the
 state's settlement and every HTLC it carries, so a signer that holds a balance can check what
 the state pays it) and `hsmd_sign_sym_htlc` (the HTLC basepoint over a settlement HTLC's
-claim). The fee coins of every stage are signed with `hsmd_sign_htlc_tx_mingle`.
+claim). The fee coins of every stage are signed with `hsmd_sign_htlc_tx_mingle`. The device
+signer (`contrib/seqln-signer`, its README) signs the kickoff only as this channel's: the
+funding output alone, into KO rebuilt from the chain, the funding outpoint and both update keys,
+for the funding's value and asset. It builds each state's message itself from the state's
+settlement, and signs only when every settlement output is a side's balance or the output of an
+HTLC the state carries, the outputs add up to the funding, and what the state leaves it is held to
+the payments it approved; it counts a state of its own as validated, for the revocations and for a
+mutual close, once the peer's update signature on it verifies. It claims a settlement HTLC only
+by its own leaf, to its own scripts, and signs a stage's fee coins when the outputs before them
+carry exactly the value of the channel output they spend.
 
 **Developers.** `dev-sym-snapshot id` freezes the best state a node holds; its next unilateral
 close then publishes that one as though it held nothing newer, which is how the tests make a
@@ -1079,8 +1088,10 @@ other was away, replaced by the latest one when that side returns within the del
 latest split settled; HTLCs in flight claimed from the settlement by their SUCCESS leaf with the
 preimage, and by their TIMEOUT leaf after the expiry; a mutual close; and, with the victim
 offline, `speculad` holding only its store replacing the stale state by the latest and settling
-it after the delay, each with a fee coin from its own wallet in another asset
-(`test_symmetric.py`). They need `sequentiad`, `sequentia-cli`
+it after the delay, each with a fee coin from its own wallet in another asset; and a keyless
+node whose device signs the kickoff, every state, the revocations, the funding and each stage's
+fee coins of a unilateral close, and, holding an HTLC it received, its claim by the SUCCESS leaf,
+refusing nothing (`test_symmetric.py`). They need `sequentiad`, `sequentia-cli`
 and a Bitcoin Core `bitcoind` on `PATH`, and the keyless tests need the device signer built
 (`cargo build --release` in `contrib/seqln-signer`, or `SEQLN_SIGNER=/path/to/seqln-signer`).
 The test plugins run under the `python3` on `PATH`, which needs the `pyln` packages, so the

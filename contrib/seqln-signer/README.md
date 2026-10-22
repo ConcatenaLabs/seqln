@@ -191,6 +191,22 @@ What enforce mode checks:
   (`SIGN_HTLC_TX_MINGLE`) are held to the withdrawal rule below, with D allowed only in a claim
   the device approved since it started; a claim it refuses comes back unsigned and lightningd
   builds it again.
+- **Symmetric channels** (`option_seq_symmetric`; `src/sym.rs`, the scripts in
+  `common/sym_scripts.h`): nothing on such a channel is punished, so the device signs three
+  things. The kickoff (`SIGN_SYM_KICKOFF`, 69), once, `SIGHASH_SINGLE|SIGHASH_ANYONECANPAY`, only
+  when it spends the channel's funding output alone into this channel's KO, rebuilt here from the
+  chain's genesis, the funding outpoint and both update keys, in the funding's asset and for its
+  whole value. Each state (`SIGN_SYM_STATE`, 70), by its update key, over the message the device
+  builds itself from the state's settlement, once every settlement output is this side's balance,
+  the peer's, or the output of one HTLC the state carries, the outputs add up to the funding, the
+  state's number is its commitment's, and what it leaves this side (its balance and the HTLCs it
+  offered) is held to the payments it approved as a commitment's split is; a state of ours counts
+  as validated, for the revocations and for a mutual close, once the peer's update signature on it
+  verifies. And a settlement HTLC's claim (`SIGN_SYM_HTLC`, 71), only by the SUCCESS leaf of an
+  HTLC it received or the TIMEOUT leaf of one it offered, to its own scripts as a covenant claim.
+  The fee coins of the kickoff, an update or a settle (`SIGN_HTLC_TX_MINGLE`) pay only the fee and
+  their change: the outputs before them carry exactly the value of the channel output they spend,
+  in its asset.
 - **Withdrawals** (every spend of the node's wallet: `withdraw`, `signpsbt`, a channel funding, an
   anchor fee bump): every output but the fee pays one of the device's own wallet scripts (P2WPKH or
   BIP-86 P2TR of its wallet keys at indices below 5,000), unblinded, or is the funding output of a
@@ -297,6 +313,7 @@ any channel.
 | `src/noise.rs` | BOLT-8 Noise_XK transport state machine (no sockets). |
 | `src/policy.rs` | Enforce-mode commitment validation. |
 | `src/taproot.rs` | The taproot-covenant channel type's leaves and trees, the credit channel's CLAIM leaf, trees and note check, and the Elements taproot signature hash and BIP340 signing (tested against `common/test/tcov_vectors.h` and `common/test/credit_vectors.h`). |
+| `src/sym.rs` | The symmetric channel type's leaves, trees, update message and settlement check (tested against `common/test/sym_vectors.h`). |
 | `src/payments.rs` | Payment approval, the per-asset payment limits and their accounting, BOLT 11 decoding. |
 | `src/dispatch.rs` | Request -> reply dispatch; channel-state tracking for the policy. |
 | `src/hsm_secret.rs` | On-disk mnemonic `hsm_secret` parsing. |

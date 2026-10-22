@@ -393,3 +393,93 @@ def test_sym_keyless_watcher(node_factory, bitcoind, directory):
     wait_for(lambda: any(o['txid'] == settle['txid'] and o['asset'] == gold
                          and o['amount_msat'] == 70_000_000_000
                          for o in l2.rpc.listfunds()['outputs']))
+
+
+def test_sym_keyless_device(node_factory, bitcoind, directory):
+    """A keyless node, its keys on a device in enforce mode, opens a
+    symmetric channel: the device signs the kickoff once, and each state only
+    after holding its settlement to the channel and to the payments it
+    approved.  The node pays and is paid, then closes unilaterally while the
+    hub is away: the device signs only the fee coins of the kickoff, the
+    update and the settlement, which pays the node its balance.  The device
+    refuses nothing."""
+    from test_keyless_close import keyless_node, channel, answers
+    gold = bitcoind.issue_asset(1000)
+    silv = bitcoind.issue_asset(1000)
+    bitcoind.set_fee_rates({bitcoind.POLICY_ASSET: PAR, gold: PAR, silv: 2 * PAR})
+    device, l1 = keyless_node(node_factory, directory, options=dict(SYM))
+    try:
+        l2 = node_factory.get_node(options=SYM, may_reconnect=True)
+        fund_node(bitcoind, l1, gold, PAR + 50_000)
+        fund_node(bitcoind, l1, silv, 5 * PAR)
+        chan = open_channel(bitcoind, l1, l2, gold, PAR)
+        assert SYM_BIT in chan['channel_type']['bits']
+        pay(l1, l2, 30_000_000_000, gold)
+        pay(l2, l1, 5_000_000_000, gold)
+        wait_for(lambda: channel(l1, l2)['htlcs'] == [])
+        assert 'POLICY REJECT' not in device.output()
+
+        l2.stop()
+        l1.rpc.close(chan['short_channel_id'], unilateraltimeout=1)
+        kickoff, i = mined_spender(bitcoind, chan['funding_txid'], chan['funding_outnum'])
+        update, j = mined_spender(bitcoind, kickoff['txid'], i)
+        settle, _ = mined_spender(bitcoind, update['txid'], j)
+        fees = [fee_asset_of(tx) for tx in (kickoff, update, settle)]
+        assert all(a in (gold, silv) for a in fees)
+        gold_out = sorted(int(Decimal(o['value']) * PAR) for o in settle['vout']
+                          if o.get('asset') == gold)
+        print("keyless close: kickoff {} vB, update {} vB (state {}), settle {} vB,"
+              " settlement (GOLD atoms) {}, fees in {}".format(
+                  kickoff['vsize'], update['vsize'], update_n(update, j), settle['vsize'],
+                  gold_out, ['GOLD' if a == gold else 'SILV' for a in fees]))
+        assert gold_out == [25_000_000, 75_000_000]
+        wait_for(lambda: any(o['txid'] == settle['txid'] and o['asset'] == gold
+                             and o['amount_msat'] == 75_000_000_000
+                             for o in l1.rpc.listfunds()['outputs']))
+        assert 'POLICY REJECT' not in device.output()
+    finally:
+        # The node first: a device that goes before it leaves the proxy
+        # waiting for another.
+        if answers(l1, timeout=2):
+            l1.stop()
+        device.stop()
+
+
+def test_sym_keyless_device_claims_htlc(node_factory, bitcoind, directory, executor):
+    """A keyless node holds an HTLC it received when it closes: the settlement
+    carries it, and once the node learns the preimage its device signs the
+    claim by the SUCCESS leaf (SIGN_SYM_HTLC), to the node's own wallet."""
+    from test_keyless_close import keyless_node, answers
+    gold = bitcoind.issue_asset(1000)
+    silv = bitcoind.issue_asset(1000)
+    bitcoind.set_fee_rates({bitcoind.POLICY_ASSET: PAR, gold: PAR, silv: 2 * PAR})
+    device, l2 = keyless_node(node_factory, directory, options=dict(SYM, plugin=HOLD))
+    try:
+        l1 = node_factory.get_node(options=SYM, may_fail=True)
+        fund_node(bitcoind, l1, gold, PAR + 50_000)
+        fund_node(bitcoind, l2, silv, 5 * PAR)
+        chan = open_channel(bitcoind, l1, l2, gold, PAR)
+        assert SYM_BIT in chan['channel_type']['bits']
+        msat = 3_000_000_000
+        fut, htlc = held_htlc(l1, l2, executor, msat, gold)
+        l1.stop()
+        l2.rpc.close(chan['short_channel_id'], unilateraltimeout=1)
+        kickoff, i = mined_spender(bitcoind, chan['funding_txid'], chan['funding_outnum'])
+        update, j = mined_spender(bitcoind, kickoff['txid'], i)
+        settle, _ = mined_spender(bitcoind, update['txid'], j)
+        htlc_out = only_one([o['n'] for o in settle['vout']
+                             if o['scriptPubKey']['type'] == 'witness_v1_taproot'
+                             and int(Decimal(o['value']) * PAR) == msat // 1000])
+        open(os.path.join(l2.daemon.lightning_dir, TEST_NETWORK, 'unhold'), 'w').close()
+        claim, c = mined_spender(bitcoind, settle['txid'], htlc_out)
+        wit = claim['vin'][c]['txinwitness']
+        assert len(wit) == 4 and len(wit[1]) == 64   # <sig> <preimage> <leaf> <cb>
+        print("keyless SUCCESS claim:", json.dumps({k: claim[k] for k in ('txid', 'vsize')}))
+        wait_for(lambda: any(o['txid'] == claim['txid'] and o['asset'] == gold
+                             for o in l2.rpc.listfunds()['outputs']))
+        assert 'POLICY REJECT' not in device.output()
+        assert l2.daemon.is_in_log('WIRE_HSMD_SIGN_SYM_HTLC')
+    finally:
+        if answers(l2, timeout=2):
+            l2.stop()
+        device.stop()
