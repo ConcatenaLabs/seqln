@@ -29,7 +29,7 @@ BITCOIND="/usr/local/bin/bitcoind"
 
 WORK="$(mktemp -d /tmp/seqln-reconnect.XXXXXX)"
 BTCDIR="$WORK/btc"; LNDIR="$WORK/ln"; mkdir -p "$BTCDIR" "$LNDIR"
-BRPCPORT=18999; BP2P=18998; SIGNERPORT=19917; WSPORT=18917; WSPORT2=18918; LNP2P=19846
+BRPCPORT=18999; SIGNERPORT=19917; WSPORT=18917; WSPORT2=18918; LNP2P=19846
 OP_TIMEOUT_MS=5000
 
 PIDS=(); DEVPID=""; RELAYPID=""; LORISPID=""; B6JOB=""
@@ -73,14 +73,14 @@ log "starting bitcoind -regtest (-listen=0: single node, no P2P)"
   -fallbackfee=0.0002 -server=1 -listen=0 -txindex=1 -blockfilterindex=1 >"$WORK/bitcoind.log" 2>&1 &
 PIDS+=($!)
 BC(){ "$BCLI" -regtest -datadir="$BTCDIR" -rpcport=$BRPCPORT -rpcuser=u -rpcpassword=p "$@"; }
-for i in $(seq 1 60); do BC getblockchaininfo >/dev/null 2>&1 && break; sleep 0.5; done
+for _ in $(seq 1 60); do BC getblockchaininfo >/dev/null 2>&1 && break; sleep 0.5; done
 BC getblockchaininfo >/dev/null 2>&1 || fail "bitcoind did not come up"
 BC createwallet h >/dev/null 2>&1 || BC loadwallet h >/dev/null 2>&1
 ADDR="$(BC getnewaddress)"
 BC generatetoaddress 101 "$ADDR" >/dev/null 2>&1 || fail "generatetoaddress failed"
 # Ride out any post-mine RPC busyness BEFORE booting lightningd: poll the exact
 # bcli-style connection until it answers, so the backend is provably ready.
-for i in $(seq 1 40); do
+for _ in $(seq 1 40); do
   echo p | "$BCLI" -regtest -rpcclienttimeout=60 -rpcconnect=127.0.0.1 -rpcport=$BRPCPORT -rpcuser=u -stdinrpcpass getblockchaininfo >/dev/null 2>&1 && break
   sleep 0.5
 done
@@ -106,6 +106,7 @@ subdaemon=hsmd:$PROXY
 EOF
 
 start_relay(){ # $1 = ws port, $2 = extra args (e.g. "--ping-ms 0")
+  # shellcheck disable=SC2086 # $2 is split into its arguments
   node "$RELAY" --ws-port "$1" --tcp 127.0.0.1:$SIGNERPORT --tcp-retry-ms 120000 $2 \
     >"$WORK/relay-$1.log" 2>&1 & RELAYPID=$!
 }
@@ -152,7 +153,7 @@ probe_device(){ CL newaddr p2tr 2>/dev/null | grep -q 'bcrt1p'; }
 
 log "waiting for the hosted node to init (device serving INIT)…"
 NODEID=""
-for i in $(seq 1 60); do NODEID="$(jget id)"; [ -n "$NODEID" ] && break; sleep 1; done
+for _ in $(seq 1 60); do NODEID="$(jget id)"; [ -n "$NODEID" ] && break; sleep 1; done
 [ -n "$NODEID" ] || fail "hosted node never came up (getinfo returned no id) — see $WORK/ld.out $WORK/device.log"
 H0=$(jget blockheight); [ -z "$H0" ] && H0=0
 log "hosted node UP: id=$NODEID blockheight=$H0"
@@ -185,7 +186,7 @@ for c in $(seq 1 "$CYCLES"); do
 
   # Reconnect must restore service quickly (device re-attaches; NO resync).
   ok=0
-  for i in $(seq 1 30); do
+  for _ in $(seq 1 30); do
     if sign_ok "r$c"; then ok=1; break; fi
     sleep 0.5
   done
@@ -210,7 +211,7 @@ kill -TERM "$RELAYPID" 2>/dev/null; wait "$RELAYPID" 2>/dev/null; RELAYPID=""
 sleep 0.5
 start_relay "$WSPORT" "--ping-ms 0"     # keepalive OFF: only the proxy can recover
 start_device "$WSPORT"
-for i in $(seq 1 30); do sign_ok "phase2-init" && break; sleep 0.5; done
+for _ in $(seq 1 30); do sign_ok "phase2-init" && break; sleep 0.5; done
 sign_ok "phase2-init" || fail "phase2: node not serving before the wedge test"
 
 log "  freezing device (SIGSTOP) -> half-dead ESTAB link"
@@ -233,7 +234,7 @@ node "$WSDEV" "ws://127.0.0.1:$WSPORT2" "$WORK/mnemonic" "$HOST_PUB" "$DEV2_PRIV
 DEV2PID=$!
 t0=$(date +%s%N)
 recovered=0
-for i in $(seq 1 40); do
+for _ in $(seq 1 40); do
   if ! kill -0 "$STUCKPID" 2>/dev/null; then recovered=1; break; fi
   sleep 0.5
 done
@@ -287,7 +288,7 @@ for k in $(seq 1 6); do
   ms=$(getinfo_ms 6) || { WEDGE=1; fail "phase4(A6): getinfo WEDGED during storm iter $k"; }
   record "$ms"
 done
-ok=0; for i in $(seq 1 30); do sign_ok "a6" && { ok=1; break; }; sleep 0.5; done
+ok=0; for _ in $(seq 1 30); do sign_ok "a6" && { ok=1; break; }; sleep 0.5; done
 [ "$ok" = 1 ] || { WEDGE=1; fail "phase4(A6): node did not recover a serving device after the storm"; }
 ms=$(getinfo_ms 8) || { WEDGE=1; fail "phase4(A6): getinfo wedged after the storm"; }
 record "$ms"; check_height
@@ -311,11 +312,11 @@ sleep 3   # let this device get adopted + re-primed (INIT, type 11 — not rejec
 sleep 3
 LDPID_AFTER=$(pgrep -f "lightning-dir=$LNDIR" | head -1)
 if grep -qiE 'FATAL SIGNAL|master_badmsg|Log dumped' "$WORK/ld.out"; then WEDGE=1; fail "phase5(B6): node FATALED on a master-op reject (B6 regression)"; fi
-[ -n "$LDPID_AFTER" ] && [ "$LDPID_AFTER" = "$LDPID_BEFORE" ] || { WEDGE=1; fail "phase5(B6): lightningd pid changed/gone — node did NOT survive the reject"; }
+if [ -z "$LDPID_AFTER" ] || [ "$LDPID_AFTER" != "$LDPID_BEFORE" ]; then WEDGE=1; fail "phase5(B6): lightningd pid changed/gone — node did NOT survive the reject"; fi
 log "  reject fired; lightningd still alive (pid $LDPID_AFTER); parked op awaiting a fresh device"
 kill -9 "$DEVPID" 2>/dev/null; DEVPID=""
 start_device "$WSPORT2"   # fresh device (no reject) -> proxy re-primes + re-sends the parked op
-rec=0; for i in $(seq 1 40); do
+rec=0; for _ in $(seq 1 40); do
   if ! kill -0 "$B6JOB" 2>/dev/null && grep -q 'bcrt1p' "$WORK/b6.out"; then rec=1; break; fi
   sleep 0.5
 done
@@ -352,7 +353,7 @@ log "  device gone; node at block $BASEBLK. Mining 5 blocks (NO device present)�
 BC generatetoaddress 5 "$ADDR" >/dev/null
 # (a) Block-FOLLOW with no device, observed via the LOG (robust to a getinfo park).
 followed=0; NEWBLK=$BASEBLK
-for i in $(seq 1 20); do
+for _ in $(seq 1 20); do
   NEWBLK=$(lastblk); [ -z "$NEWBLK" ] && NEWBLK=0
   [ "$NEWBLK" -gt "$BASEBLK" ] && { followed=1; break; }
   sleep 1
@@ -366,7 +367,7 @@ if [ -n "$FORK" ]; then
   BC generatetoaddress 6 "$ADDR" >/dev/null 2>&1
   TIP=$(BC getblockcount 2>/dev/null)
   rf=0; RB=$NEWBLK
-  for i in $(seq 1 20); do
+  for _ in $(seq 1 20); do
     RB=$(lastblk); [ -z "$RB" ] && RB=0
     [ "$RB" -ge "$TIP" ] && { rf=1; break; }
     sleep 1
