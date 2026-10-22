@@ -11,6 +11,7 @@ use crate::hsm_secret::HsmSecret;
 use crate::kernel::{self, Kernel};
 use crate::payments::{self, AssetKey, Limits, Offered, Plan};
 use crate::policy::{self, ChannelState, ChannelStore, Htlc, Policy, Side, Split};
+use crate::sym;
 use crate::taproot;
 use crate::wire::{self, msg, BitcoinTx, Writer};
 use bitcoin::secp256k1::SecretKey;
@@ -45,7 +46,7 @@ const SWEEP_KEY_SCAN: u32 = 5000;
 /// The capabilities array from `hsmd_init()`, in the exact order libhsmd emits
 /// it, followed by the two preapprove-check caps (`dev_no_preapprove_check` is
 /// false in a normal, non-dev node).
-const CAPABILITIES: [u32; 18] = [
+const CAPABILITIES: [u32; 21] = [
     28,  // WIRE_HSMD_CHECK_PUBKEY
     56,  // WIRE_HSMD_CHECK_BIP86_PUBKEY
     142, // WIRE_HSMD_SIGN_ANY_DELAYED_PAYMENT_TO_US
@@ -62,6 +63,9 @@ const CAPABILITIES: [u32; 18] = [
     63,  // WIRE_HSMD_SIGN_TCOV_REMOTE_HTLC_TO_US
     64,  // WIRE_HSMD_SIGN_TCOV_PENALTY
     67,  // WIRE_HSMD_CREDIT_NOTE
+    69,  // WIRE_HSMD_SIGN_SYM_KICKOFF
+    70,  // WIRE_HSMD_SIGN_SYM_STATE
+    71,  // WIRE_HSMD_SIGN_SYM_HTLC
     51,  // WIRE_HSMD_PREAPPROVE_INVOICE_CHECK
     52,  // WIRE_HSMD_PREAPPROVE_KEYSEND_CHECK
 ];
@@ -290,6 +294,11 @@ impl Signer {
             | msg::HSMD_SIGN_TCOV_PENALTY => opt(self.h_sign_tcov(&req.hsmd_msg, t)),
             // A credit note this device's side holds (option_seq_credit).
             msg::HSMD_CREDIT_NOTE => self.credit_note(req),
+            // The symmetric channel type (option_seq_symmetric): its kickoff,
+            // its states and the claims of its settlement's HTLCs.
+            msg::HSMD_SIGN_SYM_KICKOFF => self.sign_sym_kickoff_checked(req),
+            msg::HSMD_SIGN_SYM_STATE => self.sign_sym_state_checked(req),
+            msg::HSMD_SIGN_SYM_HTLC => opt(self.h_sign_sym_htlc(&req.hsmd_msg)),
             msg::HSMD_SIGN_MUTUAL_CLOSE_TX => self.sign_mutual_close_tx_checked(req),
             msg::HSMD_SIGN_REMOTE_HTLC_TX => opt(self.h_sign_remote_htlc_tx(req)),
             msg::HSMD_SIGN_ANY_LOCAL_HTLC_TX => opt(self.h_sign_any_local_htlc_tx(&req.hsmd_msg)),
@@ -1975,6 +1984,324 @@ impl Signer {
         Some(w.into_vec())
     }
 
+    // =================================================================
+    // The symmetric channel type (`crate::sym`, option_seq_symmetric).
+    //
+    // Nothing on such a channel is ever punished, so no per-commitment
+    // secret guards anything: its scripts use basepoints only. What this
+    // device signs is (69) the kickoff, once, which moves the funding output
+    // to KO and can be spent only by a state both sides signed; (70) each
+    // state, whose message it builds itself from the state's settlement,
+    // after holding every output of that settlement to the channel and what
+    // it pays this side to the payments it approved; and (71) the claim of
+    // a settlement HTLC by the leaf that pays this side, to its own scripts.
+    // =================================================================
+
+    /// The channel's constants as this device knows them; `asset` is the
+    /// channel asset (0x01 || id).
+    fn sym_channel(&self, peer_id: &[u8; 33], dbid: u64, st: &ChannelState, asset: &[u8; 33]) -> Result<sym::Channel, String> {
+        let genesis = self.genesis.ok_or("not initialized")?;
+        let we_opened = st.is_outbound.ok_or("this device did not record who opened the channel")?;
+        let ours = self.kernel().channel_basepoints(peer_id, dbid)[3];
+        let (opener, accepter) = if we_opened { (ours, st.remote_delayed) } else { (st.remote_delayed, ours) };
+        Ok(sym::Channel::new(
+            &genesis,
+            &st.funding_txid,
+            st.funding_txout as u32,
+            &opener,
+            &accepter,
+            asset,
+            st.local_to_self_delay.max(st.remote_to_self_delay),
+        ))
+    }
+
+    /// SIGN_SYM_KICKOFF (69): our funding key's signature of the kickoff,
+    /// SIGHASH_SINGLE|SIGHASH_ANYONECANPAY. It covers the funding input and
+    /// output 0, which must be this channel's KO, in the funding's asset and
+    /// for its whole value; a fee input and its change join at broadcast.
+    fn sign_sym_kickoff_checked(&mut self, req: &Request) -> Outcome {
+        if let Some(reason) = self.predating(&req.node_id, req.dbid) {
+            return Outcome::Reject(format!("SIGN_SYM_KICKOFF refused: {reason}"));
+        }
+        if self.policy.is_enforce() {
+            if let Err(reason) = self.check_sym_kickoff(req) {
+                return Outcome::Reject(format!("SIGN_SYM_KICKOFF refused: {reason}"));
+            }
+        }
+        let mut r = wire::Reader::new(&req.hsmd_msg);
+        let reply = (|| {
+            r.u16()?;
+            let bt = wire::read_bitcoin_tx(&mut r)?;
+            let remote_funding = r.arr33()?;
+            let s = self.kernel().channel_secrets(&req.node_id, req.dbid);
+            let local_funding = self.kernel().pubkey_of(&s.funding);
+            let wscript = self.kernel().funding_wscript(&local_funding, &remote_funding);
+            self.sig_reply(&bt, 0, &wscript, &s.funding, SIGHASH_SINGLE_ACP, msg::HSMD_SIGN_TX_REPLY)
+        })();
+        opt(reply)
+    }
+
+    fn check_sym_kickoff(&self, req: &Request) -> Result<(), String> {
+        let st = self
+            .store
+            .get(&req.node_id, req.dbid)
+            .ok_or_else(|| self.untracked(&req.node_id, req.dbid))?;
+        if !st.option_sym {
+            return Err("the channel is not a symmetric channel".to_string());
+        }
+        let mut r = wire::Reader::new(&req.hsmd_msg);
+        r.u16().ok_or("malformed request")?;
+        let bt = wire::read_bitcoin_tx(&mut r).ok_or("malformed request")?;
+        let remote_funding = r.arr33().ok_or("malformed request")?;
+        if remote_funding != st.remote_funding {
+            return Err("remote_funding_key differs from setup_channel".to_string());
+        }
+        if bt.tx.inputs.len() != 1 {
+            return Err(format!("a kickoff spends the funding output alone, not {} inputs", bt.tx.inputs.len()));
+        }
+        let i = &bt.tx.inputs[0];
+        if i.txhash != st.funding_txid || i.index != st.funding_txout as u32 || i.is_issuance {
+            return Err("its input is not the channel's funding output".to_string());
+        }
+        let o = bt.tx.outputs.first().ok_or("it has no output")?;
+        let asset: [u8; 33] = o.asset.as_slice().try_into().map_err(|_| "output 0's asset is not explicit")?;
+        if asset[0] != 0x01 {
+            return Err("output 0's asset is not explicit".to_string());
+        }
+        if let Some(chan) = st.pay.asset {
+            if explicit_asset(&asset) != Some(chan) {
+                return Err(format!("output 0 is not in the channel's asset {}", chan.display()));
+            }
+        }
+        if let Some(funding_asset) = wire::psbt_input_asset(&bt.psbt, 0) {
+            if funding_asset != o.asset {
+                return Err("output 0 is not in the funding output's asset".to_string());
+            }
+        }
+        if explicit_amount(&o.value) != Some(st.funding_sats) {
+            return Err(format!("output 0 does not carry the funding's {} atoms", st.funding_sats));
+        }
+        let ch = self.sym_channel(&req.node_id, req.dbid, st, &asset)?;
+        let ko = ch.kickoff_spk(self.kernel().secp()).ok_or("cannot build KO")?;
+        if o.script != ko {
+            return Err(format!("output 0 pays {}, not this channel's KO", hexbytes(&o.script)));
+        }
+        Ok(())
+    }
+
+    /// SIGN_SYM_STATE (70): our update signature on a state, over the
+    /// message this device builds from the state's settlement. The
+    /// settlement is held to the channel (`sym::check_settlement`), and what
+    /// it leaves this side, its balance and the HTLCs it offered, to the
+    /// payments this device approved, as a commitment's split is. A state of
+    /// our own counts as validated, for the revocations and for the balance
+    /// a mutual close is held to, once the peer's signature on it verifies.
+    fn sign_sym_state_checked(&mut self, req: &Request) -> Outcome {
+        if let Some(reason) = self.predating(&req.node_id, req.dbid) {
+            return Outcome::Reject(format!("SIGN_SYM_STATE refused: {reason}"));
+        }
+        let checked = self.check_sym_state(req);
+        if self.policy.is_enforce() {
+            match &checked {
+                Err(reason) => return Outcome::Reject(format!("SIGN_SYM_STATE refused: {reason}")),
+                Ok(c) => {
+                    if let Err(reason) = self.check_plan(&c.plan) {
+                        return Outcome::Reject(format!("SIGN_SYM_STATE refused: {reason}"));
+                    }
+                }
+            }
+        }
+        let c = match checked {
+            Ok(c) => c,
+            // Permissive: sign what the request names, recording nothing.
+            Err(_) => return opt(self.h_sign_sym_state_unchecked(req)),
+        };
+        let sk = self.kernel().channel_secrets(&req.node_id, req.dbid).delayed;
+        let sig = taproot::sign(self.kernel().secp(), &c.msg, &sk);
+        if let Some(st) = self.store.get_mut(&req.node_id, req.dbid) {
+            let split = Split { ours: c.paid.ours, fee: 0, anchors: 0 };
+            if c.local {
+                if c.peer_signed {
+                    if st.validated_through.map_or(true, |v| c.commit_num > v) {
+                        st.validated_through = Some(c.commit_num);
+                    }
+                    if st.local_split.map_or(true, |(m, _)| c.commit_num >= m) {
+                        st.local_split = Some((c.commit_num, split));
+                    }
+                }
+            } else if st.remote_split.map_or(true, |(m, _)| c.commit_num >= m) {
+                st.remote_split = Some((c.commit_num, split));
+            }
+            self.store_dirty = true;
+        }
+        self.apply_plan(&req.node_id, req.dbid, c.plan);
+        let mut w = Writer::new(msg::HSMD_SIGN_SYM_STATE_REPLY);
+        w.bytes(&sig);
+        Outcome::Reply(w.into_vec())
+    }
+
+    fn check_sym_state(&self, req: &Request) -> Result<SymChecked, String> {
+        let st = self
+            .store
+            .get(&req.node_id, req.dbid)
+            .ok_or_else(|| self.untracked(&req.node_id, req.dbid))?;
+        if !st.option_sym {
+            return Err("the channel is not a symmetric channel".to_string());
+        }
+        let q = parse_sym_state(&req.hsmd_msg).ok_or("malformed request")?;
+        if q.funding_txid != st.funding_txid || q.funding_vout != st.funding_txout as u32 {
+            return Err("the request names another funding output".to_string());
+        }
+        if Some(q.we_opened) != st.is_outbound {
+            return Err("the request says the other side opened the channel".to_string());
+        }
+        if q.remote_update_key != st.remote_delayed {
+            return Err("the peer's update key differs from setup_channel".to_string());
+        }
+        let delay = st.local_to_self_delay.max(st.remote_to_self_delay);
+        if q.delay != delay {
+            return Err(format!("shared delay {} is not the channel's {delay}", q.delay));
+        }
+        if q.asset[0] != 0x01 {
+            return Err("the channel asset is not explicit".to_string());
+        }
+        let asset = explicit_asset(&q.asset).ok_or("the channel asset is not explicit")?;
+        if let Some(chan) = st.pay.asset {
+            if chan != asset {
+                return Err(format!("the state is not in the channel's asset {}", chan.display()));
+            }
+        }
+        // Whose commitment it is decides its number: ours count in our
+        // sequence (even when we opened), theirs in theirs.
+        let local = match q.owner {
+            0 => true,
+            1 => false,
+            o => return Err(format!("bad owner {o}")),
+        };
+        let owner_opened = local == q.we_opened;
+        if sym::state_num(q.commit_num, owner_opened) != Some(q.num) {
+            return Err(format!("state {} is not the number of commitment {}", q.num, q.commit_num));
+        }
+        let secp = self.kernel().secp();
+        let bp = self.kernel().channel_basepoints(&req.node_id, req.dbid);
+        let htlcs: Vec<sym::StateHtlc> = q
+            .htlcs
+            .iter()
+            .map(|h| sym::StateHtlc {
+                ours: h.side == Side::Local as u8,
+                amount_msat: h.amount_msat,
+                payment_hash: h.payment_hash,
+                cltv_expiry: h.cltv_expiry,
+            })
+            .collect();
+        let paid = sym::check_settlement(
+            secp,
+            st.funding_sats,
+            &bp[1],
+            &st.remote_payment,
+            &bp[2],
+            &st.remote_htlc,
+            &htlcs,
+            &q.outs,
+        )?;
+        let ch = self.sym_channel(&req.node_id, req.dbid, st, &q.asset)?;
+        let (program, rest) = ch.state(secp, q.num, &q.outs).ok_or("cannot build the state's output")?;
+        let msg = ch.upd_msg(q.num, &program, &rest);
+        // The peer's signature, when the request carries it, must be on
+        // this very state.
+        let peer_signed = match q.sig_remote {
+            None => false,
+            Some(sig) => {
+                if !sym::verify(self.kernel().secp(), &msg, &sig, &st.remote_delayed) {
+                    return Err(format!("the peer's signature on state {} does not verify", q.num));
+                }
+                true
+            }
+        };
+        let offered: Vec<Offered> = htlcs
+            .iter()
+            .filter(|h| h.ours)
+            .map(|h| Offered { amount_msat: h.amount_msat, hash: h.payment_hash, cltv: h.cltv_expiry })
+            .collect();
+        // What the state leaves this side: its balance and the HTLC outputs
+        // it offered (an offered HTLC below the dust limit is in the
+        // balance already).
+        let value = paid.ours.saturating_add(paid.offered);
+        let plan = st.pay.plan(local, q.commit_num, asset, value, offered, htlcs.len());
+        Ok(SymChecked { local, commit_num: q.commit_num, paid, msg, peer_signed, plan })
+    }
+
+    /// Permissive mode only: the update signature on what the request names.
+    fn h_sign_sym_state_unchecked(&self, req: &Request) -> Option<Vec<u8>> {
+        let q = parse_sym_state(&req.hsmd_msg)?;
+        let st = self.store.get(&req.node_id, req.dbid)?;
+        let ch = self.sym_channel(&req.node_id, req.dbid, st, &q.asset).ok()?;
+        let (program, rest) = ch.state(self.kernel().secp(), q.num, &q.outs)?;
+        let sk = self.kernel().channel_secrets(&req.node_id, req.dbid).delayed;
+        let sig = taproot::sign(self.kernel().secp(), &ch.upd_msg(q.num, &program, &rest), &sk);
+        let mut w = Writer::new(msg::HSMD_SIGN_SYM_STATE_REPLY);
+        w.bytes(&sig);
+        Some(w.into_vec())
+    }
+
+    /// SIGN_SYM_HTLC (71): a settlement HTLC output, by the leaf that pays
+    /// this side (the SUCCESS of one it received, the TIMEOUT of one it
+    /// offered), with its HTLC basepoint's key, untweaked. The claim pays
+    /// this device's own scripts only, as a taproot-covenant claim does.
+    fn h_sign_sym_htlc(&self, m: &[u8]) -> Option<Vec<u8>> {
+        let mut r = wire::Reader::new(m);
+        r.u16()?;
+        let (bt, proofs_empty) = wire::read_elements_tx_proofs(&mut r)?;
+        let input = r.u32()? as usize;
+        let leaf = r.u16_prefixed()?;
+        let peer_id = r.arr33()?;
+        let dbid = r.u64()?;
+        if input >= bt.tx.inputs.len() || leaf.is_empty() {
+            return None;
+        }
+        let genesis = self.genesis?;
+        let prevouts = (0..bt.tx.inputs.len())
+            .map(|i| {
+                wire::psbt_input_elements_prevout(&bt.psbt, i)
+                    .map(|(asset, value, script)| taproot::Prevout { asset, value, script })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        if !is_p2tr(&prevouts[input].script) {
+            return None;
+        }
+        let k = self.kernel();
+        let ours = k.channel_basepoints(&peer_id, dbid)[2];
+        if self.policy.is_enforce() && !sym::leaf_pays_key(&leaf, &ours) {
+            self.refuse(
+                "SIGN_SYM_HTLC refused: the leaf is neither the SUCCESS nor the TIMEOUT leaf of \
+                 this side's HTLC key"
+                    .to_string(),
+            );
+            return None;
+        }
+        if let Some(st) = self.store.get(&peer_id, dbid) {
+            if self.policy.is_enforce() && !st.option_sym {
+                self.refuse("SIGN_SYM_HTLC refused: the channel is not a symmetric channel".to_string());
+                return None;
+            }
+        }
+        self.enforce_tcov("SIGN_SYM_HTLC", &peer_id, dbid, &bt, proofs_empty, input, &prevouts, None)
+            .ok()?;
+        let sighash = taproot::elements_sighash(
+            &bt.tx,
+            &prevouts,
+            input,
+            Some(&leaf),
+            taproot::SIGHASH_DEFAULT,
+            &genesis,
+        )?;
+        let sk = k.channel_secrets(&peer_id, dbid).htlc;
+        let sig = taproot::sign(k.secp(), &sighash, &sk);
+        let mut w = Writer::new(msg::HSMD_SIGN_TCOV_REPLY);
+        w.bytes(&sig);
+        Some(w.into_vec())
+    }
+
     /// The enforce gate for a taproot-covenant spend, whose signature commits
     /// to every output: each one is unblinded and pays one of the node's own
     /// scripts, or, for SIGN_TCOV_LOCAL_HTLC (`local_point` given), D, the
@@ -2105,6 +2432,66 @@ impl Signer {
         }
     }
 
+    /// A symmetric channel's kickoff, update or settle (`crate::sym`), whose
+    /// fee coins this device is asked to sign: input 0 is the channel's
+    /// output, which this device does not sign here (its witness is the
+    /// kickoff's two signatures from the open, both update signatures, or
+    /// nothing at all), and the outputs from 0 on pass its value on. Those
+    /// outputs are let through the withdrawal rule, for this transaction
+    /// only, when together they carry exactly input 0's explicit value in its
+    /// explicit asset: the wallet's coins then fund only the fee and their
+    /// own change, which the rule still holds to the limits.
+    fn note_sym_spend(&self, peer_id: &[u8; 33], dbid: u64, utxos: &[wire::HsmUtxo], psbt: &[u8]) {
+        let Some(st) = self.store.get(peer_id, dbid) else {
+            return;
+        };
+        if !st.option_sym {
+            return;
+        }
+        let Some(tx) = wire::reconstruct_elements_tx_from_pset(psbt) else {
+            return;
+        };
+        let (Some((in_asset, in_value, _)), Some(txid), Some(i0)) =
+            (wire::psbt_input_elements_prevout(psbt, 0), wire::unsigned_txid(&tx), tx.inputs.first())
+        else {
+            return;
+        };
+        if utxos.iter().any(|u| u.txid == i0.txhash && u.vout == i0.index) {
+            return;
+        }
+        let (Some(_), Some(v0)) = (explicit_asset(&in_asset), explicit_amount(&in_value)) else {
+            return;
+        };
+        let mut carried: u64 = 0;
+        let mut m = 0;
+        for o in &tx.outputs {
+            if carried == v0 {
+                break;
+            }
+            let Some(v) = explicit_amount(&o.value) else {
+                return;
+            };
+            if o.script.is_empty() || o.asset != in_asset || o.nonce != [0x00] {
+                return;
+            }
+            let Some(c) = carried.checked_add(v) else {
+                return;
+            };
+            carried = c;
+            m += 1;
+        }
+        if m == 0 || carried != v0 {
+            return;
+        }
+        let mut claims = self.tcov_claims.borrow_mut();
+        for o in &tx.outputs[..m] {
+            if claims.len() >= TCOV_CLAIMS {
+                claims.pop_front();
+            }
+            claims.push_back((txid, o.script.clone()));
+        }
+    }
+
     /// Whether `script`, paid by the transaction `txid`, is D, the covenant
     /// output of a taproot-covenant claim SIGN_TCOV_LOCAL_HTLC approved.
     fn tcov_claim_pays(&self, txid: &[u8; 32], script: &[u8]) -> bool {
@@ -2122,6 +2509,7 @@ impl Signer {
     fn h_sign_htlc_tx_mingle(&self, m: &[u8]) -> Option<Vec<u8>> {
         let (peer_id, dbid, utxos, psbt) = wire::parse_sign_htlc_tx_mingle(m)?;
         self.note_credit_claim(&peer_id, dbid, &psbt);
+        self.note_sym_spend(&peer_id, dbid, &utxos, &psbt);
         let (out, _) = self.sign_wallet_inputs_into_psbt("SIGN_HTLC_TX_MINGLE", &utxos, psbt, Bound::Each, 0)?;
         let mut w = Writer::new(msg::HSMD_SIGN_HTLC_TX_MINGLE_REPLY);
         w.u32(out.len() as u32);
@@ -3090,6 +3478,7 @@ fn parse_setup_channel(m: &[u8]) -> Option<ChannelState> {
         peer_reached_reserve: false,
         option_credit,
         credit: None,
+        option_sym: policy::channel_type_has_sym(&features),
     })
 }
 
@@ -3156,6 +3545,84 @@ fn parse_remote_commitment(m: &[u8]) -> Option<(BitcoinTx, [u8; 33], [u8; 33], V
     let num_htlcs = r.u16()? as usize;
     let htlcs = read_htlcs(&mut r, num_htlcs)?;
     Some((bt, remote_funding, remote_per_commit, htlcs, commit_num))
+}
+
+/// What `hsmd_sign_sym_state` names: the channel's constants as the host
+/// gives them, the state (`towire_sym_state`) and the HTLCs it carries.
+struct SymRequest {
+    funding_txid: [u8; 32],
+    funding_vout: u32,
+    we_opened: bool,
+    remote_update_key: [u8; 33],
+    asset: [u8; 33],
+    delay: u16,
+    /// 0: our commitment, 1: the peer's.
+    owner: u8,
+    commit_num: u64,
+    num: i64,
+    outs: Vec<sym::Out>,
+    /// The peer's update signature on it, when the host holds it.
+    sig_remote: Option<[u8; 64]>,
+    htlcs: Vec<Htlc>,
+}
+
+fn parse_sym_state(m: &[u8]) -> Option<SymRequest> {
+    let mut r = wire::Reader::new(m);
+    r.u16()?;
+    let funding_txid = r.arr32()?;
+    let funding_vout = r.u32()?;
+    let we_opened = r.bool()?;
+    let remote_update_key = r.arr33()?;
+    let asset = r.arr33()?;
+    let delay = r.u16()?;
+    let owner = r.u8()?;
+    let commit_num = r.u64()?;
+    let num = r.u64()? as i64;
+    let n = r.u16()? as usize;
+    let mut outs = Vec::with_capacity(n);
+    for _ in 0..n {
+        let amount = r.u64()?;
+        let spk = r.u16_prefixed()?;
+        outs.push(sym::Out { amount, spk });
+    }
+    let mut sigs = [None, None];
+    for s in &mut sigs {
+        let has = r.bool()?;
+        let sig: [u8; 64] = r.take_bytes(64)?.try_into().ok()?;
+        if has {
+            *s = Some(sig);
+        }
+    }
+    let nh = r.u16()? as usize;
+    let htlcs = read_htlcs(&mut r, nh)?;
+    if r.remaining() != 0 {
+        return None;
+    }
+    Some(SymRequest {
+        funding_txid,
+        funding_vout,
+        we_opened,
+        remote_update_key,
+        asset,
+        delay,
+        owner,
+        commit_num,
+        num,
+        outs,
+        sig_remote: sigs[1],
+        htlcs,
+    })
+}
+
+/// A state this device checked: whose it is, what it pays this side, the
+/// message to sign, whether the peer signed it, and its payment plan.
+struct SymChecked {
+    local: bool,
+    commit_num: u64,
+    paid: sym::Paid,
+    msg: [u8; 32],
+    peer_signed: bool,
+    plan: Plan,
 }
 
 /// Parse `hsmd_validate_commitment_tx` -> (tx, htlcs, commit_num).
@@ -4172,8 +4639,17 @@ mod close_and_revocation_tests {
         assert!(matches!(revoke(&mut s, 0), Outcome::Reply(_)));
         assert!(s.store.record_close([0x99; 32]));
         assert!(!s.store.record_close([0x99; 32]));
-        let v11 = policy::encode_channel_store(&s.store);
-        assert_eq!(v11[4], 11);
+        let v12 = policy::encode_channel_store(&s.store);
+        assert_eq!(v12[4], 12);
+        // A version-11 payload: the same, without the entry's symmetric
+        // flag (the byte before the ledger and the close record).
+        let l = &s.store.ledger;
+        let at12 = v12.len() - (2 + 32) - (2 + 40 * l.approvals.len() + 2 + 49 * l.spends.len()) - 1;
+        assert_eq!(v12[at12], 0);
+        let mut v11 = [&v12[..at12], &v12[at12 + 1..]].concat();
+        v11[4] = 11;
+        let (back, _, _) = policy::decode_channel_store(&v11).unwrap();
+        assert!(!back[0].1.option_sym);
         // A version-10 payload: the same, without the entry's credit flag
         // and credit-note flag (the two bytes before the ledger and the
         // close record; the channel holds no credit).
@@ -5849,8 +6325,8 @@ mod close_and_revocation_tests {
             assert!(matches!(validate(&mut s, n, 300_000, 699_000, 1_000), Outcome::Reply(_)));
         }
         let full = policy::encode_channel_store(&s.store);
-        // Version 11 less the entry's six flags and the close record: version 6.
-        let mut payload = [&full[..full.len() - 2 - 4 - 6], &full[full.len() - 2 - 4..full.len() - 2]].concat();
+        // Version 12 less the entry's seven flags and the close record: version 6.
+        let mut payload = [&full[..full.len() - 2 - 4 - 7], &full[full.len() - 2 - 4..full.len() - 2]].concat();
         payload[4] = 6;
         let mac = s.chstore_mac(&payload);
         payload.extend_from_slice(&mac);
@@ -6744,6 +7220,7 @@ mod close_output_spend_tests {
             limits: None,
             peer_reached_reserve: false,
             option_credit: false,
+            option_sym: false,
             credit: None,
         }
     }
@@ -6823,6 +7300,7 @@ mod tcov_tests {
             limits: None,
             peer_reached_reserve: false,
             option_credit: false,
+            option_sym: false,
             credit: None,
         }
     }
@@ -7605,5 +8083,277 @@ mod tcov_tests {
         let mut t = signer(Policy::Enforce);
         assert_eq!(t.import_channels(&blob), Ok(1));
         assert!(t.store.get(&PEER, DBID).unwrap().option_tcov);
+    }
+}
+
+/// Enforce mode on a symmetric channel (`crate::sym`): the kickoff is signed
+/// only as this channel's, a state only when its settlement pays the channel's
+/// scripts and leaves this side what it holds, and our own state counts as
+/// validated, for the revocations, only once the peer's signature verifies.
+#[cfg(test)]
+mod sym_tests {
+    use super::*;
+    use crate::hsm_secret::HsmSecret;
+    use crate::kernel::{Kernel, BIP32_VER_TEST_PRIVATE, BIP32_VER_TEST_PUBLIC};
+    use crate::policy::Policy;
+
+    const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    const PEER: [u8; 33] = [0x02; 33];
+    const DBID: u64 = 9;
+    const FUNDING_TXID: [u8; 32] = [0x44; 32];
+    const FUNDING: u64 = 1_000_000;
+    const GENESIS: [u8; 32] = [0x0f; 32];
+
+    fn asset() -> [u8; 33] {
+        let mut a = [0x55u8; 33];
+        a[0] = 0x01;
+        a
+    }
+
+    fn signer() -> Signer {
+        let seed = crate::kernel::bip39_seed(MNEMONIC, "");
+        let kernel = Kernel::new(seed.to_vec(), BIP32_VER_TEST_PUBLIC, BIP32_VER_TEST_PRIVATE);
+        let secret = HsmSecret { seed, secret_type: 2, mnemonic: String::new() };
+        let mut s = Signer::with_policy(secret, Policy::Enforce);
+        s.kernel = Some(kernel);
+        s.hsm_version = 6;
+        s.genesis = Some(GENESIS);
+        s
+    }
+
+    fn secret(k: u8) -> SecretKey {
+        SecretKey::from_slice(&[k; 32]).unwrap()
+    }
+
+    fn point(s: &Signer, k: u8) -> [u8; 33] {
+        s.kernel().pubkey_of(&secret(k))
+    }
+
+    fn req(msg: Vec<u8>) -> Request {
+        Request { is_main: false, node_id: PEER, dbid: DBID, capabilities: 0, hsmd_msg: msg }
+    }
+
+    /// setup_channel for a channel we opened, of the symmetric type (bits
+    /// 12 and 178) or not.
+    fn track(s: &mut Signer, symmetric: bool) {
+        let mut w = Writer::new(msg::HSMD_SETUP_CHANNEL);
+        w.bool(true);
+        w.u64(FUNDING);
+        w.u64(0);
+        w.bytes(&FUNDING_TXID);
+        w.u16(0);
+        w.u16(144);
+        w.u16(0);
+        w.bool(false);
+        for k in 1..=5u8 {
+            w.bytes(&point(s, k));
+        }
+        w.u16(144);
+        w.u16(0);
+        let mut ct = vec![0u8; 23];
+        ct[21] = 0x10;
+        if symmetric {
+            ct[0] = 0x04;
+        }
+        w.u16(ct.len() as u16);
+        w.bytes(&ct);
+        assert!(matches!(s.handle(&req(w.into_vec())), Outcome::Reply(_)));
+        assert_eq!(s.store.get(&PEER, DBID).unwrap().option_sym, symmetric);
+    }
+
+    fn channel(s: &Signer) -> sym::Channel {
+        let ours = s.kernel().channel_basepoints(&PEER, DBID)[3];
+        sym::Channel::new(&GENESIS, &FUNDING_TXID, 0, &ours, &point(s, 4), &asset(), 144)
+    }
+
+    /// A settlement paying us `ours` and the peer the rest.
+    fn split(s: &Signer, ours: u64) -> Vec<sym::Out> {
+        let mine = s.kernel().channel_basepoints(&PEER, DBID)[1];
+        vec![
+            sym::Out { amount: FUNDING - ours, spk: taproot::p2wpkh(&point(s, 2)) },
+            sym::Out { amount: ours, spk: taproot::p2wpkh(&mine) },
+        ]
+    }
+
+    fn state_msg(
+        s: &Signer,
+        owner: u8,
+        commit_num: u64,
+        num: i64,
+        outs: &[sym::Out],
+        peer_sig: Option<[u8; 64]>,
+    ) -> Vec<u8> {
+        let mut w = Writer::new(msg::HSMD_SIGN_SYM_STATE);
+        w.bytes(&FUNDING_TXID);
+        w.u32(0);
+        w.bool(true);
+        w.bytes(&point(s, 4));
+        w.bytes(&asset());
+        w.u16(144);
+        w.u8(owner);
+        w.u64(commit_num);
+        w.u64(num as u64);
+        w.u16(outs.len() as u16);
+        for o in outs {
+            w.u64(o.amount);
+            w.u16(o.spk.len() as u16);
+            w.bytes(&o.spk);
+        }
+        for sig in [None, peer_sig] {
+            w.bool(sig.is_some());
+            w.bytes(&sig.unwrap_or([0; 64]));
+        }
+        w.u16(0);
+        w.into_vec()
+    }
+
+    fn msg_of(s: &Signer, num: i64, outs: &[sym::Out]) -> [u8; 32] {
+        let c = channel(s);
+        let (program, rest) = c.state(s.kernel().secp(), num, outs).unwrap();
+        c.upd_msg(num, &program, &rest)
+    }
+
+    fn refused(o: Outcome, why: &str) {
+        match o {
+            Outcome::Reject(r) => assert!(r.contains(why), "{r}"),
+            _ => panic!("must be refused ({why})"),
+        }
+    }
+
+    #[test]
+    fn signs_a_state_that_pays_this_side() {
+        let mut s = signer();
+        track(&mut s, true);
+        // The peer's first state (theirs is commitment 0, state 1: we opened).
+        let outs = split(&s, 600_000);
+        let reply = match s.handle(&req(state_msg(&s, 1, 0, 1, &outs, None))) {
+            Outcome::Reply(r) => r,
+            _ => panic!("the first state must be signed"),
+        };
+        assert_eq!(&reply[..2], &msg::HSMD_SIGN_SYM_STATE_REPLY.to_be_bytes());
+        let sig: [u8; 64] = reply[2..].try_into().unwrap();
+        let ours = s.kernel().channel_basepoints(&PEER, DBID)[3];
+        assert!(sym::verify(s.kernel().secp(), &msg_of(&s, 1, &outs), &sig, &ours));
+        assert_eq!(st(&s).remote_split.unwrap().1.ours, 600_000);
+
+        // Their next state takes half of what we hold, for no payment.
+        refused(
+            s.handle(&req(state_msg(&s, 1, 1, 3, &split(&s, 300_000), None))),
+            "no payment it approved accounts for the difference",
+        );
+        // An output to someone else.
+        let mut foreign = split(&s, 600_000);
+        foreign[0].spk = taproot::p2wpkh(&point(&s, 9));
+        refused(s.handle(&req(state_msg(&s, 1, 1, 3, &foreign, None))), "neither side's balance");
+        // Not the funding's value.
+        let mut short = split(&s, 600_000);
+        short[0].amount -= 1;
+        refused(s.handle(&req(state_msg(&s, 1, 1, 3, &short, None))), "atoms of a");
+        // A number that is not that commitment's (ours is even).
+        refused(s.handle(&req(state_msg(&s, 1, 1, 2, &split(&s, 600_000), None))), "is not the number");
+        // Their next state, paying us the same: signed.
+        assert!(matches!(s.handle(&req(state_msg(&s, 1, 1, 3, &split(&s, 600_000), None))), Outcome::Reply(_)));
+    }
+
+    #[test]
+    fn our_state_is_validated_by_the_peers_signature() {
+        let mut s = signer();
+        track(&mut s, true);
+        let outs = split(&s, 600_000);
+        let good = taproot::sign(s.kernel().secp(), &msg_of(&s, 0, &outs), &secret(4));
+        let bad = taproot::sign(s.kernel().secp(), &msg_of(&s, 2, &outs), &secret(4));
+        refused(s.handle(&req(state_msg(&s, 0, 0, 0, &outs, Some(bad)))), "does not verify");
+        assert!(matches!(s.handle(&req(state_msg(&s, 0, 0, 0, &outs, Some(good)))), Outcome::Reply(_)));
+        assert_eq!(st(&s).validated_through, Some(0));
+        assert_eq!(st(&s).local_split.unwrap().1.ours, 600_000);
+        // Revoking commitment 0 needs commitment 1 validated.
+        let revoke = |s: &mut Signer, n: u64| {
+            let mut w = Writer::new(msg::HSMD_REVOKE_COMMITMENT_TX);
+            w.u64(n);
+            s.handle(&req(w.into_vec()))
+        };
+        refused(revoke(&mut s, 0), "not validated");
+        // Commitment 1 without the peer's signature is signed (a resent
+        // revocation carries it) but validates nothing.
+        assert!(matches!(s.handle(&req(state_msg(&s, 0, 1, 2, &outs, None))), Outcome::Reply(_)));
+        assert_eq!(st(&s).validated_through, Some(0));
+        let sig1 = taproot::sign(s.kernel().secp(), &msg_of(&s, 2, &outs), &secret(4));
+        assert!(matches!(s.handle(&req(state_msg(&s, 0, 1, 2, &outs, Some(sig1)))), Outcome::Reply(_)));
+        assert!(matches!(revoke(&mut s, 0), Outcome::Reply(_)));
+    }
+
+    #[test]
+    fn states_only_on_symmetric_channels() {
+        let mut s = signer();
+        track(&mut s, false);
+        refused(
+            s.handle(&req(state_msg(&s, 1, 0, 1, &split(&s, 600_000), None))),
+            "not a symmetric channel",
+        );
+    }
+
+    fn kickoff_msg(s: &Signer, outs: &[(Vec<u8>, u64)]) -> Vec<u8> {
+        let mut t = Vec::new();
+        t.extend_from_slice(&2u32.to_le_bytes());
+        t.push(0x00);
+        t.push(0x01);
+        t.extend_from_slice(&FUNDING_TXID);
+        t.extend_from_slice(&0u32.to_le_bytes());
+        t.push(0x00);
+        t.extend_from_slice(&0xffff_fffdu32.to_le_bytes());
+        t.push(outs.len() as u8);
+        for (script, value) in outs {
+            t.extend_from_slice(&asset());
+            t.push(0x01);
+            t.extend_from_slice(&value.to_be_bytes());
+            t.push(0x00);
+            t.push(script.len() as u8);
+            t.extend_from_slice(script);
+        }
+        t.extend_from_slice(&0u32.to_le_bytes());
+        let mut wu = asset().to_vec();
+        wu.push(0x01);
+        wu.extend_from_slice(&FUNDING.to_be_bytes());
+        wu.push(0x00);
+        wu.push(34);
+        wu.extend_from_slice(&[0x00, 0x20]);
+        wu.extend_from_slice(&[0x66; 32]);
+        let mut p = b"psbt\xff".to_vec();
+        p.push(0x00);
+        p.extend_from_slice(&[0x01, 0x01]);
+        p.push(wu.len() as u8);
+        p.extend_from_slice(&wu);
+        p.push(0x00);
+        let mut w = Writer::new(msg::HSMD_SIGN_SYM_KICKOFF);
+        w.u32(t.len() as u32);
+        w.bytes(&t);
+        w.u32(p.len() as u32);
+        w.bytes(&p);
+        w.bytes(&point(s, 5));
+        w.into_vec()
+    }
+
+    #[test]
+    fn signs_only_this_channels_kickoff() {
+        let mut s = signer();
+        track(&mut s, true);
+        let ko = channel(&s).kickoff_spk(s.kernel().secp()).unwrap();
+        match s.handle(&req(kickoff_msg(&s, &[(ko.clone(), FUNDING), (vec![], 0)]))) {
+            Outcome::Reply(r) => assert_eq!(r[r.len() - 1], 0x83, "SIGHASH_SINGLE|ANYONECANPAY"),
+            _ => panic!("the channel's kickoff must be signed"),
+        }
+        refused(
+            s.handle(&req(kickoff_msg(&s, &[(taproot::p2wpkh(&point(&s, 9)), FUNDING), (vec![], 0)]))),
+            "not this channel's KO",
+        );
+        refused(s.handle(&req(kickoff_msg(&s, &[(ko, FUNDING - 1), (vec![], 1)]))), "funding's");
+        let mut n = signer();
+        track(&mut n, false);
+        let ko = channel(&n).kickoff_spk(n.kernel().secp()).unwrap();
+        refused(n.handle(&req(kickoff_msg(&n, &[(ko, FUNDING), (vec![], 0)]))), "not a symmetric channel");
+    }
+
+    fn st(s: &Signer) -> &ChannelState {
+        s.store.get(&PEER, DBID).expect("tracked")
     }
 }

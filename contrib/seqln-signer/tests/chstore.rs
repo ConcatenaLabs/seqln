@@ -67,6 +67,8 @@ fn chan(seed: u8) -> ChannelState {
             sig: [seed.wrapping_add(12); 64],
             preimage: Some([seed.wrapping_add(13); 32]),
         }),
+        // A symmetric channel's flag rides the round trip too.
+        option_sym: seed == 11,
     }
 }
 

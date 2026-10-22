@@ -157,7 +157,7 @@ def store_as_version(device, version):
     blob = open(path, 'rb').read()
     payload, mac = blob[:-32], blob[-32:]
     assert hmac.compare_digest(store_mac(payload), mac)
-    assert payload[:4] == b'SQCH' and payload[4] in (6, 7, 8, 9, 10, 11), payload[:5]
+    assert payload[:4] == b'SQCH' and payload[4] in (6, 7, 8, 9, 10, 11, 12), payload[:5]
     v = payload[4]
     count = struct.unpack('<I', payload[5:9])[0]
     o, entries = 9, []
@@ -217,6 +217,8 @@ def store_as_version(device, version):
                 skip(8 + 32 + 64)
                 if u8():
                     skip(32)
+        if v >= 12:                    # symmetric channel type (12)
+            skip(1)
         entries.append(entry)
     old = b'SQCH' + bytes([version]) + struct.pack('<I', count) + b''.join(entries)
     with open(path + '.tmp', 'wb') as f:
