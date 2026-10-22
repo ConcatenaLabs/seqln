@@ -9,6 +9,7 @@
 #include <common/utils.h>
 #include <wally_core.h>
 #include <wally_script.h>
+#include <wally_transaction.h>
 
 /* The Elements opcodes the leaves use, beyond Bitcoin's. */
 #define SYM_OP_CAT 0x7e
@@ -23,6 +24,9 @@
 #define SYM_OP_INSPECTOUTPUTSCRIPTPUBKEY 0xd1
 #define SYM_OP_GREATERTHAN64 0xde
 #define SYM_OP_CHECKSIGFROMSTACKVERIFY 0xc2
+#define SYM_OP_1SUB 0x8c
+#define SYM_OP_INSPECTINPUTSCRIPTPUBKEY 0xca
+#define SYM_OP_INSPECTLOCKTIME 0xd3
 
 /* BIP341's H: lift_x(0x50929b74...803ac0), whose discrete log nobody knows. */
 static const u8 nums_der[PUBKEY_CMPR_LEN] = {
@@ -102,6 +106,36 @@ void sym_channel_init(struct sym_channel *sc,
 	assert(asset_tag && asset_tag[0] == 0x01);
 	memcpy(sc->asset, asset_tag, sizeof(sc->asset));
 	sc->delay = delay;
+	sc->has_clock = false;
+	memset(&sc->clock, 0, sizeof(sc->clock));
+}
+
+void sym_marker_id(const struct bitcoin_outpoint *issuer, u8 marker[32])
+{
+	u8 entropy[32], contract[32];
+
+	memset(contract, 0, sizeof(contract));
+	if (wally_tx_elements_issuance_generate_entropy(issuer->txid.shad.sha.u.u8,
+							sizeof(issuer->txid.shad.sha.u.u8),
+							issuer->n, contract,
+							sizeof(contract), entropy,
+							sizeof(entropy)) != WALLY_OK
+	    || wally_tx_elements_issuance_calculate_asset(entropy,
+							  sizeof(entropy),
+							  marker, 32) != WALLY_OK)
+		abort();
+}
+
+void sym_channel_set_clock(struct sym_channel *sc, const u8 marker[32],
+			   const u8 *funding_wscript, struct amount_sat capacity)
+{
+	struct sha256 prog;
+
+	sha256(&prog, funding_wscript, tal_bytelen(funding_wscript));
+	sc->has_clock = true;
+	memcpy(sc->clock.marker, marker, sizeof(sc->clock.marker));
+	memcpy(sc->clock.funding_prog, prog.u.u8, sizeof(sc->clock.funding_prog));
+	sc->clock.capacity = capacity;
 }
 
 s64 sym_state_num(u64 commitment_index, bool opener)
@@ -115,6 +149,13 @@ u8 *sym_leaf_upd(const tal_t *ctx, const struct sym_channel *sc, s64 k)
 	u8 *s = tal_arr(ctx, u8, 0);
 	u8 kb[8];
 
+	/* The settle clock: every update's lock time is at or past the
+	 * floor, and the clock takes only lock time 0. */
+	if (sc->has_clock) {
+		push_num(&s, SYM_CLOCK_LOCKTIME_FLOOR);
+		op(&s, OP_CHECKLOCKTIMEVERIFY);
+		op(&s, OP_DROP);
+	}
 	le8s(k, kb);
 	/* n > k */
 	op(&s, OP_OVER);
@@ -212,14 +253,37 @@ u8 *sym_leaf_settle(const tal_t *ctx, const struct sym_channel *sc,
 	struct sha256 digest;
 
 	assert(m >= 1);
-	push_num(&s, sc->delay);
-	op(&s, OP_CHECKSEQUENCEVERIFY);
-	op(&s, OP_DROP);
-	for (size_t i = 0; i < m; i++) {
+	/* The settle clock: no delay here (the clock has it), the marker
+	 * stays where it is, and the settlement follows it. */
+	size_t first = 0;
+	if (sc->has_clock) {
+		const u8 pairs[3][2] = {
+			{ SYM_OP_INSPECTOUTPUTSCRIPTPUBKEY,
+			  SYM_OP_INSPECTINPUTSCRIPTPUBKEY },
+			{ SYM_OP_INSPECTOUTPUTASSET, SYM_OP_INSPECTINPUTASSET },
+			{ SYM_OP_INSPECTOUTPUTVALUE, SYM_OP_INSPECTINPUTVALUE },
+		};
+		for (size_t p = 0; p < 3; p++) {
+			op(&s, SYM_OP_PUSHCURRENTINPUTINDEX);
+			op(&s, pairs[p][0]);
+			op(&s, SYM_OP_PUSHCURRENTINPUTINDEX);
+			op(&s, pairs[p][1]);
+			op(&s, OP_ROT);
+			op(&s, OP_EQUALVERIFY);
+			op(&s, OP_EQUALVERIFY);
+		}
+		first = 1;
+	} else {
+		push_num(&s, sc->delay);
+		op(&s, OP_CHECKSEQUENCEVERIFY);
+		op(&s, OP_DROP);
+	}
+	for (size_t j = 0; j < m; j++) {
+		size_t i = first + j;
 		push_num(&s, i);
 		op(&s, SYM_OP_INSPECTOUTPUTASSET);
 		op(&s, SYM_OP_CAT);
-		op(&s, i == 0 ? SYM_OP_SHA256INITIALIZE : SYM_OP_SHA256UPDATE);
+		op(&s, j == 0 ? SYM_OP_SHA256INITIALIZE : SYM_OP_SHA256UPDATE);
 		push_num(&s, i);
 		op(&s, SYM_OP_INSPECTOUTPUTVALUE);
 		op(&s, SYM_OP_CAT);
@@ -228,7 +292,7 @@ u8 *sym_leaf_settle(const tal_t *ctx, const struct sym_channel *sc,
 		op(&s, SYM_OP_INSPECTOUTPUTSCRIPTPUBKEY);
 		op(&s, SYM_OP_CAT);
 		op(&s, OP_SHA256);
-		op(&s, i == m - 1 ? SYM_OP_SHA256FINALIZE : SYM_OP_SHA256UPDATE);
+		op(&s, j == m - 1 ? SYM_OP_SHA256FINALIZE : SYM_OP_SHA256UPDATE);
 	}
 	sym_settle_digest(sc, outs, &digest);
 	push(&s, digest.u.u8, sizeof(digest.u.u8));
@@ -328,6 +392,140 @@ void sym_kickoff_tree(const tal_t *ctx, const struct sym_channel *sc,
 	memset(&tree->rest, 0, sizeof(tree->rest));
 	memset(&tree->settle_hash, 0, sizeof(tree->settle_hash));
 	tweak_nums(&tree->merkle_root, tree->output_der);
+}
+
+/* An output tr(H, ...) of merkle root @root; its control block for a leaf
+ * whose path is @sibling (NULL: the only leaf). */
+static u8 *nums_spk(const tal_t *ctx, const struct sha256 *root,
+		    const struct sha256 *sibling, u8 **cb)
+{
+	u8 der[PUBKEY_CMPR_LEN];
+	u8 *spk = tal_arr(ctx, u8, BITCOIN_SCRIPTPUBKEY_P2TR_LEN);
+
+	tweak_nums(root, der);
+	spk[0] = OP_1;
+	spk[1] = 32;
+	memcpy(spk + 2, der + 1, 32);
+	if (cb) {
+		*cb = tal_arr(ctx, u8, 33);
+		(*cb)[0] = TAPSCRIPT_LEAF_VERSION_ELEMENTS
+			| (der[0] == SECP256K1_TAG_PUBKEY_ODD ? 1 : 0);
+		memcpy(*cb + 1, nums_der + 1, 32);
+		if (sibling) {
+			tal_resize(cb, 65);
+			memcpy(*cb + 33, sibling->u.u8, 32);
+		}
+	}
+	return spk;
+}
+
+u8 *sym_leaf_clock(const tal_t *ctx, const struct sym_channel *sc)
+{
+	u8 *s = tal_arr(ctx, u8, 0);
+	u8 zero[4];
+
+	assert(sc->has_clock);
+	memset(zero, 0, sizeof(zero));
+	push_num(&s, sc->delay);
+	op(&s, OP_CHECKSEQUENCEVERIFY);
+	op(&s, OP_DROP);
+	/* Lock time 0: no update (its lock time is at the floor). */
+	op(&s, SYM_OP_INSPECTLOCKTIME);
+	push(&s, zero, sizeof(zero));
+	op(&s, OP_EQUALVERIFY);
+	/* The input before it holds the marker. */
+	op(&s, SYM_OP_PUSHCURRENTINPUTINDEX);
+	op(&s, SYM_OP_1SUB);
+	op(&s, SYM_OP_INSPECTINPUTASSET);
+	op(&s, OP_1);
+	op(&s, OP_EQUALVERIFY);
+	push(&s, sc->clock.marker, sizeof(sc->clock.marker));
+	op(&s, OP_EQUAL);
+	return s;
+}
+
+u8 *sym_clock_spk(const tal_t *ctx, const struct sym_channel *sc, u8 **cb)
+{
+	struct sha256 root;
+
+	tap_leaf_hash(sym_leaf_clock(tmpctx, sc), &root);
+	return nums_spk(ctx, &root, NULL, cb);
+}
+
+/* OP_PUSHCURRENTINPUTINDEX [OP_1SUB] <inspect> OP_1 OP_EQUALVERIFY <v>
+ * OP_EQUALVERIFY: an explicit field of this input's neighbour or output. */
+static void explicit_is(u8 **s, bool before, u8 inspect, const void *v,
+			size_t len)
+{
+	op(s, SYM_OP_PUSHCURRENTINPUTINDEX);
+	if (before)
+		op(s, SYM_OP_1SUB);
+	op(s, inspect);
+	op(s, OP_1);
+	op(s, OP_EQUALVERIFY);
+	push(s, v, len);
+	op(s, OP_EQUALVERIFY);
+}
+
+u8 *sym_leaf_kick(const tal_t *ctx, const struct sym_channel *sc)
+{
+	u8 *s = tal_arr(ctx, u8, 0);
+	u8 cap[8], clock_prog[32];
+	u8 *clock = sym_clock_spk(tmpctx, sc, NULL);
+	le64 v = cpu_to_le64(sc->clock.capacity.satoshis); /* Raw: script operand */
+
+	assert(sc->has_clock);
+	memcpy(cap, &v, sizeof(cap));
+	memcpy(clock_prog, clock + 2, sizeof(clock_prog));
+	/* The input before it is the funding output: its v0 program... */
+	op(&s, SYM_OP_PUSHCURRENTINPUTINDEX);
+	op(&s, SYM_OP_1SUB);
+	op(&s, SYM_OP_INSPECTINPUTSCRIPTPUBKEY);
+	op(&s, OP_0);
+	op(&s, OP_EQUALVERIFY);
+	push(&s, sc->clock.funding_prog, sizeof(sc->clock.funding_prog));
+	op(&s, OP_EQUALVERIFY);
+	/* ...and the capacity in the channel asset. */
+	explicit_is(&s, true, SYM_OP_INSPECTINPUTVALUE, cap, sizeof(cap));
+	explicit_is(&s, true, SYM_OP_INSPECTINPUTASSET, sc->asset + 1, 32);
+	/* The output at its own index is the clock, with the capacity. */
+	explicit_is(&s, false, SYM_OP_INSPECTOUTPUTASSET, sc->asset + 1, 32);
+	explicit_is(&s, false, SYM_OP_INSPECTOUTPUTVALUE, cap, sizeof(cap));
+	op(&s, SYM_OP_PUSHCURRENTINPUTINDEX);
+	op(&s, SYM_OP_INSPECTOUTPUTSCRIPTPUBKEY);
+	op(&s, OP_1);
+	op(&s, OP_EQUALVERIFY);
+	push(&s, clock_prog, sizeof(clock_prog));
+	op(&s, OP_EQUAL);
+	return s;
+}
+
+u8 *sym_leaf_retire(const tal_t *ctx, const struct sym_channel *sc)
+{
+	u8 *s = tal_arr(ctx, u8, 0);
+
+	push_xonly(&s, &sc->upd_key[SYM_OPENER]);
+	op(&s, OP_CHECKSIGVERIFY);
+	push_xonly(&s, &sc->upd_key[SYM_ACCEPTER]);
+	op(&s, OP_CHECKSIG);
+	return s;
+}
+
+u8 *sym_seed_spk(const tal_t *ctx, const struct sym_channel *sc,
+		 u8 **kick_cb, u8 **retire_cb)
+{
+	struct sha256 kick, retire, root;
+	u8 *spk;
+
+	tap_leaf_hash(sym_leaf_kick(tmpctx, sc), &kick);
+	tap_leaf_hash(sym_leaf_retire(tmpctx, sc), &retire);
+	tap_branch_hash(&kick, &retire, &root);
+	spk = nums_spk(ctx, &root, &retire, kick_cb);
+	if (retire_cb)
+		nums_spk(tmpctx, &root, &kick, retire_cb);
+	if (retire_cb)
+		*retire_cb = tal_steal(ctx, *retire_cb);
+	return spk;
 }
 
 void sym_rebuild_state(const tal_t *ctx, const struct sym_channel *sc, s64 k,

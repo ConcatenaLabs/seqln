@@ -106,6 +106,18 @@ struct sym_channel {
 	u8 asset[33];
 	/* The shared delay, blocks: the larger of the two to_self_delays. */
 	u16 delay;
+	/* The settle clock (option_seq_symmetric_clock), or none: see
+	 * sym_channel_set_clock. */
+	bool has_clock;
+	struct sym_clock {
+		/* The marker: the asset the funding issued one atom of into
+		 * the seed (internal byte order). */
+		u8 marker[32];
+		/* The funding output's P2WSH program. */
+		u8 funding_prog[32];
+		/* The capacity, in the channel asset, that the clock holds. */
+		struct amount_sat capacity;
+	} clock;
 };
 
 #define SYM_OPENER 0
@@ -118,6 +130,64 @@ void sym_channel_init(struct sym_channel *sc,
 		      const struct pubkey *opener_upd_key,
 		      const struct pubkey *accepter_upd_key,
 		      const u8 *asset_tag, u16 delay);
+
+/*~ The settle clock (option_seq_symmetric_clock, design M).
+ *
+ * The base type's state output waits its own delay, so a peer that withheld
+ * its last acknowledgement restarts the wait once with a late update.  Here
+ * the wait is on a clock that the kickoff creates once, beside a marker that
+ * nobody else can hold: the funding transaction issues one atom of a fresh
+ * asset (its id derives from the issuing input) into a seed output, beside
+ * the usual 2-of-2 funding output.
+ *
+ *   seed     tr(H, {KICK, RETIRE}).  KICK: the input before it is the
+ *            funding output (its program and the capacity in the channel
+ *            asset), and the output at its own index is the clock, carrying
+ *            the capacity.  RETIRE: both update keys (a mutual close takes
+ *            the marker).
+ *   kickoff  input j the funding, input j+1 the seed; output j KO holding
+ *            the marker, output j+1 the clock.  The pairing is CROSSED: the
+ *            funding keys sign SIGHASH_SINGLE|SIGHASH_ANYONECANPAY over
+ *            output j, KO with the marker, so the funding output cannot be
+ *            spent without the one marker atom; KICK binds the clock, so the
+ *            clock is born at kickoff.  Signing the funding over the clock
+ *            instead would let a party move the funds into the clock alone,
+ *            early, and settle a stale state in one block once it matured.
+ *   UPD      <500000001> OP_CHECKLOCKTIMEVERIFY OP_DROP, then UPD(k): every
+ *            update's lock time is a time at or past the floor.
+ *   SETTLE   no signature, no delay: the marker stays where it is (the output
+ *            at its own index has its script, asset and value) and outputs
+ *            1 .. m are the settlement.
+ *   clock    tr(H, CLOCK): <delay> OP_CHECKSEQUENCEVERIFY, lock time 0, and
+ *            the input before it holds the marker.  No update can spend it,
+ *            and it pays only beside the marker, whose one lock-time-0 path
+ *            is SETTLE.
+ *
+ * The scripts cannot see the funding's issuance: the accepter must check
+ * that it issued exactly one atom, with no reissuance token, into the seed,
+ * or a spare atom could take the clock. */
+
+/* The marker that a new issuance (contract hash zero) on @issuer creates. */
+void sym_marker_id(const struct bitcoin_outpoint *issuer, u8 marker[32]);
+
+/* Make @sc a settle-clock channel: its UPD and SETTLE leaves become the
+ * clock's, and its clock and seed are those of @marker, the funding output's
+ * 2-of-2 @funding_wscript and @capacity. */
+void sym_channel_set_clock(struct sym_channel *sc, const u8 marker[32],
+			   const u8 *funding_wscript, struct amount_sat capacity);
+
+/* The clock's leaf, and its output (with the leaf's control block). */
+u8 *sym_leaf_clock(const tal_t *ctx, const struct sym_channel *sc);
+u8 *sym_clock_spk(const tal_t *ctx, const struct sym_channel *sc, u8 **cb);
+
+/* The seed's leaves, and its output (with each leaf's control block). */
+u8 *sym_leaf_kick(const tal_t *ctx, const struct sym_channel *sc);
+u8 *sym_leaf_retire(const tal_t *ctx, const struct sym_channel *sc);
+u8 *sym_seed_spk(const tal_t *ctx, const struct sym_channel *sc,
+		 u8 **kick_cb, u8 **retire_cb);
+
+/* The floor every settle-clock update's lock time must reach. */
+#define SYM_CLOCK_LOCKTIME_FLOOR 500000001
 
 /* The state number of a commitment: each side's commitments in its own
  * sequence, opener's even, accepter's odd.  When a side revokes commitment
