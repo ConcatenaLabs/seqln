@@ -1,5 +1,6 @@
 #ifndef LIGHTNING_COMMON_TEST_SYM_M_VECTORS_H
 #define LIGHTNING_COMMON_TEST_SYM_M_VECTORS_H
+#include "config.h"
 /* Vectors for the settle clock (option_seq_symmetric_clock) in
  * run-sym_scripts.c, made with the Sequentia node's test framework from the
  * builders proved on a Sequentia chain; the keys, funding and settlement
