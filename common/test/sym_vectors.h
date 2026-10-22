@@ -4,6 +4,8 @@
  * framework from the builders that were proved on a Sequentia chain: the
  * leaves, trees, messages and signatures of one channel, and its kickoff's
  * signature hash. */
+#include "config.h"
+
 #define V_OPENER_UPD_SECRET "1111111111111111111111111111111111111111111111111111111111111111"
 #define V_ACCEPTER_UPD_SECRET "2222222222222222222222222222222222222222222222222222222222222222"
 #define V_OPENER_PAY_SECRET "3333333333333333333333333333333333333333333333333333333333333333"
