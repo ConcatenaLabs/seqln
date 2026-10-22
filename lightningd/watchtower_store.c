@@ -655,7 +655,9 @@ bool wt_store_put_sym(struct lightningd *ld, const struct channel *channel)
 	char *dir;
 
 	sym_channel_from(channel, &sc);
-	towire_u64(&buf, WT_SYM_VERSION);
+	/* A plain channel's record is version 1, as an older tower reads it;
+	 * a factory channel's is version 2, which carries the factory. */
+	towire_u64(&buf, channel_is_sym_factory(channel) ? WT_SYM_VERSION : 1);
 	towire_u64(&buf, channel->dbid);
 	towire_bitcoin_blkid(&buf, &chainparams->genesis_blockhash);
 	towire_bitcoin_outpoint(&buf, &channel->funding);
@@ -676,9 +678,10 @@ bool wt_store_put_sym(struct lightningd *ld, const struct channel *channel)
 		towire_sym_state(&buf, channel->sym_remote_pending);
 	/* A factory channel: the factory, from whose output the tower walks
 	 * (lightningd/sym_factory.h). */
-	towire_bool(&buf, channel_is_sym_factory(channel));
-	if (channel_is_sym_factory(channel))
+	if (channel_is_sym_factory(channel)) {
+		towire_bool(&buf, true);
 		towire_sym_factory(&buf, channel->sym_factory);
+	}
 
 	dir = channel_store_dir(tmpctx, ld, channel, NULL);
 	if (!dir)

@@ -345,9 +345,9 @@ def test_factory_keyless_watcher(node_factory, bitcoind, directory):
     # latest over KO 1 before the hub's stale update gets there).
     hub.rpc.close(m1.info['id'])
     split, _ = mined_spender(bitcoind, f['factory_txid'], f['factory_outnum'])
-    first, j = mined_spender(bitcoind, split['txid'], 1)
+    first, j = mined_spender(bitcoind, split['txid'], f['slot'])
     assert update_n(first, j) == stale
-    print("stale state", stale, "mined over KO 1:",
+    print("stale state", stale, "mined over KO", f['slot'], ":",
           json.dumps({x: first[x] for x in ('txid', 'vsize')}))
     tower.start()
     try:
