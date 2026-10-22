@@ -70,6 +70,7 @@ impl LightningProvider for ClnApiRpc {
                 utxos: None,
                 amount: AmountOrAll::Amount(Amount::from_msat(amount.msat())),
                 id: peer_id.to_owned(),
+                asset: None,
             })
             .await
             .with_context(|| "calling fundchannel")?;
