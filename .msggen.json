@@ -2069,6 +2069,9 @@
             "FundChannel_Start.asset": 10,
             "FundChannel_Start.channel_type[]": 9,
             "FundChannel_Start.close_to": 5,
+            "FundChannel_Start.factory_nonce": 11,
+            "FundChannel_Start.factory_size": 12,
+            "FundChannel_Start.factory_slot": 13,
             "FundChannel_Start.feerate": 3,
             "FundChannel_Start.id": 1,
             "FundChannel_Start.mindepth": 7,
@@ -3292,6 +3295,7 @@
             "ListPeerChannels.channels[].receivable_msat": 34,
             "ListPeerChannels.channels[].reestablished": 58,
             "ListPeerChannels.channels[].scratch_txid": 4,
+            "ListPeerChannels.channels[].seq_factory": 65,
             "ListPeerChannels.channels[].short_channel_id": 8,
             "ListPeerChannels.channels[].spendable_msat": 33,
             "ListPeerChannels.channels[].state": 3,
@@ -3348,6 +3352,15 @@
             "ListPeerChannels.channels[].inflight[].scratch_txid": 6,
             "ListPeerChannels.channels[].inflight[].splice_amount": 7,
             "ListPeerChannels.channels[].inflight[].total_funding_msat": 4
+        },
+        "ListpeerchannelsChannelsSeqFactory": {
+            "ListPeerChannels.channels[].seq_factory.factory_outnum": 1,
+            "ListPeerChannels.channels[].seq_factory.factory_txid": 2,
+            "ListPeerChannels.channels[].seq_factory.ko_outnum": 3,
+            "ListPeerChannels.channels[].seq_factory.ko_txid": 4,
+            "ListPeerChannels.channels[].seq_factory.nonce": 5,
+            "ListPeerChannels.channels[].seq_factory.size": 6,
+            "ListPeerChannels.channels[].seq_factory.slot": 7
         },
         "ListpeerchannelsChannelsStateChanges": {
             "ListPeerChannels.channels[].state_changes[].cause": 4,
@@ -3627,6 +3640,7 @@
         "MultifundchannelRequest": {
             "MultiFundChannel.commitment_feerate": 6,
             "MultiFundChannel.destinations[]": 1,
+            "MultiFundChannel.factory": 7,
             "MultiFundChannel.feerate": 2,
             "MultiFundChannel.minchannels": 5,
             "MultiFundChannel.minconf": 3,
@@ -8404,6 +8418,18 @@
             "added": "pre-v0.10.1",
             "deprecated": null
         },
+        "FundChannel_Start.factory_nonce": {
+            "added": "v26.06",
+            "deprecated": null
+        },
+        "FundChannel_Start.factory_size": {
+            "added": "v26.06",
+            "deprecated": null
+        },
+        "FundChannel_Start.factory_slot": {
+            "added": "v26.06",
+            "deprecated": null
+        },
         "FundChannel_Start.feerate": {
             "added": "pre-v0.10.1",
             "deprecated": null
@@ -12024,6 +12050,38 @@
             "added": "v23.02",
             "deprecated": null
         },
+        "ListPeerChannels.channels[].seq_factory": {
+            "added": "v26.06",
+            "deprecated": null
+        },
+        "ListPeerChannels.channels[].seq_factory.factory_outnum": {
+            "added": "v26.06",
+            "deprecated": null
+        },
+        "ListPeerChannels.channels[].seq_factory.factory_txid": {
+            "added": "v26.06",
+            "deprecated": null
+        },
+        "ListPeerChannels.channels[].seq_factory.ko_outnum": {
+            "added": "v26.06",
+            "deprecated": null
+        },
+        "ListPeerChannels.channels[].seq_factory.ko_txid": {
+            "added": "v26.06",
+            "deprecated": null
+        },
+        "ListPeerChannels.channels[].seq_factory.nonce": {
+            "added": "v26.06",
+            "deprecated": null
+        },
+        "ListPeerChannels.channels[].seq_factory.size": {
+            "added": "v26.06",
+            "deprecated": null
+        },
+        "ListPeerChannels.channels[].seq_factory.slot": {
+            "added": "v26.06",
+            "deprecated": null
+        },
         "ListPeerChannels.channels[].short_channel_id": {
             "added": "v23.02",
             "deprecated": null
@@ -12818,6 +12876,10 @@
         },
         "MultiFundChannel.destinations[].reserve": {
             "added": "pre-v0.10.1",
+            "deprecated": null
+        },
+        "MultiFundChannel.factory": {
+            "added": "v26.06",
             "deprecated": null
         },
         "MultiFundChannel.failed[]": {

@@ -1519,6 +1519,7 @@ message ListpeerchannelsChannels {
 	optional Amount our_max_htlc_value_in_flight_msat = 62;
 	repeated string features = 63;
 	optional bytes channel_asset = 64;
+	optional ListpeerchannelsChannelsSeqFactory seq_factory = 65;
 }
 
 message ListpeerchannelsChannelsAlias {
@@ -1571,6 +1572,16 @@ message ListpeerchannelsChannelsInflight {
 	Amount our_funding_msat = 5;
 	optional bytes scratch_txid = 6;
 	sint64 splice_amount = 7;
+}
+
+message ListpeerchannelsChannelsSeqFactory {
+	uint32 factory_outnum = 1;
+	bytes factory_txid = 2;
+	optional uint32 ko_outnum = 3;
+	optional bytes ko_txid = 4;
+	bytes nonce = 5;
+	uint32 size = 6;
+	uint32 slot = 7;
 }
 
 message ListpeerchannelsChannelsStateChanges {
@@ -2193,6 +2204,9 @@ message FundchannelStartRequest {
 	optional Amount reserve = 8;
 	repeated uint32 channel_type = 9;
 	optional bytes asset = 10;
+	optional bytes factory_nonce = 11;
+	optional uint32 factory_size = 12;
+	optional uint32 factory_slot = 13;
 }
 
 message FundchannelStartResponse {
@@ -2510,6 +2524,7 @@ message MultifundchannelRequest {
 	repeated Outpoint utxos = 4;
 	optional sint64 minchannels = 5;
 	optional Feerate commitment_feerate = 6;
+	optional bool factory = 7;
 }
 
 message MultifundchannelResponse {

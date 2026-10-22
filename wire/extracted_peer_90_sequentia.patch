@@ -11,7 +11,7 @@ the BOLTs' own and upstream's patches so check-wire-format keeps them.
  msgtype,accept_channel,33
  msgdata,accept_channel,temporary_channel_id,byte,32
  msgdata,accept_channel,dust_limit_satoshis,u64,
-@@ -148,9 +150,18 @@ msgdata,funding_created,temporary_channel_id,byte,32
+@@ -148,9 +150,25 @@ msgdata,funding_created,temporary_channel_id,byte,32
  msgdata,funding_created,funding_txid,sha256,
  msgdata,funding_created,funding_output_index,u16,
  msgdata,funding_created,signature,signature,
@@ -21,6 +21,13 @@ the BOLTs' own and upstream's patches so check-wire-format keeps them.
 +# sender's update signature on the receiver's first state.
 +tlvtype,funding_created_tlvs,sym_sig,48041
 +tlvdata,funding_created_tlvs,sym_sig,sig,bip340sig,
++# SEQUENTIA: on a factory channel (common/sym_factory.h) `funding_txid` and
++# `funding_output_index` are the channel's id in the factory, (nonce, slot);
++# sym_factory is the factory (towire_sym_factory): nonce, slot, asset, the
++# factory output on chain, and each slot's KO program and amount.  There is
++# no kickoff, so `signature` is zero.
++tlvtype,funding_created_tlvs,sym_factory,48043
++tlvdata,funding_created_tlvs,sym_factory,factory,byte,...
  msgtype,funding_signed,35
  msgdata,funding_signed,channel_id,channel_id,
  msgdata,funding_signed,signature,signature,
@@ -30,7 +37,7 @@ the BOLTs' own and upstream's patches so check-wire-format keeps them.
  msgtype,channel_ready,36
  msgdata,channel_ready,channel_id,channel_id,
  msgdata,channel_ready,second_per_commitment_point,point,
-@@ -282,6 +293,8 @@ msgdata,update_add_htlc,cltv_expiry,u32,
+@@ -282,6 +300,8 @@ msgdata,update_add_htlc,cltv_expiry,u32,
  msgdata,update_add_htlc,onion_routing_packet,byte,1366
  tlvtype,update_add_htlc_tlvs,blinded_path,0
  tlvdata,update_add_htlc_tlvs,blinded_path,path_key,point,
@@ -39,7 +46,7 @@ the BOLTs' own and upstream's patches so check-wire-format keeps them.
  msgtype,update_fulfill_htlc,130
  msgdata,update_fulfill_htlc,channel_id,channel_id,
  msgdata,update_fulfill_htlc,id,u64,
-@@ -310,10 +323,21 @@ msgdata,commitment_signed,htlc_signature,signature,num_htlcs
+@@ -310,10 +330,21 @@ msgdata,commitment_signed,htlc_signature,signature,num_htlcs
  msgdata,commitment_signed,splice_channel_id,commitment_signed_tlvs,
  tlvtype,commitment_signed_tlvs,splice_info,1
  tlvdata,commitment_signed_tlvs,splice_info,funding_txid,sha256,

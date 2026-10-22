@@ -1325,6 +1325,21 @@ impl From<responses::ListpeerchannelsChannelsInflight> for pb::ListpeerchannelsC
 }
 
 #[allow(unused_variables)]
+impl From<responses::ListpeerchannelsChannelsSeqFactory> for pb::ListpeerchannelsChannelsSeqFactory {
+    fn from(c: responses::ListpeerchannelsChannelsSeqFactory) -> Self {
+        Self {
+            factory_outnum: c.factory_outnum, // Rule #2 for type u32
+            factory_txid: hex::decode(&c.factory_txid).unwrap(), // Rule #2 for type txid
+            ko_outnum: c.ko_outnum, // Rule #2 for type u32?
+            ko_txid: c.ko_txid.map(|v| hex::decode(v).unwrap()), // Rule #2 for type txid?
+            nonce: hex::decode(&c.nonce).unwrap(), // Rule #2 for type txid
+            size: c.size, // Rule #2 for type u32
+            slot: c.slot, // Rule #2 for type u32
+        }
+    }
+}
+
+#[allow(unused_variables)]
 impl From<responses::ListpeerchannelsChannelsStateChanges> for pb::ListpeerchannelsChannelsStateChanges {
     fn from(c: responses::ListpeerchannelsChannelsStateChanges) -> Self {
         Self {
@@ -1431,6 +1446,7 @@ impl From<responses::ListpeerchannelsChannels> for pb::ListpeerchannelsChannels 
             receivable_msat: c.receivable_msat.map(|f| f.into()), // Rule #2 for type msat?
             reestablished: c.reestablished, // Rule #2 for type boolean?
             scratch_txid: c.scratch_txid.map(|v| hex::decode(v).unwrap()), // Rule #2 for type txid?
+            seq_factory: c.seq_factory.map(|v| v.into()),
             short_channel_id: c.short_channel_id.map(|v| v.to_string()), // Rule #2 for type short_channel_id?
             spendable_msat: c.spendable_msat.map(|f| f.into()), // Rule #2 for type msat?
             state: c.state as i32,
@@ -6182,6 +6198,9 @@ impl From<requests::FundchannelStartRequest> for pb::FundchannelStartRequest {
             // Field: FundChannel_Start.channel_type[]
             channel_type: c.channel_type.map(|arr| arr.into_iter().map(|i| i.into()).collect()).unwrap_or(vec![]), // Rule #3
             close_to: c.close_to, // Rule #2 for type string?
+            factory_nonce: c.factory_nonce.map(|v| hex::decode(v).unwrap()), // Rule #2 for type txid?
+            factory_size: c.factory_size, // Rule #2 for type u32?
+            factory_slot: c.factory_slot, // Rule #2 for type u32?
             feerate: c.feerate.map(|o|o.into()), // Rule #2 for type feerate?
             id: c.id.serialize().to_vec(), // Rule #2 for type pubkey
             mindepth: c.mindepth, // Rule #2 for type u32?
@@ -6336,6 +6355,7 @@ impl From<requests::MultifundchannelRequest> for pb::MultifundchannelRequest {
             commitment_feerate: c.commitment_feerate.map(|o|o.into()), // Rule #2 for type feerate?
             // Field: MultiFundChannel.destinations[]
             destinations: c.destinations.into_iter().map(|i| i.into()).collect(), // Rule #3 for type MultifundchannelDestinations
+            factory: c.factory, // Rule #2 for type boolean?
             feerate: c.feerate.map(|o|o.into()), // Rule #2 for type feerate?
             minchannels: c.minchannels, // Rule #2 for type integer?
             minconf: c.minconf, // Rule #2 for type integer?
@@ -8289,6 +8309,9 @@ impl From<pb::FundchannelStartRequest> for requests::FundchannelStartRequest {
             asset: c.asset.map(|v| hex::encode(v)), // Rule #1 for type hex?
             channel_type: Some(c.channel_type.into_iter().map(|s| s).collect()), // Rule #4
             close_to: c.close_to, // Rule #1 for type string?
+            factory_nonce: c.factory_nonce.map(|v| hex::encode(v)), // Rule #1 for type txid?
+            factory_size: c.factory_size, // Rule #1 for type u32?
+            factory_slot: c.factory_slot, // Rule #1 for type u32?
             feerate: c.feerate.map(|a| a.into()), // Rule #1 for type feerate?
             id: PublicKey::from_slice(&c.id).unwrap(), // Rule #1 for type pubkey
             mindepth: c.mindepth, // Rule #1 for type u32?
@@ -8433,6 +8456,7 @@ impl From<pb::MultifundchannelRequest> for requests::MultifundchannelRequest {
         Self {
             commitment_feerate: c.commitment_feerate.map(|a| a.into()), // Rule #1 for type feerate?
             destinations: c.destinations.into_iter().map(|s| s.into()).collect(), // Rule #4
+            factory: c.factory, // Rule #1 for type boolean?
             feerate: c.feerate.map(|a| a.into()), // Rule #1 for type feerate?
             minchannels: c.minchannels, // Rule #1 for type integer?
             minconf: c.minconf, // Rule #1 for type integer?
