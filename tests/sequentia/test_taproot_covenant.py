@@ -509,6 +509,65 @@ def test_tcov_claim_on_their_commitment(node_factory, bitcoind, executor, leaf):
                          for o in claimer.rpc.listfunds()['outputs']))
 
 
+def test_tcov_returning_node_spends_no_spent_output(node_factory, bitcoind, executor):
+    """l1 closes with an HTLC it offered in flight and is away before its
+    commitment is mined.  l2 learns the preimage and takes the HTLC by the
+    SUCCESS leaf of l1's commitment, in the same block as the commitment.
+    Back online, l1's lightningd sees that block, the commitment and l2's
+    claim, before its onchaind proposes the TIMEOUT claim of the same
+    output.  That claim can never be mined: it must not be built, and must
+    not hold l1's only fee coin (SILV: l1 holds no GOLD outside the
+    channel)."""
+    l1, l2, gold, silv, scid = tcov_pair(
+        node_factory, bitcoind,
+        opts=({'may_fail': True}, {'plugin': HOLD, 'may_fail': True}))
+    addr = bitcoind.rpc.getnewaddress()
+    l1.rpc.call('withdraw', {'destination': addr, 'satoshi': 'all', 'asset': gold})
+    bitcoind.generate_block(1, wait_for_mempool=1)
+    fund_node(bitcoind, l1, silv, 5 * PAR)
+    wait_for(lambda: all(o['asset'] != gold for o in l1.rpc.listfunds()['outputs']
+                         if o['status'] == 'confirmed'))
+    coin = only_one([o for o in l1.rpc.listfunds()['outputs'] if o['asset'] == silv])
+
+    msat = 3_000_000_000
+    fut, htlc = held_htlc(l1, l2, executor, msat, gold)
+    l2.stop()
+    commitment = only_one(l1.rpc.close(scid, unilateraltimeout=1)['txids'])
+    wait_for(lambda: commitment in bitcoind.rpc.getrawmempool())
+    l1.stop()
+
+    # l2 sees the commitment mined, learns the preimage, and claims.
+    l2.start()
+    first = bitcoind.generate_block(1, wait_for_mempool=commitment)[0]
+    dec = bitcoind.rpc.getrawtransaction(commitment, 1)
+    htlc_out = only_one([o['n'] for o in dec['vout']
+                         if o['scriptPubKey']['type'] == 'witness_v1_taproot'
+                         and int(Decimal(o['value']) * PAR) == msat // 1000])
+    wait_for(lambda: only_one(l2.rpc.listpeerchannels(l1.info['id'])['channels'])['state']
+             == 'ONCHAIN')
+    open(os.path.join(l2.daemon.lightning_dir, TEST_NETWORK, 'unhold'), 'w').close()
+    claim, i = wait_spender(bitcoind, commitment, htlc_out)
+    assert len(claim['vin'][i]['txinwitness']) == 4   # the SUCCESS leaf
+    l2.stop()
+
+    # The same block again, now with l2's claim beside the commitment.
+    bitcoind.rpc.invalidateblock(first)
+    wait_for(lambda: {commitment, claim['txid']} <= set(bitcoind.rpc.getrawmempool()))
+    block = bitcoind.generate_block(1)[0]
+    assert {commitment, claim['txid']} <= set(bitcoind.rpc.getblock(block)['tx'])
+
+    l1.start()
+    l1.daemon.wait_for_log('OUR_UNILATERAL/OUR_HTLC gave us preimage')
+    bitcoind.generate_block(3)
+    sync_blockheight(bitcoind, [l1])
+    assert builds_of(l1, commitment, htlc_out) == 0
+    assert l1.daemon.is_in_log('tcov spend of {}:{}: already spent on chain,'
+                               ' not attempted'.format(commitment, htlc_out))
+    held = [o for o in l1.rpc.listfunds()['outputs']
+            if (o['txid'], o['output']) == (coin['txid'], coin['output'])]
+    assert only_one(held)['reserved'] is False
+
+
 def test_tcov_keyless_device_signs_channel_and_claims(node_factory, bitcoind, executor,
                                                       directory):
     """l1 keeps its keys on the device signer (contrib/seqln-signer) in
