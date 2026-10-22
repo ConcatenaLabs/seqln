@@ -196,6 +196,26 @@ int main(int argc, char *argv[])
 		struct sha256 r;
 		assert(sym_parse_update_witness((const u8 **)w, &n, &r));
 		assert(n == 7 && sha256_eq(&r, &st.rest));
+
+		/* An annex (BIP341), which whoever mines the update may add,
+		 * is left out: the same n and R. */
+		u8 *annex = tal_arrz(w, u8, 9);
+		annex[0] = TAP_ANNEX_TAG;
+		tal_arr_expand(&w, annex);
+		assert(tal_count(w) == 7 && sym_witness_len((const u8 **)w) == 6);
+		n = 0;
+		assert(sym_parse_update_witness((const u8 **)w, &n, &r));
+		assert(n == 7 && sha256_eq(&r, &st.rest));
+		/* A settle with one: the two items the scripts see. */
+		u8 **sw = sym_settle_witness(tmpctx, &st);
+		tal_arr_expand(&sw, annex);
+		assert(sym_witness_len((const u8 **)sw) == 2);
+		/* An item that starts with 0x50 alone is no annex. */
+		u8 **one = tal_arr(tmpctx, u8 *, 1);
+		one[0] = annex;
+		assert(sym_witness_len((const u8 **)one) == 1);
+		tal_resize(&w, 6);
+
 		w[2] = tal_arr(w, u8, 7);
 		assert(!sym_parse_update_witness((const u8 **)w, &n, &r));
 	}

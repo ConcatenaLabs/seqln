@@ -41,6 +41,15 @@ struct tap_tree2 {
 /* The 32-byte x-only form of a key (its x coordinate). */
 void pubkey_to_xonly(const struct pubkey *key, u8 xonly[32]);
 
+/* BIP341: when a taproot witness has at least two items and the last one
+ * starts with 0x50, that item is the annex, which no script sees and no
+ * script-path signature here covers: anyone who relays or mines the spend
+ * can add one.  The number of items a reader of the witness should look at,
+ * the annex left out. */
+#define TAP_ANNEX_TAG 0x50
+struct wally_tx_witness_stack;
+size_t tap_witness_items(const struct wally_tx_witness_stack *wit);
+
 /* tagged_hash("TapLeaf/elements", 0xc4 || compact_size(len) || script) */
 void tap_leaf_hash(const u8 *script, struct sha256 *hash);
 

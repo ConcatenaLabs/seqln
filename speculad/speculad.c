@@ -1978,7 +1978,9 @@ static void sym_follow(const struct spd_sym *s, struct sym_cursor *k,
 			return;
 		}
 		n = -1;
-	} else if (tal_count(wit) == 2) {
+	} else if (sym_witness_len((const u8 **)wit) == 2) {
+		/* A settle (an annex, which whoever mined it may have added,
+		 * left out). */
 		sym_say(k, "state %"PRId64" settled by %s", k->num,
 			fmt_bitcoin_txid(tmpctx, txid));
 		k->done = true;

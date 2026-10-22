@@ -247,8 +247,13 @@ u8 **sym_update_witness(const tal_t *ctx,
 			const u8 *prev_leaf, const u8 *prev_cb);
 u8 **sym_settle_witness(const tal_t *ctx, const struct sym_tree *tree);
 
+/* How many items of the witness @wit (a tal array) the scripts see: an annex
+ * (BIP341, bitcoin/tapscript.h) is left out.  Anyone who mines a spend can add
+ * one, so every reader of a state output's witness counts with this. */
+size_t sym_witness_len(const u8 **wit);
+
 /* What an update's witness published: its new state's number and R.
- * False if @wit is not an update's. */
+ * False if @wit (an annex left out) is not an update's. */
 bool sym_parse_update_witness(const u8 **wit, s64 *n, struct sha256 *rest);
 
 /* The kickoff, unsigned: one input, the funding output (@funding_wscript),
