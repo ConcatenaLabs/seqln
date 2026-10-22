@@ -18,6 +18,17 @@
 #include <wally_psbt.h>
 #include <wally_transaction.h>
 
+size_t tap_witness_items(const struct wally_tx_witness_stack *wit)
+{
+	if (!wit)
+		return 0;
+	if (wit->num_items >= 2
+	    && wit->items[wit->num_items - 1].witness_len > 0
+	    && wit->items[wit->num_items - 1].witness[0] == TAP_ANNEX_TAG)
+		return wit->num_items - 1;
+	return wit->num_items;
+}
+
 void pubkey_to_xonly(const struct pubkey *key, u8 xonly[32])
 {
 	u8 der[PUBKEY_CMPR_LEN];

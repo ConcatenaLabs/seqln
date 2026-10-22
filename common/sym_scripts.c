@@ -2,6 +2,7 @@
 #include <assert.h>
 #include <bitcoin/chainparams.h>
 #include <bitcoin/script.h>
+#include <bitcoin/tapscript.h>
 #include <ccan/asort/asort.h>
 #include <ccan/crypto/sha256/sha256.h>
 #include <ccan/endian/endian.h>
@@ -450,11 +451,21 @@ u8 **sym_settle_witness(const tal_t *ctx, const struct sym_tree *tree)
 	return w;
 }
 
+size_t sym_witness_len(const u8 **wit)
+{
+	size_t n = tal_count(wit);
+
+	if (n >= 2 && tal_bytelen(wit[n - 1]) > 0
+	    && wit[n - 1][0] == TAP_ANNEX_TAG)
+		return n - 1;
+	return n;
+}
+
 bool sym_parse_update_witness(const u8 **wit, s64 *n, struct sha256 *rest)
 {
 	le64 le;
 
-	if (tal_count(wit) != 6
+	if (sym_witness_len(wit) != 6
 	    || tal_bytelen(wit[0]) != 64 || tal_bytelen(wit[1]) != 64
 	    || tal_bytelen(wit[2]) != 8 || tal_bytelen(wit[3]) != 32)
 		return false;

@@ -1,5 +1,6 @@
 #include "config.h"
 #include <bitcoin/script.h>
+#include <bitcoin/tapscript.h>
 #include <ccan/array_size/array_size.h>
 #include <ccan/asort/asort.h>
 #include <ccan/cast/cast.h>
@@ -3780,7 +3781,9 @@ static void tcov_extract_preimage(struct tracked_output *out,
 	struct sha256 sha;
 	struct ripemd160 ripemd;
 
-	if (!wit || wit->num_items != 4
+	/* An annex, which whoever mined the claim may have added, does not
+	 * hide the preimage. */
+	if (!wit || tap_witness_items(wit) != 4
 	    || wit->items[1].witness_len != sizeof(preimage)) {
 		status_broken("%s/%s spent by %s with a witness that is not"
 			      " the SUCCESS leaf's",
@@ -4509,7 +4512,7 @@ static void sym_state_spent(struct tracked_output ***outs,
 
 	if (!resolved_by_proposal(out, tx))
 		resolved_by_other(out, &tx->txid,
-				  wit && wit->num_items == 2
+				  tap_witness_items(wit) == 2
 				  ? SYM_SETTLE : SYM_UPDATE);
 	if (!wit) {
 		status_broken("State %"PRId64" spent by %s without a witness",
@@ -4517,8 +4520,9 @@ static void sym_state_spent(struct tracked_output ***outs,
 		return;
 	}
 
-	/* A settle: leaf and control block. */
-	if (wit->num_items == 2) {
+	/* A settle: leaf and control block (and perhaps an annex, which
+	 * whoever mined it may have added). */
+	if (tap_witness_items(wit) == 2) {
 		status_info("State %"PRId64" settled by %s", out->sym_num,
 			    fmt_bitcoin_txid(tmpctx, &tx->txid));
 		sym_settled(outs, tx, tx_blockheight);
