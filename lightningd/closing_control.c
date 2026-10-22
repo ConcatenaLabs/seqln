@@ -23,6 +23,7 @@
 #include <lightningd/opening_common.h>
 #include <lightningd/peer_fd.h>
 #include <lightningd/sym_factory.h>
+#include <lightningd/sym_lanes.h>
 #include <openingd/dualopend_wiregen.h>
 
 struct close_command {
@@ -894,6 +895,18 @@ static struct command_result *json_close(struct command *cmd,
 		/* drop_to_chain answers the command, at once. */
 		channel_fail_permanent(channel, REASON_USER,
 				       "A factory channel closes unilaterally");
+		return command_its_complicated("answered by drop_to_chain");
+	}
+	/* SEQUENTIA: nor does a channel of several assets: a mutual close of
+	 * its own funding output would leave the other lanes to a settlement
+	 * that pays it again (lightningd/sym_lanes.h). */
+	if (channel_is_sym_lanes(channel)
+	    && (channel->state == CHANNELD_NORMAL
+		|| channel->state == CHANNELD_AWAITING_LOCKIN)) {
+		register_close_command(cmd->ld, cmd, channel, 0);
+		channel_fail_permanent(channel, REASON_USER,
+				       "A channel of several assets closes"
+				       " unilaterally");
 		return command_its_complicated("answered by drop_to_chain");
 	}
 

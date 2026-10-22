@@ -1173,6 +1173,17 @@ static const struct db_migration dbmigrations[] = {
 	 ", PRIMARY KEY (channel_id)"
 	 ");"), NULL,
      SQL("DROP TABLE channel_sym_factory"), NULL},
+    /* Channels of several assets (lightningd/sym_lanes.h): their other
+     * lanes, our balance in each, the peer's kickoff signatures and the
+     * swaps in flight; and each HTLC's lane. */
+    {SQL("CREATE TABLE channel_sym_lanes ("
+	 "  channel_id BIGINT REFERENCES channels(id) ON DELETE CASCADE"
+	 ", lanes BLOB"
+	 ", PRIMARY KEY (channel_id)"
+	 ");"), NULL,
+     SQL("DROP TABLE channel_sym_lanes"), NULL},
+    {SQL("ALTER TABLE channel_htlcs ADD sym_lane INTEGER DEFAULT 0;"), NULL,
+     SQL("ALTER TABLE channel_htlcs DROP COLUMN sym_lane"), NULL},
 };
 
 const struct db_migration *get_db_migrations(size_t *num)

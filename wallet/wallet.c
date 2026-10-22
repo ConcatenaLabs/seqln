@@ -12,6 +12,7 @@
 #include <common/onionreply.h>
 #include <common/randbytes.h>
 #include <common/sym_factory.h>
+#include <common/sym_lanes.h>
 #include <common/sym_state.h>
 #include <common/trace.h>
 #include <db/bindings.h>
@@ -27,6 +28,7 @@
 #include <lightningd/notification.h>
 #include <lightningd/peer_htlcs.h>
 #include <lightningd/runes.h>
+#include <lightningd/sym_lanes.h>
 #include <lightningd/symmetric.h>
 #include <onchaind/onchaind_wiregen.h>
 #include <wallet/datastore.h>
@@ -1015,7 +1017,8 @@ bool wallet_add_onchaind_utxo(struct wallet *w,
 			      const struct channel *channel,
 			      /* NULL if option_static_remotekey */
 			      const struct pubkey *commitment_point,
-			      u32 csv_lock)
+			      u32 csv_lock,
+			      const u8 asset[33])
 {
 	struct db_stmt *stmt;
 
@@ -1073,10 +1076,10 @@ bool wallet_add_onchaind_utxo(struct wallet *w,
 	db_bind_blob(stmt, scriptpubkey, tal_bytelen(scriptpubkey));
 
 	db_bind_int(stmt, csv_lock);
-	/* Every output of a channel's commitment is in the channel's asset
-	 * (asset-aware channels; all zeroes on a chain without assets).  Left
-	 * out, it would read back as the policy asset. */
-	db_bind_blob(stmt, channel->channel_asset, sizeof(channel->channel_asset));
+	/* The output's asset: the channel's, or on a channel of several
+	 * assets its lane's (all zeroes on a chain without assets).  Left out,
+	 * it would read back as the policy asset. */
+	db_bind_blob(stmt, asset, 33);
 
 	db_exec_prepared_v2(take(stmt));
 	return true;
@@ -2267,6 +2270,8 @@ static struct channel *wallet_stmt2channel(struct wallet *w, struct db_stmt *stm
 		wallet_sym_load(w, chan);
 		if (channel_type_has(chan->type, OPT_SEQ_SYMMETRIC_FACTORY))
 			wallet_sym_factory_load(w, chan);
+		if (channel_type_has(chan->type, OPT_SEQ_SYMMETRIC_LANES))
+			wallet_sym_lanes_load(w, chan);
 		if (chan->last_tx && sym_is_kickoff(chan, chan->last_tx))
 			chan->last_sig.sighash_type
 				= SIGHASH_SINGLE | SIGHASH_ANYONECANPAY;
@@ -3490,8 +3495,9 @@ void wallet_htlc_save_in(struct wallet *wallet,
 				 " min_commit_num, "
 				 " fail_immediate,"
 				 " lock_point,"
-				 " point_add) VALUES "
-				 "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"));
+				 " point_add,"
+				 " sym_lane) VALUES "
+				 "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"));
 
 	in->dbid = htlcs_index_created(wallet->ld,
 				       in->key.id,
@@ -3536,6 +3542,7 @@ void wallet_htlc_save_in(struct wallet *wallet,
 		db_bind_secret(stmt, in->point_add);
 	else
 		db_bind_null(stmt);
+	db_bind_int(stmt, in->lane);
 
 	db_exec_prepared_v2(take(stmt));
 }
@@ -3693,6 +3700,113 @@ void wallet_sym_factory_load(struct wallet *w, struct channel *channel)
 	tal_free(stmt);
 }
 
+/* SEQUENTIA: a channel of several assets (lightningd/sym_lanes.h), as one
+ * blob: its lanes, our balance and the peer's kickoff signature in each,
+ * the swap in flight, and the one we asked for with its expiry. */
+void wallet_sym_lanes_save(struct wallet *w, const struct channel *channel)
+{
+	const struct sym_lanes_info *info = channel->sym_lanes;
+	struct db_stmt *stmt;
+	u8 *blob = tal_arr(tmpctx, u8, 0);
+
+	towire_u16(&blob, tal_count(info->lanes));
+	for (size_t i = 0; i < tal_count(info->lanes); i++) {
+		towire_sym_lane(&blob, &info->lanes[i]);
+		towire_amount_msat(&blob, info->our_msat[i]);
+		towire_secp256k1_ecdsa_signature(&blob,
+						 &info->kickoff_sigs[i].s);
+		towire_secp256k1_ecdsa_signature(&blob,
+						 &info->local_kickoff_sigs[i].s);
+	}
+	towire_bool(&blob, info->swap != NULL);
+	if (info->swap)
+		towire_sym_swap(&blob, info->swap);
+	towire_bool(&blob, info->req != NULL);
+	if (info->req) {
+		towire_sym_swap(&blob, info->req);
+		towire_u32(&blob, info->req_expiry);
+	}
+	towire_u16(&blob, tal_count(info->spends));
+	for (size_t i = 0; i < tal_count(info->spends); i++) {
+		towire_bitcoin_tx(&blob, info->spends[i].tx);
+		towire_u32(&blob, info->spends[i].input);
+		towire_u32(&blob, info->spends[i].height);
+	}
+
+	stmt = db_prepare_v2(w->db, SQL("DELETE FROM channel_sym_lanes"
+					" WHERE channel_id = ?;"));
+	db_bind_u64(stmt, channel->dbid);
+	db_exec_prepared_v2(take(stmt));
+	stmt = db_prepare_v2(w->db, SQL("INSERT INTO channel_sym_lanes ("
+					"  channel_id, lanes) VALUES (?, ?);"));
+	db_bind_u64(stmt, channel->dbid);
+	db_bind_talarr(stmt, blob);
+	db_exec_prepared_v2(take(stmt));
+}
+
+void wallet_sym_lanes_load(struct wallet *w, struct channel *channel)
+{
+	struct db_stmt *stmt;
+	struct sym_lanes_info *info;
+	const u8 *b;
+	size_t max;
+	u16 n;
+
+	stmt = db_prepare_v2(w->db, SQL("SELECT lanes FROM channel_sym_lanes"
+					" WHERE channel_id = ?;"));
+	db_bind_u64(stmt, channel->dbid);
+	db_query_prepared(stmt);
+	if (!db_step(stmt)) {
+		tal_free(stmt);
+		return;
+	}
+	b = db_col_arr(tmpctx, stmt, "lanes", u8);
+	tal_free(stmt);
+	max = tal_bytelen(b);
+
+	info = tal(channel, struct sym_lanes_info);
+	n = fromwire_u16(&b, &max);
+	info->lanes = tal_arr(info, struct sym_lane, n);
+	info->our_msat = tal_arr(info, struct amount_msat, n);
+	info->kickoff_sigs = tal_arr(info, struct bitcoin_signature, n);
+	info->local_kickoff_sigs = tal_arr(info, struct bitcoin_signature, n);
+	for (size_t i = 0; i < n; i++) {
+		fromwire_sym_lane(&b, &max, &info->lanes[i]);
+		info->our_msat[i] = fromwire_amount_msat(&b, &max);
+		fromwire_secp256k1_ecdsa_signature(&b, &max,
+						   &info->kickoff_sigs[i].s);
+		fromwire_secp256k1_ecdsa_signature(&b, &max,
+						   &info->local_kickoff_sigs[i].s);
+		info->kickoff_sigs[i].sighash_type
+			= info->local_kickoff_sigs[i].sighash_type
+			= SIGHASH_SINGLE | SIGHASH_ANYONECANPAY;
+	}
+	info->swap = info->req = NULL;
+	info->req_expiry = 0;
+	info->cmd = NULL;
+	if (fromwire_bool(&b, &max)) {
+		info->swap = tal(info, struct sym_swap);
+		fromwire_sym_swap(&b, &max, info->swap);
+	}
+	if (fromwire_bool(&b, &max)) {
+		info->req = tal(info, struct sym_swap);
+		fromwire_sym_swap(&b, &max, info->req);
+		info->req_expiry = fromwire_u32(&b, &max);
+	}
+	info->spends = tal_arr(info, struct sym_lane_spend,
+			       fromwire_u16(&b, &max));
+	for (size_t i = 0; i < tal_count(info->spends); i++) {
+		info->spends[i].tx = fromwire_bitcoin_tx(info->spends, &b, &max);
+		info->spends[i].input = fromwire_u32(&b, &max);
+		info->spends[i].height = fromwire_u32(&b, &max);
+	}
+	info->onchaind_txid = NULL;
+	info->kicked = false;
+	if (!b)
+		fatal("Corrupt lanes of channel %"PRIu64, channel->dbid);
+	channel->sym_lanes = info;
+}
+
 void wallet_credit_note_save(struct wallet *w, u64 chan_dbid, bool issued,
 			     const struct credit_note *n)
 {
@@ -3825,8 +3939,9 @@ void wallet_htlc_save_out(struct wallet *wallet,
 		" groupid,"
 		" fees_msat,"
 		" min_commit_num,"
-		" lock_point"
-		") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?);"));
+		" lock_point,"
+		" sym_lane"
+		") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?);"));
 
 	out->dbid = htlcs_index_created(wallet->ld,
 					out->key.id,
@@ -3873,6 +3988,7 @@ void wallet_htlc_save_out(struct wallet *wallet,
 		db_bind_pubkey(stmt, out->lock_point);
 	else
 		db_bind_null(stmt);
+	db_bind_int(stmt, out->lane);
 
 	db_exec_prepared_v2(take(stmt));
 }
@@ -4035,6 +4151,7 @@ static bool wallet_stmt2htlc_in(struct channel *channel,
 	in->fail_immediate = db_col_int(stmt, "fail_immediate");
 	in->lock_point = db_col_optional(in, stmt, "lock_point", pubkey);
 	in->point_add = db_col_optional(in, stmt, "point_add", secret);
+	in->lane = db_col_int(stmt, "sym_lane");
 
 	return ok;
 }
@@ -4083,6 +4200,7 @@ static bool wallet_stmt2htlc_out(struct wallet *wallet,
 	out->in = NULL;
 	out->fees = db_col_amount_msat(stmt, "fees_msat");
 	out->lock_point = db_col_optional(out, stmt, "lock_point", pubkey);
+	out->lane = db_col_int(stmt, "sym_lane");
 
 	if (!db_col_is_null(stmt, "origin_htlc")) {
 		u64 in_id = db_col_u64(stmt, "origin_htlc");
@@ -4165,6 +4283,7 @@ bool wallet_htlcs_load_in_for_channel(struct wallet *wallet,
 					     ", fail_immediate"
 					     ", lock_point"
 					     ", point_add"
+					     ", sym_lane"
 					     " FROM channel_htlcs"
 					     " WHERE direction= ?"
 					     " AND channel_id= ?"
@@ -4219,6 +4338,7 @@ bool wallet_htlcs_load_out_for_channel(struct wallet *wallet,
 					     ", groupid"
 					     ", fees_msat"
 					     ", lock_point"
+					     ", sym_lane"
 					     " FROM channel_htlcs"
 					     " WHERE direction = ?"
 					     " AND channel_id = ?"

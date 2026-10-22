@@ -173,5 +173,6 @@ common/test/run-tcov_annex: wire/fromwire.o wire/towire.o
 common/test/run-sym_scripts: wire/fromwire.o wire/towire.o
 common/test/run-sym_factory: wire/fromwire.o wire/towire.o
 common/test/run-sym_lanes: wire/fromwire.o wire/towire.o
+common/test/run-sym_lanes_wire: wire/fromwire.o wire/towire.o
 common/test/run-point_lock: wire/fromwire.o wire/towire.o
 common/test/run-credit_scripts: wire/fromwire.o wire/towire.o

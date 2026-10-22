@@ -28,7 +28,9 @@ void update_per_commit_point(struct channel *channel,
 
 /* Returns NULL on success, otherwise failmsg.  @lock_point: NULL for a
  * hash-locked HTLC, else its lock point (@payment_hash its x coordinate;
- * common/point_lock.h). */
+ * common/point_lock.h).  @asset: the HTLC's asset, which picks its lane on
+ * a channel of several assets (lightningd/sym_lanes.h); NULL, the
+ * channel's own. */
 const u8 *send_htlc_out(const tal_t *ctx,
 			struct channel *out,
 			struct amount_msat amount, u32 cltv,
@@ -41,7 +43,11 @@ const u8 *send_htlc_out(const tal_t *ctx,
 			const u8 *onion_routing_packet,
 			struct htlc_in *in,
 			const struct pubkey *lock_point,
+			const u8 *asset,
 			struct htlc_out **houtp);
+
+/* SEQUENTIA: the asset an incoming HTLC is in: its lane's. */
+const u8 *htlc_in_asset(const struct htlc_in *hin);
 
 /* SEQUENTIA: can @channel carry a point-locked HTLC we offer
  * (option_seq_point_locks on a taproot-covenant channel, offered by both

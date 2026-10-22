@@ -3,6 +3,7 @@
 #include <lightningd/channel.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/routehint.h>
+#include <lightningd/sym_lanes.h>
 
 static bool scid_in_arr(const struct short_channel_id *scidarr,
 			struct short_channel_id scid)
@@ -130,7 +131,7 @@ routehint_candidates(const tal_t *ctx,
 
 		/* Sequentia: an invoice is paid in one asset, and only a
 		 * channel in it can carry the payment to us. */
-		if (asset && !memeq(asset, 33, candidate.c->channel_asset, 33)) {
+		if (asset && channel_lane_of_asset(candidate.c, asset) < 0) {
 			log_debug(ld->log, "%s: in another asset",
 				  fmt_short_channel_id(tmpctx,
 						       r->short_channel_id));
@@ -145,6 +146,13 @@ routehint_candidates(const tal_t *ctx,
 		 * limit anyway */
 		/* FIXME: Present max capacity of multiple channels? */
 		candidate.capacity = channel_amount_receivable(candidate.c);
+		/* SEQUENTIA: what the asset's lane can still bring us
+		 * (lightningd/sym_lanes.h). */
+		if (asset && channel_lane_of_asset(candidate.c, asset) > 0)
+			candidate.capacity
+				= channel_lane_receivable(candidate.c,
+							  channel_lane_of_asset(candidate.c,
+										asset));
 		if (amount_msat_greater(candidate.capacity, htlc_max))
 			candidate.capacity = htlc_max;
 

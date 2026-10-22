@@ -72,8 +72,14 @@
  *                              (common/sym_factory.h): `funding` is then the
  *                              channel's id in the factory, and its output
  *                              on chain the factory output until the split,
- *                              its KO after it].  A plain channel's record
- *                              is version 1, as an older tower reads it.  Rewritten whenever either state
+ *                              its KO after it], then (version 3 only) bool
+ *                              has_lanes [a channel of several assets
+ *                              (lightningd/sym_lanes.h): u16 count, then
+ *                              each other lane, towire_sym_lane: its asset,
+ *                              its funding output's index in the funding
+ *                              transaction, its amount].  A plain channel's
+ *                              record is version 1, as an older tower reads
+ *                              it.  Rewritten whenever either state
  *                              changes, before channeld goes on
  *                              (wt_store_put_sym).
  *
@@ -102,6 +108,7 @@ bool wt_store_enabled(const struct lightningd *ld);
 #define WT_BLOB_SET_VERSION 1
 #define WT_BLOB_SET_FILE "blobs"
 #define WT_SYM_VERSION 2
+#define WT_SYM_VERSION_LANES 3
 #define WT_SYM_FILE "sym"
 
 struct lightningd;

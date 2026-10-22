@@ -118,6 +118,11 @@ struct funding_channel {
 	struct bitcoin_outpoint *factory_id;
 	u32 factory_size;
 	struct sym_factory *factory;
+
+	/* SEQUENTIA: a channel of several assets: its other lanes, which we
+	 * fund, their outputs once fundchannel_complete found them
+	 * (lightningd/sym_lanes.h); NULL else. */
+	struct sym_lane *sym_lanes;
 };
 
 struct uncommitted_channel *new_uncommitted_channel(struct peer *peer);

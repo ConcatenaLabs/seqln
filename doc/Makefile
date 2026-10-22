@@ -149,6 +149,7 @@ MARKDOWNPAGES := doc/addgossip.7 \
 	doc/spliceout.7 \
 	doc/staticbackup.7 \
 	doc/stop.7 \
+	doc/symswap.7 \
 	doc/txdiscard.7 \
 	doc/txprepare.7 \
 	doc/txsend.7 \

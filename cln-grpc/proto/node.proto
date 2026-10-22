@@ -352,6 +352,7 @@ message SendpayRequest {
 	optional bytes localinvreqid = 11;
 	optional bytes payment_metadata = 12;
 	optional string description = 13;
+	optional bytes asset = 14;
 }
 
 message SendpayResponse {
@@ -978,6 +979,7 @@ message SendonionRequest {
 	optional string description = 14;
 	optional Amount total_amount_msat = 15;
 	optional bytes lock_point = 16;
+	optional bytes asset = 17;
 }
 
 message SendonionResponse {
@@ -1520,6 +1522,8 @@ message ListpeerchannelsChannels {
 	repeated string features = 63;
 	optional bytes channel_asset = 64;
 	optional ListpeerchannelsChannelsSeqFactory seq_factory = 65;
+	repeated ListpeerchannelsChannelsSeqLanes seq_lanes = 66;
+	optional ListpeerchannelsChannelsSeqSwap seq_swap = 67;
 }
 
 message ListpeerchannelsChannelsAlias {
@@ -1582,6 +1586,29 @@ message ListpeerchannelsChannelsSeqFactory {
 	bytes nonce = 5;
 	uint32 size = 6;
 	uint32 slot = 7;
+}
+
+message ListpeerchannelsChannelsSeqLanes {
+	bytes asset = 1;
+	Outpoint funding_outpoint = 2;
+	uint32 lane = 3;
+	Amount to_us_msat = 4;
+	Amount total_msat = 5;
+}
+
+message ListpeerchannelsChannelsSeqSwap {
+	// ListPeerChannels.channels[].seq_swap.sender
+	enum ListpeerchannelsChannelsSeqSwapSender {
+		LOCAL = 0;
+		REMOTE = 1;
+	}
+	bytes give_asset = 1;
+	Amount give_msat = 2;
+	uint64 id = 3;
+	ListpeerchannelsChannelsSeqSwapSender sender = 4;
+	string state = 5;
+	bytes take_asset = 6;
+	Amount take_msat = 7;
 }
 
 message ListpeerchannelsChannelsStateChanges {
@@ -2176,6 +2203,7 @@ message FundchannelRequest {
 	optional Amount reserve = 13;
 	repeated uint32 channel_type = 14;
 	optional bytes asset = 15;
+	repeated FundchannelLanes lanes = 16;
 }
 
 message FundchannelResponse {
@@ -2186,6 +2214,11 @@ message FundchannelResponse {
 	optional bytes close_to = 5;
 	optional uint32 mindepth = 6;
 	FundchannelChannelType channel_type = 7;
+}
+
+message FundchannelLanes {
+	Amount amount = 1;
+	bytes asset = 2;
 }
 
 message FundchannelChannelType {
@@ -2207,6 +2240,7 @@ message FundchannelStartRequest {
 	optional bytes factory_nonce = 11;
 	optional uint32 factory_size = 12;
 	optional uint32 factory_slot = 13;
+	repeated FundchannelStartLanes lanes = 14;
 }
 
 message FundchannelStartResponse {
@@ -2216,6 +2250,11 @@ message FundchannelStartResponse {
 	optional bytes close_to = 4;
 	string warning_usage = 5;
 	optional uint32 mindepth = 6;
+}
+
+message FundchannelStartLanes {
+	Amount amount = 1;
+	bytes asset = 2;
 }
 
 message FundchannelStartChannelType {
@@ -2545,6 +2584,12 @@ message MultifundchannelDestinations {
 	optional uint32 mindepth = 8;
 	optional Amount reserve = 9;
 	optional bytes asset = 10;
+	repeated MultifundchannelDestinationsLanes lanes = 11;
+}
+
+message MultifundchannelDestinationsLanes {
+	Amount amount = 1;
+	bytes asset = 2;
 }
 
 message MultifundchannelChannelIds {

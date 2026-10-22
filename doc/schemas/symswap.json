@@ -1,0 +1,129 @@
+{
+  "$schema": "../rpc-schema-draft.json",
+  "type": "object",
+  "additionalProperties": false,
+  "rpc": "symswap",
+  "title": "Command to swap one asset for another inside a channel of several assets",
+  "added": "v26.06",
+  "description": [
+    "The **symswap** RPC command asks the peer of a channel of several assets for a swap between two of the channel's lanes: we give *give_msat* of *give_asset* and take *take_msat* of *take_asset*. The peer's `sym_swap` hook decides; a node with no plugin registered for it refuses every swap. A peer that takes it sends it as one channel update, a state both sides sign in which both lanes' balances have moved: it is applied whole or not at all, on chain as off it.",
+    "",
+    "The command returns once the swap is in both sides' balances, and fails if the peer refuses it or it has not been sent by *expiry_blocks* blocks from now (and a grace of three)."
+  ],
+  "request": {
+    "required": [
+      "id",
+      "give_asset",
+      "give_msat",
+      "take_asset",
+      "take_msat"
+    ],
+    "additionalProperties": false,
+    "properties": {
+      "id": {
+        "type": "hash",
+        "description": [
+          "The channel's id."
+        ]
+      },
+      "give_asset": {
+        "type": "hex",
+        "description": [
+          "The 32-byte display id of the asset we give."
+        ]
+      },
+      "give_msat": {
+        "type": "msat",
+        "description": [
+          "How much of it, in thousandths of its atoms."
+        ]
+      },
+      "take_asset": {
+        "type": "hex",
+        "description": [
+          "The 32-byte display id of the asset we take."
+        ]
+      },
+      "take_msat": {
+        "type": "msat",
+        "description": [
+          "How much of it, in thousandths of its atoms."
+        ]
+      },
+      "expiry_blocks": {
+        "type": "u32",
+        "description": [
+          "How many blocks the peer has to send the swap, at most 1008."
+        ],
+        "default": "6"
+      }
+    }
+  },
+  "response": {
+    "required": [
+      "id",
+      "channel_id",
+      "lanes"
+    ],
+    "additionalProperties": false,
+    "properties": {
+      "id": {
+        "type": "u64",
+        "description": [
+          "The swap's id."
+        ]
+      },
+      "channel_id": {
+        "type": "hash",
+        "description": [
+          "The channel's id."
+        ]
+      },
+      "lanes": {
+        "type": "array",
+        "description": [
+          "Our balance in each of the channel's assets, the swap applied."
+        ],
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "asset",
+            "to_us_msat"
+          ],
+          "properties": {
+            "asset": {
+              "type": "hex",
+              "description": [
+                "The asset's 32-byte display id."
+              ]
+            },
+            "to_us_msat": {
+              "type": "msat",
+              "description": [
+                "Our balance in it."
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "errors": [
+    "The following error codes may occur:",
+    "",
+    "- -32602: The channel holds no such assets, or the amounts are zero.",
+    "- -1: The channel is not active, a swap is in flight, the peer refused it, or it expired."
+  ],
+  "author": [
+    "The SeqLN authors."
+  ],
+  "see_also": [
+    "lightning-listpeerchannels(7)",
+    "lightning-fundchannel(7)"
+  ],
+  "resources": [
+    "Main web site: <https://github.com/ConcatenaLabs/seqln>"
+  ],
+  "examples": []
+}

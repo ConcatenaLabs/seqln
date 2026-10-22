@@ -15,6 +15,7 @@
 #include <lightningd/opening_common.h>
 #include <lightningd/ping.h>
 #include <lightningd/plugin_hook.h>
+#include <lightningd/sym_lanes.h>
 
 struct connect {
 	struct list_node list;
@@ -412,8 +413,10 @@ static void handle_custommsg_in(struct lightningd *ld, const u8 *msg)
 		return;
 	}
 
-	/* SEQUENTIA: a credit note (lightningd/credit.h) is lightningd's. */
-	if (credit_handle_peer_msg(ld, &p->peer_id, p->msg)) {
+	/* SEQUENTIA: a credit note (lightningd/credit.h) is lightningd's, as
+	 * is a swap request or refusal (lightningd/sym_lanes.h). */
+	if (credit_handle_peer_msg(ld, &p->peer_id, p->msg)
+	    || sym_lanes_handle_peer_msg(ld, &p->peer_id, p->msg)) {
 		subd_send_msg(ld->connectd,
 			      take(towire_connectd_custommsg_in_complete(NULL,
 									 &p->peer_id)));

@@ -25,6 +25,10 @@ struct htlc {
 	 * x coordinate), or NULL for a hash-locked one (common/point_lock.h). */
 	struct pubkey *lock_point;
 
+	/* SEQUENTIA: its lane on a channel of several assets
+	 * (common/sym_lanes.h): 0, the channel's own, on every other. */
+	u16 lane;
+
 	/* If they fail the HTLC, we store why here. */
 	const struct failed_htlc *failed;
 
