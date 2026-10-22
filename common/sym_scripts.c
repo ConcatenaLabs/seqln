@@ -2,7 +2,6 @@
 #include <assert.h>
 #include <bitcoin/chainparams.h>
 #include <bitcoin/script.h>
-#include <bitcoin/tapscript.h>
 #include <ccan/asort/asort.h>
 #include <ccan/crypto/sha256/sha256.h>
 #include <ccan/endian/endian.h>
