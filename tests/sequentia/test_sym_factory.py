@@ -14,6 +14,7 @@ from fixtures import *  # noqa: F401,F403
 from utils import TEST_NETWORK, only_one, wait_for
 
 import json
+import os
 import pytest
 import time
 
@@ -83,15 +84,17 @@ def mined_spender(bitcoind, txid, n, max_blocks=DELAY + 15):
     raise ValueError('no block spends {}:{}'.format(txid, n))
 
 
-def factory(node_factory, bitcoind):
+def factory(node_factory, bitcoind, opts=None):
     """A hub and four members, the hub's four channels opened as one
     factory in GOLD.  SILV is another asset every node accepts for fees,
     worth two reference atoms an atom; the members hold only SILV, so every
-    fee they pay on chain is in SILV."""
+    fee they pay on chain is in SILV.  `opts`: each node's extra options,
+    the hub's first."""
     gold = bitcoind.issue_asset(1000)
     silv = bitcoind.issue_asset(1000)
     bitcoind.set_fee_rates({bitcoind.POLICY_ASSET: PAR, gold: PAR, silv: 2 * PAR})
-    hub, *members = node_factory.get_nodes(5, opts=[dict(FAC) for _ in range(5)])
+    opts = opts or [{} for _ in range(5)]
+    hub, *members = node_factory.get_nodes(5, opts=[dict(FAC, **o) for o in opts])
     fund_node(bitcoind, hub, gold, PAR + 50_000_000)
     for n in [hub] + members:
         fund_node(bitcoind, n, silv, 2 * PAR)
@@ -312,3 +315,61 @@ def test_factory_split_reorged(node_factory, bitcoind):
             == (split['txid'], slot)
     pay(hub, m1, 2_000_000_000, gold)
     wait_for(lambda: chan(m1, hub)['to_us_msat'] == 6_000_000_000)
+
+
+def test_factory_keyless_watcher(node_factory, bitcoind, directory):
+    """The hub keeps an old state of member 1's channel, pays member 1 more,
+    and closes with the old one while member 1 is offline: the split, then
+    the stale state over KO 1.  speculad, holding no key and only member 1's
+    store (its factory and the latest state it holds whole), walks from the
+    factory output to KO 1, replaces the stale state with the latest, and
+    settles it after the shared delay, each with a fee coin in SILV from its
+    own wallet.  Back online, member 1 finds its balance in its wallet."""
+    from test_watchtower import Speculad, fee_wallet
+    victim = {'watchtower-store': 'on'}
+    hub, members, gold, silv, ftxid = factory(node_factory, bitcoind,
+                                               opts=[{}, {}, victim, {}, {}])
+    m0, m1, m2, m3 = members
+    pay(hub, m1, 5_000_000_000, gold)
+    stale = hub.rpc.call('dev-sym-snapshot', {'id': m1.info['id']})['state']
+    pay(hub, m1, 15_000_000_000, gold)
+    store = os.path.join(m1.daemon.lightning_dir, TEST_NETWORK, 'watchtower')
+    assert any(os.path.exists(os.path.join(store, d, 'sym')) for d in os.listdir(store))
+    f = chan(hub, m1)['seq_factory']
+
+    m1.stop()
+    wallet = fee_wallet(bitcoind, silv, [(silv, 1)])
+    tower = Speculad(m1, bitcoind, wallet, directory)
+    # The tower starts once the stale state is mined over KO 1, so it is
+    # that state the tower must answer (started sooner, it can put the
+    # latest over KO 1 before the hub's stale update gets there).
+    hub.rpc.close(m1.info['id'])
+    split, _ = mined_spender(bitcoind, f['factory_txid'], f['factory_outnum'])
+    first, j = mined_spender(bitcoind, split['txid'], f['slot'])
+    assert update_n(first, j) == stale
+    print("stale state", stale, "mined over KO", f['slot'], ":",
+          json.dumps({x: first[x] for x in ('txid', 'vsize')}))
+    tower.start()
+    try:
+        latest, k = mined_spender(bitcoind, first['txid'], j)
+        n_latest = update_n(latest, k)
+        assert n_latest > stale
+        assert fee_asset_of(latest) == silv
+        print("the tower replaced it by state", n_latest,
+              json.dumps({x: latest[x] for x in ('txid', 'vsize')}))
+        settle, _ = mined_spender(bitcoind, latest['txid'], k)
+        assert fee_asset_of(settle) == silv
+        gold_out = sorted(atoms(o['value']) for o in settle['vout'] if o.get('asset') == gold)
+        print("settlement (GOLD atoms):", gold_out)
+        assert gold_out == [10_000_000, 20_000_000]
+    finally:
+        tower.stop()
+        print(tower.output())
+    out = tower.output()
+    assert 'replacing it by state {}'.format(n_latest) in out
+    assert 'broadcast the settlement' in out
+
+    m1.start()
+    wait_for(lambda: any(o['txid'] == settle['txid'] and o['asset'] == gold
+                         and o['amount_msat'] == 20_000_000_000
+                         for o in m1.rpc.listfunds()['outputs']))

@@ -757,6 +757,9 @@ KO has no clock: a channel anchored on it stays open until someone publishes a s
 Its short channel id is F's block and transaction with `0x8000 + slot` as the output number,
 which no real output can have, so a hub's channels never share one.
 
+The keyless watcher (section 7b) guards a factory channel as a plain one: its record carries the
+factory, and it walks from the factory output, through the split, to the channel's KO.
+
 A unilateral close (`close` on a factory channel is always unilateral: there is no 2-of-2 to close
 together) publishes the split with a fee coin if F is unspent, then, once the split is mined, the
 best state over the channel's KO; when the KO is spent, onchaind takes the channel from the update
@@ -1037,7 +1040,9 @@ fee wallet as a justice transaction does and is raised by replacement at each ne
 its input is spent. Any older state output is rebuilt from the number and R its update
 published, so the record does not grow with the states. A reorg below what it scanned restarts
 the walk from the funding output. The settlement's HTLC outputs are left to the node, whose key
-claims them.
+claims them. A factory channel's record (section 5f) also carries its factory, and the walk
+starts from the factory output: the split that spends it pays the channel's KO at the output
+numbered as its slot, and from there the walk is a plain channel's.
 
 The Specula design note is not yet published in this repository; the header comment of
 `speculad/speculad.c` is the fullest description of the model.
@@ -1207,8 +1212,10 @@ unilateral exit (the split, its state over its KO, the settlement, each with a f
 another asset) while the other three channels stay open on their KOs and are paid again, the
 offline members included once they return; the hub's stale state over a member's KO, mined while
 that member is away, replaced by the member's latest when it returns; and a split mined in a
-block whose Bitcoin anchor is reorganised away, mined again, and the exit carried on from it
-(`test_sym_factory.py`). They need `sequentiad`, `sequentia-cli`
+block whose Bitcoin anchor is reorganised away, mined again, and the exit carried on from it;
+and, with the member offline, `speculad` holding only its store walking from the factory output
+to its KO, replacing the hub's stale state there by the latest and settling it, each with a fee
+coin from its own wallet (`test_sym_factory.py`). They need `sequentiad`, `sequentia-cli`
 and a Bitcoin Core `bitcoind` on `PATH`, and the keyless tests need the device signer built
 (`cargo build --release` in `contrib/seqln-signer`, or `SEQLN_SIGNER=/path/to/seqln-signer`).
 The test plugins run under the `python3` on `PATH`, which needs the `pyln` packages, so the

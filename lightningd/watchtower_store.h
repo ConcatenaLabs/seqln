@@ -55,7 +55,8 @@
  *     sym                      a SYMMETRIC channel's whole record (common/
  *                              sym_scripts.h), in place of the files above:
  *                              nothing is ever punished, so nothing is kept
- *                              per old state.  u64 version(=1), u64
+ *                              per old state.  u64 version (1, or 2 for a
+ *                              factory channel), u64
  *                              channel_dbid, bitcoin_blkid genesis,
  *                              bitcoin_outpoint funding, u32 funding_height
  *                              (0 before lock-in), amount_sat funding_sats,
@@ -65,9 +66,16 @@
  *                              best: the best state this node holds with both
  *                              update signatures], then bool has_pending
  *                              [sym_state pending: the peer's newest, signed
- *                              by this node only], each towire_sym_state.
- *                              Rewritten whenever either changes, before
- *                              channeld goes on (wt_store_put_sym).
+ *                              by this node only], each towire_sym_state,
+ *                              then (version 2 only) bool is_factory [the
+ *                              channel's factory, towire_sym_factory
+ *                              (common/sym_factory.h): `funding` is then the
+ *                              channel's id in the factory, and its output
+ *                              on chain the factory output until the split,
+ *                              its KO after it].  A plain channel's record
+ *                              is version 1, as an older tower reads it.  Rewritten whenever either state
+ *                              changes, before channeld goes on
+ *                              (wt_store_put_sym).
  *
  *   Readers also take the layouts this grew out of, so a store written by an
  *   earlier lightningd is read as it stands until its next advance rewrites
@@ -93,7 +101,7 @@ bool wt_store_enabled(const struct lightningd *ld);
 #define WT_STATE_FILE "state"
 #define WT_BLOB_SET_VERSION 1
 #define WT_BLOB_SET_FILE "blobs"
-#define WT_SYM_VERSION 1
+#define WT_SYM_VERSION 2
 #define WT_SYM_FILE "sym"
 
 struct lightningd;
