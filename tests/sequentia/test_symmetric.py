@@ -51,6 +51,14 @@ def open_channel(bitcoind, l1, l2, asset, atoms, **kwargs):
 
 
 def pay(src, dst, msat, asset):
+    """`src` pays `dst` over their channel, once it can: on a loaded machine
+    a keyless node's peer may still be reconnecting after a slow device
+    round trip, and pay finds no channel to a peer that is away."""
+    def ready():
+        chans = src.rpc.listpeerchannels(dst.info['id'])['channels']
+        return any(c['peer_connected'] and c['state'] == 'CHANNELD_NORMAL'
+                   and c['spendable_msat'] >= msat for c in chans)
+    wait_for(ready)
     inv = dst.rpc.call('invoice', {'amount_msat': msat, 'label': 'l%d' % pay.n,
                                    'description': 'sym', 'asset': asset})
     pay.n += 1
