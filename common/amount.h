@@ -244,6 +244,12 @@ struct amount_sat amount_tx_fee_rounded_down(u32 fee_per_kw, size_t weight);
  * on Liquid it is the fee asset itself, at par (R == EXCHANGE_RATE_SCALE). */
 #define EXCHANGE_RATE_SCALE ((u64)100000000)
 
+/* (a * b + add) / div, the product and sum taken in 128 bits, saturating at
+ * UINT64_MAX when the quotient does not fit; div must not be 0.  The
+ * exchange-rate conversions go through it: a 32-bit build has no 128-bit
+ * integer type. */
+u64 u64_mul_add_div(u64 a, u64 b, u64 add, u64 div);
+
 /* A feerate in reference atoms per kw, expressed in atoms per kw of an
  * asset at rate `rate`: worth at least as much, rounded up, saturating at
  * UINT32_MAX.  A rate of 0 (an asset with no rate) is returned unchanged. */

@@ -245,8 +245,8 @@ static struct amount_sat asset_tx_fee(u32 feerate_per_kw, size_t weight,
 	if (rate == EXCHANGE_RATE_SCALE)
 		return pol;
 
-	return amount_sat((u64)(((__uint128_t)pol.satoshis /* Raw: rescaled */
-				 * EXCHANGE_RATE_SCALE + rate - 1) / rate));
+	return amount_sat(u64_mul_add_div(pol.satoshis, /* Raw: rescaled */
+					  EXCHANGE_RATE_SCALE, rate - 1, rate));
 }
 
 /**
