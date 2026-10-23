@@ -30,10 +30,19 @@ class Sqlite3Db(BaseDb):
         return None
 
     def query(self, query: str) -> Union[List[Dict[str, Union[int, bytes]]], List[Dict[str, Optional[int]]], List[Dict[str, str]], List[Dict[str, Union[str, int]]], List[Dict[str, int]]]:
+        # A snapshot through SQLite itself, not a copy of the file: the
+        # node keeps its database in WAL mode, where recent writes live in
+        # the -wal file beside it until a checkpoint, and a reader sees
+        # them while the node writes.
         orig = os.path.join(self.path)
         copy = self.path + ".copy"
-        shutil.copyfile(orig, copy)
+        if os.path.exists(copy):
+            os.remove(copy)
+        src = sqlite3.connect("file:{}?mode=ro".format(orig), uri=True,
+                              timeout=5)
         db = sqlite3.connect(copy)
+        src.backup(db)
+        src.close()
 
         db.row_factory = sqlite3.Row
         c = db.cursor()
