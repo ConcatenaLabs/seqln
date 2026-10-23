@@ -1178,6 +1178,8 @@ static bool test_wallet_outputs(struct lightningd *ld, const tal_t *ctx, bool bi
 	channel.peer = new_peer(ld, 0, &id, &addr, NULL, NULL, false);
 	channel.dbid = 1;
 	channel.type = channel_type_anchors_zero_fee_htlc(tmpctx);
+	/* A chain without assets: the channel's asset is all zeroes. */
+	memset(channel.channel_asset, 0, sizeof(channel.channel_asset));
 	memset(&u.outpoint, 3, sizeof(u.outpoint));
 	CHECK_MSG(wallet_add_onchaind_utxo(w, &u.outpoint,
 					   u.scriptPubkey,
