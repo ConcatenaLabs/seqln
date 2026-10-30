@@ -143,7 +143,12 @@ static struct command_result *json_newaddr(struct command *cmd,
 
 	if (!addrtype) {
 		addrtype = tal(cmd, enum addrtype);
-		if (command_deprecated_in_ok(cmd, "addresstype.defaultbech32",
+		/* hsmd cannot sign a taproot wallet input on an elements
+		 * chain, so an elements node never hands out a p2tr address:
+		 * the default is bech32, as an explicit *p2tr* is refused. */
+		if (chainparams->is_elements)
+			*addrtype = ADDR_BECH32;
+		else if (command_deprecated_in_ok(cmd, "addresstype.defaultbech32",
 					     "v25.12", "v26.12"))
 			*addrtype = ADDR_ALL;
 		else
@@ -166,7 +171,7 @@ static struct command_result *json_newaddr(struct command *cmd,
 
 	if (*addrtype & ADDR_BECH32)
 		json_add_string(response, "bech32", bech32);
-	if (*addrtype & ADDR_P2TR)
+	if ((*addrtype & ADDR_P2TR) && !chainparams->is_elements)
 		json_add_string(response, "p2tr", p2tr);
 	return command_success(cmd, response);
 }
