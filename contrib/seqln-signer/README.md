@@ -209,9 +209,11 @@ What enforce mode checks:
   in its asset.
 - **Withdrawals** (every spend of the node's wallet: `withdraw`, `signpsbt`, a channel funding, an
   anchor fee bump): every output but the fee pays one of the device's own wallet scripts (P2WPKH or
-  BIP-86 P2TR of its wallet keys at indices below 5,000), unblinded, or is the funding output of a
-  channel this side is opening. A spend to any other address is refused until the device has a way
-  for its user to approve an address on it: the host's word is not that. A funding output counts
+  BIP-86 P2TR of its wallet keys at indices below 5,000) or a script the wallet holding the
+  device's seed named as its own (`approveCloseDestination`, `SEQLN_SIGNER_CLOSE_TO`), unblinded,
+  or is the funding output of a channel this side is opening. So the node's coins outside its
+  channels can go home to that wallet's address. A spend to any other address is refused: the
+  host's word is not the wallet's, and nothing in a frame can name a script. A funding output counts
   only at the outpoint `setup_channel` named for a channel this side opened, paying exactly that
   channel's 2-of-2 (the device's funding key for it and the peer's), unblinded, its whole funding
   amount in the asset of its commitments, and only once the device holds a commitment of ours for
@@ -374,8 +376,8 @@ Other environment knobs: `SEQLN_SIGNER_POLICY=enforce|permissive` (default enfor
 limits `SEQLN_SIGNER_PAY_LIMIT_REFERENCE`, `SEQLN_SIGNER_RATES`, `SEQLN_SIGNER_PAY_LIMIT`,
 `SEQLN_SIGNER_PAY_LIMITS` and `SEQLN_SIGNER_PAY_PERIOD` (see
 "Scope"), `SEQLN_SIGNER_CLOSE_TO` (hex scriptPubKeys of the operator's own wallet, comma-separated,
-that a cooperative close may pay this side's balance to: the native form of
-`approveCloseDestination`),
+that a cooperative close may pay this side's balance to, and a spend of the node's wallet may pay:
+the native form of `approveCloseDestination`),
 `SEQLN_SIGNER_TRACE` (per-request trace logging), `SEQLN_SIGNER_STORE` (the channel store's path,
 default `seqln-signer-channels` in the working directory), `SEQLN_SIGNER_CONNECT` (the env form of
 `--connect`), and `SEQLN_SIGNER_NETWORK=bitcoin|elements`, which selects the sighash family when one

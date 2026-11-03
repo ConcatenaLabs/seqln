@@ -56,7 +56,8 @@ def into_block(bitcoind, raw, script, other, what):
         bitcoind.rpc.generateblock(bitcoind.rpc.getnewaddress(), [bad])
     msg = e.value.error['message']
     print('{} forced into a block: {}'.format(what, msg))
-    assert 'mandatory-script-verify-flag-failed' in msg, e.value.error
+    # Bitcoin Core 31 says block-script-verify-flag-failed, older ones mandatory-...
+    assert 'script-verify-flag-failed' in msg, e.value.error
     return msg
 
 
@@ -155,6 +156,57 @@ def test_close_payout_funds_a_channel(node_factory, bitcoind, directory):
         print('the new channel {} paid both ways; {} commitments validated; refusals on it: {}'
               .format(scid, device.requests(35) - validated,
                       [ln for ln in device.output().splitlines() if 'POLICY REJECT' in ln and scid in ln]))
+    finally:
+        if kc.answers(l1, timeout=2):
+            l1.stop()
+        device.stop()
+
+
+@needs_device
+def test_node_coins_go_home_to_the_wallet(node_factory, bitcoind, directory):
+    """Coins on the node's own wallet, outside any channel (what a close paid
+    the node, an interrupted deposit), go back to the wallet that holds the
+    device's seed: the device signs a spend paying a script that wallet named
+    (SEQLN_SIGNER_CLOSE_TO here, approveCloseDestination in a browser), as it
+    signs one to the node's own scripts. A script the wallet did not name is
+    still refused."""
+    cos.checks_scripts_one_by_one(bitcoind)
+    asset = ks.coin(bitcoind)
+    wallet_addr = bitcoind.rpc.getnewaddress()
+    script = bitcoind.rpc.getaddressinfo(wallet_addr)['scriptPubKey']
+    device, l1 = kc.keyless_node(node_factory, directory, close_to=[script], broken_log='.*')
+    try:
+        addr = l1.rpc.newaddr('bech32')['bech32']
+        if SEQ:
+            txid = bitcoind.send_and_mine_block(addr, 10**8, asset)
+        else:
+            txid = bitcoind.rpc.sendtoaddress(addr, 1)
+            bitcoind.generate_block(1, wait_for_mempool=txid)
+        wait_for(lambda: any(o['txid'] == txid and o['status'] == 'confirmed'
+                             for o in l1.rpc.listfunds()['outputs']))
+
+        # To an address the wallet did not name: refused.
+        before = device.output().count(cos.REFUSED)
+        with pytest.raises(RpcError, match='not finalizeable'):
+            tps.withdraw_all(l1, bitcoind.getnewaddress(), asset)
+        wait_for(lambda: device.output().count(cos.REFUSED) > before)
+        line = [ln for ln in device.output().splitlines() if cos.REFUSED in ln][-1]
+        print('to an address not named:', line.split('seqln-signer: ', 1)[-1])
+        assert FOREIGN in line, line
+
+        # To the wallet's address: signed, and it confirms there.
+        home = tps.withdraw_all(l1, wallet_addr, asset)
+        raw = bitcoind.rpc.getrawtransaction(home)
+        into_block(bitcoind, raw, script, '0014' + 'ee' * 20, 'the spend home, redirected')
+        bitcoind.generate_block(1, wait_for_mempool=home)
+        tx = bitcoind.rpc.getrawtransaction(home, True)
+        assert any(i['txid'] == txid for i in tx['vin'])
+        paid = only_one([v for v in tx['vout'] if v['scriptPubKey'].get('hex') == script])
+        if SEQ:
+            assert paid['asset'] == asset
+        print('the node\'s coin {} went home to the wallet in {}: {}'.format(txid, home, paid['value']))
+        wait_for(lambda: not any(o['status'] != 'spent' and o['txid'] == txid
+                                 for o in l1.rpc.listfunds()['outputs']))
     finally:
         if kc.answers(l1, timeout=2):
             l1.stop()

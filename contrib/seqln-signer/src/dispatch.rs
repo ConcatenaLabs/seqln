@@ -186,10 +186,12 @@ impl Signer {
 
     /// Name `script` as one of this wallet's own: a cooperative close may pay
     /// this side's balance to it, held to the same balance and fee as a close
-    /// to the node's wallet. The host is the wallet that derived this device
-    /// from its own seed (the browser); it names its own on-chain address
-    /// before asking the node to close there. Nothing in a frame can add one,
-    /// so the node cannot steer a close to a script of its choosing. Not
+    /// to the node's wallet, and a spend of the node's wallet coins may pay
+    /// it as it pays the node's own scripts ([`Self::check_withdrawal`]). The
+    /// host is the wallet that derived this device from its own seed (the
+    /// browser); it names its own on-chain address before asking the node to
+    /// close or send there. Nothing in a frame can add one, so the node
+    /// cannot steer a close or a spend to a script of its choosing. Not
     /// persisted: the host names its scripts again after a restart.
     pub fn approve_close_destination(&mut self, script: Vec<u8>) {
         if !script.is_empty() {
@@ -2802,10 +2804,13 @@ impl Signer {
 
     /// D45, the rule for every wallet spend this device signs (enforce mode).
     /// Each output but the fee pays one of this device's own wallet scripts
-    /// ([`Self::own_sweep_script_set`]), unblinded, or is the funding output
-    /// of a channel this side is opening ([`Self::funding_output`]). A spend
-    /// to any other address is refused: the device has no way yet for its
-    /// user to approve an address on it, and the host's word is not that.
+    /// ([`Self::own_sweep_script_set`]) or a script the wallet holding its
+    /// seed named as its own ([`Self::approve_close_destination`]), unblinded,
+    /// or is the funding output of a channel this side is opening
+    /// ([`Self::funding_output`]). A spend to any other address is refused:
+    /// the node's word is not the wallet's. What reaches the wallet's script
+    /// stays the user's, so like the node's own scripts it is not counted as
+    /// leaving.
     /// Returns what the transaction lets leave the device, per asset: its
     /// fee, and for a funding output what the channel's first commitments
     /// give the peer. On Sequentia the fee is the explicit fee outputs, which
@@ -2854,7 +2859,10 @@ impl Signer {
                 ),
             };
             paid = paid.saturating_add(amount);
-            if own.contains(&o.script) || self.tcov_claim_pays(txid, &o.script) {
+            if own.contains(&o.script)
+                || self.close_destinations.contains(&o.script)
+                || self.tcov_claim_pays(txid, &o.script)
+            {
                 continue;
             }
             match self.funding_output(txid, i, o, network) {
@@ -2864,8 +2872,8 @@ impl Signer {
                     return Err(format!(
                         "output {i} pays {}, which is not one of this device's own scripts nor \
                          the funding output of a channel it is opening: it moves coins only to \
-                         its own addresses and into its channels until its user can approve an \
-                         address on the device",
+                         its own addresses, to the addresses its wallet named, and into its \
+                         channels",
                         hexbytes(&o.script)
                     ))
                 }
@@ -6909,6 +6917,39 @@ mod close_output_spend_tests {
         let psbt = psbt_v0(&coin, &[(99_000, foreign_spk())]);
         assert_eq!(reply_psbt(s.handle(&req(withdrawal(&coin, &psbt)))), psbt);
         assert!(s.take_refusal().unwrap().contains("not one of this device's own scripts"));
+    }
+
+    /// The node's wallet coins may go home: a spend paying a script the wallet
+    /// named is signed like one to the node's own, a script it did not name
+    /// is still refused, and what reaches the wallet is not charged to the
+    /// period's limit (only the fee is).
+    #[test]
+    fn withdrawal_to_an_approved_destination_is_signed() {
+        let mut s = signer(Policy::Enforce);
+        gold_limit(&mut s, 5_000);
+        s.set_now(1_000);
+        let wallet: Vec<u8> = [0x00u8, 0x14].iter().copied().chain([0xBB; 20]).collect();
+        let ins = [wallet_coin(&s, [0x51; 32], 4, 1_000_000)];
+        let psbt = pset(&ins, &[(GOLD, 998_000, wallet.clone()), (GOLD, 2_000, vec![])], false);
+        assert_eq!(reply_psbt(s.handle(&req(withdrawal(&ins, &psbt)))), psbt, "not named yet: unsigned");
+        let why = s.take_refusal().unwrap();
+        println!("to the wallet's address before it is named: {why}");
+        assert!(why.contains("which is not one of this device's own scripts"), "{why}");
+        s.approve_close_destination(wallet.clone());
+        assert_ne!(reply_psbt(s.handle(&req(withdrawal(&ins, &psbt)))), psbt, "named: signed");
+        assert_eq!(s.take_refusal(), None);
+        // Only the fee counts against the period.
+        assert_eq!(s.store.ledger.spent_msat(&AssetKey::Asset(GOLD), 1_000, 86_400), 2_000_000);
+        // A script it did not name, beside the named one, is still refused.
+        let ins = [wallet_coin(&s, [0x52; 32], 4, 1_000_000)];
+        let psbt = pset(&ins, &[(GOLD, 500_000, wallet.clone()), (GOLD, 498_000, foreign_spk()), (GOLD, 2_000, vec![])], false);
+        assert_eq!(reply_psbt(s.handle(&req(withdrawal(&ins, &psbt)))), psbt);
+        assert!(s.take_refusal().unwrap().starts_with("SIGN_WITHDRAWAL refused: output 1 pays 0014eeee"));
+        // Bitcoin too.
+        let coin = [wallet_coin(&s, [0x53; 32], 5, 100_000)];
+        let psbt = psbt_v0(&coin, &[(99_000, wallet.clone())]);
+        assert_ne!(reply_psbt(s.handle(&req(withdrawal(&coin, &psbt)))), psbt);
+        assert_eq!(s.take_refusal(), None);
     }
 
     /// What withdrawals let leave counts against the period, like payments:
