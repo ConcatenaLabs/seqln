@@ -282,6 +282,8 @@ def test_pay_disconnect(node_factory, bitcoind):
     l1.daemon.wait_for_log('ONCHAIN')
 
 
+@pytest.mark.xfail(TEST_NETWORK in SEQUENTIA_NETWORKS, strict=True,
+                   reason="ConcatenaLabs/seqln#151: pay retries a route hint at its stale fee")
 def test_pay_error_update_fees(node_factory):
     """We should process an update inside a temporary_channel_failure"""
     l1, l2, l3 = node_factory.line_graph(3, fundchannel=True, wait_for_announce=True)
@@ -1853,6 +1855,8 @@ def test_pay_retry(node_factory, bitcoind, executor, chainparams):
         l1.dev_pay(inv, dev_use_shadow=False)
 
 
+@pytest.mark.xfail(TEST_NETWORK in SEQUENTIA_NETWORKS, strict=True,
+                   reason="ConcatenaLabs/seqln#152: listpays shows failed while pay retries")
 def test_pay_avoid_low_fee_chan(node_factory, bitcoind, executor, chainparams):
     """Make sure we're able to route around a low fee depleted channel """
 
@@ -4639,8 +4643,12 @@ def test_fetchinvoice(node_factory, bitcoind):
 
     l1.rpc.pay(inv1['invoice'])
 
-    # We can't pay the other one now.
-    with pytest.raises(RpcError, match="Destination said it doesn't know invoice: incorrect_or_unknown_payment_details"):
+    # We can't pay the other one now.  (Sequentia keeps pay on its own
+    # route search rather than xpay, which words the refusal its own way.)
+    refusal = ("Destination said it doesn't know invoice: incorrect_or_unknown_payment_details"
+               if TEST_NETWORK not in SEQUENTIA_NETWORKS
+               else "WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS")
+    with pytest.raises(RpcError, match=refusal):
         l1.rpc.pay(inv2['invoice'])
 
     # We can't reuse the offer, either.
