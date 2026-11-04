@@ -482,7 +482,7 @@ jobs:
   # For speed, we run a first integration test using gcc and sqlite3, in 6 parts.
   # If that passes, we move on to the more complete integration tests.
   first-integration:
-    name: First Integration Tests (${{ matrix.GROUP }}/${{ matrix.GROUP_COUNT }})
+    name: First Integration Tests ${{ matrix.TEST_NETWORK }} (${{ matrix.GROUP }}/${{ matrix.GROUP_COUNT }})
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
@@ -497,7 +497,7 @@ jobs:
         GROUP_COUNT: [6]
         TEST_DB_PROVIDER: [sqlite3]
         COMPILER: [gcc]
-        TEST_NETWORK: [regtest]
+        TEST_NETWORK: [regtest, sequentia-regtest]
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -532,6 +532,12 @@ jobs:
           # Make sure source appears older than what we're about to unpack
           find . -type f -print0 | xargs -0 touch -d yesterday
           tar xaf cln-${{ matrix.CFG }}.tar.gz
+
+      - name: Switch network
+        if: ${{ matrix.TEST_NETWORK != 'regtest' }}
+        run: |
+          sed -i 's/TEST_NETWORK=regtest/TEST_NETWORK=${{ matrix.TEST_NETWORK }}/g' config.vars
+          cat config.vars
 
       - name: Test
         env:

@@ -448,6 +448,44 @@ class SimpleBitcoinProxy:
         return f
 
 
+class SequentiaProxy(SimpleBitcoinProxy):
+    """A SimpleBitcoinProxy that names the fee asset the way a wallet does.
+
+    On Sequentia's open fee market every transaction names the asset its
+    fee is paid in, and `sequentiad` refuses a send that does not.  The
+    upstream tests call `sendtoaddress` and `sendmany` as on Bitcoin, so
+    this fills in the asset being sent (the policy asset unless the call
+    names one) as the fee asset, unless the call names a fee asset itself.
+    """
+    def __init__(self, btc_conf_file, fee_asset, *args, **kwargs):
+        SimpleBitcoinProxy.__init__(self, btc_conf_file, *args, **kwargs)
+        self.__fee_asset__ = fee_asset
+
+    def __getattr__(self, name):
+        f = SimpleBitcoinProxy.__getattr__(self, name)
+        # Position of the asset sent and of the fee asset in each call.
+        positions = {'sendtoaddress': (9, 12), 'sendmany': (8, 11)}
+        if name not in positions:
+            return f
+        asset_pos, fee_pos = positions[name]
+
+        def with_fee_asset(*args):
+            args = list(args) + [None] * (fee_pos + 1 - len(args))
+            if args[fee_pos] is None:
+                sent = args[asset_pos]
+                if isinstance(sent, dict):
+                    # sendmany's output_assets: one asset for every output.
+                    sent = set(sent.values())
+                    sent = sent.pop() if len(sent) == 1 else None
+                args[fee_pos] = sent or self.__fee_asset__
+            while len(args) > 2 and args[-1] is None:
+                args.pop()
+            return f(*args)
+
+        with_fee_asset.__name__ = name
+        return with_fee_asset
+
+
 class BitcoinD(TailableProc):
 
     def __init__(self, bitcoin_dir="/tmp/bitcoind-test", rpcport=None):
@@ -792,7 +830,8 @@ class SequentiaD(BitcoinD):
         ] + ['-staker={}:1'.format(pub) for _, pub in self.STAKERS]
         write_config(self.conf_file, config, {'rpcport': self.rpcport},
                      section_name=self.CHAIN)
-        self.rpc = SimpleBitcoinProxy(btc_conf_file=self.conf_file)
+        self.rpc = SequentiaProxy(btc_conf_file=self.conf_file,
+                                  fee_asset=self.POLICY_ASSET)
         self.prefix = 'sequentiad'
 
     def start(self, wallet_file=None):
