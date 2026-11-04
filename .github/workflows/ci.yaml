@@ -3,9 +3,10 @@ name: Continuous Integration
 on:
   push:
     branches:
-      - "master"
+      - "sequentia-stable"
   pull_request:
     types: [opened, synchronize, edited]
+  workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -40,8 +41,8 @@ jobs:
           fetch-depth: 0
 
       - name: Rebase
-        # We can't rebase if we're on master already.
-        if: github.ref != 'refs/heads/master'
+        # Only a pull request has a base to rebase onto.
+        if: github.event_name == 'pull_request'
         run: |
           git config user.name github-actions
           git config user.email github-actions@github.com
