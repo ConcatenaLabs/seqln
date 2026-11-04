@@ -1,6 +1,7 @@
 from bitcoin.rpc import JSONRPCError
 from decimal import Decimal
 from fixtures import *  # noqa: F401,F403
+from pyln.testing.utils import ELEMENTS_NETWORKS
 from fixtures import TEST_NETWORK
 from pyln.client import RpcError, Millisatoshi
 from utils import (
@@ -1370,6 +1371,9 @@ def test_hsmtool_dump_descriptors(node_factory, bitcoind):
 
     # Deprecated or empty line
     descriptors = [desc for desc in descriptors if not (desc.startswith("sh(wpkh(") or desc == '')]
+    # An elements node gives no P2TR addresses (newaddr is bech32 only there).
+    if TEST_NETWORK in ELEMENTS_NETWORKS:
+        descriptors = [desc for desc in descriptors if not desc.startswith("tr(")]
 
     withdraw_addr = None
     index_offset = 2  # index starts handing out addrs at 2
@@ -1395,7 +1399,8 @@ def test_hsmtool_dump_descriptors(node_factory, bitcoind):
         l1.daemon.wait_for_log('Owning output .* txid {} CONFIRMED'.format(txid))
         actual_index = len(cln_addrs) - 1 + index_offset
         res = bitcoind.rpc.scantxoutset("start", [{"desc": descriptor, "range": [actual_index, actual_index]}])
-        assert res["total_amount"] == Decimal('0.00001000')
+        # (An elements node reports no total_amount, so sum the coins.)
+        assert sum(u["amount"] for u in res["unspents"]) == Decimal('0.00001000')
 
 
 @pytest.mark.parametrize("mnemonic,passphrase,expected_format", [
@@ -2321,7 +2326,7 @@ def test_repro_4258(node_factory, bitcoind):
     assert([i0['txid'], i0['vout']] == [out['txid'], out['output']])
 
 
-@unittest.skipIf(TEST_NETWORK == 'liquid-regtest', "Uses regtest addresses")
+@unittest.skipIf(TEST_NETWORK in ELEMENTS_NETWORKS, "P2TR not yet supported on Elements")
 def test_withdraw_bech32m(node_factory, bitcoind):
     l1 = node_factory.get_node()
     l1.fundwallet(10000000)

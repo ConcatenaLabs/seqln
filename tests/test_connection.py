@@ -1,4 +1,5 @@
 from fixtures import *  # noqa: F401,F403
+from pyln.testing.utils import ELEMENTS_NETWORKS
 from fixtures import TEST_NETWORK
 from decimal import Decimal
 from pathlib import Path
@@ -2079,7 +2080,7 @@ def test_multifunding_wumbo(node_factory):
     l1.rpc.multifundchannel(destinations)
 
 
-@unittest.skipIf(TEST_NETWORK == 'liquid-regtest', "Fees on elements are different")
+@unittest.skipIf(TEST_NETWORK in ELEMENTS_NETWORKS, "Fees on elements are different")
 @pytest.mark.openchannel('v1')  # v2 the weight calculation is off by 3
 @pytest.mark.parametrize("anchors", [False, True])
 def test_multifunding_feerates(node_factory, bitcoind, anchors):

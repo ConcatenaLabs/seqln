@@ -3,11 +3,12 @@
 import unittest
 
 from fixtures import *  # noqa: F401,F403
+from pyln.testing.utils import ELEMENTS_NETWORKS
 from fixtures import TEST_NETWORK
 from utils import wait_for
 
 
-@unittest.skipIf(TEST_NETWORK == 'liquid-regtest', "P2TR not yet supported on Elements")
+@unittest.skipIf(TEST_NETWORK in ELEMENTS_NETWORKS, "P2TR not yet supported on Elements")
 def test_p2tr_change_dust_limit(node_factory, bitcoind):
 
     l1 = node_factory.get_node(feerates=(253, 253, 253, 253))

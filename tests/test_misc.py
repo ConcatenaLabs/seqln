@@ -2,6 +2,7 @@ import base64
 from bitcoin.rpc import RawProxy
 from decimal import Decimal
 from fixtures import *  # noqa: F401,F403
+from pyln.testing.utils import ELEMENTS_NETWORKS
 from fixtures import LightningNode, TEST_NETWORK
 from pathlib import Path
 from pyln.client import RpcError, Millisatoshi
@@ -567,7 +568,7 @@ def test_htlc_in_timeout(node_factory, bitcoind, executor):
     l2.daemon.wait_for_log('onchaind complete, forgetting peer')
 
 
-@unittest.skipIf(TEST_NETWORK == 'liquid-regtest', 'must be on bitcoin network')
+@unittest.skipIf(TEST_NETWORK in ELEMENTS_NETWORKS, 'must be on bitcoin network')
 def test_p2tr_funding(node_factory, chainparams):
     # Don't get any funds from previous runs.
     l1, l2 = node_factory.line_graph(2, opts={'random_hsm': True}, fundchannel=False)
@@ -1794,7 +1795,7 @@ def test_ipv4_and_ipv6(node_factory):
         assert int(bind[0]['port']) == port
 
 
-@unittest.skipIf(TEST_NETWORK == 'liquid-regtest', "Fees on elements are different")
+@unittest.skipIf(TEST_NETWORK in ELEMENTS_NETWORKS, "Fees on elements are different")
 @pytest.mark.parametrize("anchors", [False, True])
 def test_feerates(node_factory, anchors):
     opts = {'log-level': 'io',
@@ -2263,7 +2264,7 @@ def test_bitcoind_fail_first(node_factory, bitcoind):
     assert l1.daemon.is_in_stderr('bad response to getrawblockbyheight')
 
 
-@unittest.skipIf(TEST_NETWORK == 'liquid-regtest', "Fees on elements are different")
+@unittest.skipIf(TEST_NETWORK in ELEMENTS_NETWORKS, "Fees on elements are different")
 @pytest.mark.parametrize("anchors", [False, True])
 def test_bitcoind_feerate_floor(node_factory, bitcoind, anchors):
     """Don't return a feerate less than minrelaytxfee/mempoolminfee."""
