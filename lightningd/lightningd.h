@@ -333,6 +333,12 @@ struct lightningd {
 	/* Allow and accept localhost node_announcement addresses */
 	bool dev_allow_localhost;
 
+	/* Sequentia, for tests written for a single-asset chain: the asset
+	 * (33-byte tag) of an invoice that names none and that no channel
+	 * decides, made even with no channel in it, as upstream makes any
+	 * invoice.  NULL: the caller names the asset. */
+	const u8 *dev_invoice_asset;
+
 	/* Speedup gossip propagation, for testing. */
 	bool dev_fast_gossip;
 	bool dev_fast_gossip_prune;

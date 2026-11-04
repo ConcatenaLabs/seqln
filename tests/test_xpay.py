@@ -282,7 +282,7 @@ def test_xpay_fake_channeld(node_factory, bitcoind, chainparams, slow_mode):
         inv = subprocess.check_output(["devtools/bolt11-cli",
                                        "encode",
                                        n.to_bytes(length=8, byteorder=sys.byteorder).hex() + '01' * 24,
-                                       f"currency={chainparams['bip173_prefix']}",
+                                       f"currency={chainparams['lightning_hrp']}",
                                        f"p={hash_hex}",
                                        f"s={'00' * 32}",
                                        "9=020000",  # option_basic_mpp
@@ -398,6 +398,9 @@ def test_xpay_partial_msat(node_factory, executor):
     l3pay.result(TIMEOUT)
 
 
+@unittest.skipIf(TEST_NETWORK in SEQUENTIA_NETWORKS,
+                 "Sequentia keeps pay on its own, asset-aware route search; xpay never"
+                 " takes it over there (plugins/xpay/xpay.c)")
 def test_xpay_takeover(node_factory, executor):
     l1, l2, l3 = node_factory.line_graph(3, wait_for_announce=True,
                                          opts={'xpay-handle-pay': True,
@@ -524,6 +527,9 @@ def test_xpay_takeover(node_factory, executor):
     l1.daemon.wait_for_log('Converted maxfeepercent=0.25, exemptfee=UNSET to maxfee 5000msat')
 
 
+@unittest.skipIf(TEST_NETWORK in SEQUENTIA_NETWORKS,
+                 "Sequentia keeps pay on its own, asset-aware route search; xpay never"
+                 " takes it over there (plugins/xpay/xpay.c)")
 def test_xpay_takeover_null_parms(node_factory, executor):
     """Test passing through RPC a list of parameters some of which have null
     json value."""
@@ -628,11 +634,14 @@ def test_xpay_no_mpp(node_factory, chainparams):
                                           "encode",
                                           # secret for l3
                                           "79893b45d1e57cf2ebf302af91aa52c9e573f638a61a83c6e603a331b53f452c",
-                                          f"currency={chainparams['bip173_prefix']}",
+                                          f"currency={chainparams['lightning_hrp']}",
                                           f"p={no_mpp['payment_hash']}",
                                           f"s={no_mpp['payment_secret']}",
                                           f"d=Paying l3 without mpp",
-                                          f"amount={AMOUNT}"]).decode('utf-8').strip()
+                                          f"amount={AMOUNT}"]
+                                         # A Sequentia invoice names its asset.
+                                         + ([f"a={l3.rpc.decode(no_mpp['bolt11'])['asset']}"]
+                                            if TEST_NETWORK in SEQUENTIA_NETWORKS else [])).decode('utf-8').strip()
 
     # This should not mpp!
     ret = l1.rpc.xpay(b11_no_mpp)

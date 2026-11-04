@@ -1060,6 +1060,12 @@ class LightningD(TailableProc):
         if TEST_NETWORK in SEQUENTIA_NETWORKS and SEQUENTIA_NATIVE:
             for k in ('cltv-delta', 'cltv-final', 'watchtime-blocks', 'rescan'):
                 del self.opts[k]
+        # A Sequentia node refuses an invoice that names no asset when no
+        # channel decides it (no asset is privileged, so none is assumed),
+        # and one no channel could pay.  The upstream tests know only the
+        # chain's one asset and upstream's invoices, so name it for them.
+        if TEST_NETWORK in SEQUENTIA_NETWORKS and not SEQUENTIA_NATIVE:
+            self.opts['dev-invoice-asset'] = SequentiaD.POLICY_ASSET
 
         if not os.path.exists(os.path.join(lightning_dir, TEST_NETWORK)):
             os.makedirs(os.path.join(lightning_dir, TEST_NETWORK))
@@ -1152,8 +1158,6 @@ class PrettyPrintingLightningRpc(LightningRpc):
         )
         self.jsonschemas = jsonschemas
         self.check_request_schemas = True
-        # On Sequentia, the asset an upstream test's invoice is paid in.
-        self.invoice_asset = None
 
     def call(self, method, payload=None, cmdprefix=None, filter=None):
         id = self.get_json_id(method, cmdprefix)
@@ -1192,27 +1196,7 @@ class PrettyPrintingLightningRpc(LightningRpc):
             except ValueError:
                 pass
 
-        try:
-            res = LightningRpc.call(self, method, payload, cmdprefix, filter)
-        except RpcError as e:
-            # A Sequentia node with no channel to receive on refuses an
-            # invoice that does not name its asset (no asset is privileged,
-            # so none is assumed), and one no channel could pay unless told
-            # allow_unfunded (upstream makes it and warns).  An upstream test
-            # knows only the chain's one asset and upstream's behaviour, so
-            # ask for those, as its caller would.
-            if not (method == 'invoice' and self.invoice_asset
-                    and isinstance(payload, dict)
-                    and isinstance(e.error, dict)):
-                raise
-            message = e.error.get('message', '')
-            if not ('name the asset this invoice is paid in' in message
-                    or 'pass allow_unfunded=true' in message):
-                raise
-            payload = dict(payload, allow_unfunded=True)
-            if payload.get('asset') is None:
-                payload['asset'] = self.invoice_asset
-            res = LightningRpc.call(self, method, payload, cmdprefix, filter)
+        res = LightningRpc.call(self, method, payload, cmdprefix, filter)
         self.logger.debug(json.dumps({
             "id": id,
             "result": res
@@ -1378,8 +1362,6 @@ class LightningNode(object):
             self.executor,
             jsonschemas=jsonschemas
         )
-        if TEST_NETWORK in SEQUENTIA_NETWORKS and not SEQUENTIA_NATIVE:
-            self.rpc.invoice_asset = self.bitcoin.POLICY_ASSET
 
     @property
     def grpc(self):

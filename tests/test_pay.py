@@ -5352,7 +5352,7 @@ def test_pay_bolt11_metadata(node_factory, chainparams):
     inv_with_metadata = subprocess.check_output(['devtools/bolt11-cli', 'encode',
                                                  # l2's private key (old_hsmsecret, WIF byte stripped)
                                                  '0c633a7c17c701a0980158f5483035e01fa8bd091b47fadf2e86e589a9f93fca',
-                                                 f"currency={chainparams['bip173_prefix']}",
+                                                 f"currency={chainparams['lightning_hrp']}",
                                                  f"p={inv['payment_hash']}",
                                                  f"s={inv['payment_secret']}",
                                                  "d=desc",
@@ -6031,6 +6031,9 @@ def test_offer_path_self(node_factory):
     l2.rpc.pay(inv)
 
     # We can also handle it if invoice has next hop specified by real scid, or alias.
+    # (Sequentia keeps pay on its own route search; the hop mapping below is
+    # xpay's, which it uses for this.)
+    pay = l2.rpc.xpay if TEST_NETWORK in SEQUENTIA_NETWORKS else l2.rpc.pay
     scid = only_one(l2.rpc.listpeerchannels(l3.info['id'])['channels'])['alias']['local']
 
     l3.stop()
@@ -6041,7 +6044,7 @@ def test_offer_path_self(node_factory):
     inv = l2.rpc.fetchinvoice(offer['bolt12'])['invoice']
 
     # And can pay it!
-    l2.rpc.pay(inv)
+    pay(inv)
 
     # It should have mapped the hop.
     l2.daemon.wait_for_log(f"injectpaymentonion: sending to channel {scid}")
@@ -6053,7 +6056,12 @@ def test_offer_selfpay(node_factory):
 
     offer = l1.rpc.offer(amount='2msat', description='test_offer_path_self')['bolt12']
     inv = l1.rpc.fetchinvoice(offer)['invoice']
-    l1.rpc.pay(inv)
+    # Sequentia keeps pay on its own route search, which pays only over a
+    # channel; xpay pays this node itself (plugins/xpay/xpay.c).
+    if TEST_NETWORK in SEQUENTIA_NETWORKS:
+        l1.rpc.xpay(inv)
+    else:
+        l1.rpc.pay(inv)
 
 
 def test_decryptencrypteddata(node_factory):

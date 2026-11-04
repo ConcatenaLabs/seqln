@@ -1260,11 +1260,18 @@ static struct command_result *json_invoice(struct command *cmd,
 	 * and the Sequence token is no default. */
 	if (chainparams->has_anchor_header) {
 		const char *unfunded;
+		bool dev_asset = false;
 
 		if (!info->asset) {
 			bool several;
 			info->asset = invoice_default_asset(cmd, cmd->ld,
 							    &several);
+			if (!info->asset && cmd->ld->dev_invoice_asset) {
+				info->asset = tal_dup_arr(info, u8,
+							  cmd->ld->dev_invoice_asset,
+							  33, 0);
+				dev_asset = true;
+			}
 			if (!info->asset)
 				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 						    "%s: name the asset this"
@@ -1280,7 +1287,7 @@ static struct command_result *json_invoice(struct command *cmd,
 		 * paid to us; make one only when the caller says a channel
 		 * is coming. */
 		unfunded = invoice_unfunded_asset(cmd, cmd->ld, info->asset);
-		if (unfunded && !*allow_unfunded)
+		if (unfunded && !*allow_unfunded && !dev_asset)
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 					    "This node holds no channel in"
 					    " asset %s (it holds %s), so an"

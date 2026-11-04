@@ -12,7 +12,6 @@ from pyln.testing.utils import (
     wait_for, TailableProc, env, mine_funding_to_announce, SEQUENTIA_NETWORKS,
 )
 from utils import (
-    cli_invoice_args,
     account_balance, scriptpubkey_addr, check_coin_moves, first_scid,
     serialize_payload_tlv, serialize_payload_final_tlv,
 )
@@ -1154,8 +1153,8 @@ def test_cli(node_factory):
     subprocess.check_output(['cli/lightning-cli',
                              '--network={}'.format(TEST_NETWORK),
                              '--lightning-dir={}'
-                             .format(l1.daemon.lightning_dir)]
-                            + cli_invoice_args(l1.bitcoin, '123000', 'l"[]{}', 'd"[]{}')).decode('utf-8')
+                             .format(l1.daemon.lightning_dir),
+                             'invoice', '123000', 'l"[]{}', 'd"[]{}']).decode('utf-8')
     # Check label is correct, and also that cli's keyword parsing works.
     out = subprocess.check_output(['cli/lightning-cli',
                                    '--network={}'.format(TEST_NETWORK),
@@ -1327,8 +1326,8 @@ def test_cli_commando(node_factory):
                              '--commando={}:{}'.format(l2.info['id'], rune),
                              '--network={}'.format(TEST_NETWORK),
                              '--lightning-dir={}'
-                             .format(l1.daemon.lightning_dir)]
-                            + cli_invoice_args(l1.bitcoin, '123000', 'l"[]{}', 'd"[]{}')).decode('utf-8')
+                             .format(l1.daemon.lightning_dir),
+                             'invoice', '123000', 'l"[]{}', 'd"[]{}']).decode('utf-8')
     # Check label is correct, and also that cli's keyword parsing works.
     out = subprocess.check_output(['cli/lightning-cli',
                                    '--commando={}:{}'.format(l2.info['id'], rune),

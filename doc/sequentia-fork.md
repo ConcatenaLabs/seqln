@@ -1113,9 +1113,10 @@ The upstream tests in `tests/` run on the same chain (CI runs them there as well
 regtest). For them the harness keeps what they were written against: the suite's short test
 timelocks (`cltv-delta`, `cltv-final`, `watchtime-blocks`) and its one-block `rescan`, which are
 far from Bitcoin's own defaults too; the policy asset as the fee asset of `sendtoaddress` and `sendmany`, the asset being
-sent, since every Sequentia transaction names its fee asset; and, when a node with no channel
-refuses an `invoice` for naming no asset or for being unpayable, the policy asset and
-`allow_unfunded`, which is upstream's behaviour. A test that cannot apply to Sequentia says why in its skip (no P2TR
+sent, since every Sequentia transaction names its fee asset; and `--dev-invoice-asset` set to the
+policy asset, so that an invoice naming no asset, which no channel decides, is in that asset and
+is made even with no channel in it, as upstream makes any invoice (a node otherwise refuses it:
+no asset is assumed). `devtools/bolt11-cli encode` takes the asset as `a=<id>`. A test that cannot apply to Sequentia says why in its skip (no P2TR
 or v1+ shutdown scripts on an elements chain; a coinbase cannot be mined to a node's address on a
 staked chain; Bitcoin-specific fee figures), and one that meets a known SeqLN defect there is an
 expected failure (`strict`) naming its issue.

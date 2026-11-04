@@ -202,6 +202,17 @@ static void encode(const tal_t *ctx,
 				if (!b11->features)
 					errx(ERROR_USAGE, "Invalid hex features %s", val);
 				break;
+			case 'a': {
+				/* Sequentia: the asset id (display order). */
+				u8 id[32];
+				if (!hex_decode(val, strlen(val), id, sizeof(id)))
+					errx(ERROR_USAGE, "Invalid asset id %s", val);
+				b11->asset = tal_arr(b11, u8, 33);
+				b11->asset[0] = 0x01;
+				for (size_t i = 0; i < sizeof(id); i++)
+					b11->asset[1 + i] = id[sizeof(id) - 1 - i];
+				break;
+			}
 			case 'f':
 				errx(ERROR_USAGE, "FIXME: `f` unsupported!");
 			default:
