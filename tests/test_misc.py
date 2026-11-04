@@ -176,8 +176,7 @@ def test_bitcoin_pruned(node_factory, bitcoind):
         nonlocal fetched_peerblock
         if fetched_peerblock:
             fetched_peerblock = False
-            conf_file = os.path.join(bitcoind.bitcoin_dir, "bitcoin.conf")
-            brpc = RawProxy(btc_conf_file=conf_file)
+            brpc = RawProxy(btc_conf_file=bitcoind.conf_file)
             return {
                 "result": brpc._call(r["method"], *r["params"]),
                 "error": None,
@@ -4159,21 +4158,22 @@ def test_field_filter(node_factory, chainparams):
     l1, l2 = node_factory.get_nodes(2)
 
     addr1 = l1.rpc.newaddr('bech32')['bech32']
-    addr2 = '2MxqzNANJNAdMjHQq8ZLkwzooxAFiRzXvEz' if not chainparams['elements'] else 'XGx1E2JSTLZLmqYMAo3CGpsco85aS7so33'
+    # Sequentia shares Bitcoin's address prefixes; Liquid has its own.
+    addr2 = 'XGx1E2JSTLZLmqYMAo3CGpsco85aS7so33' if TEST_NETWORK == 'liquid-regtest' else '2MxqzNANJNAdMjHQq8ZLkwzooxAFiRzXvEz'
     inv = l1.rpc.invoice(123000, 'label', 'description', 3700, [addr1, addr2])
 
     # Simple case: single field
     dec = l1.rpc.call('decode', {'string': inv['bolt11']}, filter={"currency": True})
-    assert dec == {"currency": chainparams['bip173_prefix']}
+    assert dec == {"currency": chainparams['lightning_hrp']}
 
     # Use context manager:
     with l1.rpc.reply_filter({"currency": True}):
         dec = l1.rpc.decode(string=inv['bolt11'])
-    assert dec == {"currency": chainparams['bip173_prefix']}
+    assert dec == {"currency": chainparams['lightning_hrp']}
 
     # Two fields
     dec = l1.rpc.call('decode', {'string': inv['bolt11']}, filter={"currency": True, "payment_hash": True})
-    assert dec == {"currency": chainparams['bip173_prefix'],
+    assert dec == {"currency": chainparams['lightning_hrp'],
                    "payment_hash": inv['payment_hash']}
 
     # Nested fields
@@ -4181,7 +4181,7 @@ def test_field_filter(node_factory, chainparams):
                       filter={"currency": True,
                               "payment_hash": True,
                               "fallbacks": [{"type": True}]})
-    assert dec == {"currency": chainparams['bip173_prefix'],
+    assert dec == {"currency": chainparams['lightning_hrp'],
                    "payment_hash": inv['payment_hash'],
                    "fallbacks": [{"type": 'P2WPKH'}, {"type": 'P2SH'}]}
 
@@ -4200,7 +4200,7 @@ def test_field_filter(node_factory, chainparams):
     # C plugins implement filters!
     res = l1.rpc.call('decode', {'string': inv['bolt11']},
                       filter={"currency": True})
-    assert res == {"currency": chainparams['bip173_prefix']}
+    assert res == {"currency": chainparams['lightning_hrp']}
 
 
 def test_checkmessage_pubkey_not_found(node_factory):
@@ -4923,6 +4923,11 @@ def test_set_feerate_offset(node_factory, bitcoind):
     # First payment causes fee update, which should reflect the feerate offset.
     if 'anchors/even' in only_one(l1.rpc.listpeerchannels()['channels'])['channel_type']['names']:
         feerate = 3850
+        min_feerate = 253
+    elif TEST_NETWORK in SEQUENTIA_NETWORKS:
+        # A Sequentia node's lowest commitment feerate is the relay floor,
+        # as an anchor channel's is (chaintopology.c peer_commitment_feerate_min).
+        feerate = 11100
         min_feerate = 253
     else:
         feerate = 11100
