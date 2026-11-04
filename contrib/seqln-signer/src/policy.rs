@@ -217,6 +217,26 @@ pub struct ChannelState {
     /// symmetric type (`crate::sym`), signed by update signatures, and
     /// nothing on it is ever punished.
     pub option_sym: bool,
+    /// `option_seq_symmetric_lanes`: the channel's further lanes, one per
+    /// asset beside its own, each its own output of the funding transaction
+    /// to the same 2-of-2. Learnt from the first request that names them (a
+    /// lane's kickoff, which also gives its output, or a state) and never
+    /// replaced: a later request naming other lanes is refused.
+    pub lanes: Vec<Lane>,
+}
+
+/// The most further lanes a channel may have (`SYM_MAX_LANES`).
+pub const MAX_LANES: usize = 8;
+
+/// A further lane of a channel of several assets: its asset, its value, its
+/// funding output's index (once a kickoff of it was signed), and what its
+/// states pay away, tracked as the channel's own asset is (`crate::payments`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Lane {
+    pub asset: [u8; 33],
+    pub sats: u64,
+    pub outnum: Option<u32>,
+    pub pay: PayTrack,
 }
 
 /// A credit note: the provider owes the holder `credit` atoms of the
@@ -324,6 +344,10 @@ impl ChannelState {
         self.option_credit |= old.option_credit;
         if let Some(n) = old.credit {
             self.learn_credit(n);
+        }
+        // The lanes are learnt once and never replaced.
+        if self.lanes.is_empty() {
+            self.lanes = old.lanes.clone();
         }
     }
 }
@@ -537,11 +561,15 @@ pub const CHSTORE_MAGIC: [u8; 4] = *b"SQCH";
 /// after that, whether the channel is `option_seq_taproot_covenant` (1 byte).
 /// Version 11 adds, after that, whether it is `option_seq_credit` (1 byte)
 /// and the latest credit note (flag(1), then credit(8), payment hash(32),
-/// signature(64) and preimage flag(1), preimage(32) if set).
+/// signature(64) and preimage flag(1), preimage(32) if set). Version 12
+/// adds, after that, whether it is `option_seq_symmetric` (1 byte). Version
+/// 13 adds, after that, its further lanes (count(1), then per lane its asset
+/// (33), value (8), funding output flag(1) and index (4) if set, and its
+/// payment tracking as the channel's own).
 /// Versions 1 to 9 still import (the fields they lack unknown); each channel of a store older
 /// than version 6, written by a device that validated nothing, predates
 /// validation.
-pub const CHSTORE_VERSION: u8 = 12;
+pub const CHSTORE_VERSION: u8 = 13;
 
 /// The first store version a validating device wrote.
 pub const CHSTORE_FIRST_VALIDATING: u8 = 6;
@@ -706,6 +734,19 @@ pub fn encode_channel_store(store: &ChannelStore) -> Vec<u8> {
             }
         }
         out.push(st.option_sym as u8);
+        out.push(st.lanes.len() as u8);
+        for l in &st.lanes {
+            out.extend_from_slice(&l.asset);
+            out.extend_from_slice(&l.sats.to_le_bytes());
+            match l.outnum {
+                None => out.push(0),
+                Some(n) => {
+                    out.push(1);
+                    out.extend_from_slice(&n.to_le_bytes());
+                }
+            }
+            push_pay(&mut out, &l.pay);
+        }
     }
     push_ledger(&mut out, &store.ledger);
     out.extend_from_slice(&(store.close_txids.len() as u16).to_le_bytes());
@@ -880,6 +921,7 @@ pub fn decode_channel_store(bytes: &[u8]) -> Result<DecodedStore, String> {
             option_credit: false,
             option_sym: false,
             credit: None,
+            lanes: Vec::new(),
         };
         if version >= 2 {
             st.is_outbound = r.opt_bool()?;
@@ -973,6 +1015,23 @@ pub fn decode_channel_store(bytes: &[u8]) -> Result<DecodedStore, String> {
                 1 => true,
                 v => return Err(format!("bad symmetric flag {v} in channel-store blob")),
             };
+        }
+        if version >= 13 {
+            let n = r.u8()? as usize;
+            if n > MAX_LANES {
+                return Err(format!("{n} lanes in a channel-store blob"));
+            }
+            for _ in 0..n {
+                let asset: [u8; 33] = r.take(33)?.try_into().unwrap();
+                let sats = r.u64()?;
+                let outnum = match r.u8()? {
+                    0 => None,
+                    1 => Some(u32::from_le_bytes(r.take(4)?.try_into().unwrap())),
+                    v => return Err(format!("bad lane outnum flag {v} in channel-store blob")),
+                };
+                let pay = r.pay()?;
+                st.lanes.push(Lane { asset, sats, outnum, pay });
+            }
         }
         out.push(((node_id, dbid), st));
     }
@@ -1772,6 +1831,117 @@ pub fn validate_mutual_close(
     }
     let fee = st.funding_sats - ours_value - theirs_value;
     check_close_balance(st, (ours == 1).then_some(ours_value), theirs_value, fee)
+}
+
+/// The mutual close of a channel of several assets (seqln's
+/// `common/close_tx.h`): input 0 the channel's funding output and each
+/// further input one of its other lanes', in lane order. Lane 0 (the
+/// channel's own asset and the fee) is held exactly as a plain close is
+/// ([`validate_mutual_close`]); each further lane must pay this wallet at
+/// least the balance its latest states left it, pay the rest to the peer
+/// only, add up to the lane's value and pay nothing else. An output in an
+/// asset outside the lanes is refused.
+pub fn validate_lanes_close(
+    st: &ChannelState,
+    own: &std::collections::HashSet<Vec<u8>>,
+    own_close: Option<&[u8]>,
+    approved: &std::collections::HashSet<Vec<u8>>,
+    tx: &ElementsTx,
+) -> Result<(), String> {
+    if st.lanes.is_empty() {
+        return Err("the channel holds one asset, the close spends several outputs".to_string());
+    }
+    if tx.network != Network::Elements || tx.inputs.len() != 1 + st.lanes.len() {
+        return Err(format!(
+            "the close has {} inputs, not one for each of the channel's {} lanes",
+            tx.inputs.len(),
+            1 + st.lanes.len()
+        ));
+    }
+    for (l, lane) in st.lanes.iter().enumerate() {
+        let inp = &tx.inputs[1 + l];
+        let n = lane
+            .outnum
+            .ok_or_else(|| format!("lane {} has no funding output this device knows", l + 1))?;
+        if inp.txhash != st.funding_txid || inp.index != n || inp.is_issuance {
+            return Err(format!("input {} is not lane {}'s funding output", 1 + l, l + 1));
+        }
+    }
+    let lane_of = |o: &TxOutput| -> Option<usize> {
+        if o.asset.len() != 33 || o.asset[0] != 0x01 {
+            return None;
+        }
+        st.lanes.iter().position(|l| l.asset[..] == o.asset[..])
+    };
+    // Lane 0: the funding input, the outputs not in a further lane's asset
+    // (the fee among them), held as any close.
+    let lane0 = ElementsTx {
+        version: tx.version,
+        inputs: vec![crate::kernel::TxInput {
+            txhash: tx.inputs[0].txhash,
+            index: tx.inputs[0].index,
+            sequence: tx.inputs[0].sequence,
+            is_issuance: tx.inputs[0].is_issuance,
+        }],
+        outputs: tx
+            .outputs
+            .iter()
+            .filter(|o| o.script.is_empty() || lane_of(o).is_none())
+            .map(|o| TxOutput {
+                asset: o.asset.clone(),
+                value: o.value.clone(),
+                nonce: o.nonce.clone(),
+                script: o.script.clone(),
+            })
+            .collect(),
+        locktime: tx.locktime,
+        network: tx.network,
+    };
+    validate_mutual_close(st, own, own_close, approved, &lane0)?;
+    for (l, lane) in st.lanes.iter().enumerate() {
+        let (mut ours, mut theirs, mut total) = (None, 0usize, 0u64);
+        for (i, o) in tx.outputs.iter().enumerate() {
+            if o.script.is_empty() || lane_of(o) != Some(l) {
+                continue;
+            }
+            let v = output_value(o, tx.network)
+                .ok_or_else(|| format!("output {i} has a non-explicit value"))?;
+            total = total.checked_add(v).ok_or("the close overflows")?;
+            if own.contains(&o.script) || own_close == Some(o.script.as_slice()) || approved.contains(&o.script) {
+                if ours.is_some() {
+                    return Err(format!("lane {} pays this wallet twice", l + 1));
+                }
+                ours = Some(v);
+            } else if st.remote_shutdown_script.is_empty() || o.script == st.remote_shutdown_script {
+                theirs += 1;
+                if theirs > 1 {
+                    return Err(format!("lane {} pays the peer twice", l + 1));
+                }
+            } else {
+                return Err(format!(
+                    "output {i} pays neither this wallet nor the peer's recorded shutdown script \
+                     (lane {}, value {v})",
+                    l + 1
+                ));
+            }
+        }
+        if total != lane.sats {
+            return Err(format!("the close pays {total} atoms of lane {}'s {}", l + 1, lane.sats));
+        }
+        let due = [&lane.pay.local, &lane.pay.remote]
+            .iter()
+            .filter_map(|t| t.as_ref().map(|t| t.value))
+            .max()
+            .ok_or_else(|| format!("no balance of lane {} is known yet", l + 1))?;
+        let paid = ours.unwrap_or(0);
+        if paid < due {
+            return Err(format!(
+                "the close pays this wallet {paid} atoms of lane {}, which owes it {due}",
+                l + 1
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The credit a mutual close must pay this side on top of its balance: the

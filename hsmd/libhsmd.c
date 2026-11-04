@@ -132,6 +132,7 @@ bool hsmd_check_client_capabilities(struct hsmd_client *client,
 	case WIRE_HSMD_SIGN_SYM_KICKOFF:
 	case WIRE_HSMD_SIGN_SYM_STATE:
 	case WIRE_HSMD_SIGN_SYM_LANES_STATE:
+	case WIRE_HSMD_APPROVE_SYM_SWAP:
 		return (client->capabilities & HSM_PERM_SIGN_REMOTE_TX) != 0;
 
 	case WIRE_HSMD_SIGN_MUTUAL_CLOSE_TX:
@@ -236,6 +237,7 @@ bool hsmd_check_client_capabilities(struct hsmd_client *client,
 	case WIRE_HSMD_SIGN_SYM_STATE_REPLY:
 	case WIRE_HSMD_SIGN_SYM_LANES_STATE_REPLY:
 	case WIRE_HSMD_SIGN_MUTUAL_CLOSE_LANES_TX_REPLY:
+	case WIRE_HSMD_APPROVE_SYM_SWAP_REPLY:
 	case WIRE_HSMD_SIGN_ANY_CANNOUNCEMENT_REPLY:
 		break;
 	}
@@ -1471,6 +1473,20 @@ static u8 *handle_sign_mutual_close_tx(struct hsmd_client *c, const u8 *msg_in)
 	return towire_hsmd_sign_tx_reply(NULL, &sig);
 }
 
+/* SEQUENTIA: a swap on a channel of several assets (common/sym_lanes.h).
+ * This signer holds no balance, so it approves every one; a validating one
+ * records it and holds the state that moves the two lanes to it. */
+static u8 *handle_approve_sym_swap(struct hsmd_client *c, const u8 *msg_in)
+{
+	u8 give_asset[33], take_asset[33];
+	struct amount_msat give, take;
+
+	if (!fromwire_hsmd_approve_sym_swap(msg_in, give_asset, &give,
+					    take_asset, &take))
+		return hsmd_status_malformed_request(c, msg_in);
+	return towire_hsmd_approve_sym_swap_reply(NULL, true);
+}
+
 /* SEQUENTIA: the mutual close of a channel of several assets
  * (common/close_tx.h): every input spends one of the channel's funding
  * outputs, all to the same 2-of-2, and we sign each.  Like the plain close,
@@ -2622,6 +2638,7 @@ static u8 *handle_sign_sym_lanes_state(struct hsmd_client *c, const u8 *msg_in)
 	u16 delay;
 	struct sym_state *st;
 	struct hsm_htlc *htlcs;
+	u16 *htlc_lanes;
 	struct secret channel_seed;
 	struct pubkey our_key;
 	struct privkey privkey;
@@ -2635,7 +2652,7 @@ static u8 *handle_sign_sym_lanes_state(struct hsmd_client *c, const u8 *msg_in)
 						&we_opened, &remote_update_key,
 						asset, &funding_sats, &delay,
 						&lane_sats, &lane_assets, &st,
-						&htlcs))
+						&htlcs, &htlc_lanes))
 		return hsmd_status_malformed_request(c, msg_in);
 	nlanes = tal_count(lane_sats);
 	if (tal_bytelen(lane_assets) != nlanes * 33)
@@ -2645,6 +2662,11 @@ static u8 *handle_sign_sym_lanes_state(struct hsmd_client *c, const u8 *msg_in)
 						   tal_bytelen(lane_assets));
 	if (tal_count(st->outs) == 0 || st->num < 0)
 		return hsmd_status_bad_request_fmt(c, msg_in, "empty state");
+	if (tal_count(htlc_lanes) != tal_count(htlcs))
+		return hsmd_status_bad_request_fmt(c, msg_in,
+						   "%zu HTLCs, %zu lanes of them",
+						   tal_count(htlcs),
+						   tal_count(htlc_lanes));
 
 	/* What the settlement pays each lane: [0] the channel's asset. */
 	paid = tal_arrz(tmpctx, struct amount_sat, nlanes + 1);
@@ -2815,6 +2837,8 @@ u8 *hsmd_handle_client_message(const tal_t *ctx, struct hsmd_client *client,
 		return handle_sign_mutual_close_tx(client, msg);
 	case WIRE_HSMD_SIGN_MUTUAL_CLOSE_LANES_TX:
 		return handle_sign_mutual_close_lanes_tx(client, msg);
+	case WIRE_HSMD_APPROVE_SYM_SWAP:
+		return handle_approve_sym_swap(client, msg);
 	case WIRE_HSMD_SIGN_SPLICE_TX:
 		return handle_sign_splice_tx(client, msg);
 	case WIRE_HSMD_SIGN_REMOTE_HTLC_TX:
@@ -2931,6 +2955,7 @@ u8 *hsmd_handle_client_message(const tal_t *ctx, struct hsmd_client *client,
 	case WIRE_HSMD_SIGN_SYM_STATE_REPLY:
 	case WIRE_HSMD_SIGN_SYM_LANES_STATE_REPLY:
 	case WIRE_HSMD_SIGN_MUTUAL_CLOSE_LANES_TX_REPLY:
+	case WIRE_HSMD_APPROVE_SYM_SWAP_REPLY:
 	case WIRE_HSMD_SIGN_ANY_CANNOUNCEMENT_REPLY:
 		break;
 	}
@@ -3035,6 +3060,7 @@ u8 *hsmd_init(const u8 *secret_data, size_t secret_len, const u64 hsmd_version,
 		WIRE_HSMD_SIGN_SYM_HTLC,
 		WIRE_HSMD_SIGN_SYM_LANES_STATE,
 		WIRE_HSMD_SIGN_MUTUAL_CLOSE_LANES_TX,
+		WIRE_HSMD_APPROVE_SYM_SWAP,
 	};
 	u32 *caps;
 

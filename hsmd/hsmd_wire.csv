@@ -683,9 +683,25 @@ msgdata,hsmd_sign_sym_lanes_state,lane_assets,byte,lane_assets_len
 msgdata,hsmd_sign_sym_lanes_state,state,sym_state,
 msgdata,hsmd_sign_sym_lanes_state,num_htlcs,u16,
 msgdata,hsmd_sign_sym_lanes_state,htlcs,hsm_htlc,num_htlcs
+# Each HTLC's lane, in the order of htlcs.
+msgdata,hsmd_sign_sym_lanes_state,num_htlc_lanes,u16,
+msgdata,hsmd_sign_sym_lanes_state,htlc_lanes,u16,num_htlc_lanes
 
 msgtype,hsmd_sign_sym_lanes_state_reply,175
 msgdata,hsmd_sign_sym_lanes_state_reply,sig,bip340sig,
+
+# A swap on a channel of several assets (common/sym_lanes.h), before we
+# commit to it: we give give_msat of give_asset and take take_msat of
+# take_asset.  A signer that holds a balance records it, so that the state
+# that moves the two lanes is one it approved, and may refuse it.
+msgtype,hsmd_approve_sym_swap,76
+msgdata,hsmd_approve_sym_swap,give_asset,byte,33
+msgdata,hsmd_approve_sym_swap,give_msat,amount_msat,
+msgdata,hsmd_approve_sym_swap,take_asset,byte,33
+msgdata,hsmd_approve_sym_swap,take_msat,amount_msat,
+
+msgtype,hsmd_approve_sym_swap_reply,176
+msgdata,hsmd_approve_sym_swap_reply,approved,bool,
 
 # The mutual close of a channel of several assets (common/close_tx.h): input
 # 0 spends the channel's funding output and each further input one of its

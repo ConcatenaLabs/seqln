@@ -371,3 +371,133 @@ def test_lanes_mutual_close(node_factory, bitcoind):
     assert not l2.daemon.is_in_log('Broadcasting the kickoff')
     bitcoind.generate_block(100)
     wait_for(lambda: l1.rpc.listpeerchannels()['channels'] == [])
+
+
+def keyless_lanes_pair(node_factory, bitcoind, directory):
+    """l2, a hub with the dealer, opens a channel of GOLD and SILV to l1, a
+    keyless node whose keys are on a device in enforce mode, and pays it in
+    each asset."""
+    import test_keyless_close as kc
+    gold = bitcoind.issue_asset(1000)
+    silv = bitcoind.issue_asset(1000)
+    bitcoind.set_fee_rates({bitcoind.POLICY_ASSET: PAR, gold: PAR,
+                            silv: 2 * PAR})
+    # LANES holds may_reconnect, a harness setting, beside the options.
+    opts = {k: v for k, v in LANES.items() if k != 'may_reconnect'}
+    device, l1 = kc.keyless_node(node_factory, directory, broken_log='.*',
+                                 options=opts, may_reconnect=True)
+    l2 = node_factory.get_node(options=dict(opts, plugin=DEALER),
+                               may_reconnect=True)
+    fund_node(bitcoind, l2, gold, PAR)
+    fund_node(bitcoind, l2, silv, PAR)
+    l2.rpc.connect(l1.info['id'], 'localhost', l1.port)
+    res = l2.rpc.call('fundchannel', {
+        'id': l1.info['id'], 'amount': GOLD_CAP, 'asset': gold,
+        'lanes': [{'asset': silv, 'amount': SILV_CAP}]})
+    bitcoind.generate_block(1, wait_for_mempool=res['txid'])
+    wait_for(lambda: chan(l1, l2)['state'] == 'CHANNELD_NORMAL')
+    wait_for(lambda: chan(l2, l1)['state'] == 'CHANNELD_NORMAL')
+    assert LANES_BIT in chan(l1, l2)['channel_type']['bits']
+    pay(l2, l1, 9_000_000_000, gold)
+    pay(l2, l1, 8_000_000_000, silv)
+    wait_for(lambda: lanes(l1, l2) == {gold: 9_000_000_000, silv: 8_000_000_000})
+    return device, l1, l2, gold, silv
+
+
+def misstate_lane(node, lane, msat):
+    """Move `msat` of the node's balance in further lane `lane` to its peer in
+    its own database (channel_sym_lanes: a u16 count, then per lane its
+    asset (33), output (4), value (8), our balance (8, big-endian) and two
+    signatures), as a host lying to its device would."""
+    import sqlite3
+    path = os.path.join(node.daemon.lightning_dir, TEST_NETWORK, 'lightningd.sqlite3')
+    db = sqlite3.connect(path)
+    try:
+        (blob,) = db.execute("SELECT lanes FROM channel_sym_lanes").fetchone()
+        at = 2 + (lane - 1) * (45 + 8 + 128) + 45
+        ours = int.from_bytes(blob[at:at + 8], 'big')
+        blob = blob[:at] + (ours - msat).to_bytes(8, 'big') + blob[at + 8:]
+        db.execute("UPDATE channel_sym_lanes SET lanes = ?", (blob,))
+        db.commit()
+    finally:
+        db.close()
+    return ours
+
+
+@pytest.mark.skipif(not os.path.exists(os.environ.get('SEQLN_SIGNER', os.path.join(
+    os.path.dirname(__file__), '..', '..', 'contrib', 'seqln-signer', 'target', 'release',
+    'seqln-signer'))), reason='needs the seqln-signer binary')
+def test_lanes_keyless_device(node_factory, bitcoind, directory):
+    """A keyless node holds a channel of two assets.  Its device signs each
+    lane's kickoff, then each state only after holding every lane's
+    settlement to the channel and what it leaves this side in each lane to
+    the payments and swaps it approved; it approves the swap the node asks
+    for, and signs the mutual close, which pays the node its balance in each
+    asset.  It refuses nothing."""
+    device, l1, l2, gold, silv = keyless_lanes_pair(node_factory, bitcoind, directory)
+    try:
+        pay(l1, l2, 1_000_000_000, silv)
+        res = l1.rpc.call('symswap', {'id': chan(l1, l2)['channel_id'],
+                                      'give_asset': silv, 'give_msat': 2_000_000_000,
+                                      'take_asset': gold, 'take_msat': 1_500_000_000})
+        assert res['id']
+        want = {gold: 10_500_000_000, silv: 5_000_000_000}
+        wait_for(lambda: lanes(l1, l2) == want)
+        assert 'POLICY REJECT' not in device.output()
+
+        res = l1.rpc.close(l2.info['id'])
+        assert res['type'] == 'mutual'
+        txid = only_one(res['txids'])
+        bitcoind.generate_block(1, wait_for_mempool=txid)
+        for asset, msat in want.items():
+            wait_for(lambda: any(o['txid'] == txid and o['asset'] == asset
+                                 and o['amount_msat'] == msat
+                                 for o in l1.rpc.listfunds()['outputs']))
+        out = device.output()
+        assert 'POLICY REJECT' not in out, out
+        print("keyless lanes: payments, a swap and a mutual close, the device refusing nothing")
+    finally:
+        # The node first: a device that goes before it leaves the proxy
+        # waiting for another.
+        from test_keyless_close import answers
+        if answers(l1, timeout=2):
+            l1.stop()
+        device.stop()
+
+
+@pytest.mark.skipif(not os.path.exists(os.environ.get('SEQLN_SIGNER', os.path.join(
+    os.path.dirname(__file__), '..', '..', 'contrib', 'seqln-signer', 'target', 'release',
+    'seqln-signer'))), reason='needs the seqln-signer binary')
+def test_lanes_keyless_misstated_lane_refused(node_factory, bitcoind, executor, directory):
+    """The host takes 10,000 atoms of SILV off the keyless node's balance in
+    its database, which the device was never asked to approve.  The next
+    state it asks the device to sign, for an approved payment, is refused:
+    it leaves this wallet less SILV than the device tracks."""
+    device, l1, l2, gold, silv = keyless_lanes_pair(node_factory, bitcoind, directory)
+    try:
+        l1.stop()
+        before = misstate_lane(l1, 1, 10_000_000)
+        print("host database: our SILV {} msat, now {} msat".format(before, before - 10_000_000))
+        l1.start()
+        l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+        wait_for(lambda: chan(l1, l2)['state'] == 'CHANNELD_NORMAL'
+                 and chan(l1, l2)['peer_connected'])
+        inv = l2.rpc.call('invoice', {'amount_msat': 1_000_000_000, 'label': 'after',
+                                      'description': 'after', 'asset': silv})['bolt11']
+        executor.submit(l1.rpc.pay, inv)
+        wait_for(lambda: 'POLICY REJECT' in device.output()
+                 or l1.daemon.is_in_log('Bad commit_sig signature'))
+        assert not l1.daemon.is_in_log('Bad commit_sig signature')
+        refusal = only_one([line for line in device.output().splitlines()
+                            if 'POLICY REJECT' in line][:1])
+        print("device:", refusal)
+        assert 'SIGN_SYM_LANES_STATE refused: lane 1' in refusal
+        assert 'it leaves this wallet' in refusal
+        assert l2.rpc.listinvoices('after')['invoices'][0]['status'] == 'unpaid'
+    finally:
+        # The node first: a device that goes before it leaves the proxy
+        # waiting for another.
+        from test_keyless_close import answers
+        if answers(l1, timeout=2):
+            l1.stop()
+        device.stop()

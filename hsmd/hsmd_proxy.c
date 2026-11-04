@@ -1638,6 +1638,7 @@ static struct io_plan *handle_client(struct io_conn *conn, struct client *c)
 	case WIRE_HSMD_SIGN_SYM_HTLC:
 	case WIRE_HSMD_SIGN_SYM_LANES_STATE:
 	case WIRE_HSMD_SIGN_MUTUAL_CLOSE_LANES_TX:
+	case WIRE_HSMD_APPROVE_SYM_SWAP:
 		/* Forward to the out-of-process signer. */
 		return forward_to_signer(conn, c, c->msg_in);
 
@@ -1689,6 +1690,7 @@ static struct io_plan *handle_client(struct io_conn *conn, struct client *c)
 	case WIRE_HSMD_SIGN_SYM_STATE_REPLY:
 	case WIRE_HSMD_SIGN_SYM_LANES_STATE_REPLY:
 	case WIRE_HSMD_SIGN_MUTUAL_CLOSE_LANES_TX_REPLY:
+	case WIRE_HSMD_APPROVE_SYM_SWAP_REPLY:
 		return bad_req_fmt(conn, c, c->msg_in,
 				   "Received an incoming message of type %s, "
 				   "which is not a request",

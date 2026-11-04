@@ -790,7 +790,7 @@ static void sym_sign_state(const struct channel *channel,
 						       channel->channel_asset,
 						       channel->funding_sats,
 						       sym_shared_delay(channel),
-						       sats, assets, st, NULL);
+						       sats, assets, st, NULL, NULL);
 		wire_sync_write(HSM_FD, take(msg));
 		msg = wire_sync_read(tmpctx, HSM_FD);
 		if (!fromwire_hsmd_sign_sym_lanes_state_reply(msg,

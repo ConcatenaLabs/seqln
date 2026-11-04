@@ -42,6 +42,7 @@
  * v6 with sign_sym_* (Sequentia symmetric channels): 0fe54c3ab13d8fd2a71715aac9bee34815e8a72d658382d77f235fb2b7d1ccbc
  * v6 with sign_sym_lanes_state (Sequentia several assets per channel): 87fa4c38733589532bfbc4a10d870a225b64f9b1b0315b3289c78071fb6ea1cb
  * v6 with sign_mutual_close_lanes_tx (Sequentia several assets per channel): 972fba6378bbe3683da26bb5b1363267a7d84780ca8755b3cdcfd14cf8ea380b
+ * v6 with approve_sym_swap and the lanes of a state's HTLCs (Sequentia several assets per channel): 3c9d619aef1da10a4642a263875dd77f55eb375c35ddf8afa578c414fa0dc87f
  */
 #define HSM_MIN_VERSION 5
 #define HSM_MAX_VERSION 6
