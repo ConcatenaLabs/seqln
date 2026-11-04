@@ -2184,7 +2184,14 @@ def test_zeroreserve_mixed(node_factory, bitcoind):
     l1.connect(l2)
     l3.connect(l1)
 
-    l1.rpc.fundchannel(l2.info['id'], 10**6, reserve='0sat')
+    if TEST_NETWORK in SEQUENTIA_NETWORKS:
+        # A Sequentia node that allows no dust reserve keeps its dust limit
+        # at or below the reserve asked of it, lowering it only so far
+        # (openingd.c), so l2 refuses l1's zero reserve.
+        with pytest.raises(RpcError, match=r'channel_reserve_satoshis 0sat is below our dust limit'):
+            l1.rpc.fundchannel(l2.info['id'], 10**6, reserve='0sat')
+    else:
+        l1.rpc.fundchannel(l2.info['id'], 10**6, reserve='0sat')
     l3.rpc.fundchannel(l1.info['id'], 10**6)
 
 

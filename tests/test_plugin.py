@@ -6,7 +6,7 @@ from hashlib import sha256
 from pyln.client import RpcError, Millisatoshi
 from pyln.proto import Invoice
 from pyln.proto.onion import TlvPayload
-from pyln.testing.utils import FUNDAMOUNT
+from pyln.testing.utils import FUNDAMOUNT, SEQUENTIA_NETWORKS
 from utils import (
     only_one, sync_blockheight, TIMEOUT, wait_for, TEST_NETWORK,
     expected_peer_features, expected_node_features,
@@ -1592,6 +1592,9 @@ def test_forward_event_notification(node_factory, bitcoind, executor):
         del p['payment_hash']
         if p.get('preimage') is not None:
             del p['preimage']
+        # SeqLN's forward_event names the asset; listforwards does not
+        # (ConcatenaLabs/seqln#163).
+        p.pop('asset', None)
 
     # use stats to build what we expect went to plugin.
     expect = stats[0].copy()
@@ -4977,7 +4980,11 @@ def test_pay_plugin_notifications(node_factory, bitcoind, chainparams):
     data = zero_timestamps(ast.literal_eval(dict_str))
 
     channel_hint_update_core = {'scid': first_scid(l1, l2) + '/1',
-                                'estimated_capacity_msat': 964719000 if chainparams['elements'] else 978718000,
+                                # Sequentia rounds a fee up (common/amount.c amount_tx_fee), so
+                                # one sat less of the channel can be spent.
+                                'estimated_capacity_msat': (978718000 if not chainparams['elements']
+                                                            else 964718000 if TEST_NETWORK in SEQUENTIA_NETWORKS
+                                                            else 964719000),
                                 'total_capacity_msat': 1000000000,
                                 'timestamp': 0,
                                 'enabled': True}

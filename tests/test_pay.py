@@ -259,7 +259,10 @@ def test_pay_disconnect(node_factory, bitcoind):
     l1.set_feerates((10**6, 10**6, 10**6, 10**6), False)
 
     # Wait for l1 notice
-    if 'anchors/even' in only_one(l1.rpc.listpeerchannels()['channels'])['channel_type']['names']:
+    # (A Sequentia commitment's lowest feerate is the relay floor, as an
+    # anchor channel's is: chaintopology.c peer_commitment_feerate_min.)
+    if ('anchors/even' in only_one(l1.rpc.listpeerchannels()['channels'])['channel_type']['names']
+            or TEST_NETWORK in SEQUENTIA_NETWORKS):
         l1.daemon.wait_for_log(r'WARNING .*: update_fee \d+ outside range 253-75000')
     else:
         l1.daemon.wait_for_log(r'WARNING .*: update_fee \d+ outside range 1875-75000')
