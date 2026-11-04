@@ -1649,9 +1649,11 @@ def test_gossip_store_compact(node_factory, bitcoind):
 
     # Now compact store.
     l2.rpc.call('dev-compact-gossip-store')
-    # Splicing changes features, making this size 2365 bytes -> 2065 bytes.
-    l2.daemon.wait_for_logs(['gossipd: compaction done: 236[25] -> 206[25] bytes',
-                             'connectd: Reopened gossip_store, reduced to offset 206[25]'])
+    # Splicing changes features, making this size 2365 bytes -> 2065 bytes
+    # upstream.  SeqLN stores each channel's asset in a 47-byte record after
+    # its amount, so two channels add 94 bytes.
+    l2.daemon.wait_for_logs(['gossipd: compaction done: 24(56|59) -> 21(56|59) bytes',
+                             'connectd: Reopened gossip_store, reduced to offset 21(56|59)'])
 
     # Should still be connected.
     time.sleep(1)
@@ -1702,13 +1704,14 @@ def test_gossip_store_compact_while_extending(node_factory, bitcoind, executor):
         f.write(b'')
 
     fut.result(TIMEOUT)
-    # Exact gossip size varies with SPLICING.
+    # Exact gossip size varies with SPLICING.  SeqLN adds a 47-byte asset
+    # record for each of the two live channels (upstream: 224[59]).
     l1.daemon.wait_for_logs(['gossipd: compaction done',
-                             'connectd: Reopened gossip_store, reduced to offset 224[59]'])
+                             'connectd: Reopened gossip_store, reduced to offset 23(39|43)'])
 
     post_channels = l1.rpc.listchannels()
     post_nodes = sorted(l1.rpc.listnodes()['nodes'], key=lambda n: n['nodeid'])
-    l1.daemon.wait_for_log('topology: Reopened gossip_store, reduced to offset 224[59]')
+    l1.daemon.wait_for_log('topology: Reopened gossip_store, reduced to offset 23(39|43)')
 
     assert post_channels == pre_channels
     assert post_nodes == pre_nodes
