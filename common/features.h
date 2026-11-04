@@ -179,6 +179,12 @@ struct feature_set *feature_set_dup(const tal_t *ctx,
  * --symmetric-channels where the chain has tapscript introspection. */
 #define OPT_SEQ_SYMMETRIC			178
 
+/* SEQUENTIA: the symmetric type's settle clock (common/sym_scripts.h,
+ * design M): the funding issues a marker into a seed, and the shared delay
+ * runs once, on a clock the kickoff creates.  Always with
+ * OPT_SEQ_SYMMETRIC. */
+#define OPT_SEQ_SYMMETRIC_CLOCK			180
+
 /* SEQUENTIA: a symmetric channel opened from a factory (common/sym_factory.h):
  * one funding output for many channels.  Offered with --symmetric-channels,
  * beside OPT_SEQ_SYMMETRIC. */

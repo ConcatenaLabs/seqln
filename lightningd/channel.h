@@ -239,6 +239,9 @@ struct channel {
 	 * output then, as F was before (lightningd/sym_factory.h). */
 	struct sym_factory *sym_factory;
 	struct bitcoin_outpoint *sym_factory_ko;
+	/* A settle-clock channel's issuer and seed (lightningd/sym_clock.h),
+	 * or NULL. */
+	struct sym_clock_funding *sym_clock;
 
 	/* Watch we have on funding output. */
 	struct txowatch *funding_spend_watch;

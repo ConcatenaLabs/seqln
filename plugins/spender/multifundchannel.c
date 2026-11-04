@@ -91,6 +91,22 @@ static bool dest_failed(struct multifundchannel_destination *dest)
 	return dest->state == MULTIFUNDCHANNEL_FAILED;
 }
 
+/* SEQUENTIA: does this destination's channel have the settle clock
+ * (lightningd/sym_clock.h)?  When both offer it and nothing asks for another
+ * type; never a factory slot or a dual-funded channel. */
+static bool dest_has_clock(const struct multifundchannel_command *mfc,
+			   const struct multifundchannel_destination *dest)
+{
+	if (mfc->factory || is_v2(dest))
+		return false;
+	if (dest->channel_type)
+		return channel_type_has(dest->channel_type,
+					OPT_SEQ_SYMMETRIC_CLOCK);
+	return feature_negotiated(plugin_feature_set(mfc->cmd->plugin),
+				  dest->their_features,
+				  OPT_SEQ_SYMMETRIC_CLOCK);
+}
+
 bool is_v2(const struct multifundchannel_destination *dest)
 {
 	return dest->protocol == OPEN_CHANNEL;
@@ -981,6 +997,38 @@ perform_funding_tx_finalize(struct multifundchannel_command *mfc)
 			       fmt_amount_sat(tmpctx, dest->amount));
 	}
 
+	/* SEQUENTIA: each settle-clock channel's issuer issues its marker,
+	 * and the seed takes it, after the funding outputs so their numbers
+	 * stand (lightningd/sym_clock.h). */
+	for (i = 0; i < tal_count(mfc->destinations); i++) {
+		struct multifundchannel_destination *d = &mfc->destinations[i];
+		bool issued = false;
+
+		if (!d->sym_seed_script)
+			continue;
+		for (size_t k = 0; k < mfc->psbt->num_inputs; k++) {
+			struct bitcoin_outpoint o;
+
+			wally_psbt_input_get_outpoint(&mfc->psbt->inputs[k], &o);
+			if (!bitcoin_outpoint_eq(&o, d->sym_issuer))
+				continue;
+			if (wally_psbt_input_set_issuance_amount(
+				    &mfc->psbt->inputs[k], d->sym_marker_atoms)
+			    != WALLY_OK)
+				plugin_err(mfc->cmd->plugin,
+					   "Could not issue on input %zu", k);
+			issued = true;
+		}
+		if (!issued)
+			return mfc_fail(mfc, LIGHTNINGD, "The funding no longer"
+					" spends the issuer %s",
+					fmt_bitcoin_outpoint(tmpctx,
+							     d->sym_issuer));
+		(void) psbt_append_output_asset(mfc->psbt, d->sym_seed_script,
+						amount_sat(d->sym_marker_atoms),
+						d->sym_marker_tag);
+	}
+
 	if (v2_dest_count > 0) {
 		/* Add serial_ids to all the new outputs */
 		psbt_add_serials(mfc->psbt, TX_INITIATOR);
@@ -1138,6 +1186,29 @@ fundchannel_start_ok(struct command *cmd,
 		plugin_err(cmd->plugin,
 			   "fundchannel_start parsing error: %s", err);
 
+	/* SEQUENTIA: a settle-clock channel's seed and marker. */
+	dest->sym_seed_script = NULL;
+	if (json_get_member(buf, result, "sym_seed_scriptpubkey")) {
+		struct sha256 marker;
+
+		dest->sym_marker_atoms = 1;
+		err = json_scan(tmpctx, buf, result,
+				"{sym_seed_scriptpubkey:%,sym_marker:%,"
+				"dev_sym_marker_atoms?:%}",
+				JSON_SCAN_TAL(mfc, json_tok_bin_from_hex,
+					      &dest->sym_seed_script),
+				JSON_SCAN(json_to_sha256, &marker),
+				JSON_SCAN(json_to_u32,
+					  &dest->sym_marker_atoms));
+		if (err)
+			plugin_err(cmd->plugin, "fundchannel_start parsing"
+				   " error: %s", err);
+		dest->sym_marker_tag[0] = 0x01;
+		for (size_t k = 0; k < sizeof(marker.u.u8); k++)
+			dest->sym_marker_tag[1 + k]
+				= marker.u.u8[sizeof(marker.u.u8) - 1 - k];
+	}
+
 	dest->state = MULTIFUNDCHANNEL_STARTED;
 
 	return fundchannel_start_done(dest);
@@ -1224,6 +1295,10 @@ fundchannel_start_dest(struct multifundchannel_destination *dest)
 	if (dest->asset)
 		json_add_string(req->js, "asset", dest->asset);
 
+	/* SEQUENTIA: the input that issues a settle-clock channel's marker. */
+	if (dest->sym_issuer)
+		json_add_outpoint(req->js, "sym_issuer", dest->sym_issuer);
+
 	/* SEQUENTIA: a slot of the factory. */
 	if (mfc->factory) {
 		json_add_txid(req->js, "factory_nonce", &mfc->factory_nonce);
@@ -1259,6 +1334,32 @@ perform_channel_start(struct multifundchannel_command *mfc)
 						" fundchannel_start, not"
 						" dual funding");
 			mfc->destinations[i].factory_slot = i;
+		}
+	}
+
+	/* SEQUENTIA: each settle-clock channel's marker is issued by an input
+	 * of its own (lightningd/sym_clock.h). */
+	{
+		size_t next = 0;
+
+		for (i = 0; i < tal_count(mfc->destinations); ++i) {
+			struct multifundchannel_destination *d
+				= &mfc->destinations[i];
+
+			d->sym_issuer = tal_free(d->sym_issuer);
+			d->sym_seed_script = NULL;
+			if (!dest_has_clock(mfc, d))
+				continue;
+			if (next == mfc->psbt->num_inputs)
+				return mfc_fail(mfc, JSONRPC2_INVALID_PARAMS,
+						"Each settle-clock channel"
+						" issues its marker from an"
+						" input of its own, and the"
+						" funding has %zu",
+						mfc->psbt->num_inputs);
+			d->sym_issuer = tal(mfc, struct bitcoin_outpoint);
+			wally_psbt_input_get_outpoint(&mfc->psbt->inputs[next++],
+						      d->sym_issuer);
 		}
 	}
 
@@ -1519,6 +1620,14 @@ perform_fundpsbt(struct multifundchannel_command *mfc, u32 feerate)
 					BITCOIN_SCRIPTPUBKEY_P2WSH_LEN)
 			      * num_outs
 			      );
+		/* SEQUENTIA: a settle-clock channel's issuance (nonce,
+		 * entropy, amount, token count and denomination: 75 bytes)
+		 * and its seed output. */
+		for (size_t i = 0; i < num_outs; i++)
+			if (dest_has_clock(mfc, &mfc->destinations[i]))
+				startweight += 75 * 4
+					+ bitcoin_tx_output_weight(
+						BITCOIN_SCRIPTPUBKEY_P2TR_LEN);
 		json_add_string(req->js, "startweight",
 				tal_fmt(tmpctx, "%zu", startweight));
 	}
@@ -2020,6 +2129,9 @@ param_destinations_array(struct command *cmd, const char *name,
 		dest->their_features = NULL;
 		dest->funding_script = NULL;
 		dest->funding_addr = NULL;
+		dest->sym_issuer = NULL;
+		dest->sym_seed_script = NULL;
+		dest->sym_marker_atoms = 1;
 		dest->all = amount_sat_eq(*amount, AMOUNT_SAT(-1ULL));
 		dest->amount = dest->all ? AMOUNT_SAT(0) : *amount;
 		dest->announce = *announce;

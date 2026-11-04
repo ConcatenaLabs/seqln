@@ -892,6 +892,16 @@ static void dev_register_opts(struct lightningd *ld)
 		       opt_set_bool_arg, opt_show_bool,
 		       &ld->config.allowdustreserve,
 		       "If true, we allow the `fundchannel` RPC command and the `openchannel` plugin hook to set a reserve that is below the dust limit.");
+	clnopt_noarg("--dev-symmetric-clock", OPT_DEV,
+		     opt_set_bool,
+		     &ld->dev_symmetric_clock,
+		     "With --symmetric-channels, also offer their settle clock"
+		     " (option_seq_symmetric_clock)");
+	clnopt_noarg("--dev-symmetric-clock-bad-funding", OPT_DEV,
+		     opt_set_bool,
+		     &ld->dev_symmetric_clock_bad_funding,
+		     "Fund settle-clock channels with a marker of two atoms,"
+		     " which our own check only logs");
 	clnopt_noarg("--dev-any-channel-type", OPT_DEV,
 		     opt_set_bool,
 		     &ld->dev_any_channel_type,
@@ -2071,6 +2081,10 @@ void handle_opts(struct lightningd *ld)
 			feature_set_or(ld->our_features,
 				       take(feature_set_for_feature(NULL,
 								    OPTIONAL_FEATURE(OPT_SEQ_SYMMETRIC_FACTORY))));
+			if (ld->dev_symmetric_clock)
+				feature_set_or(ld->our_features,
+					       take(feature_set_for_feature(NULL,
+									    OPTIONAL_FEATURE(OPT_SEQ_SYMMETRIC_CLOCK))));
 		} else
 			log_unusual(ld->log, "--symmetric-channels:"
 				    " not offered on %s, only on the"

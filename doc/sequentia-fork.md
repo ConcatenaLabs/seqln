@@ -686,17 +686,30 @@ the issuing input (`sym_marker_id`), into a seed output beside the usual 2-of-2 
   before it. No update can spend it, and it pays only beside the marker, whose one lock-time-0
   path is SETTLE.
 
-The scripts cannot see the funding's issuance, so the accepter must check that the funding
-issued exactly one atom, with no reissuance token, into the seed: a spare atom would take the
-clock. The block proof of every refusal is in the hand-back's evidence; the vectors are
-`common/test/sym_m_vectors.h`.
+The vectors are `common/test/sym_m_vectors.h`, made with the Sequentia node's test framework from
+builders spent on a Sequentia chain.
+
+**The settle clock's funding.** The opener names the funding input that issues the marker in
+`open_channel` (TLV `sym_issuer`, 48045), so the accepter knows the marker its kickoff signature
+commits to. The scripts cannot see the issuance, and a spare atom would take the clock, so both
+sides check that the funding issues one explicit atom with a null token count and pays it to the
+seed (`sym_clock_check_funding`). The opener's `fundchannel_complete` refuses a funding that does
+not. The accepter, which puts nothing into the channel, checks the funding once it is mined and
+forgets the channel before it locks in if it does not, so a settle-clock channel is never
+zero-conf and waits at least one block. `fundchannel_start` takes the issuer as `sym_issuer` and
+answers with the seed's script and the marker; **multifundchannel** gives each settle-clock
+channel an input of the funding of its own. The channel keeps its issuer and its seed's output
+(`lightningd/sym_clock.h`, table `channel_sym_clock`). The clock is offered with
+`--dev-symmetric-clock`; a settle-clock channel's kickoff, states and close are those of the base
+type, and only its funding differs.
 
 **Developers.** `dev-sym-snapshot id` freezes the best state a node holds; its next unilateral
 close then publishes that one as though it held nothing newer, which is how the tests make a
 stale state.
 
 Files: `common/sym_scripts.{c,h}`, `common/sym_state.{c,h}`, `common/sym_channel.{c,h}`,
-`channeld/sym_channeld.{c,h}`, `lightningd/symmetric.{c,h}`, and the symmetric branches of
+`channeld/sym_channeld.{c,h}`, `lightningd/symmetric.{c,h}`, `lightningd/sym_clock.{c,h}`,
+and the symmetric branches of
 `openingd/openingd.c`, `channeld/channeld.c`, `channeld/full_channel.c`,
 `common/initial_channel.c`, `onchaind/onchaind.c`, `lightningd/onchain_control.c`,
 `lightningd/opening_control.c`, `lightningd/peer_htlcs.c`, `lightningd/peer_control.c`,
@@ -704,8 +717,8 @@ Files: `common/sym_scripts.{c,h}`, `common/sym_state.{c,h}`, `common/sym_channel
 scripts, trees, messages, signatures and the kickoff's signature hash against vectors from the
 Sequentia node's test framework, whose builders were spent on a Sequentia chain with each
 negative case (an older update over a newer one, a settle before its delay, a settlement moved
-by one atom, a 33-byte key) forced into a block; `tests/sequentia/test_symmetric.py` (section
-10).
+by one atom, a 33-byte key) forced into a block, and every way a settle-clock funding can be
+wrong; `tests/sequentia/test_symmetric.py` and `test_symmetric_clock.py` (section 10).
 
 ## 5f. Factory channels (`option_seq_symmetric_factory`)
 
@@ -1206,7 +1219,11 @@ offline, `speculad` holding only its store replacing the stale state by the late
 it after the delay, each with a fee coin from its own wallet in another asset; and a keyless
 node whose device signs the kickoff, every state, the revocations, the funding and each stage's
 fee coins of a unilateral close, and, holding an HTLC it received, its claim by the SUCCESS leaf,
-refusing nothing (`test_symmetric.py`), and factory channels (section 5f): one output opening
+refusing nothing (`test_symmetric.py`), and its settle clock: a funding whose issuer input
+issues one atom of the marker, no token, into the seed, which the accepter checks once mined
+before the channel opens and is paid both ways, and a funding issuing two atoms, which the
+accepter refuses, forgetting the channel before it locks in (`test_symmetric_clock.py`), and
+factory channels (section 5f): one output opening
 four channels, two of them paid both ways while the other two members are offline, one member's
 unilateral exit (the split, its state over its KO, the settlement, each with a fee coin in
 another asset) while the other three channels stay open on their KOs and are paid again, the

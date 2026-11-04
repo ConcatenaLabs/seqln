@@ -2076,14 +2076,18 @@
             "FundChannel_Start.id": 1,
             "FundChannel_Start.mindepth": 7,
             "FundChannel_Start.push_msat": 6,
-            "FundChannel_Start.reserve": 8
+            "FundChannel_Start.reserve": 8,
+            "FundChannel_Start.sym_issuer": 14
         },
         "FundchannelStartResponse": {
             "FundChannel_Start.channel_type": 3,
             "FundChannel_Start.close_to": 4,
+            "FundChannel_Start.dev_sym_marker_atoms": 7,
             "FundChannel_Start.funding_address": 1,
             "FundChannel_Start.mindepth": 6,
             "FundChannel_Start.scriptpubkey": 2,
+            "FundChannel_Start.sym_marker": 8,
+            "FundChannel_Start.sym_seed_scriptpubkey": 9,
             "FundChannel_Start.warning_usage": 5
         },
         "FunderupdateRequest": {
@@ -8418,6 +8422,10 @@
             "added": "pre-v0.10.1",
             "deprecated": null
         },
+        "FundChannel_Start.dev_sym_marker_atoms": {
+            "added": "v26.06",
+            "deprecated": null
+        },
         "FundChannel_Start.factory_nonce": {
             "added": "v26.06",
             "deprecated": null
@@ -8456,6 +8464,18 @@
         },
         "FundChannel_Start.scriptpubkey": {
             "added": "pre-v0.10.1",
+            "deprecated": null
+        },
+        "FundChannel_Start.sym_issuer": {
+            "added": "v26.06",
+            "deprecated": null
+        },
+        "FundChannel_Start.sym_marker": {
+            "added": "v26.06",
+            "deprecated": null
+        },
+        "FundChannel_Start.sym_seed_scriptpubkey": {
+            "added": "v26.06",
             "deprecated": null
         },
         "FundChannel_Start.warning_usage": {

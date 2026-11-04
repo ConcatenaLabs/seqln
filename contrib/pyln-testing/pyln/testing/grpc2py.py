@@ -1605,9 +1605,12 @@ def fundchannel_start_channel_type2py(m):
 def fundchannel_start2py(m):
     return remove_default({
         "close_to": hexlify(m.close_to),  # PrimitiveField in generate_composite
+        "dev_sym_marker_atoms": m.dev_sym_marker_atoms,  # PrimitiveField in generate_composite
         "funding_address": m.funding_address,  # PrimitiveField in generate_composite
         "mindepth": m.mindepth,  # PrimitiveField in generate_composite
         "scriptpubkey": hexlify(m.scriptpubkey),  # PrimitiveField in generate_composite
+        "sym_marker": hexlify(m.sym_marker),  # PrimitiveField in generate_composite
+        "sym_seed_scriptpubkey": hexlify(m.sym_seed_scriptpubkey),  # PrimitiveField in generate_composite
         "warning_usage": m.warning_usage,  # PrimitiveField in generate_composite
     })
 

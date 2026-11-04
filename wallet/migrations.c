@@ -1173,6 +1173,17 @@ static const struct db_migration dbmigrations[] = {
 	 ", PRIMARY KEY (channel_id)"
 	 ");"), NULL,
      SQL("DROP TABLE channel_sym_factory"), NULL},
+    /* Settle-clock channels (lightningd/sym_clock.h): the funding input
+     * that issues the marker, and the seed's output in the funding once
+     * the funding was checked. */
+    {SQL("CREATE TABLE channel_sym_clock ("
+	 "  channel_id BIGINT REFERENCES channels(id) ON DELETE CASCADE"
+	 ", issuer_txid BLOB"
+	 ", issuer_outnum INTEGER"
+	 ", seed_outnum INTEGER"
+	 ", PRIMARY KEY (channel_id)"
+	 ");"), NULL,
+     SQL("DROP TABLE channel_sym_clock"), NULL},
 };
 
 const struct db_migration *get_db_migrations(size_t *num)

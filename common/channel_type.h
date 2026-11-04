@@ -13,6 +13,8 @@ struct channel_type *channel_type_seq_taproot_covenant(const tal_t *ctx);
 /* SEQUENTIA: the symmetric type, no penalty (common/sym_scripts.h) */
 struct channel_type *channel_type_seq_symmetric(const tal_t *ctx);
 struct channel_type *channel_type_seq_symmetric_factory(const tal_t *ctx);
+/* SEQUENTIA: the same with its settle clock (common/sym_scripts.h) */
+struct channel_type *channel_type_seq_symmetric_clock(const tal_t *ctx);
 struct channel_type *channel_type_seq_credit(const tal_t *ctx);
 
 /* channel_type variants */

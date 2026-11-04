@@ -2176,9 +2176,12 @@ impl From<responses::FundchannelStartResponse> for pb::FundchannelStartResponse 
         Self {
             channel_type: c.channel_type.map(|v| v.into()),
             close_to: c.close_to.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
+            dev_sym_marker_atoms: c.dev_sym_marker_atoms, // Rule #2 for type u32?
             funding_address: c.funding_address, // Rule #2 for type string
             mindepth: c.mindepth, // Rule #2 for type u32?
             scriptpubkey: hex::decode(&c.scriptpubkey).unwrap(), // Rule #2 for type hex
+            sym_marker: c.sym_marker.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
+            sym_seed_scriptpubkey: c.sym_seed_scriptpubkey.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
             warning_usage: c.warning_usage, // Rule #2 for type string
         }
     }
@@ -6206,6 +6209,7 @@ impl From<requests::FundchannelStartRequest> for pb::FundchannelStartRequest {
             mindepth: c.mindepth, // Rule #2 for type u32?
             push_msat: c.push_msat.map(|f| f.into()), // Rule #2 for type msat?
             reserve: c.reserve.map(|f| f.into()), // Rule #2 for type sat?
+            sym_issuer: c.sym_issuer.map(|o|o.into()), // Rule #2 for type outpoint?
         }
     }
 }
@@ -8317,6 +8321,7 @@ impl From<pb::FundchannelStartRequest> for requests::FundchannelStartRequest {
             mindepth: c.mindepth, // Rule #1 for type u32?
             push_msat: c.push_msat.map(|a| a.into()), // Rule #1 for type msat?
             reserve: c.reserve.map(|a| a.into()), // Rule #1 for type sat?
+            sym_issuer: c.sym_issuer.map(|a| a.into()), // Rule #1 for type outpoint?
         }
     }
 }

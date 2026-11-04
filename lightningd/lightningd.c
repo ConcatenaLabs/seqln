@@ -142,6 +142,8 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	ld->dev_disable_commit = -1;
 	ld->dev_no_ping_timer = false;
 	ld->dev_any_channel_type = false;
+	ld->dev_symmetric_clock = false;
+	ld->dev_symmetric_clock_bad_funding = false;
 	ld->dev_allow_shutdown_destination_change = false;
 	ld->dev_hsmd_no_preapprove_check = false;
 	ld->dev_hsmd_fail_preapprove = false;

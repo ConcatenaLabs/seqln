@@ -89,6 +89,15 @@ struct funding_channel {
 	/* The scriptpubkey to pay (once started) */
 	u8 *funding_scriptpubkey;
 
+	/* SEQUENTIA: a settle-clock channel (lightningd/sym_clock.h): the
+	 * funding input that issues its marker, the seed openingd answered
+	 * with, and the seed's output once fundchannel_complete checked the
+	 * funding. */
+	struct bitcoin_outpoint *sym_issuer;
+	u8 *sym_seed_scriptpubkey;
+	bool sym_seed_checked;
+	u32 sym_seed_outnum;
+
 	/* The asset this channel is denominated in (33-byte version+tag);
 	 * the policy asset for an ordinary channel. Asset-aware channels. */
 	u8 channel_asset[33];

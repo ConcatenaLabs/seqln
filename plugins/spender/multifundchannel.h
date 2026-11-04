@@ -120,6 +120,14 @@ struct multifundchannel_destination {
 	/* SEQUENTIA: in a factory, this destination's slot. */
 	unsigned int factory_slot;
 
+	/* SEQUENTIA: a settle-clock channel (lightningd/sym_clock.h): the
+	 * funding input that issues its marker, and from fundchannel_start
+	 * the seed, the marker's asset tag and the atoms to issue. */
+	struct bitcoin_outpoint *sym_issuer;
+	const u8 *sym_seed_script;
+	u8 sym_marker_tag[33];
+	u32 sym_marker_atoms;
+
 	/* whether the channel to this destination will
 	be announced.
 	*/

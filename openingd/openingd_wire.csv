@@ -114,6 +114,9 @@ msgdata,openingd_funder_start,channel_asset,byte,33
 # SEQUENTIA: a factory channel's id, (nonce, slot) (common/sym_factory.h):
 # the funding script it answers with is then the channel's KO.
 msgdata,openingd_funder_start,factory_id,?bitcoin_outpoint,
+# SEQUENTIA: a settle-clock channel's issuer (common/sym_scripts.h): the
+# funding input whose issuance makes its marker.
+msgdata,openingd_funder_start,sym_issuer,?bitcoin_outpoint,
 
 # openingd->master: send back output script for 2-of-2 funding output
 msgtype,openingd_funder_start_reply,6102
@@ -121,6 +124,10 @@ msgdata,openingd_funder_start_reply,script_len,u8,
 msgdata,openingd_funder_start_reply,scriptpubkey,u8,script_len
 msgdata,openingd_funder_start_reply,upfront_shutdown_negotiated,bool,
 msgdata,openingd_funder_start_reply,channel_type,channel_type,
+# SEQUENTIA: a settle-clock channel's seed, which the funding pays the marker;
+# empty for any other channel.
+msgdata,openingd_funder_start_reply,sym_seed_len,u16,
+msgdata,openingd_funder_start_reply,sym_seed_scriptpubkey,u8,sym_seed_len
 
 # master->openingd: complete channel establishment for a funding
 # tx that will be paid for by an external wallet
@@ -174,6 +181,8 @@ msgdata,openingd_fundee,sym_local,?sym_state,
 msgdata,openingd_fundee,sym_remote,?sym_state,
 # SEQUENTIA: a factory channel's factory, as the peer sent it and we checked.
 msgdata,openingd_fundee,factory,?sym_factory,
+# SEQUENTIA: a settle-clock channel's issuer, as the peer sent it.
+msgdata,openingd_fundee,sym_issuer,?bitcoin_outpoint,
 
 # master -> openingd: do you have a memleak?
 msgtype,openingd_dev_memleak,6033

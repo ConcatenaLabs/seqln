@@ -2,16 +2,22 @@ SEQUENTIA: the fork's own wire fields (doc/sequentia-fork.md), applied after
 the BOLTs' own and upstream's patches so check-wire-format keeps them.
 --- wire/peer_wire.csv
 +++ -
-@@ -123,6 +123,8 @@ tlvtype,open_channel_tlvs,upfront_shutdown_script,0
+@@ -123,6 +123,14 @@ tlvtype,open_channel_tlvs,upfront_shutdown_script,0
  tlvdata,open_channel_tlvs,upfront_shutdown_script,shutdown_scriptpubkey,byte,...
  tlvtype,open_channel_tlvs,channel_type,1
  tlvdata,open_channel_tlvs,channel_type,type,byte,...
 +tlvtype,open_channel_tlvs,asset_id,3
 +tlvdata,open_channel_tlvs,asset_id,asset,byte,...
++# SEQUENTIA: on a symmetric channel with the settle clock
++# (common/sym_scripts.h), the opener's input whose issuance in the
++# funding transaction makes the channel's marker.
++tlvtype,open_channel_tlvs,sym_issuer,48045
++tlvdata,open_channel_tlvs,sym_issuer,txid,sha256,
++tlvdata,open_channel_tlvs,sym_issuer,outnum,u32,
  msgtype,accept_channel,33
  msgdata,accept_channel,temporary_channel_id,byte,32
  msgdata,accept_channel,dust_limit_satoshis,u64,
-@@ -148,9 +150,25 @@ msgdata,funding_created,temporary_channel_id,byte,32
+@@ -148,9 +156,25 @@ msgdata,funding_created,temporary_channel_id,byte,32
  msgdata,funding_created,funding_txid,sha256,
  msgdata,funding_created,funding_output_index,u16,
  msgdata,funding_created,signature,signature,
@@ -37,7 +43,7 @@ the BOLTs' own and upstream's patches so check-wire-format keeps them.
  msgtype,channel_ready,36
  msgdata,channel_ready,channel_id,channel_id,
  msgdata,channel_ready,second_per_commitment_point,point,
-@@ -282,6 +300,8 @@ msgdata,update_add_htlc,cltv_expiry,u32,
+@@ -282,6 +306,8 @@ msgdata,update_add_htlc,cltv_expiry,u32,
  msgdata,update_add_htlc,onion_routing_packet,byte,1366
  tlvtype,update_add_htlc_tlvs,blinded_path,0
  tlvdata,update_add_htlc_tlvs,blinded_path,path_key,point,
@@ -46,7 +52,7 @@ the BOLTs' own and upstream's patches so check-wire-format keeps them.
  msgtype,update_fulfill_htlc,130
  msgdata,update_fulfill_htlc,channel_id,channel_id,
  msgdata,update_fulfill_htlc,id,u64,
-@@ -310,10 +330,21 @@ msgdata,commitment_signed,htlc_signature,signature,num_htlcs
+@@ -310,10 +336,21 @@ msgdata,commitment_signed,htlc_signature,signature,num_htlcs
  msgdata,commitment_signed,splice_channel_id,commitment_signed_tlvs,
  tlvtype,commitment_signed_tlvs,splice_info,1
  tlvdata,commitment_signed_tlvs,splice_info,funding_txid,sha256,

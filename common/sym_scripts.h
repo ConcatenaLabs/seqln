@@ -186,6 +186,31 @@ u8 *sym_leaf_retire(const tal_t *ctx, const struct sym_channel *sc);
 u8 *sym_seed_spk(const tal_t *ctx, const struct sym_channel *sc,
 		 u8 **kick_cb, u8 **retire_cb);
 
+/* The seed a settle-clock channel's funding pays the marker @issuer makes:
+ * that of @sc's constants (its clock not yet set), the funding output's
+ * 2-of-2 @funding_wscript and @capacity.  It does not depend on the funding
+ * outpoint, so the opener knows it before the funding exists. */
+u8 *sym_clock_seed(const tal_t *ctx, const struct sym_channel *sc,
+		   const struct bitcoin_outpoint *issuer,
+		   const u8 *funding_wscript, struct amount_sat capacity);
+
+/* The check of a settle-clock channel's funding transaction: the opener
+ * makes it before it signs the funding, the accepter when the funding is
+ * mined, before the channel locks in.  @tx is @funding's transaction, whose
+ * output there pays @funding_spk the capacity in @asset; the input spending
+ * @issuer is a new issuance (zero blinding nonce, zero contract hash) of one
+ * explicit atom with a null token count; and exactly one output holds that
+ * marker in the clear: one explicit atom paying @seed_spk.  With one atom
+ * and no token, nothing but that output can ever hold the marker.  NULL and
+ * the seed's output number, or why not. */
+const char *sym_clock_check_funding(const tal_t *ctx,
+				    const struct bitcoin_tx *tx,
+				    const struct bitcoin_outpoint *funding,
+				    const u8 *funding_spk, const u8 asset[33],
+				    struct amount_sat capacity,
+				    const struct bitcoin_outpoint *issuer,
+				    const u8 *seed_spk, u32 *seed_outnum);
+
 /* The floor every settle-clock update's lock time must reach. */
 #define SYM_CLOCK_LOCKTIME_FLOOR 500000001
 
