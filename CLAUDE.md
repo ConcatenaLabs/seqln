@@ -90,11 +90,11 @@ ELEMCLI=/path/to/sequentia-cli python3 tests/sequentia/verify_block_parse.py
 
 The device signer has its own workspace: `cargo test` in `contrib/seqln-signer/`.
 
-**The GitHub workflows are unmodified upstream CLN CI. Nothing in CI builds or tests anything
-Sequentia-specific.** Whatever you do not run locally is not run at all.
-
-`tests/plugins/channeld_fakenet` and `wallet/test/run-wallet` are known broken on a clean tree
-(pre-existing drift). Do not treat their failure as something you caused.
+**CI (`.github/workflows/ci.yaml`) is upstream CLN's workflow.** It runs on every pull request,
+on every push to `sequentia-stable`, and by hand on any branch
+(`gh workflow run ci.yaml --ref <branch>`). Its integration tests run on Bitcoin regtest, so
+nothing in CI tests anything Sequentia-specific: whatever you do not run locally is not run at
+all.
 
 ## One binary, not two
 
