@@ -8,7 +8,7 @@ from pyln.testing.utils import EXPERIMENTAL_DUAL_FUND, FUNDAMOUNT, scid_to_int, 
 from utils import (
     wait_for, only_one, sync_blockheight, TIMEOUT,
     mine_funding_to_announce, first_scid, serialize_payload_tlv, serialize_payload_final_tlv,
-    tu64_encode
+    tu64_encode, pay_refusal
 )
 import copy
 import os
@@ -168,7 +168,7 @@ def test_pay_exclude_node(node_factory, bitcoind):
 
     inv = l3.rpc.invoice(amount, "test1", 'description')['bolt11']
     # It should have eliminated route hint.
-    with pytest.raises(RpcError, match=r"Failed after 1 attempts. We got a weird error \(temporary_node_failure\) for the invoice's route hint \([0-9x]*/0\): disabling it for this payment. Then routing failed: We could not find a usable set of paths. All 1 channels to the destination are disabled."):
+    with pytest.raises(RpcError, match=pay_refusal(r"Failed after 1 attempts. We got a weird error \(temporary_node_failure\) for the invoice's route hint \([0-9x]*/0\): disabling it for this payment. Then routing failed: We could not find a usable set of paths. All 1 channels to the destination are disabled.")):
         l1.rpc.pay(inv)
 
     # Get a fresh invoice, but do it before other routes exist, so routehint
@@ -1854,7 +1854,7 @@ def test_pay_retry(node_factory, bitcoind, executor, chainparams):
     # It will try l1->l2->l3->l4->l5, which fails.
     # Finally, fails to find a route.
     inv = l5.rpc.invoice(10**8, 'test_retry2', 'test_retry2')['bolt11']
-    with pytest.raises(RpcError, match=r'Failed after [0-9]* attempts'):
+    with pytest.raises(RpcError, match=pay_refusal(r'Failed after [0-9]* attempts')):
         l1.dev_pay(inv, dev_use_shadow=False)
 
 
@@ -2325,7 +2325,7 @@ def test_setchannel_routing(node_factory, bitcoind):
                          label='test_setchannel_1',
                          description='desc',
                          dev_routes=[])
-    with pytest.raises(RpcError, match=f'The shortest path is [0-9x]*->{scid}, but {scid}/0 exceeds htlc_maximum_msat ~4001792msat'):
+    with pytest.raises(RpcError, match=pay_refusal(f'The shortest path is [0-9x]*->{scid}, but {scid}/0 exceeds htlc_maximum_msat ~4001792msat')):
         l1.dev_pay(inv['bolt11'], dev_use_shadow=False)
 
     # 1337 + 4000000 * 137 / 1000000 = 1885
@@ -3444,7 +3444,7 @@ def test_excluded_adjacent_routehint(node_factory, bitcoind):
     wait_for(lambda: 'remote' in only_one(l1.rpc.listpeerchannels()['channels'])['updates'])
 
     # This will make it reject the routehint.
-    err = 'Failed: Could not find route without excessive cost'
+    err = pay_refusal('Failed: Could not find route without excessive cost')
     with pytest.raises(RpcError, match=err):
         l1.rpc.pay(bolt11=inv['bolt11'], maxfeepercent=0, exemptfee=0)
 

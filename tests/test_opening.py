@@ -1695,7 +1695,10 @@ def test_zeroconf_public(bitcoind, node_factory, chainparams):
     assert('short_channel_id' not in l2chan)
 
     # Channel is "proposed"
-    chan_val = 993888000 if chainparams['elements'] else 970073000
+    # (Sequentia rounds a fee up, common/amount.c amount_tx_fee: one sat less.)
+    chan_val = (970073000 if not chainparams['elements']
+                else 993887000 if TEST_NETWORK in SEQUENTIA_NETWORKS
+                else 993888000)
     l1_mvts = [
         {'type': 'chain_mvt', 'credit_msat': chan_val, 'debit_msat': 0, 'tags': ['channel_proposed', 'opener']},
         {'type': 'channel_mvt', 'credit_msat': 0, 'debit_msat': 20000000, 'tags': ['pushed'], 'fees_msat': '0msat'},
