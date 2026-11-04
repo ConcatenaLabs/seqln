@@ -25,6 +25,7 @@
 #include <channeld/watchtower.h>
 #include <common/billboard.h>
 #include <common/ecdh_hsmd.h>
+#include <common/hsm_capable.h>
 #include <common/interactivetx.h>
 #include <common/key_derive.h>
 #include <common/memleak.h>
@@ -6812,6 +6813,32 @@ static void handle_funding_depth(struct peer *peer, const u8 *msg)
 	billboard_update(peer);
 }
 
+/* SEQUENTIA: the signer's approval of a swap before we commit to it: we
+ * give @give in lane @give_lane and take @take in lane @take_lane.  A signer
+ * that holds a balance signs the state that moves the two lanes only for a
+ * swap it approved.  NULL if approved. */
+static const char *sym_swap_approved(struct peer *peer,
+				     u16 give_lane, struct amount_msat give,
+				     u16 take_lane, struct amount_msat take)
+{
+	const u8 *msg;
+	bool approved;
+
+	if (!hsm_is_capable(peer->hsm_capabilities, WIRE_HSMD_APPROVE_SYM_SWAP))
+		return NULL;
+	msg = towire_hsmd_approve_sym_swap(NULL,
+					   sym_lane_asset(peer->channel, give_lane),
+					   give,
+					   sym_lane_asset(peer->channel, take_lane),
+					   take);
+	msg = hsm_req(tmpctx, take(msg));
+	if (!fromwire_hsmd_approve_sym_swap_reply(msg, &approved))
+		status_failed(STATUS_FAIL_HSM_IO,
+			      "Bad approve_sym_swap reply %s",
+			      tal_hex(tmpctx, msg));
+	return approved ? NULL : "the signing device refused the swap";
+}
+
 /* SEQUENTIA: we ask the peer for a swap (common/sym_lanes.h): @swap is the
  * swap as it will send it, which we then take in its commitment. */
 static void handle_sym_swap_request(struct peer *peer, const u8 *inmsg)
@@ -6829,6 +6856,10 @@ static void handle_sym_swap_request(struct peer *peer, const u8 *inmsg)
 		err = "a swap we asked for is outstanding";
 	else
 		err = channel_sym_swap_check(tmpctx, peer->channel, &swap);
+	/* As we see it: we give what it takes. */
+	if (!err)
+		err = sym_swap_approved(peer, swap.take_lane, swap.take,
+					swap.give_lane, swap.give);
 	if (!err) {
 		peer->channel->sym_swap_req = tal_dup(peer->channel,
 						      struct sym_swap, &swap);
@@ -6863,6 +6894,10 @@ static void handle_sym_swap_accept(struct peer *peer, const u8 *inmsg)
 		err = "we asked for a swap ourselves";
 	else
 		err = channel_sym_swap_check(tmpctx, peer->channel, &swap);
+	/* Ours to send: we give its give. */
+	if (!err)
+		err = sym_swap_approved(peer, swap.give_lane, swap.give,
+					swap.take_lane, swap.take);
 	if (!err) {
 		channel_sym_swap_add(peer->channel, &swap);
 		start_commit_timer(peer);

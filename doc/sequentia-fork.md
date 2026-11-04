@@ -864,10 +864,14 @@ other lanes' funding outputs is the close's, not a lane kicked off: nothing is k
 onchaind takes it as a mutual close (each side's script matched once per asset).
 
 **Signer.** `hsmd_sign_sym_lanes_state` names the channel's lanes, each asset and funding value,
-and signs a state only if each lane's outputs add up to that lane's whole value and no output is
-in an asset outside the lanes; `hsmd_sign_sym_state` refuses a state that names an asset.
-`hsmd_sign_mutual_close_lanes_tx` signs every input of the mutual close with the funding key, and
-`hsmd_sign_commitment_tx` takes a close of several inputs, signing input 0.
+and each HTLC's lane, and signs a state only if each lane's outputs add up to that lane's whole
+value and no output is in an asset outside the lanes; `hsmd_sign_sym_state` refuses a state that
+names an asset. Before channeld asks for a swap or takes one, it sends the signer
+`hsmd_approve_sym_swap` (what this side gives and takes, each asset and amount), and refuses the
+swap if the signer does. `hsmd_sign_mutual_close_lanes_tx` signs every input of the mutual close
+with the funding key, and `hsmd_sign_commitment_tx` takes a close of several inputs, signing input
+0. lightningd offers the type only to a signer that has all three. The device signer holds every
+lane to the payments and swaps it approved (`contrib/seqln-signer/README.md`).
 
 Files: `common/sym_lanes.{c,h}`, `lightningd/sym_lanes.{c,h}`, and the lanes branches of
 `channeld/full_channel.c` (a balance per lane per view, the swap as a pending change),

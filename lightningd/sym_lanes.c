@@ -10,7 +10,6 @@
 #include <common/json_param.h>
 #include <common/json_stream.h>
 #include <common/pseudorand.h>
-#include <common/sym_lanes.h>
 #include <common/sym_scripts.h>
 #include <connectd/connectd_wiregen.h>
 #include <lightningd/chaintopology.h>

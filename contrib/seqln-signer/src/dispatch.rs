@@ -46,7 +46,7 @@ const SWEEP_KEY_SCAN: u32 = 5000;
 /// The capabilities array from `hsmd_init()`, in the exact order libhsmd emits
 /// it, followed by the two preapprove-check caps (`dev_no_preapprove_check` is
 /// false in a normal, non-dev node).
-const CAPABILITIES: [u32; 21] = [
+const CAPABILITIES: [u32; 24] = [
     28,  // WIRE_HSMD_CHECK_PUBKEY
     56,  // WIRE_HSMD_CHECK_BIP86_PUBKEY
     142, // WIRE_HSMD_SIGN_ANY_DELAYED_PAYMENT_TO_US
@@ -66,6 +66,9 @@ const CAPABILITIES: [u32; 21] = [
     69,  // WIRE_HSMD_SIGN_SYM_KICKOFF
     70,  // WIRE_HSMD_SIGN_SYM_STATE
     71,  // WIRE_HSMD_SIGN_SYM_HTLC
+    75,  // WIRE_HSMD_SIGN_SYM_LANES_STATE
+    77,  // WIRE_HSMD_SIGN_MUTUAL_CLOSE_LANES_TX
+    76,  // WIRE_HSMD_APPROVE_SYM_SWAP
     51,  // WIRE_HSMD_PREAPPROVE_INVOICE_CHECK
     52,  // WIRE_HSMD_PREAPPROVE_KEYSEND_CHECK
 ];
@@ -125,6 +128,10 @@ pub struct Signer {
     /// (`approve_close_destination`): a close may pay this side's balance to
     /// one of them as to the node's own wallet. Not persisted.
     close_destinations: std::collections::HashSet<Vec<u8>>,
+    /// The swaps this device approved on channels of several assets
+    /// (APPROVE_SYM_SWAP), each until a state of each side has applied it.
+    /// Not persisted: a swap pending across a restart is refused.
+    swaps: Vec<SwapApproval>,
     /// The chain's genesis hash, from INIT: an Elements taproot signature
     /// hash commits to it.
     genesis: Option<[u8; 32]>,
@@ -179,6 +186,7 @@ impl Signer {
             refusal: std::cell::RefCell::new(None),
             charged_withdrawals: std::collections::HashSet::new(),
             close_destinations: std::collections::HashSet::new(),
+            swaps: Vec::new(),
             genesis: None,
             tcov_claims: std::cell::RefCell::new(std::collections::VecDeque::new()),
         }
@@ -301,6 +309,9 @@ impl Signer {
             msg::HSMD_SIGN_SYM_KICKOFF => self.sign_sym_kickoff_checked(req),
             msg::HSMD_SIGN_SYM_STATE => self.sign_sym_state_checked(req),
             msg::HSMD_SIGN_SYM_HTLC => opt(self.h_sign_sym_htlc(&req.hsmd_msg)),
+            msg::HSMD_SIGN_SYM_LANES_STATE => self.sign_sym_lanes_state_checked(req),
+            msg::HSMD_APPROVE_SYM_SWAP => self.approve_sym_swap(req),
+            msg::HSMD_SIGN_MUTUAL_CLOSE_LANES_TX => self.sign_mutual_close_lanes_checked(req),
             msg::HSMD_SIGN_MUTUAL_CLOSE_TX => self.sign_mutual_close_tx_checked(req),
             msg::HSMD_SIGN_REMOTE_HTLC_TX => opt(self.h_sign_remote_htlc_tx(req)),
             msg::HSMD_SIGN_ANY_LOCAL_HTLC_TX => opt(self.h_sign_any_local_htlc_tx(&req.hsmd_msg)),
@@ -1334,8 +1345,14 @@ impl Signer {
         }
         if !policy::is_commitment_shaped(&bt.tx) {
             let own_close = self.own_close_script(st);
-            policy::validate_mutual_close(
-                st, self.own_sweep_script_set(), own_close.as_deref(), &self.close_destinations, &bt.tx)?;
+            if bt.tx.inputs.len() > 1 {
+                // The mutual close of a channel of several assets.
+                policy::validate_lanes_close(
+                    st, self.own_sweep_script_set(), own_close.as_deref(), &self.close_destinations, &bt.tx)?;
+            } else {
+                policy::validate_mutual_close(
+                    st, self.own_sweep_script_set(), own_close.as_deref(), &self.close_destinations, &bt.tx)?;
+            }
             return self.paid_fee_within_limit(st, &bt.tx, Self::close_fee(st, &bt.tx), "the close's fee");
         }
         let n = policy::commitment_number(self.kernel(), &peer_id, dbid, st, &bt.tx)
@@ -2026,8 +2043,10 @@ impl Signer {
             return Outcome::Reject(format!("SIGN_SYM_KICKOFF refused: {reason}"));
         }
         if self.policy.is_enforce() {
-            if let Err(reason) = self.check_sym_kickoff(req) {
-                return Outcome::Reject(format!("SIGN_SYM_KICKOFF refused: {reason}"));
+            match self.check_sym_kickoff(req) {
+                Err(reason) => return Outcome::Reject(format!("SIGN_SYM_KICKOFF refused: {reason}")),
+                Ok(Some((outnum, asset, sats))) => self.pin_lane(&req.node_id, req.dbid, asset, sats, Some(outnum)),
+                Ok(None) => {}
             }
         }
         let mut r = wire::Reader::new(&req.hsmd_msg);
@@ -2043,7 +2062,9 @@ impl Signer {
         opt(reply)
     }
 
-    fn check_sym_kickoff(&self, req: &Request) -> Result<(), String> {
+    /// Checks a kickoff; Ok(Some(lane)) for another lane's, to record
+    /// (its output index, asset, value).
+    fn check_sym_kickoff(&self, req: &Request) -> Result<Option<(u32, [u8; 33], u64)>, String> {
         let st = self
             .store
             .get(&req.node_id, req.dbid)
@@ -2062,33 +2083,62 @@ impl Signer {
             return Err(format!("a kickoff spends the funding output alone, not {} inputs", bt.tx.inputs.len()));
         }
         let i = &bt.tx.inputs[0];
-        if i.txhash != st.funding_txid || i.index != st.funding_txout as u32 || i.is_issuance {
-            return Err("its input is not the channel's funding output".to_string());
-        }
         let o = bt.tx.outputs.first().ok_or("it has no output")?;
         let asset: [u8; 33] = o.asset.as_slice().try_into().map_err(|_| "output 0's asset is not explicit")?;
         if asset[0] != 0x01 {
             return Err("output 0's asset is not explicit".to_string());
-        }
-        if let Some(chan) = st.pay.asset {
-            if explicit_asset(&asset) != Some(chan) {
-                return Err(format!("output 0 is not in the channel's asset {}", chan.display()));
-            }
         }
         if let Some(funding_asset) = wire::psbt_input_asset(&bt.psbt, 0) {
             if funding_asset != o.asset {
                 return Err("output 0 is not in the funding output's asset".to_string());
             }
         }
-        if explicit_amount(&o.value) != Some(st.funding_sats) {
-            return Err(format!("output 0 does not carry the funding's {} atoms", st.funding_sats));
+        let mut lane = None;
+        if i.txhash == st.funding_txid && i.index != st.funding_txout as u32 && !i.is_issuance {
+            // Another lane of a channel of several assets: another output of
+            // the funding transaction, to the same 2-of-2 (its witness script
+            // is this channel's), kicked off alone to the same KO, in its
+            // own asset for its whole value. Its signature binds that value
+            // (BIP143); the lane is recorded for every later state and close.
+            let v = explicit_amount(&o.value).ok_or("output 0's value is not explicit")?;
+            if st.pay.asset.is_some() && explicit_asset(&asset) == st.pay.asset {
+                return Err("another lane in the channel's own asset".to_string());
+            }
+            match st.lanes.iter().find(|l| l.asset == asset || l.outnum == Some(i.index)) {
+                Some(l) if l.asset != asset || l.sats != v || l.outnum.map_or(false, |n| n != i.index) => {
+                    return Err(format!(
+                        "output {} of the funding is not the lane in {} of {} atoms this device knows",
+                        i.index,
+                        hexbytes(&l.asset),
+                        l.sats
+                    ));
+                }
+                Some(_) => {}
+                None if st.lanes.len() >= policy::MAX_LANES => {
+                    return Err("more lanes than a channel may hold".to_string());
+                }
+                None => {}
+            }
+            lane = Some((i.index, asset, v));
+        } else {
+            if i.txhash != st.funding_txid || i.index != st.funding_txout as u32 || i.is_issuance {
+                return Err("its input is not the channel's funding output".to_string());
+            }
+            if let Some(chan) = st.pay.asset {
+                if explicit_asset(&asset) != Some(chan) {
+                    return Err(format!("output 0 is not in the channel's asset {}", chan.display()));
+                }
+            }
+            if explicit_amount(&o.value) != Some(st.funding_sats) {
+                return Err(format!("output 0 does not carry the funding's {} atoms", st.funding_sats));
+            }
         }
         let ch = self.sym_channel(&req.node_id, req.dbid, st, &asset)?;
         let ko = ch.kickoff_spk(self.kernel().secp()).ok_or("cannot build KO")?;
         if o.script != ko {
             return Err(format!("output 0 pays {}, not this channel's KO", hexbytes(&o.script)));
         }
-        Ok(())
+        Ok(lane)
     }
 
     /// SIGN_SYM_STATE (70): our update signature on a state, over the
@@ -2244,6 +2294,429 @@ impl Signer {
         let mut w = Writer::new(msg::HSMD_SIGN_SYM_STATE_REPLY);
         w.bytes(&sig);
         Some(w.into_vec())
+    }
+
+    // =================================================================
+    // Channels of several assets (`option_seq_symmetric_lanes`)
+    // =================================================================
+
+    /// Record a further lane of a channel the first time a request names it.
+    fn pin_lane(&mut self, peer: &[u8; 33], dbid: u64, asset: [u8; 33], sats: u64, outnum: Option<u32>) {
+        if let Some(st) = self.store.get_mut(peer, dbid) {
+            match st.lanes.iter_mut().find(|l| l.asset == asset) {
+                Some(l) => {
+                    if l.outnum.is_none() && outnum.is_some() {
+                        l.outnum = outnum;
+                        self.store_dirty = true;
+                    }
+                }
+                None => {
+                    if st.lanes.len() < policy::MAX_LANES {
+                        st.lanes.push(policy::Lane { asset, sats, outnum, pay: crate::payments::PayTrack::default() });
+                        self.store_dirty = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// SIGN_SYM_LANES_STATE (75): our update signature on a state of a
+    /// channel of several assets. Each lane's settlement is held to that
+    /// lane as a one-asset channel's is (`sym::check_settlement`), and what
+    /// it leaves this side in each lane to the payments this device
+    /// approved in that lane's asset, and to the swaps it approved
+    /// (APPROVE_SYM_SWAP): a state that gives a lane's asset away with no
+    /// payment or swap of ours to account for it is refused.
+    fn sign_sym_lanes_state_checked(&mut self, req: &Request) -> Outcome {
+        const WHAT: &str = "SIGN_SYM_LANES_STATE refused";
+        if let Some(reason) = self.predating(&req.node_id, req.dbid) {
+            return Outcome::Reject(format!("{WHAT}: {reason}"));
+        }
+        let checked = self.check_sym_lanes_state(req);
+        let mut c = match checked {
+            Ok(c) => c,
+            Err(reason) => {
+                if self.policy.is_enforce() {
+                    return Outcome::Reject(format!("{WHAT}: {reason}"));
+                }
+                return opt(self.h_sign_sym_lanes_state_unchecked(req));
+            }
+        };
+        let mut swap_used = None;
+        if self.policy.is_enforce() {
+            match self.lanes_balance(req, &c) {
+                Err(reason) => return Outcome::Reject(format!("{WHAT}: {reason}")),
+                Ok(s) => swap_used = s,
+            }
+            for (l, plan) in c.plans.iter().enumerate() {
+                let mut p = plan.clone();
+                p.balance = None;
+                if let Err(reason) = self.check_plan(&p) {
+                    return Outcome::Reject(format!("{WHAT}: lane {l}: {reason}"));
+                }
+            }
+        }
+        for (asset, sats) in &c.pin {
+            self.pin_lane(&req.node_id, req.dbid, *asset, *sats, None);
+        }
+        let sk = self.kernel().channel_secrets(&req.node_id, req.dbid).delayed;
+        let sig = taproot::sign(self.kernel().secp(), &c.msg, &sk);
+        if let Some(st) = self.store.get_mut(&req.node_id, req.dbid) {
+            let split = Split { ours: c.paid0, fee: 0, anchors: 0 };
+            if c.local {
+                if c.peer_signed {
+                    if st.validated_through.map_or(true, |v| c.commit_num > v) {
+                        st.validated_through = Some(c.commit_num);
+                    }
+                    if st.local_split.map_or(true, |(m, _)| c.commit_num >= m) {
+                        st.local_split = Some((c.commit_num, split));
+                    }
+                }
+            } else if st.remote_split.map_or(true, |(m, _)| c.commit_num >= m) {
+                st.remote_split = Some((c.commit_num, split));
+            }
+            self.store_dirty = true;
+        }
+        let plans = std::mem::take(&mut c.plans);
+        for (l, plan) in plans.into_iter().enumerate() {
+            if l == 0 {
+                self.apply_plan(&req.node_id, req.dbid, plan);
+                continue;
+            }
+            let charge = (plan.asset, plan.charge_msat);
+            if let Some(st) = self.store.get_mut(&req.node_id, req.dbid) {
+                if let Some(lane) = st.lanes.get_mut(l - 1) {
+                    if lane.pay != plan.track {
+                        lane.pay = plan.track;
+                        self.store_dirty = true;
+                    }
+                }
+            }
+            if self.policy.is_enforce() && charge.1 > 0 {
+                self.store.ledger.prune(self.now, self.limits.period_secs);
+                self.store.ledger.charge(charge.0, charge.1, self.now);
+                self.store_dirty = true;
+            }
+        }
+        if let Some(i) = swap_used {
+            let side = if c.local { 0 } else { 1 };
+            self.swaps[i].used[side] = true;
+            if self.swaps[i].used == [true, true] {
+                self.swaps.remove(i);
+            }
+        }
+        let mut w = Writer::new(msg::HSMD_SIGN_SYM_LANES_STATE_REPLY);
+        w.bytes(&sig);
+        Outcome::Reply(w.into_vec())
+    }
+
+    /// The lanes' balance checks: a lane short of what this device tracks is
+    /// refused, unless it is the leg this side gives of a swap it approved
+    /// whose other leg this state pays it. Ok(Some(i)): swap `i` applied.
+    fn lanes_balance(&self, req: &Request, c: &LanesChecked) -> Result<Option<usize>, String> {
+        let short: Vec<usize> = (0..c.plans.len())
+            .filter(|&l| c.plans[l].balance.map_or(false, |b| b.short > 0))
+            .collect();
+        if short.is_empty() {
+            return Ok(None);
+        }
+        let side = if c.local { 0 } else { 1 };
+        if short.len() == 1 {
+            let g = short[0];
+            let b = c.plans[g].balance.unwrap();
+            for (i, sw) in self.swaps.iter().enumerate() {
+                if sw.peer != req.node_id || sw.dbid != req.dbid || sw.used[side] {
+                    continue;
+                }
+                if sw.give_asset != c.lane_assets[g] {
+                    continue;
+                }
+                // What it gives may round up an atom; what it takes down.
+                if b.short > sw.give_msat / 1000 + 1 {
+                    continue;
+                }
+                let t = match c.lane_assets.iter().position(|a| *a == sw.take_asset) {
+                    Some(t) if t != g => t,
+                    _ => continue,
+                };
+                let tb = match c.plans[t].balance {
+                    Some(tb) => tb,
+                    None => continue,
+                };
+                let before = tb.prev_value.saturating_sub(tb.removed_atoms);
+                if tb.value.saturating_add(1) >= before.saturating_add(sw.take_msat / 1000) {
+                    return Ok(Some(i));
+                }
+            }
+        }
+        let l = short[0];
+        Err(format!(
+            "lane {l} ({}): {}",
+            hexbytes(&c.lane_assets[l]),
+            c.plans[l].balance.and_then(|b| b.refusal()).unwrap_or_default()
+        ))
+    }
+
+    fn check_sym_lanes_state(&self, req: &Request) -> Result<LanesChecked, String> {
+        let st = self
+            .store
+            .get(&req.node_id, req.dbid)
+            .ok_or_else(|| self.untracked(&req.node_id, req.dbid))?;
+        if !st.option_sym {
+            return Err("the channel is not a symmetric channel".to_string());
+        }
+        let q = parse_sym_lanes_state(&req.hsmd_msg).ok_or("malformed request")?;
+        let b = &q.base;
+        if b.funding_txid != st.funding_txid || b.funding_vout != st.funding_txout as u32 {
+            return Err("the request names another funding output".to_string());
+        }
+        if Some(b.we_opened) != st.is_outbound {
+            return Err("the request says the other side opened the channel".to_string());
+        }
+        if b.remote_update_key != st.remote_delayed {
+            return Err("the peer's update key differs from setup_channel".to_string());
+        }
+        let delay = st.local_to_self_delay.max(st.remote_to_self_delay);
+        if b.delay != delay {
+            return Err(format!("shared delay {} is not the channel's {delay}", b.delay));
+        }
+        let asset0 = explicit_asset(&b.asset).ok_or("the channel asset is not explicit")?;
+        if let Some(chan) = st.pay.asset {
+            if chan != asset0 {
+                return Err(format!("the state is not in the channel's asset {}", chan.display()));
+            }
+        }
+        if q.funding_sats != st.funding_sats {
+            return Err(format!("lane 0 is {} atoms, not the funding's {}", q.funding_sats, st.funding_sats));
+        }
+        if q.lanes.is_empty() || q.lanes.len() > policy::MAX_LANES {
+            return Err(format!("{} further lanes", q.lanes.len()));
+        }
+        let mut lane_assets = vec![b.asset];
+        let mut lane_sats = vec![st.funding_sats];
+        let mut pin = Vec::new();
+        for (l, (a, v)) in q.lanes.iter().enumerate() {
+            if a[0] != 0x01 || lane_assets.contains(a) {
+                return Err(format!("lane {}'s asset is the channel's or another lane's", l + 1));
+            }
+            match st.lanes.get(l) {
+                Some(known) if known.asset != *a || known.sats != *v => {
+                    return Err(format!(
+                        "lane {} is {} atoms of {}; this device knows {} atoms of {}",
+                        l + 1,
+                        v,
+                        hexbytes(a),
+                        known.sats,
+                        hexbytes(&known.asset)
+                    ));
+                }
+                Some(_) => {}
+                None => pin.push((*a, *v)),
+            }
+            lane_assets.push(*a);
+            lane_sats.push(*v);
+        }
+        if st.lanes.len() > q.lanes.len() {
+            return Err(format!("the request names {} lanes of the {} this device knows", q.lanes.len(), st.lanes.len()));
+        }
+        let local = match b.owner {
+            0 => true,
+            1 => false,
+            o => return Err(format!("bad owner {o}")),
+        };
+        let owner_opened = local == b.we_opened;
+        if sym::state_num(b.commit_num, owner_opened) != Some(b.num) {
+            return Err(format!("state {} is not the number of commitment {}", b.num, b.commit_num));
+        }
+        if q.htlc_lanes.len() != b.htlcs.len() || q.htlc_lanes.iter().any(|&l| l as usize >= lane_assets.len()) {
+            return Err("an HTLC names no lane of the channel".to_string());
+        }
+        // Each output's lane: by its asset, lane 0's when it names none.
+        let mut out_lane = Vec::with_capacity(b.outs.len());
+        for i in 0..b.outs.len() {
+            let a = b.assets.get(i).copied().flatten().unwrap_or(b.asset);
+            let l = lane_assets
+                .iter()
+                .position(|x| *x == a)
+                .ok_or_else(|| format!("settlement output {i} is in no lane of the channel"))?;
+            out_lane.push(l);
+        }
+        let secp = self.kernel().secp();
+        let bp = self.kernel().channel_basepoints(&req.node_id, req.dbid);
+        let mut plans = Vec::with_capacity(lane_assets.len());
+        let mut paid0 = 0;
+        for l in 0..lane_assets.len() {
+            let outs: Vec<sym::Out> =
+                (0..b.outs.len()).filter(|&i| out_lane[i] == l).map(|i| b.outs[i].clone()).collect();
+            let htlcs: Vec<sym::StateHtlc> = (0..b.htlcs.len())
+                .filter(|&i| q.htlc_lanes[i] as usize == l)
+                .map(|i| sym::StateHtlc {
+                    ours: b.htlcs[i].side == Side::Local as u8,
+                    amount_msat: b.htlcs[i].amount_msat,
+                    payment_hash: b.htlcs[i].payment_hash,
+                    cltv_expiry: b.htlcs[i].cltv_expiry,
+                })
+                .collect();
+            let paid = sym::check_settlement(
+                secp,
+                lane_sats[l],
+                &bp[1],
+                &st.remote_payment,
+                &bp[2],
+                &st.remote_htlc,
+                &htlcs,
+                &outs,
+            )
+            .map_err(|e| format!("lane {l}: {e}"))?;
+            if l == 0 {
+                paid0 = paid.ours;
+            }
+            let offered: Vec<Offered> = htlcs
+                .iter()
+                .filter(|h| h.ours)
+                .map(|h| Offered { amount_msat: h.amount_msat, hash: h.payment_hash, cltv: h.cltv_expiry })
+                .collect();
+            let key = explicit_asset(&lane_assets[l]).ok_or("a lane's asset is not explicit")?;
+            let track = if l == 0 {
+                st.pay.clone()
+            } else {
+                st.lanes.get(l - 1).map(|x| x.pay.clone()).unwrap_or_default()
+            };
+            let value = paid.ours.saturating_add(paid.offered);
+            plans.push(track.plan(local, b.commit_num, key, value, offered, htlcs.len()));
+        }
+        let ch = self.sym_channel(&req.node_id, req.dbid, st, &b.asset)?;
+        let (program, rest) =
+            ch.state_in(secp, b.num, &b.outs, &b.assets).ok_or("cannot build the state's output")?;
+        let msg = ch.upd_msg(b.num, &program, &rest);
+        let peer_signed = match b.sig_remote {
+            None => false,
+            Some(sig) => {
+                if !sym::verify(secp, &msg, &sig, &st.remote_delayed) {
+                    return Err(format!("the peer's signature on state {} does not verify", b.num));
+                }
+                true
+            }
+        };
+        Ok(LanesChecked { local, commit_num: b.commit_num, paid0, msg, peer_signed, plans, lane_assets, pin })
+    }
+
+    /// Permissive mode only: the update signature on what the request names.
+    fn h_sign_sym_lanes_state_unchecked(&self, req: &Request) -> Option<Vec<u8>> {
+        let q = parse_sym_lanes_state(&req.hsmd_msg)?;
+        let st = self.store.get(&req.node_id, req.dbid)?;
+        let ch = self.sym_channel(&req.node_id, req.dbid, st, &q.base.asset).ok()?;
+        let (program, rest) = ch.state_in(self.kernel().secp(), q.base.num, &q.base.outs, &q.base.assets)?;
+        let sk = self.kernel().channel_secrets(&req.node_id, req.dbid).delayed;
+        let sig = taproot::sign(self.kernel().secp(), &ch.upd_msg(q.base.num, &program, &rest), &sk);
+        let mut w = Writer::new(msg::HSMD_SIGN_SYM_LANES_STATE_REPLY);
+        w.bytes(&sig);
+        Some(w.into_vec())
+    }
+
+    /// APPROVE_SYM_SWAP (76): a swap this side asks for or takes on a
+    /// channel of several assets, before it is committed. Approved when
+    /// both assets are the channel's and what it gives fits that asset's
+    /// allowance, as a payment's amount does; recorded, so that the state
+    /// that moves the two lanes is one this device approved.
+    fn approve_sym_swap(&mut self, req: &Request) -> Outcome {
+        let mut r = wire::Reader::new(&req.hsmd_msg);
+        let parsed = (|| {
+            r.u16()?;
+            let give_asset = r.arr33()?;
+            let give_msat = r.u64()?;
+            let take_asset = r.arr33()?;
+            let take_msat = r.u64()?;
+            (r.remaining() == 0).then_some((give_asset, give_msat, take_asset, take_msat))
+        })();
+        let (give_asset, give_msat, take_asset, take_msat) = match parsed {
+            Some(p) => p,
+            None => return Outcome::Sentinel,
+        };
+        let decision = (|| {
+            let st = self
+                .store
+                .get(&req.node_id, req.dbid)
+                .ok_or_else(|| self.untracked(&req.node_id, req.dbid))?;
+            let ours = |a: &[u8; 33]| {
+                st.pay.asset.map_or(false, |c| explicit_asset(a) == Some(c))
+                    || st.lanes.iter().any(|l| l.asset == *a)
+            };
+            if !ours(&give_asset) || !ours(&take_asset) || give_asset == take_asset {
+                return Err("a swap between two of the channel's assets".to_string());
+            }
+            if self.policy.is_enforce() {
+                self.payment_fits(Some(give_msat), explicit_asset(&give_asset).as_ref())?;
+            }
+            Ok(())
+        })();
+        if let Err(reason) = decision {
+            eprintln!("seqln-signer: APPROVE_SYM_SWAP declined: {reason}");
+            return Outcome::Reply(approve_reply(msg::HSMD_APPROVE_SYM_SWAP_REPLY, false));
+        }
+        if self.swaps.len() >= MAX_SWAPS {
+            self.swaps.remove(0);
+        }
+        self.swaps.push(SwapApproval {
+            peer: req.node_id,
+            dbid: req.dbid,
+            give_asset,
+            give_msat,
+            take_asset,
+            take_msat,
+            used: [false, false],
+        });
+        Outcome::Reply(approve_reply(msg::HSMD_APPROVE_SYM_SWAP_REPLY, true))
+    }
+
+    /// SIGN_MUTUAL_CLOSE_LANES_TX (77): closingd's signatures on a close of
+    /// a channel of several assets, one per input, each lane held to what
+    /// it owes this side (`policy::validate_lanes_close`).
+    fn sign_mutual_close_lanes_checked(&mut self, req: &Request) -> Outcome {
+        const WHAT: &str = "SIGN_MUTUAL_CLOSE_LANES_TX refused";
+        if let Some(reason) = self.predating(&req.node_id, req.dbid) {
+            return Outcome::Reject(format!("{WHAT}: {reason}"));
+        }
+        let mut r = wire::Reader::new(&req.hsmd_msg);
+        let (bt, remote_funding) = match (r.u16(), wire::read_bitcoin_tx(&mut r), r.arr33()) {
+            (Some(_), Some(bt), Some(k)) => (bt, k),
+            _ => return Outcome::Sentinel,
+        };
+        if self.policy.is_enforce() {
+            let check = (|| {
+                let st = self
+                    .store
+                    .get(&req.node_id, req.dbid)
+                    .ok_or_else(|| self.untracked(&req.node_id, req.dbid))?;
+                if remote_funding != st.remote_funding {
+                    return Err("remote_funding_key differs from setup_channel".to_string());
+                }
+                let own_close = self.own_close_script(st);
+                policy::validate_lanes_close(st, self.own_sweep_script_set(), own_close.as_deref(),
+                    &self.close_destinations, &bt.tx)?;
+                self.paid_fee_within_limit(st, &bt.tx, Self::close_fee(st, &bt.tx), "the close's fee")
+            })();
+            if let Err(reason) = check {
+                return Outcome::Reject(format!("{WHAT}: {reason}"));
+            }
+        }
+        let s = self.kernel().channel_secrets(&req.node_id, req.dbid);
+        let local_funding = self.kernel().pubkey_of(&s.funding);
+        let wscript = self.kernel().funding_wscript(&local_funding, &remote_funding);
+        let mut w = Writer::new(msg::HSMD_SIGN_MUTUAL_CLOSE_LANES_TX_REPLY);
+        w.u16(bt.tx.inputs.len() as u16);
+        for i in 0..bt.tx.inputs.len() {
+            let one = match self.sig_reply(&bt, i, &wscript, &s.funding, SIGHASH_ALL, 0) {
+                Some(v) => v,
+                None => return Outcome::Sentinel,
+            };
+            // A sign-tx reply: type(2), then the signature and its sighash.
+            w.bytes(&one[2..]);
+        }
+        if self.store.record_close(bt.txid) {
+            self.store_dirty = true;
+        }
+        Outcome::Reply(w.into_vec())
     }
 
     /// SIGN_SYM_HTLC (71): a settlement HTLC output, by the leaf that pays
@@ -3487,6 +3960,7 @@ fn parse_setup_channel(m: &[u8]) -> Option<ChannelState> {
         option_credit,
         credit: None,
         option_sym: policy::channel_type_has_sym(&features),
+        lanes: Vec::new(),
     })
 }
 
@@ -3569,9 +4043,49 @@ struct SymRequest {
     commit_num: u64,
     num: i64,
     outs: Vec<sym::Out>,
+    /// Each output's asset, when the state names any.
+    assets: Vec<Option<[u8; 33]>>,
     /// The peer's update signature on it, when the host holds it.
     sig_remote: Option<[u8; 64]>,
     htlcs: Vec<Htlc>,
+}
+
+/// A `sym_state` (`common/sym_state.h`): (owner, commit_num, num, outputs,
+/// each output's asset when the state names any (0x80 in the owner byte),
+/// the two signatures).
+#[allow(clippy::type_complexity)]
+fn read_sym_state(
+    r: &mut wire::Reader,
+) -> Option<(u8, u64, i64, Vec<sym::Out>, Vec<Option<[u8; 33]>>, [Option<[u8; 64]>; 2])> {
+    let owner_byte = r.u8()?;
+    let named = owner_byte & 0x80 != 0;
+    let owner = owner_byte & 0x7f;
+    let commit_num = r.u64()?;
+    let num = r.u64()? as i64;
+    let n = r.u16()? as usize;
+    let mut outs = Vec::with_capacity(n);
+    let mut assets = Vec::new();
+    for _ in 0..n {
+        let amount = r.u64()?;
+        let spk = r.u16_prefixed()?;
+        outs.push(sym::Out { amount, spk });
+        if named {
+            let a = if r.bool()? { Some(r.arr33()?) } else { None };
+            if a.map_or(false, |a| a[0] != 0x01) {
+                return None;
+            }
+            assets.push(a);
+        }
+    }
+    let mut sigs = [None, None];
+    for s in &mut sigs {
+        let has = r.bool()?;
+        let sig: [u8; 64] = r.take_bytes(64)?.try_into().ok()?;
+        if has {
+            *s = Some(sig);
+        }
+    }
+    Some((owner, commit_num, num, outs, assets, sigs))
 }
 
 fn parse_sym_state(m: &[u8]) -> Option<SymRequest> {
@@ -3583,23 +4097,11 @@ fn parse_sym_state(m: &[u8]) -> Option<SymRequest> {
     let remote_update_key = r.arr33()?;
     let asset = r.arr33()?;
     let delay = r.u16()?;
-    let owner = r.u8()?;
-    let commit_num = r.u64()?;
-    let num = r.u64()? as i64;
-    let n = r.u16()? as usize;
-    let mut outs = Vec::with_capacity(n);
-    for _ in 0..n {
-        let amount = r.u64()?;
-        let spk = r.u16_prefixed()?;
-        outs.push(sym::Out { amount, spk });
-    }
-    let mut sigs = [None, None];
-    for s in &mut sigs {
-        let has = r.bool()?;
-        let sig: [u8; 64] = r.take_bytes(64)?.try_into().ok()?;
-        if has {
-            *s = Some(sig);
-        }
+    let (owner, commit_num, num, outs, assets, sigs) = read_sym_state(&mut r)?;
+    // A state that names assets comes only with its lanes
+    // (HSMD_SIGN_SYM_LANES_STATE).
+    if assets.iter().any(|a| a.is_some()) {
+        return None;
     }
     let nh = r.u16()? as usize;
     let htlcs = read_htlcs(&mut r, nh)?;
@@ -3617,9 +4119,106 @@ fn parse_sym_state(m: &[u8]) -> Option<SymRequest> {
         commit_num,
         num,
         outs,
+        assets,
         sig_remote: sigs[1],
         htlcs,
     })
+}
+
+/// The most swap approvals a device holds at once.
+const MAX_SWAPS: usize = 16;
+
+/// A swap this device approved (APPROVE_SYM_SWAP): on channel (peer, dbid)
+/// this side gives `give_msat` of `give_asset` and takes `take_msat` of
+/// `take_asset`; `used`: whether a state of ours (0) and of the peer's (1)
+/// applied it.
+struct SwapApproval {
+    peer: [u8; 33],
+    dbid: u64,
+    give_asset: [u8; 33],
+    give_msat: u64,
+    take_asset: [u8; 33],
+    take_msat: u64,
+    used: [bool; 2],
+}
+
+/// What `hsmd_sign_sym_lanes_state` names beyond a one-asset state: lane
+/// 0's value, each further lane's asset and value, and each HTLC's lane.
+struct LanesRequest {
+    base: SymRequest,
+    funding_sats: u64,
+    lanes: Vec<([u8; 33], u64)>,
+    htlc_lanes: Vec<u16>,
+}
+
+fn parse_sym_lanes_state(m: &[u8]) -> Option<LanesRequest> {
+    let mut r = wire::Reader::new(m);
+    r.u16()?;
+    let funding_txid = r.arr32()?;
+    let funding_vout = r.u32()?;
+    let we_opened = r.bool()?;
+    let remote_update_key = r.arr33()?;
+    let asset = r.arr33()?;
+    let funding_sats = r.u64()?;
+    let delay = r.u16()?;
+    let nl = r.u16()? as usize;
+    let mut sats = Vec::with_capacity(nl);
+    for _ in 0..nl {
+        sats.push(r.u64()?);
+    }
+    let alen = r.u16()? as usize;
+    if alen != nl * 33 {
+        return None;
+    }
+    let mut lanes = Vec::with_capacity(nl);
+    for v in sats {
+        lanes.push((r.arr33()?, v));
+    }
+    let (owner, commit_num, num, outs, assets, sigs) = read_sym_state(&mut r)?;
+    let nh = r.u16()? as usize;
+    let htlcs = read_htlcs(&mut r, nh)?;
+    let nhl = r.u16()? as usize;
+    let mut htlc_lanes = Vec::with_capacity(nhl);
+    for _ in 0..nhl {
+        htlc_lanes.push(r.u16()?);
+    }
+    if r.remaining() != 0 {
+        return None;
+    }
+    Some(LanesRequest {
+        base: SymRequest {
+            funding_txid,
+            funding_vout,
+            we_opened,
+            remote_update_key,
+            asset,
+            delay,
+            owner,
+            commit_num,
+            num,
+            outs,
+            assets,
+            sig_remote: sigs[1],
+            htlcs,
+        },
+        funding_sats,
+        lanes,
+        htlc_lanes,
+    })
+}
+
+/// A state of a channel of several assets this device checked: as
+/// [`SymChecked`], with a plan per lane (lane 0 first), each lane's asset,
+/// and the lanes to record.
+struct LanesChecked {
+    local: bool,
+    commit_num: u64,
+    paid0: u64,
+    msg: [u8; 32],
+    peer_signed: bool,
+    plans: Vec<Plan>,
+    lane_assets: Vec<[u8; 33]>,
+    pin: Vec<([u8; 33], u64)>,
 }
 
 /// A state this device checked: whose it is, what it pays this side, the
@@ -4647,8 +5246,17 @@ mod close_and_revocation_tests {
         assert!(matches!(revoke(&mut s, 0), Outcome::Reply(_)));
         assert!(s.store.record_close([0x99; 32]));
         assert!(!s.store.record_close([0x99; 32]));
-        let v12 = policy::encode_channel_store(&s.store);
-        assert_eq!(v12[4], 12);
+        let v13 = policy::encode_channel_store(&s.store);
+        assert_eq!(v13[4], 13);
+        // A version-12 payload: the same, without the entry's lane count
+        // (the byte before the ledger and the close record; no lanes).
+        let l = &s.store.ledger;
+        let at13 = v13.len() - (2 + 32) - (2 + 40 * l.approvals.len() + 2 + 49 * l.spends.len()) - 1;
+        assert_eq!(v13[at13], 0);
+        let mut v12 = [&v13[..at13], &v13[at13 + 1..]].concat();
+        v12[4] = 12;
+        let (back, _, _) = policy::decode_channel_store(&v12).unwrap();
+        assert!(back[0].1.lanes.is_empty());
         // A version-11 payload: the same, without the entry's symmetric
         // flag (the byte before the ledger and the close record).
         let l = &s.store.ledger;
@@ -6333,8 +6941,9 @@ mod close_and_revocation_tests {
             assert!(matches!(validate(&mut s, n, 300_000, 699_000, 1_000), Outcome::Reply(_)));
         }
         let full = policy::encode_channel_store(&s.store);
-        // Version 12 less the entry's seven flags and the close record: version 6.
-        let mut payload = [&full[..full.len() - 2 - 4 - 7], &full[full.len() - 2 - 4..full.len() - 2]].concat();
+        // Version 13 less the entry's seven flags, its lane count and the
+        // close record: version 6.
+        let mut payload = [&full[..full.len() - 2 - 4 - 8], &full[full.len() - 2 - 4..full.len() - 2]].concat();
         payload[4] = 6;
         let mac = s.chstore_mac(&payload);
         payload.extend_from_slice(&mac);
@@ -7262,6 +7871,7 @@ mod close_output_spend_tests {
             peer_reached_reserve: false,
             option_credit: false,
             option_sym: false,
+            lanes: Vec::new(),
             credit: None,
         }
     }
@@ -7342,6 +7952,7 @@ mod tcov_tests {
             peer_reached_reserve: false,
             option_credit: false,
             option_sym: false,
+            lanes: Vec::new(),
             credit: None,
         }
     }
@@ -8397,4 +9008,223 @@ mod sym_tests {
     fn st(s: &Signer) -> &ChannelState {
         s.store.get(&PEER, DBID).expect("tracked")
     }
+
+    // ---------------------------------------------------- several assets
+    const LANE: u64 = 500_000;
+
+    fn silv() -> [u8; 33] {
+        let mut a = [0x66u8; 33];
+        a[0] = 0x01;
+        a
+    }
+
+    /// A settlement of a channel of two assets: lane 0 (the channel's) pays
+    /// us `ours0`, lane 1 (SILV, `LANE` atoms) pays us `ours1`.
+    fn lanes_split(s: &Signer, ours0: u64, ours1: u64, lane1_total: u64) -> (Vec<sym::Out>, Vec<Option<[u8; 33]>>) {
+        let mine = taproot::p2wpkh(&s.kernel().channel_basepoints(&PEER, DBID)[1]);
+        let theirs = taproot::p2wpkh(&point(s, 2));
+        (
+            vec![
+                sym::Out { amount: FUNDING - ours0, spk: theirs.clone() },
+                sym::Out { amount: ours0, spk: mine.clone() },
+                sym::Out { amount: lane1_total - ours1, spk: theirs },
+                sym::Out { amount: ours1, spk: mine },
+            ],
+            vec![None, None, Some(silv()), Some(silv())],
+        )
+    }
+
+    fn lanes_msg(s: &Signer, owner: u8, commit_num: u64, num: i64, lane_sats: u64, st: &(Vec<sym::Out>, Vec<Option<[u8; 33]>>)) -> Vec<u8> {
+        let mut w = Writer::new(msg::HSMD_SIGN_SYM_LANES_STATE);
+        w.bytes(&FUNDING_TXID);
+        w.u32(0);
+        w.bool(true);
+        w.bytes(&point(s, 4));
+        w.bytes(&asset());
+        w.u64(FUNDING);
+        w.u16(144);
+        w.u16(1);
+        w.u64(lane_sats);
+        w.u16(33);
+        w.bytes(&silv());
+        w.u8(owner | 0x80);
+        w.u64(commit_num);
+        w.u64(num as u64);
+        w.u16(st.0.len() as u16);
+        for (o, a) in st.0.iter().zip(&st.1) {
+            w.u64(o.amount);
+            w.u16(o.spk.len() as u16);
+            w.bytes(&o.spk);
+            w.bool(a.is_some());
+            if let Some(a) = a {
+                w.bytes(a);
+            }
+        }
+        for _ in 0..2 {
+            w.bool(false);
+            w.bytes(&[0; 64]);
+        }
+        w.u16(0);
+        w.u16(0);
+        w.into_vec()
+    }
+
+    fn swap_msg(give: &[u8; 33], give_msat: u64, take: &[u8; 33], take_msat: u64) -> Vec<u8> {
+        let mut w = Writer::new(msg::HSMD_APPROVE_SYM_SWAP);
+        w.bytes(give);
+        w.u64(give_msat);
+        w.bytes(take);
+        w.u64(take_msat);
+        w.into_vec()
+    }
+
+    fn refusal(o: Outcome) -> String {
+        match o {
+            Outcome::Reject(r) => r,
+            Outcome::Reply(_) => panic!("signed"),
+            _ => panic!("not refused"),
+        }
+    }
+
+    /// Every lane's funds are held by the device: a state that gives a
+    /// lane's asset away with no payment or swap it approved is refused,
+    /// an approved swap moves its two legs once per side, and a lane that
+    /// does not add up, or names another value than the device knows, is
+    /// refused.
+    #[test]
+    fn lanes_states_are_held_per_lane() {
+        let mut s = signer();
+        track(&mut s, true);
+        // The opening states, ours (even) and the peer's (odd): the
+        // baseline, every lane ours.
+        let open = lanes_split(&s, FUNDING, LANE, LANE);
+        assert!(matches!(s.handle(&req(lanes_msg(&s, 0, 0, 0, LANE, &open))), Outcome::Reply(_)));
+        assert!(matches!(s.handle(&req(lanes_msg(&s, 1, 0, 1, LANE, &open))), Outcome::Reply(_)));
+        assert_eq!(s.store.get(&PEER, DBID).unwrap().lanes[0].asset, silv());
+
+        // 100,000 SILV to the peer, nothing approved: refused.
+        let taken = lanes_split(&s, FUNDING, LANE - 100_000, LANE);
+        let r = refusal(s.handle(&req(lanes_msg(&s, 0, 1, 2, LANE, &taken))));
+        println!("{r}");
+        assert!(r.contains("SIGN_SYM_LANES_STATE refused: lane 1"), "{r}");
+        assert!(r.contains("it leaves this wallet 400000 atoms of the channel"), "{r}");
+        // The same taken from lane 0, the channel's own asset.
+        let taken0 = lanes_split(&s, FUNDING - 100_000, LANE, LANE);
+        let r = refusal(s.handle(&req(lanes_msg(&s, 0, 1, 2, LANE, &taken0))));
+        assert!(r.contains("lane 0"), "{r}");
+
+        // A swap it approved: 100,000 SILV for 50,000 of the channel asset.
+        assert!(matches!(s.handle(&req(swap_msg(&silv(), 100_000_000, &asset(), 50_000_000))),
+                         Outcome::Reply(r) if r[2] == 1));
+        // Only one leg of it: refused.
+        let r = refusal(s.handle(&req(lanes_msg(&s, 0, 1, 2, LANE, &taken))));
+        assert!(r.contains("lane 1"), "{r}");
+        // Both legs, from a channel whose lane 0 the peer holds: signed,
+        // on each side once.
+        let mut s = signer();
+        track(&mut s, true);
+        let open = lanes_split(&s, 0, LANE, LANE);
+        assert!(matches!(s.handle(&req(lanes_msg(&s, 0, 0, 0, LANE, &open))), Outcome::Reply(_)));
+        assert!(matches!(s.handle(&req(lanes_msg(&s, 1, 0, 1, LANE, &open))), Outcome::Reply(_)));
+        assert!(matches!(s.handle(&req(swap_msg(&silv(), 100_000_000, &asset(), 50_000_000))),
+                         Outcome::Reply(r) if r[2] == 1));
+        let swapped = lanes_split(&s, 50_000, LANE - 100_000, LANE);
+        assert!(matches!(s.handle(&req(lanes_msg(&s, 0, 1, 2, LANE, &swapped))), Outcome::Reply(_)));
+        assert!(matches!(s.handle(&req(lanes_msg(&s, 1, 1, 3, LANE, &swapped))), Outcome::Reply(_)));
+        // The approval is spent: another 100,000 SILV for 50,000 is refused.
+        let again = lanes_split(&s, 100_000, LANE - 200_000, LANE);
+        let r = refusal(s.handle(&req(lanes_msg(&s, 0, 2, 4, LANE, &again))));
+        assert!(r.contains("lane 1"), "{r}");
+        // A swap that gives more than approved: refused.
+        assert!(matches!(s.handle(&req(swap_msg(&silv(), 100_000_000, &asset(), 50_000_000))),
+                         Outcome::Reply(r) if r[2] == 1));
+        let greedy = lanes_split(&s, 100_000, LANE - 250_000, LANE);
+        let r = refusal(s.handle(&req(lanes_msg(&s, 0, 2, 4, LANE, &greedy))));
+        assert!(r.contains("lane 1"), "{r}");
+
+        // A lane that does not add up to its value: refused.
+        let short = lanes_split(&s, 50_000, LANE - 100_000, LANE - 1);
+        let r = refusal(s.handle(&req(lanes_msg(&s, 0, 2, 4, LANE, &short))));
+        assert!(r.contains("lane 1: the settlement pays 499999 atoms of a 500000-atom channel"), "{r}");
+        // A lane of another value than the device knows: refused.
+        let bigger = lanes_split(&s, 50_000, LANE - 100_000 + 1, LANE + 1);
+        let r = refusal(s.handle(&req(lanes_msg(&s, 0, 2, 4, LANE + 1, &bigger))));
+        assert!(r.contains("this device knows 500000 atoms"), "{r}");
+        // A swap in an asset the channel does not hold: not approved.
+        let mut gold = [0x77u8; 33];
+        gold[0] = 0x01;
+        assert!(matches!(s.handle(&req(swap_msg(&gold, 1_000, &asset(), 1_000))),
+                         Outcome::Reply(r) if r[2] == 0));
+    }
+
+    /// A mutual close of the channel's two lanes, inputs (funding, 0) and
+    /// (funding, 1): `outs` are (asset, value, script), an empty script the
+    /// fee.
+    fn lanes_close(outs: &[([u8; 33], u64, Vec<u8>)]) -> kernel::ElementsTx {
+        let mut t = 2u32.to_le_bytes().to_vec();
+        t.push(0x00);
+        t.push(0x02);
+        for vout in 0..2u32 {
+            t.extend_from_slice(&FUNDING_TXID);
+            t.extend_from_slice(&vout.to_le_bytes());
+            t.push(0x00);
+            t.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+        }
+        t.extend(compact_size(outs.len()));
+        for (a, v, spk) in outs {
+            t.extend_from_slice(a);
+            t.push(0x01);
+            t.extend_from_slice(&v.to_be_bytes());
+            t.push(0x00);
+            t.extend(compact_size(spk.len()));
+            t.extend_from_slice(spk);
+        }
+        t.extend_from_slice(&0u32.to_le_bytes());
+        wire::parse_elements_tx(&t).unwrap()
+    }
+
+    /// A close of a channel of several assets pays each lane at least what
+    /// it owes this side, the rest to the peer only.
+    #[test]
+    fn lanes_close_pays_each_lane() {
+        let mut s = signer();
+        track(&mut s, true);
+        let open = lanes_split(&s, 0, LANE, LANE);
+        assert!(matches!(s.handle(&req(lanes_msg(&s, 0, 0, 0, LANE, &open))), Outcome::Reply(_)));
+        assert!(matches!(s.handle(&req(lanes_msg(&s, 1, 0, 1, LANE, &open))), Outcome::Reply(_)));
+        let mine = taproot::p2wpkh(&s.kernel().channel_basepoints(&PEER, DBID)[1]);
+        let theirs = taproot::p2wpkh(&point(&s, 2));
+        let approved: std::collections::HashSet<Vec<u8>> = [mine.clone()].into_iter().collect();
+        let none = std::collections::HashSet::new();
+        // We opened: the fee is ours, from lane 0; we hold none of lane 0.
+        let close = |ours1: u64| {
+            lanes_close(&[
+                (asset(), FUNDING - 1_000, theirs.clone()),
+                (silv(), LANE - ours1, theirs.clone()),
+                (silv(), ours1, mine.clone()),
+                (asset(), 1_000, Vec::new()),
+            ])
+        };
+        // Lane 1's funding output is not known until its kickoff is signed.
+        let st = s.store.get(&PEER, DBID).unwrap().clone();
+        let e = policy::validate_lanes_close(&st, &none, None, &approved, &close(LANE)).unwrap_err();
+        assert!(e.contains("lane 1 has no funding output this device knows"), "{e}");
+        s.pin_lane(&PEER, DBID, silv(), LANE, Some(1));
+        let st = s.store.get(&PEER, DBID).unwrap().clone();
+        policy::validate_lanes_close(&st, &none, None, &approved, &close(LANE)).unwrap();
+        // 1 atom of our SILV to the peer: refused.
+        let e = policy::validate_lanes_close(&st, &none, None, &approved, &close(LANE - 1)).unwrap_err();
+        println!("{e}");
+        assert!(e.contains("pays this wallet 499999 atoms of lane 1, which owes it 500000"), "{e}");
+        // Our SILV to a third script: refused.
+        let mut stolen = close(LANE);
+        stolen.outputs[2].script = taproot::p2wpkh(&point(&s, 3));
+        assert!(policy::validate_lanes_close(&st, &none, None, &approved, &stolen).is_err());
+        // A lane left out: refused.
+        let mut one = close(LANE);
+        one.inputs.pop();
+        let e = policy::validate_lanes_close(&st, &none, None, &approved, &one).unwrap_err();
+        assert!(e.contains("not one for each of the channel's 2 lanes"), "{e}");
+    }
+
 }

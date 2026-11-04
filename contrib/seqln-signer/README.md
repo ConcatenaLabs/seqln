@@ -207,6 +207,22 @@ What enforce mode checks:
   The fee coins of the kickoff, an update or a settle (`SIGN_HTLC_TX_MINGLE`) pay only the fee and
   their change: the outputs before them carry exactly the value of the channel output they spend,
   in its asset.
+- **Channels of several assets** (`option_seq_symmetric_lanes`): a further lane is another output
+  of the funding transaction in its own asset. The device learns each lane once, from the first
+  request that names it (a lane's kickoff, which also gives its output, or a state), and refuses
+  any later request that names other lanes. A lane's kickoff (69) is signed as lane 0's, in the
+  lane's asset for its whole value. Each state (`SIGN_SYM_LANES_STATE`, 75) is held lane by lane
+  as a one-asset state is: every lane's outputs are this side's balance, the peer's or one HTLC of
+  that lane, adding up to the lane's value, and what the state leaves this side in each lane is
+  held to the payments it approved in that lane's asset. A lane that falls with no payment of ours
+  to account for it is refused, unless it is the leg this side gives of a swap the device approved
+  (`APPROVE_SYM_SWAP`, 76) and the same state pays it the other leg. A swap is approved only
+  between two of the channel's assets, with what it gives within that asset's payment allowance,
+  and it applies once to each side's states; approvals are not kept across a restart. A mutual close
+  (`SIGN_MUTUAL_CLOSE_LANES_TX`, 77, and `SIGN_COMMITMENT_TX` when lightningd broadcasts it) spends
+  exactly every lane's funding output. Lane 0 is held as a plain close, and each further lane must
+  pay this side at least the balance its latest states left it, pay the rest only to the peer,
+  and add up to the lane's value.
 - **Withdrawals** (every spend of the node's wallet: `withdraw`, `signpsbt`, a channel funding, an
   anchor fee bump): every output but the fee pays one of the device's own wallet scripts (P2WPKH or
   BIP-86 P2TR of its wallet keys at indices below 5,000) or a script the wallet holding the

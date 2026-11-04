@@ -52,6 +52,15 @@ void sym_channeld_sign(const struct channel *channel, struct sym_state *st,
 		size_t n = tal_count(channel->sym_lanes);
 		struct amount_sat *sats = tal_arr(tmpctx, struct amount_sat, n);
 		u8 *assets = tal_arr(tmpctx, u8, n * 33);
+		/* Each HTLC's lane, in the order collect_htlcs() lists them:
+		 * channel_committed_htlcs() of the state's side. */
+		const struct htlc **committed
+			= channel_committed_htlcs(tmpctx, channel, st->owner);
+		u16 *htlc_lanes = tal_arr(tmpctx, u16, tal_count(committed));
+
+		assert(tal_count(committed) == tal_count(htlcs));
+		for (size_t i = 0; i < tal_count(committed); i++)
+			htlc_lanes[i] = committed[i]->lane;
 
 		for (size_t i = 0; i < n; i++) {
 			sats[i] = channel->sym_lanes[i].funding_sats;
@@ -63,7 +72,8 @@ void sym_channeld_sign(const struct channel *channel, struct sym_state *st,
 						       channel->channel_asset,
 						       channel->funding_sats,
 						       sym_shared_delay(channel),
-						       sats, assets, st, htlcs);
+						       sats, assets, st, htlcs,
+						       htlc_lanes);
 		msg = hsm_req(tmpctx, take(msg));
 		if (!fromwire_hsmd_sign_sym_lanes_state_reply(msg,
 							      &st->sig[LOCAL]))
