@@ -9,7 +9,7 @@ Run with TEST_NETWORK=sequentia-regtest (README.md, "Testing").
 """
 from fixtures import *  # noqa: F401,F403
 from pyln.client import RpcError
-from utils import TEST_NETWORK, only_one, wait_for
+from utils import TEST_NETWORK, wait_for
 
 import pytest
 
