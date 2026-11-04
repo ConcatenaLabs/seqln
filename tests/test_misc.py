@@ -1692,10 +1692,7 @@ def test_rescan(node_factory, bitcoind):
 
 def test_bitcoind_goes_backwards(node_factory, bitcoind):
     """Check that we refuse to acknowledge bitcoind giving a shorter chain without explicit rescan"""
-    # A Sequentia node rescans from block 1 by default, which is itself an
-    # explicit rescan: give it the suite's usual one block.
-    opts = {'rescan': 1} if TEST_NETWORK in SEQUENTIA_NETWORKS else {}
-    l1 = node_factory.get_node(may_fail=True, options=opts)
+    l1 = node_factory.get_node(may_fail=True)
 
     bitcoind.generate_block(10)
     sync_blockheight(bitcoind, [l1])

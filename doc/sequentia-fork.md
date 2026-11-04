@@ -1111,13 +1111,11 @@ opened the escaping stall. The tests in `tests/sequentia/` set `SEQUENTIA_NATIVE
 
 The upstream tests in `tests/` run on the same chain (CI runs them there as well as on Bitcoin
 regtest). For them the harness keeps what they were written against: the suite's short test
-timelocks (`cltv-delta`, `cltv-final`, `watchtime-blocks`), which are far from Bitcoin's own
-defaults too; the policy asset as the fee asset of `sendtoaddress` and `sendmany`, the asset being
+timelocks (`cltv-delta`, `cltv-final`, `watchtime-blocks`) and its one-block `rescan`, which are
+far from Bitcoin's own defaults too; the policy asset as the fee asset of `sendtoaddress` and `sendmany`, the asset being
 sent, since every Sequentia transaction names its fee asset; and, when a node with no channel
 refuses an `invoice` for naming no asset or for being unpayable, the policy asset and
-`allow_unfunded`, which is upstream's behaviour. `rescan` stays at the network's default (from
-block 1, so an anchor reorg of any depth is never fatal), except in the few tests that check a
-restart from the database. A test that cannot apply to Sequentia says why in its skip (no P2TR
+`allow_unfunded`, which is upstream's behaviour. A test that cannot apply to Sequentia says why in its skip (no P2TR
 or v1+ shutdown scripts on an elements chain; a coinbase cannot be mined to a node's address on a
 staked chain; Bitcoin-specific fee figures), and one that meets a known SeqLN defect there is an
 expected failure (`strict`) naming its issue.

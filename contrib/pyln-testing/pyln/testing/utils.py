@@ -1050,18 +1050,15 @@ class LightningD(TailableProc):
         for k, v in opts.items():
             self.opts[k] = v
 
-        # A Sequentia network has its own rescan default: the chain root is
-        # never pinned, so a reorg that follows the Bitcoin anchor, of any
-        # depth, is never fatal.  It also has its own timelock defaults,
-        # sized for its block cadence.  The upstream tests run with the
-        # same short test timelocks on every chain (on Bitcoin too they are
-        # far from the network's defaults); a test written for Sequentia
+        # A Sequentia network has its own timelock defaults, sized for its
+        # block cadence, and its own rescan default: the chain root is never
+        # pinned, so a reorg that follows the Bitcoin anchor, of any depth,
+        # is never fatal.  The upstream tests run with the suite's short test
+        # values on every chain (on Bitcoin too they are far from the
+        # network's defaults); a test written for Sequentia
         # (SEQUENTIA_NATIVE) gets the network's own.
-        if TEST_NETWORK in SEQUENTIA_NETWORKS:
-            keys = ['rescan']
-            if SEQUENTIA_NATIVE:
-                keys += ['cltv-delta', 'cltv-final', 'watchtime-blocks']
-            for k in keys:
+        if TEST_NETWORK in SEQUENTIA_NETWORKS and SEQUENTIA_NATIVE:
+            for k in ('cltv-delta', 'cltv-final', 'watchtime-blocks', 'rescan'):
                 del self.opts[k]
 
         if not os.path.exists(os.path.join(lightning_dir, TEST_NETWORK)):
