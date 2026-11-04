@@ -842,7 +842,9 @@ class SequentiaD(BitcoinD):
         self.prefix = 'sequentiad'
 
     def start(self, wallet_file=None):
-        self.parent.start()
+        # A test may restart this node alone, leaving the parent running.
+        if getattr(self.parent, 'proc', None) is None or self.parent.proc.poll() is not None:
+            self.parent.start()
         self.mine_parent(1)
 
         TailableProc.start(self)
@@ -858,8 +860,12 @@ class SequentiaD(BitcoinD):
                              .format(genesis, policy, self.GENESIS, self.POLICY_ASSET))
 
         # A legacy wallet counts the anyone-can-spend pre-mine as its own.
-        self.rpc.createwallet("lightningd-tests", False, False, "", False, False)
-        self.rpc.rescanblockchain()
+        # A restart finds it already made.
+        try:
+            self.rpc.createwallet("lightningd-tests", False, False, "", False, False)
+            self.rpc.rescanblockchain()
+        except JSONRPCError:
+            self.rpc.loadwallet("lightningd-tests")
 
     def stop(self):
         try:
@@ -870,7 +876,11 @@ class SequentiaD(BitcoinD):
             except Exception:
                 self.parent.proc.kill()
             self.parent.proc.wait()
-            self.parent.cleanup_files()
+
+    def cleanup_files(self):
+        # Only once the test is over: stop() may be followed by start().
+        BitcoinD.cleanup_files(self)
+        self.parent.cleanup_files()
 
     def mine_parent(self, numblocks=1, spacing=None):
         """Mine parent-chain blocks.  With `spacing` (seconds), each block is

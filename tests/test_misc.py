@@ -8,9 +8,10 @@ from pyln.client import RpcError, Millisatoshi
 from threading import Event
 from pyln.testing.utils import (
     TIMEOUT, VALGRIND, sync_blockheight, only_one,
-    wait_for, TailableProc, env, mine_funding_to_announce,
+    wait_for, TailableProc, env, mine_funding_to_announce, SEQUENTIA_NETWORKS,
 )
 from utils import (
+    cli_invoice_args,
     account_balance, scriptpubkey_addr, check_coin_moves, first_scid,
     serialize_payload_tlv, serialize_payload_final_tlv,
 )
@@ -1153,8 +1154,8 @@ def test_cli(node_factory):
     subprocess.check_output(['cli/lightning-cli',
                              '--network={}'.format(TEST_NETWORK),
                              '--lightning-dir={}'
-                             .format(l1.daemon.lightning_dir),
-                             'invoice', '123000', 'l"[]{}', 'd"[]{}']).decode('utf-8')
+                             .format(l1.daemon.lightning_dir)]
+                            + cli_invoice_args(l1.bitcoin, '123000', 'l"[]{}', 'd"[]{}')).decode('utf-8')
     # Check label is correct, and also that cli's keyword parsing works.
     out = subprocess.check_output(['cli/lightning-cli',
                                    '--network={}'.format(TEST_NETWORK),
@@ -1166,7 +1167,8 @@ def test_cli(node_factory):
     assert only_one(j['invoices'])['label'] == 'l"[]{}'
 
     # For those using shell scripts (you know who you are Rene), make sure we're maintaining whitespace
-    lines = [l for l in out.splitlines() if '"bolt11"' not in l and '"payment_hash"' not in l and '"expires_at"' not in l]
+    # (SeqLN lists the asset of an invoice made in a named one.)
+    lines = [l for l in out.splitlines() if '"bolt11"' not in l and '"payment_hash"' not in l and '"expires_at"' not in l and '"asset"' not in l]
     assert lines == ['{',
                      '   "invoices": [',
                      '      {',
@@ -1325,8 +1327,8 @@ def test_cli_commando(node_factory):
                              '--commando={}:{}'.format(l2.info['id'], rune),
                              '--network={}'.format(TEST_NETWORK),
                              '--lightning-dir={}'
-                             .format(l1.daemon.lightning_dir),
-                             'invoice', '123000', 'l"[]{}', 'd"[]{}']).decode('utf-8')
+                             .format(l1.daemon.lightning_dir)]
+                            + cli_invoice_args(l1.bitcoin, '123000', 'l"[]{}', 'd"[]{}')).decode('utf-8')
     # Check label is correct, and also that cli's keyword parsing works.
     out = subprocess.check_output(['cli/lightning-cli',
                                    '--commando={}:{}'.format(l2.info['id'], rune),
@@ -1679,7 +1681,10 @@ def test_rescan(node_factory, bitcoind):
 
 def test_bitcoind_goes_backwards(node_factory, bitcoind):
     """Check that we refuse to acknowledge bitcoind giving a shorter chain without explicit rescan"""
-    l1 = node_factory.get_node(may_fail=True)
+    # A Sequentia node rescans from block 1 by default, which is itself an
+    # explicit rescan: give it the suite's usual one block.
+    opts = {'rescan': 1} if TEST_NETWORK in SEQUENTIA_NETWORKS else {}
+    l1 = node_factory.get_node(may_fail=True, options=opts)
 
     bitcoind.generate_block(10)
     sync_blockheight(bitcoind, [l1])

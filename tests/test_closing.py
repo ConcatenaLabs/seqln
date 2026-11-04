@@ -1,7 +1,7 @@
 from fixtures import *  # noqa: F401,F403
 from pyln.client import RpcError, Millisatoshi
 from shutil import copyfile
-from pyln.testing.utils import SLOW_MACHINE, VALGRIND
+from pyln.testing.utils import SLOW_MACHINE, VALGRIND, SEQUENTIA_NETWORKS
 from utils import (
     only_one, sync_blockheight, wait_for, TIMEOUT,
     account_balance, first_channel_id, closing_fee, TEST_NETWORK,
@@ -1838,9 +1838,14 @@ def test_onchain_unwatch(node_factory, bitcoind, chainparams):
 def test_onchaind_replay(node_factory, bitcoind):
     disconnects = ['+WIRE_REVOKE_AND_ACK', 'permfail']
     # Feerates identical so we don't get gratuitous commit to update them
+    # A Sequentia node rescans from block 1 by default, so it would rebuild
+    # onchaind from the chain rather than restart it from the database, which
+    # is what this tests: scan from just below the tip, as on Bitcoin.
+    rescan = {'rescan': 1} if TEST_NETWORK in SEQUENTIA_NETWORKS else {}
     l1, l2 = node_factory.line_graph(2, opts=[{'watchtime-blocks': 201, 'cltv-delta': 101,
                                                'disconnect': disconnects,
-                                               'feerates': (7500, 7500, 7500, 7500)},
+                                               'feerates': (7500, 7500, 7500, 7500),
+                                               **rescan},
                                               {'watchtime-blocks': 201, 'cltv-delta': 101}],
                                      wait_for_announce=True)
 

@@ -1,4 +1,4 @@
-from pyln.testing.utils import TEST_NETWORK, TIMEOUT, VALGRIND, DEPRECATED_APIS  # noqa: F401
+from pyln.testing.utils import TEST_NETWORK, TIMEOUT, VALGRIND, DEPRECATED_APIS, SEQUENTIA_NETWORKS  # noqa: F401
 from pyln.testing.utils import env, only_one, wait_for, write_config, TailableProc, sync_blockheight, wait_channel_quiescent, get_tx_p2wsh_outnum, mine_funding_to_announce, scid_to_int  # noqa: F401
 import bitstring
 from pyln.client import Millisatoshi
@@ -474,6 +474,20 @@ def closing_fee(feerate, num_outputs):
     # Assumes p2tr outputs
     weight = 428 + (8 + 1 + 1 + 1 + 32) * 4 * num_outputs
     return (weight * feerate) // 1000
+
+
+def cli_invoice_args(bitcoind, amount, label, description):
+    """lightning-cli arguments for `invoice amount label description`.
+
+    A Sequentia node with no channel to receive on refuses an invoice that
+    does not name its asset (none is assumed) or that no channel could pay
+    (unless allow_unfunded), so there the call names the chain's one asset in
+    the tests and allows it unfunded, as upstream does by default."""
+    if TEST_NETWORK not in SEQUENTIA_NETWORKS:
+        return ['invoice', amount, label, description]
+    return ['-k', 'invoice', 'amount_msat={}'.format(amount),
+            'label={}'.format(label), 'description={}'.format(description),
+            'asset={}'.format(bitcoind.POLICY_ASSET), 'allow_unfunded=true']
 
 
 def scriptpubkey_addr(scriptpubkey):
