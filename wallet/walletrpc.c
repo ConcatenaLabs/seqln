@@ -98,6 +98,13 @@ static struct command_result *param_newaddr(struct command *cmd,
 		**addrtype = ADDR_P2TR;
 	else if (json_tok_streq(buffer, tok, "all"))
 		**addrtype = ADDR_ALL;
+	else if (chainparams->is_elements)
+		/* No P2TR here: hsmd cannot sign a taproot wallet input on an
+		 * elements chain. */
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "'%s' should be 'bech32' or 'all' on %s, not '%.*s'",
+				    name, chainparams->network_name,
+				    tok->end - tok->start, buffer + tok->start);
 	else
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 				    "'%s' should be 'p2tr', 'bech32', or 'all', not '%.*s'",

@@ -592,7 +592,7 @@ def test_p2tr_funding(node_factory, chainparams):
     assert only_one(fundingtx['vin'])['txid'] == res['wallettxid']
 
 
-@unittest.skipIf(TEST_NETWORK == 'liquid-regtest', "P2TR not yet supported on Elements")
+@unittest.skipIf(TEST_NETWORK in ELEMENTS_NETWORKS, "P2TR not yet supported on Elements")
 def test_withdraw_misc(node_factory, bitcoind, chainparams):
     def dont_spend_outputs(n, txid):
         """Reserve both outputs (we assume there are two!) in case any our ours, so we don't spend change: wrecks accounting checks"""
@@ -1388,7 +1388,8 @@ def test_blockchaintrack(node_factory, bitcoind):
     """Check that we track the blockchain correctly across reorgs
     """
     l1 = node_factory.get_node(random_hsm=True)
-    addr = l1.rpc.newaddr(addresstype='all')['p2tr']
+    # An elements node gives no P2TR addresses (newaddr is bech32 only there).
+    addr = l1.rpc.newaddr(addresstype='all')['bech32' if TEST_NETWORK in ELEMENTS_NETWORKS else 'p2tr']
 
     ######################################################################
     # First failure scenario: rollback on startup doesn't work,
@@ -1425,7 +1426,16 @@ def test_blockchaintrack(node_factory, bitcoind):
     # Our funds got reorged out, we should not have any funds that are confirmed
     # NOTE: sendtoaddress() sets locktime=103 and the reorg at 102 invalidates that tx
     # and deletes it from mempool
-    assert [o for o in l1.rpc.listfunds()['outputs'] if o['status'] != "unconfirmed"] == []
+    confirmed = [o for o in l1.rpc.listfunds()['outputs'] if o['status'] != "unconfirmed"]
+    if TEST_NETWORK in SEQUENTIA_NETWORKS:
+        # sequentiad's send sets no such locktime, so the payment stays valid
+        # and is mined again on the new branch: the node follows it there.
+        for o in confirmed:
+            blockhash = bitcoind.rpc.getrawtransaction(o['txid'], True)['blockhash']
+            assert blockhash in hashes
+            assert o['blockheight'] == bitcoind.rpc.getblockheader(blockhash)['height']
+    else:
+        assert confirmed == []
 
 
 @pytest.mark.openchannel('v1')
@@ -2239,7 +2249,11 @@ def test_newaddr(node_factory, chainparams):
     both = l1.rpc.newaddr('all')
     assert 'p2sh-segwit' not in both
     assert both['bech32'].startswith(chainparams['bip173_prefix'])
-    assert both['p2tr'].startswith(chainparams['bip173_prefix'])
+    # An elements node gives no P2TR addresses (newaddr is bech32 only there).
+    if chainparams['elements']:
+        assert 'p2tr' not in both
+    else:
+        assert both['p2tr'].startswith(chainparams['bip173_prefix'])
 
 
 def test_bitcoind_fail_first(node_factory, bitcoind):
@@ -2577,7 +2591,7 @@ def test_signmessagewithkey(node_factory, chainparams):
     message = "a test message"
     addr_bech32 = l1.rpc.newaddr("bech32")["bech32"]
     addr_other = l2.rpc.newaddr("bech32")["bech32"]
-    if TEST_NETWORK != "liquid-regtest":
+    if TEST_NETWORK not in ELEMENTS_NETWORKS:
         # refuse to sign if the address is not a P2WPKH
         addr_p2tr = l1.rpc.newaddr("p2tr")["p2tr"]
         with pytest.raises(
@@ -3075,7 +3089,7 @@ def test_emergencyrecover_old_format_handling(node_factory, bitcoind):
     l1.stop()
 
 
-@unittest.skipIf(TEST_NETWORK == 'liquid-regtest', "Txid on elements is different")
+@unittest.skipIf(TEST_NETWORK in ELEMENTS_NETWORKS, "Txid on elements is different")
 @unittest.skipIf(os.getenv('TEST_DB_PROVIDER', 'sqlite3') != 'sqlite3', "deletes database, which is assumed sqlite3")
 def test_emergencyrecoverpenaltytxn(node_factory, bitcoind):
     """
@@ -5087,7 +5101,7 @@ def test_badparam_discretion(node_factory):
     assert err.value.error['message'] == "rune: should be base64 string: invalid token '\"THIS IS NOT ACTUALLY A RUNE\"'"
 
 
-@unittest.skipIf(TEST_NETWORK == 'liquid-regtest', "P2TR not yet supported on Elements")
+@unittest.skipIf(TEST_NETWORK in ELEMENTS_NETWORKS, "P2TR not yet supported on Elements")
 def test_listaddresses(node_factory):
     """Test listaddresses command."""
     l1 = node_factory.get_node()
