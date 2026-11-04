@@ -3958,9 +3958,40 @@ def test_sql(node_factory, bitcoind):
                          'type': 'txid'},
                         {'name': 'seq_factory_ko_outnum',
                          'type': 'u32'},
+                        # SeqLN: a swap in flight on a symmetric channel's lanes.
+                        {'name': 'seq_swap_id',
+                         'type': 'u64'},
+                        {'name': 'seq_swap_state',
+                         'type': 'string'},
+                        {'name': 'seq_swap_sender',
+                         'type': 'string'},
+                        {'name': 'seq_swap_give_asset',
+                         'type': 'hex'},
+                        {'name': 'seq_swap_give_msat',
+                         'type': 'msat'},
+                        {'name': 'seq_swap_take_asset',
+                         'type': 'hex'},
+                        {'name': 'seq_swap_take_msat',
+                         'type': 'msat'},
                         {'name': 'close_to_addr',
                          'type': 'string'},
                         {'name': 'last_tx_fee_msat',
+                         'type': 'msat'}]},
+        # SeqLN: the lanes of a symmetric channel of several assets.
+        'peerchannels_seq_lanes': {
+            'columns': [{'name': 'row',
+                         'type': 'u64'},
+                        {'name': 'arrindex',
+                         'type': 'u64'},
+                        {'name': 'lane',
+                         'type': 'u32'},
+                        {'name': 'asset',
+                         'type': 'hex'},
+                        {'name': 'funding_outpoint',
+                         'type': 'outpoint'},
+                        {'name': 'total_msat',
+                         'type': 'msat'},
+                        {'name': 'to_us_msat',
                          'type': 'msat'}]},
         'peerchannels_features': {
             'columns': [{'name': 'row',
@@ -4283,6 +4314,11 @@ def test_sql(node_factory, bitcoind):
 
     for table, schema in expected_schemas.items():
         ret = l2.rpc.sql("SELECT * FROM {};".format(table))
+        # SeqLN: lanes exist only on a symmetric channel of several assets,
+        # which this test opens none of.
+        if table == 'peerchannels_seq_lanes':
+            assert ret['rows'] == []
+            continue
         # If you have created_index, we don't create an explicit rowid.
         has_rowid = not any([c['name'] == 'created_index' for c in schema['columns']])
 
