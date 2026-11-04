@@ -1108,7 +1108,7 @@ def test_funding_all_too_much(node_factory):
 @pytest.mark.openchannel('v2')
 def test_funding_fail(node_factory, bitcoind):
     """Add some funds, fund a channel without enough funds"""
-    # BOLT #4's 2016; a Sequentia network scales it to its block cadence
+    # max_htlc_cltv, 2016 by the spec; a Sequentia network scales it to its block cadence
     # (bitcoin/chainparams.c chainparams_max_htlc_cltv).
     max_locktime = 20160 if TEST_NETWORK in SEQUENTIA_NETWORKS else 2016
     l1 = node_factory.get_node()
