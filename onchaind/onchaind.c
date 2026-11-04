@@ -989,27 +989,47 @@ static u64 unmask_commit_number(const struct tx_parts *tx,
 		^ obscurer;
 }
 
+/* Whether @asset (33 bytes, or NULL off Elements) is one of @assets. */
+static bool matched_in(const u8 **assets, const u8 *asset)
+{
+	for (size_t i = 0; i < tal_count(assets); i++) {
+		if (!assets[i] || !asset) {
+			if (assets[i] == asset)
+				return true;
+		} else if (memeq(assets[i], 33, asset, 33))
+			return true;
+	}
+	return false;
+}
+
 static bool is_mutual_close(const struct tx_parts *tx,
 			    const u8 *local_scriptpubkey,
 			    const u8 *remote_scriptpubkey)
 {
 	size_t i;
-	bool local_matched = false, remote_matched = false;
+	/* SEQUENTIA: the assets each side's output was matched in.  A channel
+	 * of several assets pays each side once per lane, each lane in its own
+	 * asset (common/close_tx.h); any other close is in one asset. */
+	const u8 **local_matched = tal_arr(tmpctx, const u8 *, 0);
+	const u8 **remote_matched = tal_arr(tmpctx, const u8 *, 0);
 
 	for (i = 0; i < tal_count(tx->outputs); i++) {
-		/* To be paranoid, we only let each one match once. */
+		const u8 *asset = tx->outputs[i]->asset;
+
+		/* To be paranoid, we only let each one match once (per
+		 * asset). */
 		if (chainparams->is_elements &&
 		    tx->outputs[i]->script_len == 0) {
 			/* This is a fee output, ignore please */
 			continue;
 		} else if (wally_tx_output_scripteq(tx->outputs[i],
 						    local_scriptpubkey)
-			   && !local_matched) {
-			local_matched = true;
+			   && !matched_in(local_matched, asset)) {
+			tal_arr_expand(&local_matched, asset);
 		} else if (wally_tx_output_scripteq(tx->outputs[i],
 						    remote_scriptpubkey)
-			   && !remote_matched)
-			remote_matched = true;
+			   && !matched_in(remote_matched, asset))
+			tal_arr_expand(&remote_matched, asset);
 		else
 			return false;
 	}

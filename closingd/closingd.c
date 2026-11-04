@@ -30,6 +30,12 @@
 static u8 channel_asset[33];
 #define HSM_FD 4
 
+/* SEQUENTIA: a channel of several assets (common/close_tx.h): each further
+ * lane, as the close pays it.  Empty for any other channel.  Its close spends
+ * every lane's funding output, and closing_signed carries our signature of
+ * each further input in seq_lane_sigs. */
+static struct close_lane *close_lanes;
+
 static void notify(enum log_level level, const char *fmt, ...)
 {
 	va_list ap;
@@ -87,7 +93,7 @@ static struct bitcoin_tx *close_tx(const tal_t *ctx,
 		     fmt_amount_sat(tmpctx, fee));
 
 	/* FIXME: We need to allow this! */
-	tx = create_close_tx(ctx,
+	tx = create_close_tx_lanes(ctx,
 			     chainparams,
 			     local_wallet_index, local_wallet_ext_key,
 			     scriptpubkey[LOCAL], scriptpubkey[REMOTE],
@@ -97,7 +103,8 @@ static struct bitcoin_tx *close_tx(const tal_t *ctx,
 			     out_minus_fee[LOCAL],
 			     out_minus_fee[REMOTE],
 			     dust_limit,
-			     channel_asset);
+			     channel_asset,
+			     close_lanes);
 	if (!tx)
 		peer_failed_err(pps, channel_id,
 				"Both outputs below dust limit:"
@@ -132,6 +139,39 @@ static u8 *closing_read_peer_msg(const tal_t *ctx,
 	}
 }
 
+/* Our signature of every input of @tx: the channel's funding output, then
+ * each further lane's on a channel of several assets. */
+static struct bitcoin_signature *sign_close(const tal_t *ctx,
+					    const struct bitcoin_tx *tx,
+					    const struct pubkey *remote_funding)
+{
+	struct bitcoin_signature *sigs;
+	u8 *msg;
+
+	if (!tal_count(close_lanes)) {
+		sigs = tal_arr(ctx, struct bitcoin_signature, 1);
+		wire_sync_write(HSM_FD,
+				take(towire_hsmd_sign_mutual_close_tx(NULL, tx,
+								      remote_funding)));
+		msg = wire_sync_read(tmpctx, HSM_FD);
+		if (!fromwire_hsmd_sign_tx_reply(msg, &sigs[0]))
+			status_failed(STATUS_FAIL_HSM_IO,
+				      "Bad hsm_sign_mutual_close_tx reply %s",
+				      tal_hex(tmpctx, msg));
+		return sigs;
+	}
+	wire_sync_write(HSM_FD,
+			take(towire_hsmd_sign_mutual_close_lanes_tx(NULL, tx,
+								    remote_funding)));
+	msg = wire_sync_read(tmpctx, HSM_FD);
+	if (!fromwire_hsmd_sign_mutual_close_lanes_tx_reply(ctx, msg, &sigs)
+	    || tal_count(sigs) != tx->wtx->num_inputs)
+		status_failed(STATUS_FAIL_HSM_IO,
+			      "Bad hsm_sign_mutual_close_lanes_tx reply %s",
+			      tal_hex(tmpctx, msg));
+	return sigs;
+}
+
 static void send_offer(struct per_peer_state *pps,
 		       const struct chainparams *chainparams,
 		       const struct channel_id *channel_id,
@@ -150,7 +190,7 @@ static void send_offer(struct per_peer_state *pps,
 		       const struct tlv_closing_signed_tlvs_fee_range *tlv_fees)
 {
 	struct bitcoin_tx *tx;
-	struct bitcoin_signature our_sig;
+	struct bitcoin_signature our_sig, *sigs;
 	struct tlv_closing_signed_tlvs *close_tlvs;
 	u8 *msg;
 
@@ -178,22 +218,15 @@ static void send_offer(struct per_peer_state *pps,
 	 *   - MAY eliminate its own output.
 	 */
 	/* (We don't do this). */
-	wire_sync_write(HSM_FD,
-			take(towire_hsmd_sign_mutual_close_tx(NULL,
-							     tx,
-							     &funding_pubkey[REMOTE])));
-	msg = wire_sync_read(tmpctx, HSM_FD);
-	if (!fromwire_hsmd_sign_tx_reply(msg, &our_sig))
-		status_failed(STATUS_FAIL_HSM_IO,
-			      "Bad hsm_sign_mutual_close_tx reply %s",
-			      tal_hex(tmpctx, msg));
+	sigs = sign_close(tmpctx, tx, &funding_pubkey[REMOTE]);
+	our_sig = sigs[0];
 
 	status_debug("sending fee offer %s",
 		     fmt_amount_sat(tmpctx, fee_to_offer));
 
 	/* Add the new close_tlvs with our fee range */
 	if (tlv_fees) {
-		close_tlvs = tlv_closing_signed_tlvs_new(msg);
+		close_tlvs = tlv_closing_signed_tlvs_new(tmpctx);
 		close_tlvs->fee_range
 			= cast_const(struct tlv_closing_signed_tlvs_fee_range *,
 				     tlv_fees);
@@ -203,6 +236,19 @@ static void send_offer(struct per_peer_state *pps,
 		       fmt_amount_sat(tmpctx, tlv_fees->max_fee_satoshis));
 	} else
 		close_tlvs = NULL;
+
+	/* SEQUENTIA: our signature of each further lane's input. */
+	if (tal_count(close_lanes)) {
+		if (!close_tlvs)
+			close_tlvs = tlv_closing_signed_tlvs_new(tmpctx);
+		close_tlvs->seq_lane_sigs
+			= tal_arr(close_tlvs, secp256k1_ecdsa_signature,
+				  tal_count(sigs) - 1);
+		for (size_t i = 1; i < tal_count(sigs); i++) {
+			assert(sigs[i].sighash_type == SIGHASH_ALL);
+			close_tlvs->seq_lane_sigs[i - 1] = sigs[i].s;
+		}
+	}
 
 	assert(our_sig.sighash_type == SIGHASH_ALL);
 	msg = towire_closing_signed(NULL, channel_id, fee_to_offer, &our_sig.s,
@@ -352,6 +398,39 @@ receive_offer(struct per_peer_state *pps,
 					 : "NONE");
 		}
 		tx = trimmed;
+	}
+
+	/* SEQUENTIA: on a channel of several assets, their signature of each
+	 * further lane's input, on the very close their first one is for; we
+	 * add ours, so the close we keep is whole but for input 0, which
+	 * lightningd completes as it does for any close. */
+	if (tal_count(close_lanes)) {
+		struct bitcoin_signature *ours;
+
+		if (!close_tlvs || tal_count(close_tlvs->seq_lane_sigs)
+		    != tx->wtx->num_inputs - 1)
+			peer_failed_warn(pps, channel_id,
+					 "closing_signed without a signature"
+					 " for each of %zu lanes",
+					 tx->wtx->num_inputs - 1);
+		ours = sign_close(tmpctx, tx, &funding_pubkey[REMOTE]);
+		for (size_t i = 1; i < tx->wtx->num_inputs; i++) {
+			struct bitcoin_signature theirs;
+
+			theirs.s = close_tlvs->seq_lane_sigs[i - 1];
+			theirs.sighash_type = SIGHASH_ALL;
+			if (!check_tx_sig(tx, i, NULL, funding_wscript,
+					  &funding_pubkey[REMOTE], &theirs))
+				peer_failed_warn(pps, channel_id,
+						 "Bad closing_signed signature"
+						 " for lane %zu of %s", i,
+						 fmt_bitcoin_tx(tmpctx, tx));
+			bitcoin_tx_input_set_witness(tx, i,
+				take(bitcoin_witness_2of2(NULL, &theirs,
+							  &ours[i],
+							  &funding_pubkey[REMOTE],
+							  &funding_pubkey[LOCAL])));
+		}
 	}
 
 	status_debug("Received fee offer %s",
@@ -574,7 +653,7 @@ static size_t closing_tx_weight_estimate(u8 *scriptpubkey[NUM_SIDES],
 	struct bitcoin_outpoint dummy_funding;
 
 	memset(&dummy_funding, 0, sizeof(dummy_funding));
-	tx = create_close_tx(tmpctx, chainparams,
+	tx = create_close_tx_lanes(tmpctx, chainparams,
 			     local_wallet_index, local_wallet_ext_key,
 			     scriptpubkey[LOCAL], scriptpubkey[REMOTE],
 			     funding_wscript,
@@ -583,10 +662,13 @@ static size_t closing_tx_weight_estimate(u8 *scriptpubkey[NUM_SIDES],
 			     out[LOCAL],
 			     out[REMOTE],
 			     dust_limit,
-			     channel_asset);
+			     channel_asset,
+			     close_lanes);
 
-	/* We will have to append the witness */
-	return bitcoin_tx_weight(tx) + bitcoin_tx_2of2_input_witness_weight();
+	/* We will have to append the witness: one per input, a lane each on
+	 * a channel of several assets. */
+	return bitcoin_tx_weight(tx)
+		+ tx->wtx->num_inputs * bitcoin_tx_2of2_input_witness_weight();
 }
 
 /* Get the minimum and desired fees */
@@ -867,8 +949,11 @@ int main(int argc, char *argv[])
 				    &fee_negotiation_step_unit,
 				    &use_quickclose,
 				    &wrong_funding,
-				    channel_asset))
+				    channel_asset,
+				    &close_lanes))
 		master_badmsg(WIRE_CLOSINGD_INIT, msg);
+	if (close_lanes)
+		notleak(close_lanes);
 
 	/* stdin == requests, 3 == peer, 4 = hsmd */
 	pps = notleak(new_per_peer_state(ctx));

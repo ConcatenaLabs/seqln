@@ -687,6 +687,18 @@ msgdata,hsmd_sign_sym_lanes_state,htlcs,hsm_htlc,num_htlcs
 msgtype,hsmd_sign_sym_lanes_state_reply,175
 msgdata,hsmd_sign_sym_lanes_state_reply,sig,bip340sig,
 
+# The mutual close of a channel of several assets (common/close_tx.h): input
+# 0 spends the channel's funding output and each further input one of its
+# other lanes', all to the same 2-of-2.  Our funding key's SIGHASH_ALL
+# signature of every input, in input order.
+msgtype,hsmd_sign_mutual_close_lanes_tx,77
+msgdata,hsmd_sign_mutual_close_lanes_tx,tx,bitcoin_tx,
+msgdata,hsmd_sign_mutual_close_lanes_tx,remote_funding_key,pubkey,
+
+msgtype,hsmd_sign_mutual_close_lanes_tx_reply,177
+msgdata,hsmd_sign_mutual_close_lanes_tx_reply,num_sigs,u16,
+msgdata,hsmd_sign_mutual_close_lanes_tx_reply,sigs,bitcoin_signature,num_sigs
+
 # An HTLC output of a symmetric channel's settlement, by the leaf that pays
 # us (the SUCCESS of one we received, the TIMEOUT of one we offered): our
 # HTLC basepoint's key, untweaked (there is no revocation).  Answered by

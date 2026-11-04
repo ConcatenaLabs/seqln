@@ -135,6 +135,7 @@ bool hsmd_check_client_capabilities(struct hsmd_client *client,
 		return (client->capabilities & HSM_PERM_SIGN_REMOTE_TX) != 0;
 
 	case WIRE_HSMD_SIGN_MUTUAL_CLOSE_TX:
+	case WIRE_HSMD_SIGN_MUTUAL_CLOSE_LANES_TX:
 		return (client->capabilities & HSM_PERM_SIGN_CLOSING_TX) != 0;
 
 	case WIRE_HSMD_SIGN_SPLICE_TX:
@@ -234,6 +235,7 @@ bool hsmd_check_client_capabilities(struct hsmd_client *client,
 	case WIRE_HSMD_CREDIT_NOTE_REPLY:
 	case WIRE_HSMD_SIGN_SYM_STATE_REPLY:
 	case WIRE_HSMD_SIGN_SYM_LANES_STATE_REPLY:
+	case WIRE_HSMD_SIGN_MUTUAL_CLOSE_LANES_TX_REPLY:
 	case WIRE_HSMD_SIGN_ANY_CANNOUNCEMENT_REPLY:
 		break;
 	}
@@ -1469,6 +1471,42 @@ static u8 *handle_sign_mutual_close_tx(struct hsmd_client *c, const u8 *msg_in)
 	return towire_hsmd_sign_tx_reply(NULL, &sig);
 }
 
+/* SEQUENTIA: the mutual close of a channel of several assets
+ * (common/close_tx.h): every input spends one of the channel's funding
+ * outputs, all to the same 2-of-2, and we sign each.  Like the plain close,
+ * this signer checks nothing of what it pays; a validating one does. */
+static u8 *handle_sign_mutual_close_lanes_tx(struct hsmd_client *c,
+					     const u8 *msg_in)
+{
+	struct secret channel_seed;
+	struct bitcoin_tx *tx;
+	struct pubkey remote_funding_pubkey, local_funding_pubkey;
+	struct bitcoin_signature *sigs;
+	struct secrets secrets;
+	const u8 *funding_wscript;
+
+	if (!fromwire_hsmd_sign_mutual_close_lanes_tx(tmpctx, msg_in, &tx,
+						      &remote_funding_pubkey))
+		return hsmd_status_malformed_request(c, msg_in);
+
+	tx->chainparams = c->chainparams;
+	get_channel_seed(&c->id, c->dbid, &channel_seed);
+	derive_basepoints(&channel_seed,
+			  &local_funding_pubkey, NULL, &secrets, NULL);
+	funding_wscript = bitcoin_redeem_2of2(tmpctx,
+					      &local_funding_pubkey,
+					      &remote_funding_pubkey);
+	sigs = tal_arr(tmpctx, struct bitcoin_signature, tx->wtx->num_inputs);
+	for (size_t i = 0; i < tx->wtx->num_inputs; i++) {
+		sign_tx_input(tx, i, NULL, funding_wscript,
+			      &secrets.funding_privkey,
+			      &local_funding_pubkey,
+			      SIGHASH_ALL, &sigs[i]);
+		check_overgrind(&sigs[i]);
+	}
+	return towire_hsmd_sign_mutual_close_lanes_tx_reply(NULL, sigs);
+}
+
 /* This is used by channeld to sign the final splice tx. */
 static u8 *handle_sign_splice_tx(struct hsmd_client *c, const u8 *msg_in)
 {
@@ -1899,10 +1937,13 @@ static u8 *handle_sign_commitment_tx(struct hsmd_client *c, const u8 *msg_in)
 
 	tx->chainparams = c->chainparams;
 
-	/* Basic sanity checks. */
-	if (tx->wtx->num_inputs != 1)
+	/* Basic sanity checks.  SEQUENTIA: the mutual close of a channel of
+	 * several assets (common/close_tx.h) spends every lane's funding
+	 * output; input 0 is the channel's, the one signed here, and closingd
+	 * completed the others' witnesses when it agreed on the close. */
+	if (tx->wtx->num_inputs < 1)
 		return hsmd_status_bad_request(c, msg_in,
-					       "tx must have 1 input");
+					       "tx must have an input");
 
 	if (tx->wtx->num_outputs == 0)
 		return hsmd_status_bad_request_fmt(c, msg_in,
@@ -2772,6 +2813,8 @@ u8 *hsmd_handle_client_message(const tal_t *ctx, struct hsmd_client *client,
 		return handle_sign_withdrawal_tx(client, msg);
 	case WIRE_HSMD_SIGN_MUTUAL_CLOSE_TX:
 		return handle_sign_mutual_close_tx(client, msg);
+	case WIRE_HSMD_SIGN_MUTUAL_CLOSE_LANES_TX:
+		return handle_sign_mutual_close_lanes_tx(client, msg);
 	case WIRE_HSMD_SIGN_SPLICE_TX:
 		return handle_sign_splice_tx(client, msg);
 	case WIRE_HSMD_SIGN_REMOTE_HTLC_TX:
@@ -2887,6 +2930,7 @@ u8 *hsmd_handle_client_message(const tal_t *ctx, struct hsmd_client *client,
 	case WIRE_HSMD_CREDIT_NOTE_REPLY:
 	case WIRE_HSMD_SIGN_SYM_STATE_REPLY:
 	case WIRE_HSMD_SIGN_SYM_LANES_STATE_REPLY:
+	case WIRE_HSMD_SIGN_MUTUAL_CLOSE_LANES_TX_REPLY:
 	case WIRE_HSMD_SIGN_ANY_CANNOUNCEMENT_REPLY:
 		break;
 	}
@@ -2990,6 +3034,7 @@ u8 *hsmd_init(const u8 *secret_data, size_t secret_len, const u64 hsmd_version,
 		WIRE_HSMD_SIGN_SYM_STATE,
 		WIRE_HSMD_SIGN_SYM_HTLC,
 		WIRE_HSMD_SIGN_SYM_LANES_STATE,
+		WIRE_HSMD_SIGN_MUTUAL_CLOSE_LANES_TX,
 	};
 	u32 *caps;
 

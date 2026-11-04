@@ -60,10 +60,11 @@ def pay(src, dst, msat, asset):
 pay.n = 0
 
 
-def lanes_pair(node_factory, bitcoind, opts=None):
+def lanes_pair(node_factory, bitcoind, opts=None, more=None):
     """l1 opens a channel holding GOLD (its own) and SILV to l2, whose
     dealer plugin takes swaps at one for one.  Every node accepts both for
-    fees; SILV is worth two reference atoms an atom."""
+    fees; SILV is worth two reference atoms an atom.  @more: further lanes,
+    (asset, amount) each, funded by l1."""
     gold = bitcoind.issue_asset(1000)
     silv = bitcoind.issue_asset(1000)
     bitcoind.set_fee_rates({bitcoind.POLICY_ASSET: PAR, gold: PAR,
@@ -75,10 +76,13 @@ def lanes_pair(node_factory, bitcoind, opts=None):
     fund_node(bitcoind, l1, gold, PAR)
     fund_node(bitcoind, l1, silv, PAR)
     fund_node(bitcoind, l2, silv, PAR)
+    for asset, amount in more or []:
+        fund_node(bitcoind, l1, asset, 2 * amount)
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     res = l1.rpc.call('fundchannel', {
         'id': l2.info['id'], 'amount': GOLD_CAP, 'asset': gold,
-        'lanes': [{'asset': silv, 'amount': SILV_CAP}]})
+        'lanes': [{'asset': silv, 'amount': SILV_CAP}]
+        + [{'asset': a, 'amount': n} for a, n in more or []]})
     bitcoind.generate_block(1, wait_for_mempool=res['txid'])
     wait_for(lambda: chan(l1, l2)['state'] == 'CHANNELD_NORMAL')
     wait_for(lambda: chan(l2, l1)['state'] == 'CHANNELD_NORMAL')
@@ -219,7 +223,8 @@ def test_lanes_unilateral_close(node_factory, bitcoind):
                                        silv: 6_000_000_000})
     gold_n, silv_n = lane_outnums(bitcoind, ftxid, c, silv)
 
-    l1.rpc.close(l2.info['id'])
+    # With the peer there, close would be mutual (test_lanes_mutual_close).
+    l1.rpc.dev_fail(l2.info['id'])
     lane0 = follow_lane(bitcoind, ftxid, gold_n)
     lane1 = follow_lane(bitcoind, ftxid, silv_n)
     settle0, i0 = lane0[-1]
@@ -272,7 +277,7 @@ def test_lanes_keyless_watcher(node_factory, bitcoind, directory):
     l2.stop()
     wallet = fee_wallet(bitcoind, silv, [(silv, 1)])
     tower = Speculad(l2, bitcoind, wallet, directory)
-    l1.rpc.close(l2.info['id'])
+    l1.rpc.close(l2.info['id'], unilateraltimeout=1)
     stale_over = []
     for n in (gold_n, silv_n):
         ko, _ = mined_spender(bitcoind, ftxid, n)
@@ -308,3 +313,61 @@ def test_lanes_keyless_watcher(node_factory, bitcoind, directory):
     wait_for(lambda: any(o['txid'] == settle['txid'] and o['asset'] == silv
                          and o['amount_msat'] == 7_000_000_000
                          for o in l2.rpc.listfunds()['outputs']))
+
+
+def test_lanes_mutual_close(node_factory, bitcoind):
+    """A channel of three assets closes cooperatively in one transaction:
+    it spends every lane's funding output and pays each side its balance in
+    each asset, the fee in the channel's own asset only.  No lane is kicked
+    off."""
+    third = bitcoind.POLICY_ASSET
+    THIRD_CAP = 20_000_000
+    l1, l2, gold, silv, ftxid = lanes_pair(node_factory, bitcoind,
+                                           more=[(third, THIRD_CAP)])
+    c = chan(l1, l2)
+    pay(l1, l2, 5_000_000_000, gold)
+    pay(l1, l2, 7_000_000_000, silv)
+    pay(l1, l2, 3_000_000_000, third)
+    l1.rpc.call('symswap', {'id': c['channel_id'],
+                            'give_asset': gold, 'give_msat': 2_000_000_000,
+                            'take_asset': silv, 'take_msat': 1_000_000_000})
+    want = {gold: 7_000_000_000, silv: 6_000_000_000, third: 3_000_000_000}
+    wait_for(lambda: lanes(l2, l1) == want)
+    ftx = bitcoind.rpc.getrawtransaction(ftxid, 1)
+    spk = ftx['vout'][c['funding_outnum']]['scriptPubKey']['hex']
+    fundings = sorted((ftxid, i) for i, o in enumerate(ftx['vout'])
+                      if o['scriptPubKey']['hex'] == spk)
+    assert len(fundings) == 3
+
+    res = l1.rpc.close(l2.info['id'])
+    assert res['type'] == 'mutual'
+    txid = only_one(res['txids'])
+    bitcoind.generate_block(1, wait_for_mempool=txid)
+    dec = bitcoind.rpc.getrawtransaction(txid, 1)
+    # Every lane's funding output, and nothing else.
+    assert sorted((v['txid'], v['vout']) for v in dec['vin']) == fundings
+    fee = only_one([o for o in dec['vout'] if o['scriptPubKey']['type'] == 'fee'])
+    assert fee['asset'] == gold
+    paid = {}
+    for o in dec['vout']:
+        if o['scriptPubKey']['type'] != 'fee':
+            paid.setdefault(o['asset'], []).append(atoms(o['value']))
+    print("mutual close of three lanes:", {'txid': txid, 'vsize': dec['vsize'],
+                                           'fee': atoms(fee['value'])})
+    # Lane 0 pays the fee from the opener's share; the other lanes whole.
+    assert sorted(paid[silv]) == sorted([SILV_CAP - 6_000_000, 6_000_000])
+    assert sorted(paid[third]) == sorted([THIRD_CAP - 3_000_000, 3_000_000])
+    assert 7_000_000 in paid[gold]
+    assert sum(paid[gold]) + atoms(fee['value']) == GOLD_CAP
+    for node, amounts in ((l2, {gold: 7_000_000, silv: 6_000_000,
+                                third: 3_000_000}),
+                          (l1, {silv: SILV_CAP - 6_000_000,
+                                third: THIRD_CAP - 3_000_000})):
+        for asset, amount in amounts.items():
+            wait_for(lambda: any(o['txid'] == txid and o['asset'] == asset
+                                 and o['amount_msat'] == amount * 1000
+                                 for o in node.rpc.listfunds()['outputs']))
+    assert not l1.daemon.is_in_log('Broadcasting the kickoff')
+    assert not l2.daemon.is_in_log('Broadcasting the kickoff')
+    bitcoind.generate_block(100)
+    wait_for(lambda: l1.rpc.listpeerchannels()['channels'] == [])

@@ -1432,17 +1432,6 @@ static void peer_got_shutdown(struct channel *channel, const u8 *msg)
 		return;
 	}
 
-	/* SEQUENTIA: a channel of several assets has no mutual close: one of
-	 * its own funding output would leave the other lanes to a settlement
-	 * that pays it again (lightningd/sym_lanes.h).  It goes to chain. */
-	if (channel_is_sym_lanes(channel)) {
-		channel_fail_permanent(channel, REASON_REMOTE,
-				       "Peer asked to close a channel of"
-				       " several assets: closing it"
-				       " unilaterally");
-		return;
-	}
-
 	/* BOLT #2:
 	 * A receiving node:
 	 *...

@@ -3,6 +3,7 @@
 #include <ccan/tal/str/str.h>
 #include <channeld/channeld_wiregen.h>
 #include <closingd/closingd_wiregen.h>
+#include <common/close_tx.h>
 #include <common/closing_fee.h>
 #include <common/json_command.h>
 #include <common/shutdown_scriptpubkey.h>
@@ -394,6 +395,7 @@ static unsigned closing_msg(struct subd *sd, const u8 *msg, const int *fds UNUSE
 void peer_start_closingd(struct channel *channel, struct peer_fd *peer_fd)
 {
 	u8 *initmsg;
+	struct close_lane *lanes;
 	u32 min_feerate, feerate, max_feerate;
 	struct amount_msat their_msat;
 	struct amount_sat our_sat, their_sat, credit;
@@ -555,6 +557,39 @@ void peer_start_closingd(struct channel *channel, struct peer_fd *peer_fd)
 		local_wallet_ext_key = &ext_key_val;
 	}
 
+	/* SEQUENTIA: a channel of several assets closes every lane at once
+	 * (common/close_tx.h): each further lane pays each side its balance,
+	 * whole atoms, the opener taking what rounding leaves, as both sides
+	 * reckon it. */
+	lanes = tal_arr(tmpctx, struct close_lane, 0);
+	for (size_t l = 1; l < channel_num_lanes(channel); l++) {
+		struct close_lane cl;
+		struct amount_msat ours = channel_lane_our_msat(channel, l), theirs;
+
+		memcpy(cl.asset, channel_lane_asset(channel, l), 33);
+		channel_lane_funding(channel, l, &cl.funding, &cl.funding_sats);
+		if (!amount_sat_sub_msat(&theirs, cl.funding_sats, ours)) {
+			channel_internal_error(channel, "lane %zu: we hold %s of"
+					       " %s", l,
+					       fmt_amount_msat(tmpctx, ours),
+					       fmt_amount_sat(tmpctx,
+							      cl.funding_sats));
+			return;
+		}
+		if (channel->opener == LOCAL) {
+			cl.to_them = amount_msat_to_sat_round_down(theirs);
+			if (!amount_sat_sub(&cl.to_us, cl.funding_sats,
+					    cl.to_them))
+				abort();
+		} else {
+			cl.to_us = amount_msat_to_sat_round_down(ours);
+			if (!amount_sat_sub(&cl.to_them, cl.funding_sats,
+					    cl.to_us))
+				abort();
+		}
+		tal_arr_expand(&lanes, cl);
+	}
+
 	initmsg = towire_closingd_init(tmpctx,
 				       chainparams,
 				       &channel->cid,
@@ -579,7 +614,8 @@ void peer_start_closingd(struct channel *channel, struct peer_fd *peer_fd)
 				       || option_anchor_outputs
 				       || option_anchors_zero_fee_htlc_tx,
 				       channel->shutdown_wrong_funding,
-				       channel->channel_asset);
+				       channel->channel_asset,
+				       lanes);
 
 	/* We don't expect a response: it will give us feedback on
 	 * signatures sent and received, then closing_complete. */
@@ -897,19 +933,6 @@ static struct command_result *json_close(struct command *cmd,
 				       "A factory channel closes unilaterally");
 		return command_its_complicated("answered by drop_to_chain");
 	}
-	/* SEQUENTIA: nor does a channel of several assets: a mutual close of
-	 * its own funding output would leave the other lanes to a settlement
-	 * that pays it again (lightningd/sym_lanes.h). */
-	if (channel_is_sym_lanes(channel)
-	    && (channel->state == CHANNELD_NORMAL
-		|| channel->state == CHANNELD_AWAITING_LOCKIN)) {
-		register_close_command(cmd->ld, cmd, channel, 0);
-		channel_fail_permanent(channel, REASON_USER,
-				       "A channel of several assets closes"
-				       " unilaterally");
-		return command_its_complicated("answered by drop_to_chain");
-	}
-
 	/* Normal case.
 	 * We allow states shutting down and sigexchange; a previous
 	 * close command may have timed out, and this current command

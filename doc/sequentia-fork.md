@@ -848,13 +848,26 @@ lane's KO and state outputs, replaces an older state on any lane by the best one
 once every lane's output is at the same state, settles them in one transaction with each input's
 asset. A lane kicked off apart, by anyone, takes the channel to chain; lightningd keeps every such
 spend and hands it to onchaind whenever onchaind starts. An HTLC of another lane is claimed in its
-lane's asset. `close` on a channel of several assets is always unilateral, and a peer's
-`shutdown` takes it to chain unilaterally: a mutual close of lane 0's output would leave the other
-lanes to a settlement that pays it again.
+lane's asset.
+
+**Mutual close.** `close` with the peer there closes every lane in one transaction
+(`common/close_tx.h`, `create_close_tx_lanes`): input 0 is lane 0's funding output and each further
+input another lane's, in lane order, all to the same 2-of-2. Lane 0 pays as any close does, the fee
+the rest of lane 0 in the channel's own asset, taken from the opener's share; each further lane then
+pays each side its whole balance in its own asset, the lower (amount, script) first, the opener
+taking what rounding to whole atoms leaves. An output in an asset other than the fee's is never
+dust, so no lane's value is left to the fee. `closing_signed` carries the signature of input 0 as
+usual and, in TLV 48049 `seq_lane_sigs`, one for each further input in order; closingd checks each
+against the close the first is for and keeps that close with every further input's witness complete,
+so lightningd completes input 0 at broadcast as for any close. Once it is mined, its spend of the
+other lanes' funding outputs is the close's, not a lane kicked off: nothing is kicked off, and
+onchaind takes it as a mutual close (each side's script matched once per asset).
 
 **Signer.** `hsmd_sign_sym_lanes_state` names the channel's lanes, each asset and funding value,
 and signs a state only if each lane's outputs add up to that lane's whole value and no output is
 in an asset outside the lanes; `hsmd_sign_sym_state` refuses a state that names an asset.
+`hsmd_sign_mutual_close_lanes_tx` signs every input of the mutual close with the funding key, and
+`hsmd_sign_commitment_tx` takes a close of several inputs, signing input 0.
 
 Files: `common/sym_lanes.{c,h}`, `lightningd/sym_lanes.{c,h}`, and the lanes branches of
 `channeld/full_channel.c` (a balance per lane per view, the swap as a pending change),
@@ -864,7 +877,8 @@ of several inputs), `lightningd/opening_control.c`, `lightningd/peer_htlcs.c`,
 `lightningd/pay.c`, `lightningd/invoice.c`, `lightningd/routehint.c`,
 `lightningd/onchain_control.c`, `lightningd/watchtower_store.c`,
 `plugins/spender/multifundchannel.c`, `plugins/libplugin-pay.c`, `bitcoin/psbt.c` (fees are
-balanced in the fee asset alone) and `wallet/wallet.c` (table `channel_sym_lanes`, column
+balanced in the fee asset alone), `common/close_tx.c` and `closingd/closingd.c` (the mutual
+close), and `wallet/wallet.c` (table `channel_sym_lanes`, column
 `channel_htlcs.sym_lane`). Tests: `common/test/run-sym_lanes.c` checks a settlement over two
 lanes against vectors from the builders that were spent on a Sequentia chain with each negative
 case (an update moving one lane without the other side's signature, a swap applied to one lane
