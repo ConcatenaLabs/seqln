@@ -111,6 +111,12 @@ void channel_internal_error(struct channel *channel UNNEEDED, const char *fmt UN
 /* Generated stub for channel_is_sym_factory */
 bool channel_is_sym_factory(const struct channel *channel UNNEEDED)
 { fprintf(stderr, "channel_is_sym_factory called!\n"); abort(); }
+/* Generated stub for channel_is_sym_lanes */
+bool channel_is_sym_lanes(const struct channel *channel UNNEEDED)
+{ fprintf(stderr, "channel_is_sym_lanes called!\n"); abort(); }
+/* Generated stub for channel_lane_of_asset */
+int channel_lane_of_asset(const struct channel *channel UNNEEDED, const u8 asset[33] UNNEEDED)
+{ fprintf(stderr, "channel_lane_of_asset called!\n"); abort(); }
 /* Generated stub for channel_last_funding_feerate */
 u32 channel_last_funding_feerate(const struct channel *channel UNNEEDED)
 { fprintf(stderr, "channel_last_funding_feerate called!\n"); abort(); }
