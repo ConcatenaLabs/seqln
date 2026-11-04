@@ -1204,11 +1204,13 @@ class PrettyPrintingLightningRpc(LightningRpc):
             # allow_unfunded (upstream makes it and warns).  An upstream test
             # knows only the chain's one asset and upstream's behaviour, so
             # ask for those, as its caller would.
-            message = e.error.get('message', '')
             if not (method == 'invoice' and self.invoice_asset
                     and isinstance(payload, dict)
-                    and ('name the asset this invoice is paid in' in message
-                         or 'pass allow_unfunded=true' in message)):
+                    and isinstance(e.error, dict)):
+                raise
+            message = e.error.get('message', '')
+            if not ('name the asset this invoice is paid in' in message
+                    or 'pass allow_unfunded=true' in message):
                 raise
             payload = dict(payload, allow_unfunded=True)
             if payload.get('asset') is None:
