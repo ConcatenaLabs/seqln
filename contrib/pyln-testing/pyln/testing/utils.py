@@ -901,9 +901,11 @@ class SequentiaD(BitcoinD):
     def generate_block(self, numblocks=1, wait_for_mempool=0, to_addr=None,
                        needfeerate=None, advance_parent=None):
         """Produce `numblocks` committee-certified blocks.  `to_addr` is
-        ignored: a block's fees go to the leader that produced it."""
-        if needfeerate is not None:
-            raise NotImplementedError("needfeerate is not supported on {}".format(self.CHAIN))
+        ignored: a block's fees go to the leader that produced it.
+
+        With `needfeerate`, as on BitcoinD: if any transaction (with its
+        ancestors) pays at least that feerate, mine the mempool; otherwise
+        mine a block without any of it."""
         if wait_for_mempool:
             if isinstance(wait_for_mempool, str):
                 wait_for_mempool = [wait_for_mempool]
@@ -913,6 +915,25 @@ class SequentiaD(BitcoinD):
                 wait_for(lambda: len(self.rpc.getrawmempool()) >= wait_for_mempool)
         if advance_parent is None:
             advance_parent = self.advance_parent
+
+        if needfeerate is not None:
+            assert numblocks == 1
+            mempool = self.rpc.getrawmempool(True)
+            for txid, details in mempool.items():
+                feerate = float(details['fees']['ancestor']) * 100_000_000 / (float(details['ancestorsize']) * 4 / 1000)
+                if feerate >= needfeerate:
+                    return self.generate_block(1, advance_parent=advance_parent)
+                print(f"Feerate {feerate} for {txid} below {needfeerate}")
+            # generateposblock takes no transaction list: hold every
+            # transaction back by its priority for this one block.
+            hold = 10**8
+            for txid in mempool:
+                self.rpc.prioritisetransaction(txid, None, -hold)
+            try:
+                return self.generate_block(1, advance_parent=advance_parent)
+            finally:
+                for txid in mempool:
+                    self.rpc.prioritisetransaction(txid, None, hold)
 
         hashes = []
         for _ in range(numblocks):

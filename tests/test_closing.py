@@ -29,7 +29,14 @@ def test_closing_simple(node_factory, bitcoind, chainparams):
     l1, l2 = node_factory.line_graph(2, opts={'plugin': coin_mvt_plugin})
     chan = l1.get_channel_scid(l2)
     channel_id = first_channel_id(l1, l2)
-    fee = closing_fee(3750, 2) if not chainparams['elements'] else 4278
+    if not chainparams['elements']:
+        fee = closing_fee(3750, 2)
+    elif TEST_NETWORK == 'liquid-regtest':
+        fee = 4278
+    else:
+        # Sequentia rounds a fee up (common/amount.c amount_tx_fee): the same
+        # 1141-weight close at 3750/kw is 4278.75 sat.
+        fee = 4279
 
     l1.pay(l2, 200000000)
 
@@ -3619,10 +3626,15 @@ def test_close_feerate_range(node_factory, bitcoind, chainparams):
     if not chainparams['elements']:
         l1_range = [151, 4500]
         l2_range = [1125, 1000000]
-    else:
+    elif TEST_NETWORK == 'liquid-regtest':
         # That fee output is a little chunky.
         l1_range = [221, 6577]
         l2_range = [1644, 1000000]
+    else:
+        # Liquid's figures, each rounded up as Sequentia rounds a fee
+        # (common/amount.c amount_tx_fee).
+        l1_range = [222, 6578]
+        l2_range = [1645, 1000000]
 
     l1.daemon.wait_for_log('Negotiating closing fee between {}sat and {}sat satoshi'.format(l1_range[0], l1_range[1]))
     l2.daemon.wait_for_log('Negotiating closing fee between {}sat and {}sat satoshi'.format(l2_range[0], l2_range[1]))

@@ -558,7 +558,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: pytest-results-first-integration-${{ matrix.GROUP }}
+          name: pytest-results-first-integration-${{ matrix.TEST_NETWORK }}-${{ matrix.GROUP }}
           path: report.xml
           if-no-files-found: ignore
 
