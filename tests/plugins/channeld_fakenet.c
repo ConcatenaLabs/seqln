@@ -178,7 +178,8 @@ static void pretend_got_revoke(struct info *info, u64 htlc_id, enum htlc_state n
 	msg = towire_channeld_got_revoke(NULL, info->commit_num - 1, &secret,
 					 &next_per_commit_point, info->fee_states,
 					 info->blockheight_states, changed,
-					 NULL, NULL, NULL, NULL);
+					 NULL, NULL, NULL, NULL,
+						NULL);
 	daemon_conn_send(info->dc, take(msg));
 }
 
@@ -200,6 +201,7 @@ static void update_commitment_tx_added(struct info *info, u64 htlc_id)
 						info->fee_states,
 						info->blockheight_states,
 						changed,
+						NULL,
 						NULL);
 	daemon_conn_send(info->dc, take(msg));
 
@@ -223,7 +225,8 @@ static void update_commitment_tx_added(struct info *info, u64 htlc_id)
 					    NULL,
 					    fake_commit_point(info, info->commit_num),
 					    NULL,
-					    NULL);
+					    NULL,
+						NULL);
 	daemon_conn_send(info->dc, take(msg));
 
 	/* Tell full_channel.c the htlc is totally committed. */
@@ -425,7 +428,8 @@ static void fail(struct info *info,
 					    NULL,
 					    fake_commit_point(info, info->commit_num),
 					    NULL,
-					    NULL);
+					    NULL,
+						NULL);
 	daemon_conn_send(info->dc, take(msg));
 
 	changed = tal_arr(tmpctx, struct changed_htlc, 1);
@@ -440,6 +444,7 @@ static void fail(struct info *info,
 						info->fee_states,
 						info->blockheight_states,
 						changed,
+						NULL,
 						NULL);
 	daemon_conn_send(info->dc, take(msg));
 
@@ -561,7 +566,8 @@ static void succeed(struct info *info,
 					    NULL,
 					    fake_commit_point(info, info->commit_num),
 					    NULL,
-					    NULL);
+					    NULL,
+						NULL);
 	daemon_conn_send(info->dc, take(msg));
 
 	changed = tal_arr(tmpctx, struct changed_htlc, 1);
@@ -576,6 +582,7 @@ static void succeed(struct info *info,
 						info->fee_states,
 						info->blockheight_states,
 						changed,
+						NULL,
 						NULL);
 	daemon_conn_send(info->dc, take(msg));
 
@@ -906,6 +913,8 @@ static void handle_offer_htlc(struct info *info, const u8 *inmsg)
 	/* SEQUENTIA: a point lock (common/point_lock.h); this fake network
 	 * locks every HTLC to its hash. */
 	struct pubkey *lock_point;
+	/* SEQUENTIA: its lane (common/sym_lanes.h): one asset here. */
+	u16 lane;
 	static u64 htlc_id;
 	struct fake_htlc *htlc = tal(info, struct fake_htlc);
 
@@ -914,7 +923,7 @@ static void handle_offer_htlc(struct info *info, const u8 *inmsg)
 	if (!fromwire_channeld_offer_htlc(tmpctx, inmsg, &amount,
 					 &cltv_expiry, &htlc->payment_hash,
 					 onion_routing_packet, &blinding, &extratlvs,
-					 &lock_point))
+					 &lock_point, &lane))
 		master_badmsg(WIRE_CHANNELD_OFFER_HTLC, inmsg);
 
 	e = channel_add_htlc(info->channel, LOCAL, htlc->htlc_id,
@@ -1107,6 +1116,11 @@ static struct channel *handle_init(struct info *info, const u8 *init_msg)
 	u8 *remote_upfront_shutdown_script;
 	u32 *dev_disable_commit;
 	struct inflight **inflights;
+	/* SEQUENTIA: a channel of several assets (common/sym_lanes.h); this
+	 * fake network's channels hold one. */
+	struct sym_lane *sym_lanes;
+	struct amount_msat *sym_lane_local_msat;
+	struct sym_swap *sym_swap, *sym_swap_req;
 	struct short_channel_id local_alias;
 	struct channel *channel;
 	const u8 *wscript;
@@ -1169,7 +1183,9 @@ static struct channel *handle_init(struct info *info, const u8 *init_msg)
 				    &dev_disable_commit,
 				    &pbases,
 				    &inflights,
-				    &local_alias))
+				    &local_alias,
+				    &sym_lanes, &sym_lane_local_msat,
+				    &sym_swap, &sym_swap_req))
 		abort();
 
 	status_debug("Parsed init...");
@@ -1291,6 +1307,11 @@ static struct io_plan *recv_req(struct io_conn *conn,
 	case WIRE_CHANNELD_ADD_INFLIGHT:
 	case WIRE_CHANNELD_UPDATE_INFLIGHT:
 	case WIRE_CHANNELD_GOT_INFLIGHT:
+	case WIRE_CHANNELD_SYM_SWAP_REQUEST:
+	case WIRE_CHANNELD_SYM_SWAP_REQUEST_REPLY:
+	case WIRE_CHANNELD_SYM_SWAP_ACCEPT:
+	case WIRE_CHANNELD_SYM_SWAP_ACCEPT_REPLY:
+	case WIRE_CHANNELD_SYM_SWAP_CANCEL:
 	case WIRE_CHANNELD_SPLICE_STATE_ERROR:
 	case WIRE_CHANNELD_LOCAL_ANCHOR_INFO:
 	case WIRE_CHANNELD_REESTABLISHED:
