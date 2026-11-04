@@ -83,6 +83,9 @@ void fromwire_shachain(const u8 **cursor UNNEEDED, size_t *max UNNEEDED,
 /* Generated stub for fromwire_side */
 enum side fromwire_side(const u8 **cursor UNNEEDED, size_t *max UNNEEDED)
 { fprintf(stderr, "fromwire_side called!\n"); abort(); }
+/* Generated stub for fromwire_sym_lane */
+void fromwire_sym_lane(const u8 **cursor UNNEEDED, size_t *max UNNEEDED, struct sym_lane *lane UNNEEDED)
+{ fprintf(stderr, "fromwire_sym_lane called!\n"); abort(); }
 /* Generated stub for fromwire_sym_state */
 struct sym_state *fromwire_sym_state(const tal_t *ctx UNNEEDED,
 				     const u8 **pptr UNNEEDED, size_t *max UNNEEDED)
@@ -349,6 +352,9 @@ void towire_shachain(u8 **pptr UNNEEDED, const struct shachain *shachain UNNEEDE
 /* Generated stub for towire_side */
 void towire_side(u8 **pptr UNNEEDED, const enum side side UNNEEDED)
 { fprintf(stderr, "towire_side called!\n"); abort(); }
+/* Generated stub for towire_sym_lane */
+void towire_sym_lane(u8 **pptr UNNEEDED, const struct sym_lane *lane UNNEEDED)
+{ fprintf(stderr, "towire_sym_lane called!\n"); abort(); }
 /* Generated stub for towire_sym_state */
 void towire_sym_state(u8 **pptr UNNEEDED, const struct sym_state *st UNNEEDED)
 { fprintf(stderr, "towire_sym_state called!\n"); abort(); }
