@@ -533,6 +533,12 @@ jobs:
           find . -type f -print0 | xargs -0 touch -d yesterday
           tar xaf cln-${{ matrix.CFG }}.tar.gz
 
+      - name: Build the device signer
+        # tests/sequentia drive a keyless node with it.
+        if: ${{ matrix.TEST_NETWORK == 'sequentia-regtest' }}
+        run: |
+          cargo build --release --locked --manifest-path contrib/seqln-signer/Cargo.toml --bin seqln-signer
+
       - name: Switch network
         if: ${{ matrix.TEST_NETWORK != 'regtest' }}
         run: |

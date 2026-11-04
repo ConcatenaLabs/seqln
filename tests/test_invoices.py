@@ -15,7 +15,8 @@ def test_invoice(node_factory, chainparams):
     l1, l2 = node_factory.line_graph(2, fundchannel=False, opts={'log-level': 'io'})
 
     addr1 = l2.rpc.newaddr('bech32')['bech32']
-    addr2 = '2MxqzNANJNAdMjHQq8ZLkwzooxAFiRzXvEz' if not chainparams['elements'] else 'XGx1E2JSTLZLmqYMAo3CGpsco85aS7so33'
+    # Sequentia shares Bitcoin's address prefixes; Liquid has its own.
+    addr2 = 'XGx1E2JSTLZLmqYMAo3CGpsco85aS7so33' if TEST_NETWORK == 'liquid-regtest' else '2MxqzNANJNAdMjHQq8ZLkwzooxAFiRzXvEz'
     before = int(time.time())
     inv = l1.rpc.invoice(123000, 'label', 'description', 3700, [addr1, addr2])
 

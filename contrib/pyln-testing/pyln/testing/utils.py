@@ -731,9 +731,13 @@ class ElementsD(BitcoinD):
 
 
 SEQUENTIA_NETWORKS = ('sequentia-regtest',)
-# Whether a node on a Sequentia network runs with the network's own timelock
-# defaults rather than the suite's test values (see LightningD).
-SEQUENTIA_NETWORK_DEFAULTS = False
+# Whether the running test is written for Sequentia (tests/sequentia sets it).
+# The upstream tests know one chain asset and the suite's short test
+# timelocks; on a Sequentia network the harness keeps both for them (see
+# LightningD and PrettyPrintingLightningRpc).  A test written for Sequentia
+# gets the network as it is run: its own timelock defaults, and no asset
+# named on its behalf.
+SEQUENTIA_NATIVE = False
 ELEMENTS_NETWORKS = ('liquid-regtest',) + SEQUENTIA_NETWORKS
 
 
@@ -1041,11 +1045,11 @@ class LightningD(TailableProc):
         # depth, is never fatal.  It also has its own timelock defaults,
         # sized for its block cadence.  The upstream tests run with the
         # same short test timelocks on every chain (on Bitcoin too they are
-        # far from the network's defaults); tests that check the network's
-        # own defaults set SEQUENTIA_NETWORK_DEFAULTS (tests/sequentia does).
+        # far from the network's defaults); a test written for Sequentia
+        # (SEQUENTIA_NATIVE) gets the network's own.
         if TEST_NETWORK in SEQUENTIA_NETWORKS:
             keys = ['rescan']
-            if SEQUENTIA_NETWORK_DEFAULTS:
+            if SEQUENTIA_NATIVE:
                 keys += ['cltv-delta', 'cltv-final', 'watchtime-blocks']
             for k in keys:
                 del self.opts[k]
@@ -1141,6 +1145,8 @@ class PrettyPrintingLightningRpc(LightningRpc):
         )
         self.jsonschemas = jsonschemas
         self.check_request_schemas = True
+        # On Sequentia, the asset an upstream test's invoice is paid in.
+        self.invoice_asset = None
 
     def call(self, method, payload=None, cmdprefix=None, filter=None):
         id = self.get_json_id(method, cmdprefix)
@@ -1179,7 +1185,25 @@ class PrettyPrintingLightningRpc(LightningRpc):
             except ValueError:
                 pass
 
-        res = LightningRpc.call(self, method, payload, cmdprefix, filter)
+        try:
+            res = LightningRpc.call(self, method, payload, cmdprefix, filter)
+        except RpcError as e:
+            # A Sequentia node with no channel to receive on refuses an
+            # invoice that does not name its asset (no asset is privileged,
+            # so none is assumed), and one no channel could pay unless told
+            # allow_unfunded (upstream makes it and warns).  An upstream test
+            # knows only the chain's one asset and upstream's behaviour, so
+            # ask for those, as its caller would.
+            message = e.error.get('message', '')
+            if not (method == 'invoice' and self.invoice_asset
+                    and isinstance(payload, dict)
+                    and ('name the asset this invoice is paid in' in message
+                         or 'pass allow_unfunded=true' in message)):
+                raise
+            payload = dict(payload, allow_unfunded=True)
+            if payload.get('asset') is None:
+                payload['asset'] = self.invoice_asset
+            res = LightningRpc.call(self, method, payload, cmdprefix, filter)
         self.logger.debug(json.dumps({
             "id": id,
             "result": res
@@ -1345,6 +1369,8 @@ class LightningNode(object):
             self.executor,
             jsonschemas=jsonschemas
         )
+        if TEST_NETWORK in SEQUENTIA_NETWORKS and not SEQUENTIA_NATIVE:
+            self.rpc.invoice_asset = self.bitcoin.POLICY_ASSET
 
     @property
     def grpc(self):
