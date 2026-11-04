@@ -53,7 +53,8 @@ struct existing_htlc *new_existing_htlc(const tal_t *ctx,
 					const struct preimage *preimage TAKES,
 					const struct failed_htlc *failed TAKES,
 					const struct tlv_field *extra_tlvs TAKES,
-					const struct pubkey *lock_point TAKES)
+					const struct pubkey *lock_point TAKES,
+					u16 lane)
 {
 	struct existing_htlc *existing = tal(ctx, struct existing_htlc);
 
@@ -77,6 +78,7 @@ struct existing_htlc *new_existing_htlc(const tal_t *ctx,
 		existing->extra_tlvs = NULL;
 	existing->lock_point = tal_dup_or_null(existing, struct pubkey,
 					       lock_point);
+	existing->lane = lane;
 
 	return existing;
 }
@@ -119,6 +121,7 @@ void towire_added_htlc(u8 **pptr, const struct added_htlc *added)
 		towire_pubkey(pptr, added->lock_point);
 	} else
 		towire_bool(pptr, false);
+	towire_u16(pptr, added->lane);
 }
 
 void towire_existing_htlc(u8 **pptr, const struct existing_htlc *existing)
@@ -155,6 +158,7 @@ void towire_existing_htlc(u8 **pptr, const struct existing_htlc *existing)
 		towire_pubkey(pptr, existing->lock_point);
 	} else
 		towire_bool(pptr, false);
+	towire_u16(pptr, existing->lane);
 }
 
 void towire_fulfilled_htlc(u8 **pptr, const struct fulfilled_htlc *fulfilled)
@@ -254,6 +258,7 @@ struct added_htlc *fromwire_added_htlc(const tal_t *ctx, const u8 **cursor,
 		fromwire_pubkey(cursor, max, added->lock_point);
 	} else
 		added->lock_point = NULL;
+	added->lane = fromwire_u16(cursor, max);
 	return added;
 }
 
@@ -292,6 +297,7 @@ struct existing_htlc *fromwire_existing_htlc(const tal_t *ctx,
 		fromwire_pubkey(cursor, max, existing->lock_point);
 	} else
 		existing->lock_point = NULL;
+	existing->lane = fromwire_u16(cursor, max);
 	return existing;
 }
 

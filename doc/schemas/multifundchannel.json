@@ -90,6 +90,34 @@
               "description": [
                 "On an asset-aware chain, the 32-byte display id of the asset to fund this channel in; *amount* is then in that asset's atoms. Every destination of one call must use the same asset. The default is the chain's policy asset."
               ]
+            },
+            "lanes": {
+              "type": "array",
+              "description": [
+                "On a Sequentia network, open this destination's channel as a channel of several assets (see **fundchannel_start**): it must then be the only destination, with its own *asset* and an *amount*. The funding transaction spends coins of each asset, and its fee is paid in the channel's own asset."
+              ],
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "asset",
+                  "amount"
+                ],
+                "properties": {
+                  "asset": {
+                    "type": "hex",
+                    "description": [
+                      "The 32-byte display id of the asset."
+                    ]
+                  },
+                  "amount": {
+                    "type": "sat",
+                    "description": [
+                      "How much of it to fund, in its atoms."
+                    ]
+                  }
+                }
+              }
             }
           }
         }
@@ -232,7 +260,8 @@
                       "seq_taproot_covenant/even",
                       "seq_credit/even",
                       "seq_symmetric/even",
-                      "seq_symmetric_factory/even"
+                      "seq_symmetric_factory/even",
+                      "seq_symmetric_lanes/even"
                     ],
                     "description": [
                       "Name of feature bit."

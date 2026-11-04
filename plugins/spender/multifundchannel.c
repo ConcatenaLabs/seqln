@@ -263,6 +263,12 @@ mfc_cleanup_(struct multifundchannel_command *mfc,
 
 		++cleanup->pending;
 		mfc_cleanup_psbt(mfc->cmd, cleanup, mfc->psbt);
+	} else {
+		/* SEQUENTIA: lanes' coins not merged into it yet. */
+		for (i = 0; i < tal_count(mfc->lane_psbts); i++) {
+			++cleanup->pending;
+			mfc_cleanup_psbt(mfc->cmd, cleanup, mfc->lane_psbts[i]);
+		}
 	}
 	for (i = 0; i < tal_count(mfc->destinations); ++i) {
 		struct multifundchannel_destination *dest;
@@ -976,6 +982,14 @@ perform_funding_tx_finalize(struct multifundchannel_command *mfc)
 		 * serial_id if this contains any v2 outputs */
 		if (v2_dest_count == 0)
 			dest->outnum = outnum;
+		/* SEQUENTIA: every other lane, to the same script
+		 * (common/sym_lanes.h); fundchannel_complete finds each by
+		 * its asset. */
+		for (size_t l = 0; l < tal_count(dest->lanes); l++)
+			(void) psbt_append_output_asset(mfc->psbt,
+							dest->funding_script,
+							dest->lanes[l].amount,
+							dest->lanes[l].tag);
 		tal_append_fmt(&content, "%s: %s",
 			       fmt_node_id(tmpctx, &dest->id),
 			       fmt_amount_sat(tmpctx, dest->amount));
@@ -1224,6 +1238,20 @@ fundchannel_start_dest(struct multifundchannel_destination *dest)
 	if (dest->asset)
 		json_add_string(req->js, "asset", dest->asset);
 
+	/* SEQUENTIA: a channel of several assets. */
+	if (dest->lanes) {
+		json_array_start(req->js, "lanes");
+		for (size_t l = 0; l < tal_count(dest->lanes); l++) {
+			json_object_start(req->js, NULL);
+			json_add_string(req->js, "asset", dest->lanes[l].asset);
+			json_add_string(req->js, "amount",
+					fmt_amount_sat(tmpctx,
+						       dest->lanes[l].amount));
+			json_object_end(req->js);
+		}
+		json_array_end(req->js);
+	}
+
 	/* SEQUENTIA: a slot of the factory. */
 	if (mfc->factory) {
 		json_add_txid(req->js, "factory_nonce", &mfc->factory_nonce);
@@ -1299,6 +1327,7 @@ mfc_psbt_acquired(struct multifundchannel_command *mfc)
 /* Limited recursion if we discover 'all' is too big for non-wumbo! */
 static struct command_result *
 perform_fundpsbt(struct multifundchannel_command *mfc, u32 feerate);
+static void merge_lane_psbts(struct multifundchannel_command *mfc);
 
 static struct command_result *
 retry_fundpsbt_capped_all(struct command *cmd,
@@ -1395,6 +1424,8 @@ after_fundpsbt(struct command *cmd,
 					      retry_fundpsbt_capped_all, mfc);
 		}
 	}
+	/* SEQUENTIA: the lanes' coins and change (common/sym_lanes.h). */
+	merge_lane_psbts(mfc);
 	return mfc_psbt_acquired(mfc);
 
 fail:
@@ -1403,6 +1434,184 @@ fail:
 		   json_tok_full_len(result),
 		   json_tok_full(buf, result));
 
+}
+
+/*~ SEQUENTIA: a channel of several assets (common/sym_lanes.h).  Each lane
+ * beside the channel's own is funded by its own coins, with change, in its
+ * asset, and pays no fee: the channel's asset pays for the whole
+ * transaction, whose first inputs are its own. */
+static struct command_result *after_lane_fundpsbt(struct command *cmd,
+						  const char *method,
+						  const char *buf,
+						  const jsmntok_t *result,
+						  struct multifundchannel_command *mfc);
+
+static struct command_result *
+perform_lane_fundpsbt(struct multifundchannel_command *mfc, u32 feerate)
+{
+	struct multifundchannel_destination *dest = &mfc->destinations[0];
+	size_t next = tal_count(mfc->lane_psbts);
+	struct out_req *req;
+
+	if (next == tal_count(dest->lanes))
+		return perform_fundpsbt(mfc, feerate);
+
+	req = jsonrpc_request_start(mfc->cmd, "fundpsbt",
+				    &after_lane_fundpsbt, &mfc_forward_error,
+				    mfc);
+	json_add_u32(req->js, "minconf", mfc->minconf);
+	json_add_u32(req->js, "reserve", 2016);
+	json_add_string(req->js, "satoshi",
+			fmt_amount_sat(tmpctx, dest->lanes[next].amount));
+	json_add_string(req->js, "feerate", tal_fmt(tmpctx, "%uperkw", feerate));
+	json_add_string(req->js, "startweight",
+			tal_fmt(tmpctx, "%zu",
+				bitcoin_tx_output_weight(BITCOIN_SCRIPTPUBKEY_P2WSH_LEN)));
+	json_add_bool(req->js, "excess_as_change", true);
+	json_add_string(req->js, "asset", dest->lanes[next].asset);
+	/* Where to come back to. */
+	mfc->feerate_per_kw = feerate;
+	return send_outreq(req);
+}
+
+static struct command_result *after_lane_fundpsbt(struct command *cmd,
+						  const char *method,
+						  const char *buf,
+						  const jsmntok_t *result,
+						  struct multifundchannel_command *mfc)
+{
+	const jsmntok_t *field;
+	struct wally_psbt *psbt;
+	struct amount_sat fee = AMOUNT_SAT(0);
+	u32 weight;
+	int change = -1;
+
+	field = json_get_member(buf, result, "psbt");
+	if (!field
+	    || !(psbt = psbt_from_b64(mfc, buf + field->start,
+				      field->end - field->start))
+	    || !psbt_set_version(psbt, 2))
+		plugin_err(mfc->cmd->plugin, "Bad lane fundpsbt %.*s",
+			   json_tok_full_len(result), json_tok_full(buf, result));
+	for (size_t i = 0; i < psbt->num_inputs; i++)
+		psbt_input_mark_ours(psbt, &psbt->inputs[i]);
+	if (!tal_count(mfc->lane_psbts))
+		mfc->lane_psbts = tal_arr(mfc, struct wally_psbt *, 0);
+	tal_arr_expand(&mfc->lane_psbts, psbt);
+
+	field = json_get_member(buf, result, "estimated_final_weight");
+	if (!field || !json_to_u32(buf, field, &weight))
+		plugin_err(mfc->cmd->plugin, "Bad lane fundpsbt weight");
+	mfc->lane_weight += weight;
+	field = json_get_member(buf, result, "change_outnum");
+	if (field && !json_to_int(buf, field, &change))
+		change = -1;
+
+	/* Its fee goes to its change: the channel's asset pays. */
+	for (size_t i = 0; i < psbt->num_outputs; i++) {
+		struct amount_asset a;
+
+		if (!elements_psbt_output_is_fee(psbt, i))
+			continue;
+		a = wally_psbt_output_get_amount(&psbt->outputs[i]);
+		if (!amount_sat_add(&fee, fee, amount_sat(a.value)))
+			abort();
+		psbt_rm_output(psbt, i);
+		if (change > (int)i)
+			change--;
+		i--;
+	}
+	if (!amount_sat_is_zero(fee)) {
+		struct amount_asset a;
+		const u8 *script;
+		struct amount_sat amount;
+		u8 tag[33];
+
+		if (change < 0)
+			return mfc_fail(mfc, FUND_CANNOT_AFFORD,
+					"Lane %zu's coins leave no change:"
+					" fund it with another amount",
+					tal_count(mfc->lane_psbts));
+		a = wally_psbt_output_get_amount(&psbt->outputs[change]);
+		memcpy(tag, a.asset, sizeof(tag));
+		script = tal_dup_arr(tmpctx, u8, psbt->outputs[change].script,
+				     psbt->outputs[change].script_len, 0);
+		amount = amount_sat(a.value);
+		if (!amount_sat_add(&amount, amount, fee))
+			abort();
+		psbt_rm_output(psbt, change);
+		psbt_append_output_asset(psbt, script, amount, tag);
+	}
+	return perform_lane_fundpsbt(mfc, mfc->feerate_per_kw);
+}
+
+/* Their inputs and change join the funding transaction, after its own. */
+static void merge_lane_psbts(struct multifundchannel_command *mfc)
+{
+	for (size_t l = 0; l < tal_count(mfc->lane_psbts); l++) {
+		struct wally_psbt *lp = mfc->lane_psbts[l];
+
+		for (size_t i = 0; i < lp->num_inputs; i++) {
+			struct bitcoin_outpoint op;
+			size_t at = mfc->psbt->num_inputs;
+
+			memcpy(&op.txid, lp->inputs[i].txhash, sizeof(op.txid));
+			op.n = lp->inputs[i].index;
+			psbt_append_input(mfc->psbt, &op, lp->inputs[i].sequence,
+					  NULL, NULL, NULL);
+			tal_wally_start();
+			wally_psbt_input_set_witness_utxo(&mfc->psbt->inputs[at],
+							  lp->inputs[i].witness_utxo);
+			tal_wally_end(mfc->psbt);
+			psbt_input_mark_ours(mfc->psbt, &mfc->psbt->inputs[at]);
+		}
+		for (size_t i = 0; i < lp->num_outputs; i++) {
+			struct amount_asset a
+				= wally_psbt_output_get_amount(&lp->outputs[i]);
+
+			psbt_append_output_asset(mfc->psbt,
+						 tal_dup_arr(tmpctx, u8,
+							     lp->outputs[i].script,
+							     lp->outputs[i].script_len,
+							     0),
+						 amount_sat(a.value), a.asset);
+		}
+	}
+}
+
+static struct command_result *param_mfc_lanes(struct command *cmd,
+					      const char *name,
+					      const char *buffer,
+					      const jsmntok_t *tok,
+					      struct mfc_lane **lanes)
+{
+	size_t i;
+	const jsmntok_t *t;
+
+	if (tok->type != JSMN_ARRAY || tok->size == 0)
+		return command_fail_badparam(cmd, name, buffer, tok,
+					     "an array of lanes");
+	*lanes = tal_arr(cmd, struct mfc_lane, tok->size);
+	json_for_each_arr(i, t, tok) {
+		const jsmntok_t *at = json_get_member(buffer, t, "asset");
+		const jsmntok_t *mt = json_get_member(buffer, t, "amount");
+		u8 id[32];
+
+		if (!at || !mt
+		    || !hex_decode(buffer + at->start, at->end - at->start,
+				   id, sizeof(id))
+		    || !parse_amount_sat(&(*lanes)[i].amount,
+					 buffer + mt->start,
+					 mt->end - mt->start))
+			return command_fail_badparam(cmd, name, buffer, t,
+						     "each lane is"
+						     " {asset, amount}");
+		(*lanes)[i].asset = json_strdup(*lanes, buffer, at);
+		(*lanes)[i].tag[0] = 0x01;
+		for (size_t k = 0; k < sizeof(id); k++)
+			(*lanes)[i].tag[1 + k] = id[sizeof(id) - 1 - k];
+	}
+	return NULL;
 }
 
 static bool any_dest_negotiated_anchors(const struct plugin *plugin,
@@ -1518,7 +1727,9 @@ perform_fundpsbt(struct multifundchannel_command *mfc, u32 feerate)
 			    + ( bitcoin_tx_output_weight(
 					BITCOIN_SCRIPTPUBKEY_P2WSH_LEN)
 			      * num_outs
-			      );
+			      )
+			    /* SEQUENTIA: and every lane's coins and change. */
+			    + mfc->lane_weight;
 		json_add_string(req->js, "startweight",
 				tal_fmt(tmpctx, "%zu", startweight));
 	}
@@ -1569,6 +1780,9 @@ after_getfeerate(struct command *cmd,
 			 err, json_tok_full_len(result),
 			 json_tok_full(buf, result));
 
+	/* SEQUENTIA: a channel of several assets funds its lanes first. */
+	if (tal_count(mfc->destinations) && mfc->destinations[0].lanes)
+		return perform_lane_fundpsbt(mfc, feerate);
 	return perform_fundpsbt(mfc, feerate);
 }
 
@@ -1987,6 +2201,7 @@ param_destinations_array(struct command *cmd, const char *name,
 			   p_opt("reserve", param_sat, &dest->reserve),
 			   p_opt("channel_type", param_channel_type, &dest->channel_type),
 			   p_opt("asset", param_string, &dest->asset),
+			   p_opt("lanes", param_mfc_lanes, &dest->lanes),
 			   NULL))
 			return command_param_failed();
 
@@ -2139,6 +2354,23 @@ json_multifundchannel(struct command *cmd,
 						    "Every slot of a factory"
 						    " names the same asset");
 		}
+	}
+
+	/* SEQUENTIA: a channel of several assets opens alone, funded in one
+	 * transaction with every lane (common/sym_lanes.h). */
+	mfc->lane_psbts = NULL;
+	mfc->lane_weight = 0;
+	for (size_t i = 0; i < tal_count(dests); i++) {
+		if (!dests[i].lanes)
+			continue;
+		if (tal_count(dests) != 1 || mfc->factory || dests[i].all)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "A channel of several assets opens"
+					    " alone, for a named amount");
+		if (!dests[i].asset)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "A channel of several assets names"
+					    " its own asset");
 	}
 
 	/* Should exist; it would only nonexist if it were a notification.  */

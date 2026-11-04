@@ -2091,6 +2091,11 @@ void handle_opts(struct lightningd *ld)
 			feature_set_or(ld->our_features,
 				       take(feature_set_for_feature(NULL,
 								    OPTIONAL_FEATURE(OPT_SEQ_SYMMETRIC_FACTORY))));
+			/* Its channels of several assets
+			 * (common/sym_lanes.h). */
+			feature_set_or(ld->our_features,
+				       take(feature_set_for_feature(NULL,
+								    OPTIONAL_FEATURE(OPT_SEQ_SYMMETRIC_LANES))));
 		} else
 			log_unusual(ld->log, "--symmetric-channels:"
 				    " not offered on %s, only on the"

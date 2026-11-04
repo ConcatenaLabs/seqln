@@ -219,6 +219,25 @@ struct ext_key *hsm_init(struct lightningd *ld)
 		feature_set_sub(ld->our_features,
 				feature_set_for_feature(tmpctx,
 							OPTIONAL_FEATURE(OPT_SEQ_SYMMETRIC_FACTORY)));
+		feature_set_sub(ld->our_features,
+				feature_set_for_feature(tmpctx,
+							OPTIONAL_FEATURE(OPT_SEQ_SYMMETRIC_LANES)));
+	}
+	/* SEQUENTIA: a lanes channel's states name their assets
+	 * (common/sym_lanes.h), which only hsmd_sign_sym_lanes_state signs; its
+	 * close spends every lane (hsmd_sign_mutual_close_lanes_tx); and a swap
+	 * goes to the signer first (hsmd_approve_sym_swap). */
+	if (feature_offered(ld->our_features->bits[INIT_FEATURE],
+			    OPT_SEQ_SYMMETRIC_LANES)
+	    && !(hsm_capable(ld, WIRE_HSMD_SIGN_SYM_LANES_STATE)
+		 && hsm_capable(ld, WIRE_HSMD_SIGN_MUTUAL_CLOSE_LANES_TX)
+		 && hsm_capable(ld, WIRE_HSMD_APPROVE_SYM_SWAP))) {
+		log_unusual(ld->log, "The signer cannot sign the states of a"
+			    " channel of several assets: not offering that"
+			    " channel type");
+		feature_set_sub(ld->our_features,
+				feature_set_for_feature(tmpctx,
+							OPTIONAL_FEATURE(OPT_SEQ_SYMMETRIC_LANES)));
 	}
 
 	/* SEQUENTIA: credit channels need that channel type, and a signer

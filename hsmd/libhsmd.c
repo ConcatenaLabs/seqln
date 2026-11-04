@@ -131,9 +131,12 @@ bool hsmd_check_client_capabilities(struct hsmd_client *client,
 	case WIRE_HSMD_CREDIT_NOTE:
 	case WIRE_HSMD_SIGN_SYM_KICKOFF:
 	case WIRE_HSMD_SIGN_SYM_STATE:
+	case WIRE_HSMD_SIGN_SYM_LANES_STATE:
+	case WIRE_HSMD_APPROVE_SYM_SWAP:
 		return (client->capabilities & HSM_PERM_SIGN_REMOTE_TX) != 0;
 
 	case WIRE_HSMD_SIGN_MUTUAL_CLOSE_TX:
+	case WIRE_HSMD_SIGN_MUTUAL_CLOSE_LANES_TX:
 		return (client->capabilities & HSM_PERM_SIGN_CLOSING_TX) != 0;
 
 	case WIRE_HSMD_SIGN_SPLICE_TX:
@@ -232,6 +235,9 @@ bool hsmd_check_client_capabilities(struct hsmd_client *client,
 	case WIRE_HSMD_SIGN_CREDIT_NOTE_REPLY:
 	case WIRE_HSMD_CREDIT_NOTE_REPLY:
 	case WIRE_HSMD_SIGN_SYM_STATE_REPLY:
+	case WIRE_HSMD_SIGN_SYM_LANES_STATE_REPLY:
+	case WIRE_HSMD_SIGN_MUTUAL_CLOSE_LANES_TX_REPLY:
+	case WIRE_HSMD_APPROVE_SYM_SWAP_REPLY:
 	case WIRE_HSMD_SIGN_ANY_CANNOUNCEMENT_REPLY:
 		break;
 	}
@@ -1467,6 +1473,56 @@ static u8 *handle_sign_mutual_close_tx(struct hsmd_client *c, const u8 *msg_in)
 	return towire_hsmd_sign_tx_reply(NULL, &sig);
 }
 
+/* SEQUENTIA: a swap on a channel of several assets (common/sym_lanes.h).
+ * This signer holds no balance, so it approves every one; a validating one
+ * records it and holds the state that moves the two lanes to it. */
+static u8 *handle_approve_sym_swap(struct hsmd_client *c, const u8 *msg_in)
+{
+	u8 give_asset[33], take_asset[33];
+	struct amount_msat give, take;
+
+	if (!fromwire_hsmd_approve_sym_swap(msg_in, give_asset, &give,
+					    take_asset, &take))
+		return hsmd_status_malformed_request(c, msg_in);
+	return towire_hsmd_approve_sym_swap_reply(NULL, true);
+}
+
+/* SEQUENTIA: the mutual close of a channel of several assets
+ * (common/close_tx.h): every input spends one of the channel's funding
+ * outputs, all to the same 2-of-2, and we sign each.  Like the plain close,
+ * this signer checks nothing of what it pays; a validating one does. */
+static u8 *handle_sign_mutual_close_lanes_tx(struct hsmd_client *c,
+					     const u8 *msg_in)
+{
+	struct secret channel_seed;
+	struct bitcoin_tx *tx;
+	struct pubkey remote_funding_pubkey, local_funding_pubkey;
+	struct bitcoin_signature *sigs;
+	struct secrets secrets;
+	const u8 *funding_wscript;
+
+	if (!fromwire_hsmd_sign_mutual_close_lanes_tx(tmpctx, msg_in, &tx,
+						      &remote_funding_pubkey))
+		return hsmd_status_malformed_request(c, msg_in);
+
+	tx->chainparams = c->chainparams;
+	get_channel_seed(&c->id, c->dbid, &channel_seed);
+	derive_basepoints(&channel_seed,
+			  &local_funding_pubkey, NULL, &secrets, NULL);
+	funding_wscript = bitcoin_redeem_2of2(tmpctx,
+					      &local_funding_pubkey,
+					      &remote_funding_pubkey);
+	sigs = tal_arr(tmpctx, struct bitcoin_signature, tx->wtx->num_inputs);
+	for (size_t i = 0; i < tx->wtx->num_inputs; i++) {
+		sign_tx_input(tx, i, NULL, funding_wscript,
+			      &secrets.funding_privkey,
+			      &local_funding_pubkey,
+			      SIGHASH_ALL, &sigs[i]);
+		check_overgrind(&sigs[i]);
+	}
+	return towire_hsmd_sign_mutual_close_lanes_tx_reply(NULL, sigs);
+}
+
 /* This is used by channeld to sign the final splice tx. */
 static u8 *handle_sign_splice_tx(struct hsmd_client *c, const u8 *msg_in)
 {
@@ -1897,10 +1953,13 @@ static u8 *handle_sign_commitment_tx(struct hsmd_client *c, const u8 *msg_in)
 
 	tx->chainparams = c->chainparams;
 
-	/* Basic sanity checks. */
-	if (tx->wtx->num_inputs != 1)
+	/* Basic sanity checks.  SEQUENTIA: the mutual close of a channel of
+	 * several assets (common/close_tx.h) spends every lane's funding
+	 * output; input 0 is the channel's, the one signed here, and closingd
+	 * completed the others' witnesses when it agreed on the close. */
+	if (tx->wtx->num_inputs < 1)
 		return hsmd_status_bad_request(c, msg_in,
-					       "tx must have 1 input");
+					       "tx must have an input");
 
 	if (tx->wtx->num_outputs == 0)
 		return hsmd_status_bad_request_fmt(c, msg_in,
@@ -2540,6 +2599,14 @@ static u8 *handle_sign_sym_state(struct hsmd_client *c, const u8 *msg_in)
 		return hsmd_status_malformed_request(c, msg_in);
 	if (tal_count(st->outs) == 0 || st->num < 0)
 		return hsmd_status_bad_request_fmt(c, msg_in, "empty state");
+	/* A state that names assets is a lanes channel's: it comes with its
+	 * lanes (hsmd_sign_sym_lanes_state), or not at all. */
+	for (size_t i = 0; i < tal_count(st->outs); i++)
+		if (st->outs[i].asset)
+			return hsmd_status_bad_request_fmt(c, msg_in,
+							   "a state that names"
+							   " assets needs its"
+							   " lanes");
 
 	get_channel_seed(&c->id, c->dbid, &channel_seed);
 	if (!derive_delayed_payment_basepoint(&channel_seed, &our_key,
@@ -2554,6 +2621,112 @@ static u8 *handle_sign_sym_state(struct hsmd_client *c, const u8 *msg_in)
 	sym_upd_msg(&sc, &tree, &msg);
 	tap_sign(&msg, &privkey, &sig);
 	return towire_hsmd_sign_sym_state_reply(NULL, &sig);
+}
+
+/* A state of a channel that holds several assets: lane 0 the channel's
+ * asset at its funding value, and each further lane its own.  The
+ * settlement must pay each lane's asset exactly that lane's value, and no
+ * other asset: what a state leaves of a lane, or pays outside the lanes,
+ * the publisher of its settlement would take. */
+static u8 *handle_sign_sym_lanes_state(struct hsmd_client *c, const u8 *msg_in)
+{
+	struct bitcoin_outpoint funding;
+	bool we_opened;
+	struct pubkey remote_update_key;
+	u8 asset[33], *lane_assets;
+	struct amount_sat funding_sats, *lane_sats, *paid;
+	u16 delay;
+	struct sym_state *st;
+	struct hsm_htlc *htlcs;
+	u16 *htlc_lanes;
+	struct secret channel_seed;
+	struct pubkey our_key;
+	struct privkey privkey;
+	struct sym_channel sc;
+	struct sym_tree tree;
+	struct sha256 msg;
+	struct bip340sig sig;
+	size_t nlanes;
+
+	if (!fromwire_hsmd_sign_sym_lanes_state(tmpctx, msg_in, &funding,
+						&we_opened, &remote_update_key,
+						asset, &funding_sats, &delay,
+						&lane_sats, &lane_assets, &st,
+						&htlcs, &htlc_lanes))
+		return hsmd_status_malformed_request(c, msg_in);
+	nlanes = tal_count(lane_sats);
+	if (tal_bytelen(lane_assets) != nlanes * 33)
+		return hsmd_status_bad_request_fmt(c, msg_in,
+						   "%zu lanes, %zu bytes of"
+						   " assets", nlanes,
+						   tal_bytelen(lane_assets));
+	if (tal_count(st->outs) == 0 || st->num < 0)
+		return hsmd_status_bad_request_fmt(c, msg_in, "empty state");
+	if (tal_count(htlc_lanes) != tal_count(htlcs))
+		return hsmd_status_bad_request_fmt(c, msg_in,
+						   "%zu HTLCs, %zu lanes of them",
+						   tal_count(htlcs),
+						   tal_count(htlc_lanes));
+
+	/* What the settlement pays each lane: [0] the channel's asset. */
+	paid = tal_arrz(tmpctx, struct amount_sat, nlanes + 1);
+	for (size_t i = 0; i < tal_count(st->outs); i++) {
+		const u8 *a = st->outs[i].asset ? st->outs[i].asset : asset;
+		size_t l;
+
+		if (memeq(a, 33, asset, 33))
+			l = 0;
+		else {
+			for (l = 1; l <= nlanes; l++)
+				if (memeq(a, 33, lane_assets + (l - 1) * 33, 33))
+					break;
+			if (l > nlanes)
+				return hsmd_status_bad_request_fmt(c, msg_in,
+								   "output %zu"
+								   " is in no"
+								   " lane", i);
+		}
+		if (!amount_sat_add(&paid[l], paid[l], st->outs[i].amount))
+			return hsmd_status_bad_request_fmt(c, msg_in,
+							   "overflow");
+	}
+	if (!amount_sat_eq(paid[0], funding_sats))
+		return hsmd_status_bad_request_fmt(c, msg_in,
+						   "the state pays %s of the"
+						   " channel's %s",
+						   fmt_amount_sat(tmpctx, paid[0]),
+						   fmt_amount_sat(tmpctx,
+								  funding_sats));
+	for (size_t l = 1; l <= nlanes; l++) {
+		if (lane_assets[(l - 1) * 33] != 0x01
+		    || memeq(lane_assets + (l - 1) * 33, 33, asset, 33))
+			return hsmd_status_bad_request_fmt(c, msg_in,
+							   "lane %zu's asset",
+							   l);
+		if (!amount_sat_eq(paid[l], lane_sats[l - 1]))
+			return hsmd_status_bad_request_fmt(c, msg_in,
+							   "the state pays %s"
+							   " of lane %zu's %s",
+							   fmt_amount_sat(tmpctx,
+									  paid[l]),
+							   l,
+							   fmt_amount_sat(tmpctx,
+									  lane_sats[l - 1]));
+	}
+
+	get_channel_seed(&c->id, c->dbid, &channel_seed);
+	if (!derive_delayed_payment_basepoint(&channel_seed, &our_key,
+					      &privkey.secret))
+		return hsmd_status_bad_request_fmt(c, msg_in,
+						   "cannot derive the update key");
+	sym_channel_init(&sc, &chainparams->genesis_blockhash, &funding,
+			 we_opened ? &our_key : &remote_update_key,
+			 we_opened ? &remote_update_key : &our_key,
+			 asset, delay);
+	sym_state_tree_of(tmpctx, &sc, st, &tree);
+	sym_upd_msg(&sc, &tree, &msg);
+	tap_sign(&msg, &privkey, &sig);
+	return towire_hsmd_sign_sym_lanes_state_reply(NULL, &sig);
 }
 
 /* A settlement HTLC output, by the leaf that pays us: our HTLC basepoint's
@@ -2662,6 +2835,10 @@ u8 *hsmd_handle_client_message(const tal_t *ctx, struct hsmd_client *client,
 		return handle_sign_withdrawal_tx(client, msg);
 	case WIRE_HSMD_SIGN_MUTUAL_CLOSE_TX:
 		return handle_sign_mutual_close_tx(client, msg);
+	case WIRE_HSMD_SIGN_MUTUAL_CLOSE_LANES_TX:
+		return handle_sign_mutual_close_lanes_tx(client, msg);
+	case WIRE_HSMD_APPROVE_SYM_SWAP:
+		return handle_approve_sym_swap(client, msg);
 	case WIRE_HSMD_SIGN_SPLICE_TX:
 		return handle_sign_splice_tx(client, msg);
 	case WIRE_HSMD_SIGN_REMOTE_HTLC_TX:
@@ -2725,6 +2902,8 @@ u8 *hsmd_handle_client_message(const tal_t *ctx, struct hsmd_client *client,
 		return handle_sign_sym_kickoff(client, msg);
 	case WIRE_HSMD_SIGN_SYM_STATE:
 		return handle_sign_sym_state(client, msg);
+	case WIRE_HSMD_SIGN_SYM_LANES_STATE:
+		return handle_sign_sym_lanes_state(client, msg);
 	case WIRE_HSMD_SIGN_SYM_HTLC:
 		return handle_sign_sym_htlc(client, msg);
 
@@ -2774,6 +2953,9 @@ u8 *hsmd_handle_client_message(const tal_t *ctx, struct hsmd_client *client,
 	case WIRE_HSMD_SIGN_CREDIT_NOTE_REPLY:
 	case WIRE_HSMD_CREDIT_NOTE_REPLY:
 	case WIRE_HSMD_SIGN_SYM_STATE_REPLY:
+	case WIRE_HSMD_SIGN_SYM_LANES_STATE_REPLY:
+	case WIRE_HSMD_SIGN_MUTUAL_CLOSE_LANES_TX_REPLY:
+	case WIRE_HSMD_APPROVE_SYM_SWAP_REPLY:
 	case WIRE_HSMD_SIGN_ANY_CANNOUNCEMENT_REPLY:
 		break;
 	}
@@ -2876,6 +3058,9 @@ u8 *hsmd_init(const u8 *secret_data, size_t secret_len, const u64 hsmd_version,
 		WIRE_HSMD_SIGN_SYM_KICKOFF,
 		WIRE_HSMD_SIGN_SYM_STATE,
 		WIRE_HSMD_SIGN_SYM_HTLC,
+		WIRE_HSMD_SIGN_SYM_LANES_STATE,
+		WIRE_HSMD_SIGN_MUTUAL_CLOSE_LANES_TX,
+		WIRE_HSMD_APPROVE_SYM_SWAP,
 	};
 	u32 *caps;
 

@@ -107,6 +107,15 @@ struct credit_note *channel_credit_latest(const tal_t *ctx UNNEEDED,
 /* Generated stub for channel_has_credit */
 bool channel_has_credit(const struct channel *channel UNNEEDED)
 { fprintf(stderr, "channel_has_credit called!\n"); abort(); }
+/* Generated stub for channel_is_sym_lanes */
+bool channel_is_sym_lanes(const struct channel *channel UNNEEDED)
+{ fprintf(stderr, "channel_is_sym_lanes called!\n"); abort(); }
+/* Generated stub for channel_lane_asset */
+const u8 *channel_lane_asset(const struct channel *channel UNNEEDED, u16 lane UNNEEDED)
+{ fprintf(stderr, "channel_lane_asset called!\n"); abort(); }
+/* Generated stub for channel_lane_of_asset */
+int channel_lane_of_asset(const struct channel *channel UNNEEDED, const u8 asset[33])
+{ fprintf(stderr, "channel_lane_of_asset called!\n"); abort(); }
 /* Generated stub for channel_mvt_index_created */
 u64 channel_mvt_index_created(struct lightningd *ld UNNEEDED,
 			      struct db *db UNNEEDED,
@@ -114,6 +123,9 @@ u64 channel_mvt_index_created(struct lightningd *ld UNNEEDED,
 			      struct amount_msat credit UNNEEDED,
 			      struct amount_msat debit UNNEEDED)
 { fprintf(stderr, "channel_mvt_index_created called!\n"); abort(); }
+/* Generated stub for channel_num_lanes */
+size_t channel_num_lanes(const struct channel *channel UNNEEDED)
+{ fprintf(stderr, "channel_num_lanes called!\n"); abort(); }
 /* Generated stub for channel_unsaved_close_conn */
 void channel_unsaved_close_conn(struct channel *channel UNNEEDED, const char *why UNNEEDED)
 { fprintf(stderr, "channel_unsaved_close_conn called!\n"); abort(); }
@@ -300,16 +312,16 @@ u64 forward_index_update_status(struct lightningd *ld UNNEEDED,
 bool fromwire_channeld_dev_memleak_reply(const void *p UNNEEDED, bool *leak UNNEEDED)
 { fprintf(stderr, "fromwire_channeld_dev_memleak_reply called!\n"); abort(); }
 /* Generated stub for fromwire_channeld_got_commitsig */
-bool fromwire_channeld_got_commitsig(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, u64 *commitnum UNNEEDED, struct fee_states **fee_states UNNEEDED, struct height_states **blockheight_states UNNEEDED, struct bitcoin_signature *signature UNNEEDED, struct bitcoin_signature **htlc_signature UNNEEDED, struct added_htlc ***added UNNEEDED, struct fulfilled_htlc **fulfilled UNNEEDED, struct failed_htlc ***failed UNNEEDED, struct changed_htlc **changed UNNEEDED, struct bitcoin_tx **tx UNNEEDED, struct commitsig ***inflight_commitsigs UNNEEDED, struct pubkey *local_per_commit UNNEEDED, struct got_commitsig_htlc_info **htlc_infos UNNEEDED, struct sym_state **sym_local UNNEEDED)
+bool fromwire_channeld_got_commitsig(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, u64 *commitnum UNNEEDED, struct fee_states **fee_states UNNEEDED, struct height_states **blockheight_states UNNEEDED, struct bitcoin_signature *signature UNNEEDED, struct bitcoin_signature **htlc_signature UNNEEDED, struct added_htlc ***added UNNEEDED, struct fulfilled_htlc **fulfilled UNNEEDED, struct failed_htlc ***failed UNNEEDED, struct changed_htlc **changed UNNEEDED, struct bitcoin_tx **tx UNNEEDED, struct commitsig ***inflight_commitsigs UNNEEDED, struct pubkey *local_per_commit UNNEEDED, struct got_commitsig_htlc_info **htlc_infos UNNEEDED, struct sym_state **sym_local UNNEEDED, struct sym_swap **sym_swap UNNEEDED)
 { fprintf(stderr, "fromwire_channeld_got_commitsig called!\n"); abort(); }
 /* Generated stub for fromwire_channeld_got_revoke */
-bool fromwire_channeld_got_revoke(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, u64 *revokenum UNNEEDED, struct secret *per_commitment_secret UNNEEDED, struct pubkey *next_per_commit_point UNNEEDED, struct fee_states **fee_states UNNEEDED, struct height_states **blockheight_states UNNEEDED, struct changed_htlc **changed UNNEEDED, struct penalty_base **pbase UNNEEDED, struct bitcoin_tx **penalty_tx UNNEEDED, struct watchtower_blob ***wt_blobs UNNEEDED, struct sym_state **sym_remote UNNEEDED)
+bool fromwire_channeld_got_revoke(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, u64 *revokenum UNNEEDED, struct secret *per_commitment_secret UNNEEDED, struct pubkey *next_per_commit_point UNNEEDED, struct fee_states **fee_states UNNEEDED, struct height_states **blockheight_states UNNEEDED, struct changed_htlc **changed UNNEEDED, struct penalty_base **pbase UNNEEDED, struct bitcoin_tx **penalty_tx UNNEEDED, struct watchtower_blob ***wt_blobs UNNEEDED, struct sym_state **sym_remote UNNEEDED, struct sym_swap **sym_swap UNNEEDED)
 { fprintf(stderr, "fromwire_channeld_got_revoke called!\n"); abort(); }
 /* Generated stub for fromwire_channeld_offer_htlc_reply */
 bool fromwire_channeld_offer_htlc_reply(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, u64 *id UNNEEDED, u8 **failuremsg UNNEEDED, wirestring **failurestr UNNEEDED)
 { fprintf(stderr, "fromwire_channeld_offer_htlc_reply called!\n"); abort(); }
 /* Generated stub for fromwire_channeld_sending_commitsig */
-bool fromwire_channeld_sending_commitsig(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, u64 *commitnum UNNEEDED, struct pubkey *remote_per_commit UNNEEDED, struct penalty_base **pbase UNNEEDED, struct fee_states **fee_states UNNEEDED, struct height_states **blockheight_states UNNEEDED, struct changed_htlc **changed UNNEEDED, struct sym_state **sym_remote UNNEEDED)
+bool fromwire_channeld_sending_commitsig(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, u64 *commitnum UNNEEDED, struct pubkey *remote_per_commit UNNEEDED, struct penalty_base **pbase UNNEEDED, struct fee_states **fee_states UNNEEDED, struct height_states **blockheight_states UNNEEDED, struct changed_htlc **changed UNNEEDED, struct sym_state **sym_remote UNNEEDED, struct sym_swap **sym_swap UNNEEDED)
 { fprintf(stderr, "fromwire_channeld_sending_commitsig called!\n"); abort(); }
 /* Generated stub for fromwire_connectd_peer_connected */
 bool fromwire_connectd_peer_connected(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, struct node_id *id UNNEEDED, u64 *counter UNNEEDED, struct wireaddr_internal *addr UNNEEDED, struct wireaddr **remote_addr UNNEEDED, bool *incoming UNNEEDED, u8 **features UNNEEDED, wirestring **connect_reason UNNEEDED, u64 *connect_nsec UNNEEDED)
@@ -438,6 +450,9 @@ void json_add_log(struct json_stream *result UNNEEDED,
 		  const struct node_id *node_id UNNEEDED,
 		  enum log_level minlevel UNNEEDED)
 { fprintf(stderr, "json_add_log called!\n"); abort(); }
+/* Generated stub for json_add_sym_lanes */
+void json_add_sym_lanes(struct json_stream *js UNNEEDED, const struct channel *channel UNNEEDED)
+{ fprintf(stderr, "json_add_sym_lanes called!\n"); abort(); }
 /* Generated stub for json_add_uncommitted_channel */
 void  json_add_uncommitted_channel(struct command *cmd UNNEEDED,
 						      struct json_stream *response UNNEEDED,
@@ -605,6 +620,13 @@ struct outpointfilter *outpointfilter_new(tal_t *ctx UNNEEDED)
 void outpointfilter_remove(struct outpointfilter *of UNNEEDED,
 			   const struct bitcoin_outpoint *outpoint UNNEEDED)
 { fprintf(stderr, "outpointfilter_remove called!\n"); abort(); }
+/* Generated stub for param_asset_tag */
+struct command_result *param_asset_tag(struct command *cmd UNNEEDED,
+				       const char *name UNNEEDED,
+				       const char *buffer UNNEEDED,
+				       const jsmntok_t *tok UNNEEDED,
+				       const u8 **asset UNNEEDED)
+{ fprintf(stderr, "param_asset_tag called!\n"); abort(); }
 /* Generated stub for param_loglevel */
 struct command_result *param_loglevel(struct command *cmd UNNEEDED,
 				      const char *name UNNEEDED,
@@ -696,6 +718,24 @@ u32 sym_htlc_margin(const struct channel *channel UNNEEDED)
 /* Generated stub for sym_is_kickoff */
 bool sym_is_kickoff(const struct channel *channel UNNEEDED, const struct bitcoin_tx *tx UNNEEDED)
 { fprintf(stderr, "sym_is_kickoff called!\n"); abort(); }
+/* Generated stub for sym_lanes_check_funding */
+const char *sym_lanes_check_funding(const tal_t *ctx UNNEEDED,
+				    const struct channel *channel UNNEEDED,
+				    const struct bitcoin_tx *tx UNNEEDED)
+{ fprintf(stderr, "sym_lanes_check_funding called!\n"); abort(); }
+/* Generated stub for sym_lanes_credit */
+bool sym_lanes_credit(struct channel *channel UNNEEDED, u16 lane UNNEEDED,
+		      struct amount_msat amount UNNEEDED, bool to_us UNNEEDED)
+{ fprintf(stderr, "sym_lanes_credit called!\n"); abort(); }
+/* Generated stub for sym_lanes_kickoffs */
+void sym_lanes_kickoffs(struct lightningd *ld UNNEEDED, struct channel *channel UNNEEDED)
+{ fprintf(stderr, "sym_lanes_kickoffs called!\n"); abort(); }
+/* Generated stub for sym_lanes_swap_step */
+void sym_lanes_swap_step(struct channel *channel UNNEEDED, const struct sym_swap *swap UNNEEDED)
+{ fprintf(stderr, "sym_lanes_swap_step called!\n"); abort(); }
+/* Generated stub for sym_lanes_watch */
+void sym_lanes_watch(struct lightningd *ld UNNEEDED, struct channel *channel UNNEEDED)
+{ fprintf(stderr, "sym_lanes_watch called!\n"); abort(); }
 /* Generated stub for sym_record_local */
 void sym_record_local(struct channel *channel UNNEEDED, struct sym_state *local UNNEEDED)
 { fprintf(stderr, "sym_record_local called!\n"); abort(); }
@@ -747,7 +787,7 @@ u8 *towire_channeld_got_commitsig_reply(const tal_t *ctx UNNEEDED)
 u8 *towire_channeld_got_revoke_reply(const tal_t *ctx UNNEEDED)
 { fprintf(stderr, "towire_channeld_got_revoke_reply called!\n"); abort(); }
 /* Generated stub for towire_channeld_offer_htlc */
-u8 *towire_channeld_offer_htlc(const tal_t *ctx UNNEEDED, struct amount_msat amount_msat UNNEEDED, u32 cltv_expiry UNNEEDED, const struct sha256 *payment_hash UNNEEDED, const u8 onion_routing_packet[1366] UNNEEDED, const struct pubkey *path_key UNNEEDED, const u8 *extra_tlvs UNNEEDED, const struct pubkey *lock_point UNNEEDED)
+u8 *towire_channeld_offer_htlc(const tal_t *ctx UNNEEDED, struct amount_msat amount_msat UNNEEDED, u32 cltv_expiry UNNEEDED, const struct sha256 *payment_hash UNNEEDED, const u8 onion_routing_packet[1366] UNNEEDED, const struct pubkey *path_key UNNEEDED, const u8 *extra_tlvs UNNEEDED, const struct pubkey *lock_point UNNEEDED, u16 lane UNNEEDED)
 { fprintf(stderr, "towire_channeld_offer_htlc called!\n"); abort(); }
 /* Generated stub for towire_channeld_sending_commitsig_reply */
 u8 *towire_channeld_sending_commitsig_reply(const tal_t *ctx UNNEEDED)
@@ -1187,7 +1227,7 @@ static bool test_wallet_outputs(struct lightningd *ld, const tal_t *ctx, bool bi
 					   AMOUNT_SAT(3),
 					   &channel,
 					   NULL,
-					   5),
+					   5, channel.channel_asset),
 		  "wallet_add_utxo with close_info and csv > 1");
 	CHECK_MSG(!wallet_err, wallet_err);
 	/* Normally freed by destroy_channel, but we don't call that */

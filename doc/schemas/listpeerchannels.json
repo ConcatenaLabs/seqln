@@ -147,7 +147,8 @@
                       "seq_taproot_covenant/even",
                       "seq_credit/even",
                       "seq_symmetric/even",
-                      "seq_symmetric_factory/even"
+                      "seq_symmetric_factory/even",
+                      "seq_symmetric_lanes/even"
                     ],
                     "description": [
                       "Name of feature bit."
@@ -1069,6 +1070,121 @@
                   ]
                 }
               }
+            },
+            "seq_lanes": {
+              "added": "v26.06",
+              "type": "array",
+              "description": [
+                "On a Sequentia network, for a channel of several assets: every asset it holds, lane 0 its own, with that lane's funding output and our balance in it."
+              ],
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "lane",
+                  "asset",
+                  "funding_outpoint",
+                  "total_msat",
+                  "to_us_msat"
+                ],
+                "properties": {
+                  "lane": {
+                    "type": "u32",
+                    "description": [
+                      "The lane's number, 0 the channel's own."
+                    ]
+                  },
+                  "asset": {
+                    "type": "hex",
+                    "description": [
+                      "The 32-byte display id of its asset."
+                    ]
+                  },
+                  "funding_outpoint": {
+                    "type": "outpoint",
+                    "description": [
+                      "Its funding output."
+                    ]
+                  },
+                  "total_msat": {
+                    "type": "msat",
+                    "description": [
+                      "What it holds, in thousandths of its asset's atoms."
+                    ]
+                  },
+                  "to_us_msat": {
+                    "type": "msat",
+                    "description": [
+                      "How much of that is ours."
+                    ]
+                  }
+                }
+              }
+            },
+            "seq_swap": {
+              "added": "v26.06",
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "id",
+                "state",
+                "sender",
+                "give_asset",
+                "give_msat",
+                "take_asset",
+                "take_msat"
+              ],
+              "description": [
+                "On a channel of several assets, a swap between two of its lanes that is in flight: sent, signed by one side or both, and not yet in both sides' balances."
+              ],
+              "properties": {
+                "id": {
+                  "type": "u64",
+                  "description": [
+                    "The swap's id."
+                  ]
+                },
+                "state": {
+                  "type": "string",
+                  "description": [
+                    "Where it is in the channel's commitments, as an HTLC's state is."
+                  ]
+                },
+                "sender": {
+                  "type": "string",
+                  "enum": [
+                    "local",
+                    "remote"
+                  ],
+                  "description": [
+                    "Who sent it in a commitment: the side that took the other's request."
+                  ]
+                },
+                "give_asset": {
+                  "type": "hex",
+                  "description": [
+                    "The asset its sender gives."
+                  ]
+                },
+                "give_msat": {
+                  "type": "msat",
+                  "description": [
+                    "How much of it."
+                  ]
+                },
+                "take_asset": {
+                  "type": "hex",
+                  "description": [
+                    "The asset its sender takes."
+                  ]
+                },
+                "take_msat": {
+                  "type": "msat",
+                  "description": [
+                    "How much of it."
+                  ]
+                }
+              }
             }
           },
           "allOf": [
@@ -1191,7 +1307,9 @@
                     ]
                   },
                   "channel_asset": {},
-                  "seq_factory": {}
+                  "seq_factory": {},
+                  "seq_lanes": {},
+                  "seq_swap": {}
                 }
               }
             },
@@ -1292,7 +1410,9 @@
                     ]
                   },
                   "channel_asset": {},
-                  "seq_factory": {}
+                  "seq_factory": {},
+                  "seq_lanes": {},
+                  "seq_swap": {}
                 }
               }
             },
@@ -1394,7 +1514,9 @@
                     ]
                   },
                   "channel_asset": {},
-                  "seq_factory": {}
+                  "seq_factory": {},
+                  "seq_lanes": {},
+                  "seq_swap": {}
                 }
               }
             },
@@ -1507,7 +1629,9 @@
                     ]
                   },
                   "channel_asset": {},
-                  "seq_factory": {}
+                  "seq_factory": {},
+                  "seq_lanes": {},
+                  "seq_swap": {}
                 }
               }
             }

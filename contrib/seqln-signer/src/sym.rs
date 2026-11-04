@@ -157,10 +157,18 @@ impl Channel {
     /// output, its asset id, 0x01, its value (8 bytes LE), 0x01, and the
     /// SHA256 of its witness program and version (v0: none).
     pub fn settle_digest(&self, outs: &[Out]) -> Option<[u8; 32]> {
+        self.settle_digest_in(outs, &[])
+    }
+
+    /// The same for a channel of several assets
+    /// (`option_seq_symmetric_lanes`): output i is in `assets[i]`, or in the
+    /// channel asset when `assets` names none for it.
+    pub fn settle_digest_in(&self, outs: &[Out], assets: &[Option<[u8; 33]>]) -> Option<[u8; 32]> {
         let mut e = sha256::Hash::engine();
-        for o in outs {
+        for (i, o) in outs.iter().enumerate() {
             let (version, prog) = witness_program(&o.spk)?;
-            e.input(&self.asset[1..]);
+            let asset = assets.get(i).copied().flatten().unwrap_or(self.asset);
+            e.input(&asset[1..]);
             e.input(&[1]);
             e.input(&o.amount.to_le_bytes());
             e.input(&[1]);
@@ -176,6 +184,11 @@ impl Channel {
 
     /// SETTLE: after the shared delay, outputs 0 .. m-1 are exactly `outs`.
     pub fn leaf_settle(&self, outs: &[Out]) -> Option<Vec<u8>> {
+        self.leaf_settle_in(outs, &[])
+    }
+
+    /// SETTLE over outputs each in its own asset ([`Self::settle_digest_in`]).
+    pub fn leaf_settle_in(&self, outs: &[Out], assets: &[Option<[u8; 33]>]) -> Option<Vec<u8>> {
         let m = outs.len();
         if m == 0 || m > u32::MAX as usize {
             return None;
@@ -200,14 +213,25 @@ impl Channel {
                 if i == m - 1 { OP_SHA256FINALIZE } else { OP_SHA256UPDATE },
             ]);
         }
-        push(&mut s, &self.settle_digest(outs)?);
+        push(&mut s, &self.settle_digest_in(outs, assets)?);
         s.push(OP_EQUAL);
         Some(s)
     }
 
     /// State `n`'s output: `tr(H, {UPD(n), SETTLE(outs)})`, as (program, R).
     pub fn state(&self, secp: &Secp256k1<All>, n: i64, outs: &[Out]) -> Option<([u8; 32], [u8; 32])> {
-        let settle = self.leaf_settle(outs)?;
+        self.state_in(secp, n, outs, &[])
+    }
+
+    /// State `n`'s output over outputs each in its own asset.
+    pub fn state_in(
+        &self,
+        secp: &Secp256k1<All>,
+        n: i64,
+        outs: &[Out],
+        assets: &[Option<[u8; 33]>],
+    ) -> Option<([u8; 32], [u8; 32])> {
+        let settle = self.leaf_settle_in(outs, assets)?;
         let rest = leaf_hash(&settle);
         let tree = Tree2::new(secp, &NUMS, self.leaf_upd(n), settle)?;
         Some((tree.program, rest))

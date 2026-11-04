@@ -10,6 +10,9 @@
 #include <common/htlc.h>
 
 struct signature;
+struct sym_lane;
+struct sym_lane_balance;
+struct sym_swap;
 struct added_htlc;
 struct failed_htlc;
 struct fulfilled_htlc;
@@ -95,6 +98,14 @@ struct channel {
 	 * top of its reserve, so its balance output can always pay the note's
 	 * CLAIM.  Zero otherwise. */
 	struct amount_sat credit_floor;
+
+	/* SEQUENTIA: a channel of several assets (common/sym_lanes.h): lanes
+	 * 1 .. n, and what each view owes each side in each; NULL else. */
+	struct sym_lane *sym_lanes;
+	struct sym_lane_balance *sym_lane_bal;
+	/* The swap in flight, and the one we asked for and wait for the peer
+	 * to send (as it will send it), or NULL. */
+	struct sym_swap *sym_swap, *sym_swap_req;
 };
 
 /**

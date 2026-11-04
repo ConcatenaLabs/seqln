@@ -437,6 +437,7 @@ impl Signer {
             // Learned from the next setup_channel, which names the channel
             // type (a symmetric channel's states are refused until then).
             option_sym: false,
+            lanes: Vec::new(),
         };
         self.inner
             .arm_channel(arr33(node_id, "node_id")?, dbid, st)

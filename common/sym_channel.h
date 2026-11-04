@@ -20,12 +20,14 @@ u16 sym_shared_delay(const struct channel *channel);
 struct amount_sat sym_dust_limit(const struct channel *channel);
 
 /* The state @side's commitment @commit_num carries: its view's balances and
- * @htlcs (every committed HTLC, trimmed ones included).  NULL and *err set if
- * it cannot be paid out of the funding. */
+ * @htlcs (every committed HTLC, trimmed ones included), @htlc_lanes[i] the
+ * lane of @htlcs[i] on a channel of several assets (common/sym_lanes.h), or
+ * NULL.  NULL and *err set if it cannot be paid out of the funding. */
 struct sym_state *sym_channel_state(const tal_t *ctx,
 				    const struct channel *channel,
 				    enum side side, u64 commit_num,
 				    const struct sym_htlc *htlcs,
+				    const u16 *htlc_lanes,
 				    const char **err);
 
 /* The message both sides sign for @st. */

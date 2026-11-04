@@ -14281,6 +14281,35 @@
             "description": [
               "On an asset-aware chain, the 32-byte display id of the asset to fund the channel in; *amount* is then in that asset's atoms, and the funding transaction pays its fee in the same asset. The default is the chain's policy asset."
             ]
+          },
+          "lanes": {
+            "added": "v26.06",
+            "type": "array",
+            "description": [
+              "On a Sequentia network, open a channel of several assets: each item is another asset the channel holds beside its own, and the amount of it to fund. Each is its own output of the funding transaction, to the same 2-of-2 script, and all start as the opener's. A payment in any of them is carried by the channel, and **symswap** trades one for another in one channel update. Such a channel is unannounced, and **close** pays every lane out in one transaction, mutual or unilateral."
+            ],
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "asset",
+                "amount"
+              ],
+              "properties": {
+                "asset": {
+                  "type": "hex",
+                  "description": [
+                    "The 32-byte display id of the asset."
+                  ]
+                },
+                "amount": {
+                  "type": "sat",
+                  "description": [
+                    "How much of it to fund, in its atoms."
+                  ]
+                }
+              }
+            }
           }
         }
       },
@@ -14361,7 +14390,8 @@
                     "seq_taproot_covenant/even",
                     "seq_credit/even",
                     "seq_symmetric/even",
-                    "seq_symmetric_factory/even"
+                    "seq_symmetric_factory/even",
+                    "seq_symmetric_lanes/even"
                   ],
                   "description": [
                     "Name of feature bit."
@@ -14786,6 +14816,35 @@
             "description": [
               "How many channels the factory opens, at least two."
             ]
+          },
+          "lanes": {
+            "added": "v26.06",
+            "type": "array",
+            "description": [
+              "On a Sequentia network, open a channel of several assets: each item is another asset the channel holds beside its own, and the amount of it to fund. Each is its own output of the funding transaction, to the same 2-of-2 script, and all start as the opener's. A payment in any of them is carried by the channel, and **symswap** trades one for another in one channel update. Such a channel is unannounced, and **close** pays every lane out in one transaction, mutual or unilateral."
+            ],
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "asset",
+                "amount"
+              ],
+              "properties": {
+                "asset": {
+                  "type": "hex",
+                  "description": [
+                    "The 32-byte display id of the asset."
+                  ]
+                },
+                "amount": {
+                  "type": "sat",
+                  "description": [
+                    "How much of it to fund, in its atoms."
+                  ]
+                }
+              }
+            }
           }
         },
         "pairedWith": [
@@ -14863,7 +14922,8 @@
                     "seq_taproot_covenant/even",
                     "seq_credit/even",
                     "seq_symmetric/even",
-                    "seq_symmetric_factory/even"
+                    "seq_symmetric_factory/even",
+                    "seq_symmetric_lanes/even"
                   ],
                   "description": [
                     "Name of feature bit."
@@ -19637,7 +19697,8 @@
                           "seq_taproot_covenant/even",
                           "seq_credit/even",
                           "seq_symmetric/even",
-                          "seq_symmetric_factory/even"
+                          "seq_symmetric_factory/even",
+                          "seq_symmetric_lanes/even"
                         ],
                         "description": [
                           "Name of feature bit."
@@ -25190,7 +25251,8 @@
                           "seq_taproot_covenant/even",
                           "seq_credit/even",
                           "seq_symmetric/even",
-                          "seq_symmetric_factory/even"
+                          "seq_symmetric_factory/even",
+                          "seq_symmetric_lanes/even"
                         ],
                         "description": [
                           "Name of feature bit."
@@ -26112,6 +26174,121 @@
                       ]
                     }
                   }
+                },
+                "seq_lanes": {
+                  "added": "v26.06",
+                  "type": "array",
+                  "description": [
+                    "On a Sequentia network, for a channel of several assets: every asset it holds, lane 0 its own, with that lane's funding output and our balance in it."
+                  ],
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "lane",
+                      "asset",
+                      "funding_outpoint",
+                      "total_msat",
+                      "to_us_msat"
+                    ],
+                    "properties": {
+                      "lane": {
+                        "type": "u32",
+                        "description": [
+                          "The lane's number, 0 the channel's own."
+                        ]
+                      },
+                      "asset": {
+                        "type": "hex",
+                        "description": [
+                          "The 32-byte display id of its asset."
+                        ]
+                      },
+                      "funding_outpoint": {
+                        "type": "outpoint",
+                        "description": [
+                          "Its funding output."
+                        ]
+                      },
+                      "total_msat": {
+                        "type": "msat",
+                        "description": [
+                          "What it holds, in thousandths of its asset's atoms."
+                        ]
+                      },
+                      "to_us_msat": {
+                        "type": "msat",
+                        "description": [
+                          "How much of that is ours."
+                        ]
+                      }
+                    }
+                  }
+                },
+                "seq_swap": {
+                  "added": "v26.06",
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "id",
+                    "state",
+                    "sender",
+                    "give_asset",
+                    "give_msat",
+                    "take_asset",
+                    "take_msat"
+                  ],
+                  "description": [
+                    "On a channel of several assets, a swap between two of its lanes that is in flight: sent, signed by one side or both, and not yet in both sides' balances."
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "u64",
+                      "description": [
+                        "The swap's id."
+                      ]
+                    },
+                    "state": {
+                      "type": "string",
+                      "description": [
+                        "Where it is in the channel's commitments, as an HTLC's state is."
+                      ]
+                    },
+                    "sender": {
+                      "type": "string",
+                      "enum": [
+                        "local",
+                        "remote"
+                      ],
+                      "description": [
+                        "Who sent it in a commitment: the side that took the other's request."
+                      ]
+                    },
+                    "give_asset": {
+                      "type": "hex",
+                      "description": [
+                        "The asset its sender gives."
+                      ]
+                    },
+                    "give_msat": {
+                      "type": "msat",
+                      "description": [
+                        "How much of it."
+                      ]
+                    },
+                    "take_asset": {
+                      "type": "hex",
+                      "description": [
+                        "The asset its sender takes."
+                      ]
+                    },
+                    "take_msat": {
+                      "type": "msat",
+                      "description": [
+                        "How much of it."
+                      ]
+                    }
+                  }
                 }
               },
               "allOf": [
@@ -26234,7 +26411,9 @@
                         ]
                       },
                       "channel_asset": {},
-                      "seq_factory": {}
+                      "seq_factory": {},
+                      "seq_lanes": {},
+                      "seq_swap": {}
                     }
                   }
                 },
@@ -26335,7 +26514,9 @@
                         ]
                       },
                       "channel_asset": {},
-                      "seq_factory": {}
+                      "seq_factory": {},
+                      "seq_lanes": {},
+                      "seq_swap": {}
                     }
                   }
                 },
@@ -26437,7 +26618,9 @@
                         ]
                       },
                       "channel_asset": {},
-                      "seq_factory": {}
+                      "seq_factory": {},
+                      "seq_lanes": {},
+                      "seq_swap": {}
                     }
                   }
                 },
@@ -26550,7 +26733,9 @@
                         ]
                       },
                       "channel_asset": {},
-                      "seq_factory": {}
+                      "seq_factory": {},
+                      "seq_lanes": {},
+                      "seq_swap": {}
                     }
                   }
                 }
@@ -28527,6 +28712,34 @@
                   "description": [
                     "On an asset-aware chain, the 32-byte display id of the asset to fund this channel in; *amount* is then in that asset's atoms. Every destination of one call must use the same asset. The default is the chain's policy asset."
                   ]
+                },
+                "lanes": {
+                  "type": "array",
+                  "description": [
+                    "On a Sequentia network, open this destination's channel as a channel of several assets (see **fundchannel_start**): it must then be the only destination, with its own *asset* and an *amount*. The funding transaction spends coins of each asset, and its fee is paid in the channel's own asset."
+                  ],
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "asset",
+                      "amount"
+                    ],
+                    "properties": {
+                      "asset": {
+                        "type": "hex",
+                        "description": [
+                          "The 32-byte display id of the asset."
+                        ]
+                      },
+                      "amount": {
+                        "type": "sat",
+                        "description": [
+                          "How much of it to fund, in its atoms."
+                        ]
+                      }
+                    }
+                  }
                 }
               }
             }
@@ -28669,7 +28882,8 @@
                           "seq_taproot_covenant/even",
                           "seq_credit/even",
                           "seq_symmetric/even",
-                          "seq_symmetric_factory/even"
+                          "seq_symmetric_factory/even",
+                          "seq_symmetric_lanes/even"
                         ],
                         "description": [
                           "Name of feature bit."
@@ -29707,7 +29921,8 @@
                     "seq_taproot_covenant/even",
                     "seq_credit/even",
                     "seq_symmetric/even",
-                    "seq_symmetric_factory/even"
+                    "seq_symmetric_factory/even",
+                    "seq_symmetric_lanes/even"
                   ],
                   "description": [
                     "Name of feature bit."
@@ -30020,7 +30235,8 @@
                     "seq_taproot_covenant/even",
                     "seq_credit/even",
                     "seq_symmetric/even",
-                    "seq_symmetric_factory/even"
+                    "seq_symmetric_factory/even",
+                    "seq_symmetric_lanes/even"
                   ],
                   "description": [
                     "Name of feature bit."
@@ -30363,7 +30579,8 @@
                     "seq_taproot_covenant/even",
                     "seq_credit/even",
                     "seq_symmetric/even",
-                    "seq_symmetric_factory/even"
+                    "seq_symmetric_factory/even",
+                    "seq_symmetric_lanes/even"
                   ],
                   "description": [
                     "Name of feature bit."
@@ -33184,6 +33401,13 @@
             "description": [
               "On a Sequentia network, lock the first HTLC to this point rather than to a hash (a point lock, needing a taproot-covenant channel whose peer takes point locks): *payment_hash* must be the point's x coordinate, and the payment is complete with the scalar that opens it."
             ]
+          },
+          "asset": {
+            "added": "v26.06",
+            "type": "hex",
+            "description": [
+              "On a Sequentia network, the 32-byte display id of the asset the first hop pays in. On a channel of several assets it picks the lane the HTLC is added to; on any other channel it must be the channel's own asset. The default is the first channel's own asset."
+            ]
           }
         }
       },
@@ -33567,6 +33791,13 @@
           },
           "dev_legacy_hop": {
             "hidden": true
+          },
+          "asset": {
+            "added": "v26.06",
+            "type": "hex",
+            "description": [
+              "On a Sequentia network, the 32-byte display id of the asset the first hop pays in. On a channel of several assets it picks the lane the HTLC is added to; on any other channel it must be the channel's own asset. The default is the first channel's own asset."
+            ]
           }
         }
       },
@@ -36385,6 +36616,135 @@
           }
         }
       ]
+    },
+    "symswap.json": {
+      "$schema": "../rpc-schema-draft.json",
+      "type": "object",
+      "additionalProperties": false,
+      "rpc": "symswap",
+      "title": "Command to swap one asset for another inside a channel of several assets",
+      "added": "v26.06",
+      "description": [
+        "The **symswap** RPC command asks the peer of a channel of several assets for a swap between two of the channel's lanes: we give *give_msat* of *give_asset* and take *take_msat* of *take_asset*. The peer's `sym_swap` hook decides; a node with no plugin registered for it refuses every swap. A peer that takes it sends it as one channel update, a state both sides sign in which both lanes' balances have moved: it is applied whole or not at all, on chain as off it.",
+        "",
+        "The command returns once the swap is in both sides' balances, and fails if the peer refuses it or it has not been sent by *expiry_blocks* blocks from now (and a grace of three)."
+      ],
+      "request": {
+        "required": [
+          "id",
+          "give_asset",
+          "give_msat",
+          "take_asset",
+          "take_msat"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "hash",
+            "description": [
+              "The channel's id."
+            ]
+          },
+          "give_asset": {
+            "type": "hex",
+            "description": [
+              "The 32-byte display id of the asset we give."
+            ]
+          },
+          "give_msat": {
+            "type": "msat",
+            "description": [
+              "How much of it, in thousandths of its atoms."
+            ]
+          },
+          "take_asset": {
+            "type": "hex",
+            "description": [
+              "The 32-byte display id of the asset we take."
+            ]
+          },
+          "take_msat": {
+            "type": "msat",
+            "description": [
+              "How much of it, in thousandths of its atoms."
+            ]
+          },
+          "expiry_blocks": {
+            "type": "u32",
+            "description": [
+              "How many blocks the peer has to send the swap, at most 1008."
+            ],
+            "default": "6"
+          }
+        }
+      },
+      "response": {
+        "required": [
+          "id",
+          "channel_id",
+          "lanes"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "u64",
+            "description": [
+              "The swap's id."
+            ]
+          },
+          "channel_id": {
+            "type": "hash",
+            "description": [
+              "The channel's id."
+            ]
+          },
+          "lanes": {
+            "type": "array",
+            "description": [
+              "Our balance in each of the channel's assets, the swap applied."
+            ],
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "asset",
+                "to_us_msat"
+              ],
+              "properties": {
+                "asset": {
+                  "type": "hex",
+                  "description": [
+                    "The asset's 32-byte display id."
+                  ]
+                },
+                "to_us_msat": {
+                  "type": "msat",
+                  "description": [
+                    "Our balance in it."
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "errors": [
+        "The following error codes may occur:",
+        "",
+        "- -32602: The channel holds no such assets, or the amounts are zero.",
+        "- -1: The channel is not active, a swap is in flight, the peer refused it, or it expired."
+      ],
+      "author": [
+        "The SeqLN authors."
+      ],
+      "see_also": [
+        "lightning-listpeerchannels(7)",
+        "lightning-fundchannel(7)"
+      ],
+      "resources": [
+        "Main web site: <https://github.com/ConcatenaLabs/seqln>"
+      ],
+      "examples": []
     },
     "txdiscard.json": {
       "$schema": "../rpc-schema-draft.json",
@@ -43613,6 +43973,116 @@
           }
         ]
       }
+    },
+    "sym_swap.json": {
+      "$schema": "../rpc-schema-draft.json",
+      "added": "v26.06",
+      "type": "object",
+      "hook": "sym_swap",
+      "title": "Hook for deciding the swaps a peer asks for",
+      "description": [
+        "On a Sequentia network, the **sym_swap** hook is called when the peer of a channel of several assets asks for a swap between two of the channel's lanes (see lightning-symswap(7)): the peer gives *give_msat* of *give_asset* and takes *take_msat* of *take_asset*.",
+        "",
+        "A plugin that takes it returns `{\"result\": \"accept\"}`: the node then sends the swap in its next commitment, as one channel update, if both legs are still affordable. One that refuses it returns `{\"result\": \"refuse\"}`, with a *reason* the peer is told. `{\"result\": \"continue\"}` leaves the decision to the next plugin; when every plugin continues, or none is registered, the swap is refused.",
+        "",
+        "This is a chained hook: the first plugin to accept or refuse decides."
+      ],
+      "request": {
+        "required": [
+          "sym_swap"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "sym_swap": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "peer_id",
+              "channel_id",
+              "id",
+              "expiry"
+            ],
+            "properties": {
+              "peer_id": {
+                "type": "pubkey",
+                "description": [
+                  "The peer that asks."
+                ]
+              },
+              "channel_id": {
+                "type": "hash",
+                "description": [
+                  "The channel."
+                ]
+              },
+              "id": {
+                "type": "u64",
+                "description": [
+                  "The swap's id."
+                ]
+              },
+              "give_asset": {
+                "type": "hex",
+                "description": [
+                  "The asset the peer gives, which this node takes."
+                ]
+              },
+              "give_msat": {
+                "type": "msat",
+                "description": [
+                  "How much of it."
+                ]
+              },
+              "take_asset": {
+                "type": "hex",
+                "description": [
+                  "The asset the peer takes, which this node gives."
+                ]
+              },
+              "take_msat": {
+                "type": "msat",
+                "description": [
+                  "How much of it."
+                ]
+              },
+              "expiry": {
+                "type": "u32",
+                "description": [
+                  "The block after which the peer takes the swap no more."
+                ]
+              }
+            }
+          }
+        }
+      },
+      "response": {
+        "required": [
+          "result"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "result": {
+            "type": "string",
+            "enum": [
+              "accept",
+              "refuse",
+              "continue"
+            ],
+            "description": [
+              "Take the swap, refuse it, or leave it to the next plugin."
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "description": [
+              "With `refuse`: what the peer is told."
+            ]
+          }
+        }
+      },
+      "see_also": [
+        "lightning-symswap(7)"
+      ]
     }
   }
 }

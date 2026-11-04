@@ -17,6 +17,7 @@
 #include <common/point_lock.h>
 #include <common/status.h>
 #include <common/subdaemon.h>
+#include <common/sym_lanes.h>
 #include <common/sym_scripts.h>
 #include <common/sym_state.h>
 #include <common/tcov_scripts.h>
@@ -111,6 +112,9 @@ static struct bitcoin_outpoint sym_funding;
  * (lightningd/sym_factory.h), which only an update spends. */
 static struct bitcoin_outpoint sym_anchor;
 static bool sym_factory;
+/* A channel of several assets (common/sym_lanes.h): lanes 1 .. n, each a
+ * funding output of the same transaction as lane 0's; NULL else. */
+static struct sym_lane *sym_lanes;
 
 /* Asset-aware channels: the asset this channel is denominated in (33-byte
  * version+tag); the policy asset for an ordinary channel. All resolution/HTLC
@@ -175,6 +179,11 @@ struct tracked_output {
 	s64 sym_num;
 	struct sha256 sym_rest;
 	u8 *sym_spk;
+	/* Its lane on a channel of several assets (0: the channel's own),
+	 * and whether it is that lane's funding output, which a kickoff
+	 * spends. */
+	size_t sym_lane;
+	bool sym_lane_funding;
 };
 
 /* SEQUENTIA: the provider-signed credit, near the end of this file. */
@@ -207,6 +216,10 @@ static bool tcov_revoke_leaf_paid_us(const struct tx_parts *tx_parts,
 				     size_t input_num, u32 tx_blockheight);
 
 /* SEQUENTIA: the symmetric channel type, near the end of this file. */
+static void sym_lane_kicked_off(struct tracked_output ***outs,
+				struct tracked_output *out,
+				const struct tx_parts *tx, u32 input_num,
+				u32 tx_blockheight);
 static void sym_state_spent(struct tracked_output ***outs,
 			    struct tracked_output *out,
 			    const struct tx_parts *tx, u32 input_num,
@@ -730,6 +743,8 @@ new_tracked_output(struct tracked_output ***outs,
 	out->sym_num = 0;
 	memset(&out->sym_rest, 0, sizeof(out->sym_rest));
 	out->sym_spk = NULL;
+	out->sym_lane = 0;
+	out->sym_lane_funding = false;
 
 	tal_arr_expand(outs, out);
 
@@ -974,27 +989,47 @@ static u64 unmask_commit_number(const struct tx_parts *tx,
 		^ obscurer;
 }
 
+/* Whether @asset (33 bytes, or NULL off Elements) is one of @assets. */
+static bool matched_in(const u8 **assets, const u8 *asset)
+{
+	for (size_t i = 0; i < tal_count(assets); i++) {
+		if (!assets[i] || !asset) {
+			if (assets[i] == asset)
+				return true;
+		} else if (memeq(assets[i], 33, asset, 33))
+			return true;
+	}
+	return false;
+}
+
 static bool is_mutual_close(const struct tx_parts *tx,
 			    const u8 *local_scriptpubkey,
 			    const u8 *remote_scriptpubkey)
 {
 	size_t i;
-	bool local_matched = false, remote_matched = false;
+	/* SEQUENTIA: the assets each side's output was matched in.  A channel
+	 * of several assets pays each side once per lane, each lane in its own
+	 * asset (common/close_tx.h); any other close is in one asset. */
+	const u8 **local_matched = tal_arr(tmpctx, const u8 *, 0);
+	const u8 **remote_matched = tal_arr(tmpctx, const u8 *, 0);
 
 	for (i = 0; i < tal_count(tx->outputs); i++) {
-		/* To be paranoid, we only let each one match once. */
+		const u8 *asset = tx->outputs[i]->asset;
+
+		/* To be paranoid, we only let each one match once (per
+		 * asset). */
 		if (chainparams->is_elements &&
 		    tx->outputs[i]->script_len == 0) {
 			/* This is a fee output, ignore please */
 			continue;
 		} else if (wally_tx_output_scripteq(tx->outputs[i],
 						    local_scriptpubkey)
-			   && !local_matched) {
-			local_matched = true;
+			   && !matched_in(local_matched, asset)) {
+			tal_arr_expand(&local_matched, asset);
 		} else if (wally_tx_output_scripteq(tx->outputs[i],
 						    remote_scriptpubkey)
-			   && !remote_matched)
-			remote_matched = true;
+			   && !matched_in(remote_matched, asset))
+			tal_arr_expand(&remote_matched, asset);
 		else
 			return false;
 	}
@@ -1339,6 +1374,13 @@ static bool output_spent(struct tracked_output ***outs,
 		if (out->output_type == SYM_STATE_OUTPUT) {
 			sym_state_spent(outs, out, tx_parts, input_num,
 					tx_blockheight);
+			continue;
+		}
+		/* SEQUENTIA: another lane's funding output, kicked off
+		 * (common/sym_lanes.h). */
+		if (out->sym_lane_funding) {
+			sym_lane_kicked_off(outs, out, tx_parts, input_num,
+					    tx_blockheight);
 			continue;
 		}
 
@@ -1782,6 +1824,7 @@ static void memleak_remove_globals(struct htable *memtable, const tal_t *topctx)
 	memleak_scan_obj(memtable, sym_remote);
 	memleak_scan_obj(memtable, sym_remote_pending);
 	memleak_scan_obj(memtable, sym_htlcs);
+	memleak_scan_obj(memtable, sym_lanes);
 }
 
 static void handle_dev_memleak(struct tracked_output ***outs, const u8 *msg)
@@ -1917,6 +1960,7 @@ static void wait_for_resolved(struct tracked_output **outs)
 		case WIRE_ONCHAIND_SYM_INIT:
 		case WIRE_ONCHAIND_SYM_ANCHOR:
 		case WIRE_ONCHAIND_SPEND_SYM:
+		case WIRE_ONCHAIND_SPEND_SYM_LANES:
 			break;
 		}
 		master_badmsg(-1, msg);
@@ -2781,7 +2825,14 @@ static void tell_wallet_to_remote(const struct tx_parts *tx,
 	struct amount_asset asset = wally_tx_output_get_amount(tx->outputs[outpoint->n]);
 	struct amount_sat amt;
 
-	assert(amount_asset_is(&asset, channel_asset));
+	/* The channel's asset, or one of its lanes' (common/sym_lanes.h). */
+	if (!amount_asset_is(&asset, channel_asset)) {
+		size_t l;
+		for (l = 0; l < tal_count(sym_lanes); l++)
+			if (amount_asset_is(&asset, sym_lanes[l].asset))
+				break;
+		assert(l < tal_count(sym_lanes));
+	}
 	amt = amount_sat(asset.value);
 
 	/* A NULL per_commit_point is how we indicate the pubkey doesn't need
@@ -2795,7 +2846,9 @@ static void tell_wallet_to_remote(const struct tx_parts *tx,
 						     amt,
 						     tx_blockheight,
 						     scriptpubkey,
-						     csv_lock)));
+						     csv_lock,
+						     is_elements(chainparams)
+						     ? asset.asset : channel_asset)));
 }
 
 static void their_unilateral_local(struct tracked_output ***outs,
@@ -3897,7 +3950,8 @@ static bool tcov_revoke_leaf_paid_us(const struct tx_parts *tx_parts,
 	wire_sync_write(REQ_FD,
 			take(towire_onchaind_add_utxo(NULL, &outpoint, NULL,
 						     amount_sat(asset.value),
-						     tx_blockheight, ours, 1)));
+						     tx_blockheight, ours, 1,
+						     channel_asset)));
 	return true;
 }
 
@@ -4044,7 +4098,7 @@ static bool credit_output_spent(struct tracked_output ***outs,
 								     amount_sat(a.value),
 								     tx_blockheight,
 								     credit_params->holder_spk,
-								     0)));
+								     0, channel_asset)));
 		}
 	}
 
@@ -4306,7 +4360,29 @@ static void sym_track_state(struct tracked_output ***outs,
 			    const struct bitcoin_outpoint *outpoint,
 			    u32 tx_blockheight, struct amount_sat amt,
 			    s64 num, const struct sha256 *rest,
-			    enum tx_type tx_type);
+			    enum tx_type tx_type, size_t lane);
+
+/* SEQUENTIA: lane @lane's asset (lane 0: the channel's, NULL). */
+static const u8 *lane_asset_of(size_t lane)
+{
+	return lane ? sym_lanes[lane - 1].asset : NULL;
+}
+
+/* The lane whose funding output @in spends, or -1. */
+static int sym_lane_of_input(const struct wally_tx_input *in)
+{
+	if (!in)
+		return -1;
+	if (wally_tx_input_spends(in, &sym_funding))
+		return 0;
+	for (size_t l = 0; l < tal_count(sym_lanes); l++) {
+		struct bitcoin_outpoint op = { sym_funding.txid,
+					       sym_lanes[l].outnum };
+		if (wally_tx_input_spends(in, &op))
+			return l + 1;
+	}
+	return -1;
+}
 
 /* The state we know by number (ours, theirs, their newest), or NULL. */
 static const struct sym_state *sym_known(s64 num)
@@ -4351,7 +4427,74 @@ static void sym_propose(struct tracked_output *out, u8 **wit,
 /* What to do with a state output (KO: num -1): replace it by our best state
  * if that is newer, else settle it once the delay has passed if we know its
  * settlement, else leave it to whoever holds it. */
-static void sym_resolve_state(struct tracked_output *out)
+/* A channel of several assets settles every lane's state output in one
+ * transaction (common/sym_lanes.h): each asset's outputs balance only
+ * against its own lane's input.  Once every lane's output is at state
+ * st->num, the last of them to arrive proposes it, the others its extra
+ * inputs, after the delay has passed for all. */
+static void sym_settle_lanes(struct tracked_output ***outs,
+			     struct tracked_output *out,
+			     const struct sym_state *st,
+			     const struct sym_tree *tree)
+{
+	struct tracked_output **at = tal_arrz(tmpctx, struct tracked_output *,
+					      1 + tal_count(sym_lanes));
+	struct bitcoin_outpoint *ops;
+	struct amount_sat *amounts;
+	u8 *assets;
+	u32 minblock = 0;
+	u8 **wit;
+	const u8 *msg;
+
+	for (size_t i = 0; i < tal_count(*outs); i++) {
+		struct tracked_output *o = (*outs)[i];
+
+		if (o->output_type != SYM_STATE_OUTPUT || o->resolved
+		    || o->sym_num != st->num || o->sym_lane_funding
+		    || !memeq(o->sym_spk, tal_bytelen(o->sym_spk),
+			      out->sym_spk, tal_bytelen(out->sym_spk)))
+			continue;
+		at[o->sym_lane] = o;
+	}
+	for (size_t l = 0; l < tal_count(at); l++) {
+		if (!at[l]) {
+			status_info("State %"PRId64": lane %zu not there yet;"
+				    " the settle waits for it", st->num, l);
+			return;
+		}
+		if (rel_blockheight(at[l], sym_sc.delay) > minblock)
+			minblock = rel_blockheight(at[l], sym_sc.delay);
+	}
+
+	/* Input 0 is @out, the others follow it in lane order. */
+	ops = tal_arr(tmpctx, struct bitcoin_outpoint, 0);
+	amounts = tal_arr(tmpctx, struct amount_sat, 0);
+	assets = tal_arr(tmpctx, u8, 0);
+	for (int pass = 0; pass < 2; pass++) {
+		for (size_t l = 0; l < tal_count(at); l++) {
+			const u8 *a = lane_asset_of(at[l]->sym_lane);
+
+			if ((pass == 0) != (at[l] == out))
+				continue;
+			tal_arr_expand(&ops, at[l]->outpoint);
+			tal_arr_expand(&amounts, at[l]->sat);
+			tal_expand(&assets, a ? a : channel_asset, 33);
+		}
+	}
+	wit = sym_settle_witness(tmpctx, tree);
+	status_info("Settling state %"PRId64" over its %zu lanes after %u"
+		    " blocks", st->num, tal_count(at), sym_sc.delay);
+	msg = towire_onchaind_spend_sym_lanes(NULL, ops, amounts, assets,
+					      out->sym_spk,
+					      cast_const2(const struct onchain_witness_element **,
+							  sym_welements(tmpctx, wit)),
+					      st, sym_sc.delay, minblock,
+					      minblock + 6);
+	propose_resolution_to_master(out, take(msg), minblock, SYM_SETTLE);
+}
+
+static void sym_resolve_state(struct tracked_output ***outs,
+			      struct tracked_output *out)
 {
 	const struct bip340sig *sig_op, *sig_acc;
 	struct sym_tree tree, prev;
@@ -4373,9 +4516,14 @@ static void sym_resolve_state(struct tracked_output *out)
 					  &prev_cb);
 		sym_state_tree_of(tmpctx, &sym_sc, sym_best, &tree);
 		o = sym_state_new(tmpctx, LOCAL, 0, sym_best->num, NULL);
-		o->outs = tal_arr(o, struct sym_state_out, 1);
+		o->outs = tal_arrz(o, struct sym_state_out, 1);
 		o->outs[0].amount = out->sat;
 		o->outs[0].spk = sym_tree_spk(o->outs, &tree);
+		/* UPD keeps the input's asset: its lane's. */
+		o->outs[0].asset = out->sym_lane
+			? tal_dup_arr(o->outs, u8,
+				      lane_asset_of(out->sym_lane), 33, 0)
+			: NULL;
 		status_info("Replacing state %"PRId64" by our state %"PRId64,
 			    out->sym_num, sym_best->num);
 		sym_propose(out, sym_update_witness(tmpctx, sig_op, sig_acc,
@@ -4389,6 +4537,11 @@ static void sym_resolve_state(struct tracked_output *out)
 	if (st) {
 		sym_state_tree_of(tmpctx, &sym_sc, st, &tree);
 		spk = sym_tree_spk(tmpctx, &tree);
+		if (memeq(spk, tal_bytelen(spk), out->sym_spk,
+			  tal_bytelen(out->sym_spk)) && sym_lanes) {
+			sym_settle_lanes(outs, out, st, &tree);
+			return;
+		}
 		if (memeq(spk, tal_bytelen(spk), out->sym_spk,
 			  tal_bytelen(out->sym_spk))) {
 			status_info("Settling state %"PRId64" after %u blocks",
@@ -4410,7 +4563,7 @@ static void sym_track_state(struct tracked_output ***outs,
 			    const struct bitcoin_outpoint *outpoint,
 			    u32 tx_blockheight, struct amount_sat amt,
 			    s64 num, const struct sha256 *rest,
-			    enum tx_type tx_type)
+			    enum tx_type tx_type, size_t lane)
 {
 	struct tracked_output *out;
 	struct sym_tree tree;
@@ -4418,6 +4571,7 @@ static void sym_track_state(struct tracked_output ***outs,
 	out = new_tracked_output(outs, outpoint, tx_blockheight, tx_type, amt,
 				 SYM_STATE_OUTPUT, NULL, NULL, NULL);
 	out->sym_num = num;
+	out->sym_lane = lane;
 	if (num == -1) {
 		sym_kickoff_tree(tmpctx, &sym_sc, &tree);
 		out->sym_spk = sym_tree_spk(out, &tree);
@@ -4427,7 +4581,7 @@ static void sym_track_state(struct tracked_output ***outs,
 		sym_rebuild_state(tmpctx, &sym_sc, num, rest, &spk, &leaf, &cb);
 		out->sym_spk = tal_steal(out, spk);
 	}
-	sym_resolve_state(out);
+	sym_resolve_state(outs, out);
 }
 
 /* The settlement of a state: our balance to the wallet, the HTLCs as on a
@@ -4439,6 +4593,16 @@ static void sym_settled(struct tracked_output ***outs,
 					     &sym_basepoints[LOCAL].payment);
 	u8 **unmatched = tal_arr(tmpctx, u8 *, tal_count(sym_htlcs->htlcs));
 	static const u8 marker;
+	static struct bitcoin_txid *settled;
+
+	/* A channel of several assets: one settle spends every lane's
+	 * output, and is read once. */
+	for (size_t i = 0; i < tal_count(settled); i++)
+		if (bitcoin_txid_eq(&settled[i], &tx->txid))
+			return;
+	if (!settled)
+		settled = notleak(tal_arr(NULL, struct bitcoin_txid, 0));
+	tal_arr_expand(&settled, tx->txid);
 
 	onchain_annotate_txin(&tx->txid, 0, TX_CHANNEL_UNILATERAL);
 	for (size_t i = 0; i < tal_count(unmatched); i++)
@@ -4454,8 +4618,15 @@ static void sym_settled(struct tracked_output ***outs,
 		if (!tx->outputs[i] || tx->outputs[i]->script_len == 0)
 			continue;
 		asset = wally_tx_output_get_amount(tx->outputs[i]);
-		if (!amount_asset_is(&asset, channel_asset))
-			continue;
+		if (!amount_asset_is(&asset, channel_asset)) {
+			/* SEQUENTIA: or one of its lanes'. */
+			size_t l;
+			for (l = 0; l < tal_count(sym_lanes); l++)
+				if (amount_asset_is(&asset, sym_lanes[l].asset))
+					break;
+			if (l == tal_count(sym_lanes))
+				continue;
+		}
 		amt = amount_sat(asset.value);
 		outpoint.txid = tx->txid;
 		outpoint.n = i;
@@ -4565,7 +4736,33 @@ static void sym_state_spent(struct tracked_output ***outs,
 	status_info("State %"PRId64" replaced by state %"PRId64" (%s)",
 		    out->sym_num, num, fmt_bitcoin_txid(tmpctx, &tx->txid));
 	sym_track_state(outs, &next, tx_blockheight, amount_sat(asset.value),
-			num, &rest, SYM_UPDATE);
+			num, &rest, SYM_UPDATE, out->sym_lane);
+}
+
+/* Another lane's funding output, spent: by its kickoff, whose KO is the
+ * output at the input's index (common/sym_lanes.h). */
+static void sym_lane_kicked_off(struct tracked_output ***outs,
+				struct tracked_output *out,
+				const struct tx_parts *tx, u32 input_num,
+				u32 tx_blockheight)
+{
+	struct bitcoin_outpoint ko;
+	struct amount_asset asset;
+
+	resolved_by_other(out, &tx->txid, SYM_UPDATE);
+	ko.txid = tx->txid;
+	ko.n = input_num;
+	if (input_num >= tal_count(tx->outputs) || !tx->outputs[input_num]) {
+		status_broken("Lane %zu kicked off by %s without a KO",
+			      out->sym_lane,
+			      fmt_bitcoin_txid(tmpctx, &tx->txid));
+		return;
+	}
+	asset = wally_tx_output_get_amount(tx->outputs[input_num]);
+	status_info("Lane %zu kicked off by %s", out->sym_lane,
+		    fmt_bitcoin_txid(tmpctx, &tx->txid));
+	sym_track_state(outs, &ko, tx_blockheight, amount_sat(asset.value),
+			-1, NULL, SYM_UPDATE, out->sym_lane);
 }
 
 /* Their HTLC, whose preimage we now hold: its SUCCESS leaf, to our wallet. */
@@ -4644,7 +4841,7 @@ static void handle_symmetric_close(const struct tx_parts *tx,
 				    sym_best ? sym_best->num : (s64)-1);
 			sym_track_state(&outs, &next, tx_blockheight,
 					amount_sat(asset.value), num, &rest,
-					SYM_UPDATE);
+					SYM_UPDATE, 0);
 			wait_for_resolved(outs);
 			return;
 		}
@@ -4670,7 +4867,41 @@ static void handle_symmetric_close(const struct tx_parts *tx,
 		    fmt_bitcoin_txid(tmpctx, &tx->txid),
 		    sym_best ? sym_best->num : (s64)-1);
 	sym_track_state(&outs, &ko, tx_blockheight, amount_sat(asset.value),
-			-1, NULL, SYM_UPDATE);
+			-1, NULL, SYM_UPDATE, 0);
+
+	/* SEQUENTIA: a channel of several assets (common/sym_lanes.h): the
+	 * other lanes this transaction kicked off, and the funding outputs
+	 * of those it did not, whose kickoffs come apart. */
+	for (size_t l = 1; l <= tal_count(sym_lanes); l++) {
+		struct bitcoin_outpoint op = { sym_funding.txid,
+					       sym_lanes[l - 1].outnum };
+		struct tracked_output *lo;
+		size_t i;
+
+		for (i = 0; i < tal_count(tx->inputs); i++)
+			if (sym_lane_of_input(tx->inputs[i]) == (int)l)
+				break;
+		if (i < tal_count(tx->inputs)) {
+			struct bitcoin_outpoint lko = { tx->txid, i };
+
+			if (i >= tal_count(tx->outputs) || !tx->outputs[i]) {
+				status_broken("Lane %zu's kickoff %s has no KO",
+					      l, fmt_bitcoin_txid(tmpctx,
+								  &tx->txid));
+				continue;
+			}
+			asset = wally_tx_output_get_amount(tx->outputs[i]);
+			sym_track_state(&outs, &lko, tx_blockheight,
+					amount_sat(asset.value), -1, NULL,
+					SYM_UPDATE, l);
+			continue;
+		}
+		lo = new_tracked_output(&outs, &op, 0, FUNDING_TRANSACTION,
+					sym_lanes[l - 1].funding_sats,
+					FUNDING_OUTPUT, NULL, NULL, NULL);
+		lo->sym_lane = l;
+		lo->sym_lane_funding = true;
+	}
 	wait_for_resolved(outs);
 }
 
@@ -4765,9 +4996,11 @@ int main(int argc, char *argv[])
 		    && (!sym_best || r->num > sym_best->num))
 			sym_best = r;
 		msg = wire_sync_read(tmpctx, REQ_FD);
-		if (!fromwire_onchaind_sym_anchor(msg, &sym_anchor,
-						  &sym_factory))
+		if (!fromwire_onchaind_sym_anchor(ctx, msg, &sym_anchor,
+						  &sym_factory, &sym_lanes))
 			master_badmsg(WIRE_ONCHAIND_SYM_ANCHOR, msg);
+		if (tal_count(sym_lanes) == 0)
+			sym_lanes = tal_free(sym_lanes);
 	}
 
 	/* We need to keep tx around, but there's only one: not really a leak */

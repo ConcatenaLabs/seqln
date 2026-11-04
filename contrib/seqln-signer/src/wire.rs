@@ -57,6 +57,9 @@ pub mod msg {
     pub const HSMD_SIGN_SYM_KICKOFF: u16 = 69;
     pub const HSMD_SIGN_SYM_STATE: u16 = 70;
     pub const HSMD_SIGN_SYM_HTLC: u16 = 71;
+    pub const HSMD_SIGN_SYM_LANES_STATE: u16 = 75;
+    pub const HSMD_APPROVE_SYM_SWAP: u16 = 76;
+    pub const HSMD_SIGN_MUTUAL_CLOSE_LANES_TX: u16 = 77;
 
     pub const HSMD_ECDH_RESP: u16 = 100;
     pub const HSMD_CANNOUNCEMENT_SIG_REPLY: u16 = 102;
@@ -91,6 +94,9 @@ pub mod msg {
     pub const HSMD_SIGN_TCOV_REPLY: u16 = 161;
     pub const HSMD_CREDIT_NOTE_REPLY: u16 = 167;
     pub const HSMD_SIGN_SYM_STATE_REPLY: u16 = 170;
+    pub const HSMD_SIGN_SYM_LANES_STATE_REPLY: u16 = 175;
+    pub const HSMD_APPROVE_SYM_SWAP_REPLY: u16 = 176;
+    pub const HSMD_SIGN_MUTUAL_CLOSE_LANES_TX_REPLY: u16 = 177;
 }
 
 /// Append-only big-endian wire builder.

@@ -38,6 +38,7 @@
 #include <lightningd/peer_htlcs.h>
 #include <lightningd/plugin_hook.h>
 #include <lightningd/sym_factory.h>
+#include <lightningd/sym_lanes.h>
 #include <lightningd/symmetric.h>
 #include <lightningd/watchtower_store.h>
 #include <onchaind/onchaind_wiregen.h>
@@ -556,6 +557,12 @@ void drop_to_chain(struct lightningd *ld, struct channel *channel,
 			 * (lightningd/sym_factory.h). */
 			if (!sym_factory_close(ld, channel))
 				refused = true;
+		} else if (!cooperative && channel_is_sym_lanes(channel)) {
+			/* SEQUENTIA: a channel of several assets kicks off
+			 * every lane (lightningd/sym_lanes.h). */
+			if (!sym_broadcast_kickoff(ld, channel, cmd_id))
+				refused = true;
+			sym_lanes_kickoffs(ld, channel);
 		} else if (!cooperative
 		    && channel_type_has(channel->type, OPT_SEQ_SYMMETRIC)) {
 			if (!sym_broadcast_kickoff(ld, channel, cmd_id))
@@ -1178,6 +1185,8 @@ static void NON_NULL_ARGS(1, 2, 4, 5) json_add_channel(struct command *cmd,
 		}
 		json_object_end(response);
 	}
+	/* SEQUENTIA: a channel of several assets (lightningd/sym_lanes.h). */
+	json_add_sym_lanes(response, channel);
 
 	has_valid_inflights = false;
 	if (!list_empty(&channel->inflights)) {
@@ -2628,6 +2637,17 @@ static void channel_funding_found(struct lightningd *ld,
 				  const struct txlocator *loc,
 				  struct channel *channel)
 {
+	/* SEQUENTIA: a channel of several assets: every lane's output must be
+	 * in the funding transaction as agreed (lightningd/sym_lanes.h). */
+	if (channel_is_sym_lanes(channel)) {
+		const char *why = sym_lanes_check_funding(tmpctx, channel, tx);
+		if (why) {
+			channel_fail_permanent(channel, REASON_PROTOCOL,
+					       "Funding transaction: %s", why);
+			return;
+		}
+	}
+
 	/* Closes channel if it doesn't fit in an scid! */
 	if (depthcb_update_scid(channel, &channel->funding, loc)) {
 		/* We will almost immediately get called, which is what we want! */
@@ -2688,6 +2708,9 @@ void channel_watch_funding_out(struct lightningd *ld, struct channel *channel)
 	channel->funding_spend_watch = watch_txo(channel, ld->topology, channel,
 						 &channel->funding,
 						 funding_spent);
+	/* SEQUENTIA: and every other lane's (lightningd/sym_lanes.h). */
+	if (channel_is_sym_lanes(channel))
+		sym_lanes_watch(ld, channel);
 }
 
 void channel_watch_funding(struct lightningd *ld, struct channel *channel)

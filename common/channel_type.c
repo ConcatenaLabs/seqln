@@ -122,6 +122,17 @@ struct channel_type *channel_type_seq_symmetric_factory(const tal_t *ctx)
 	return type;
 }
 
+/* SEQUENTIA: a symmetric channel of several assets (common/sym_lanes.h):
+ * the symmetric type, with a lane per asset. */
+struct channel_type *channel_type_seq_symmetric_lanes(const tal_t *ctx)
+{
+	struct channel_type *type = channel_type_seq_symmetric(ctx);
+
+	set_feature_bit(&type->features,
+			COMPULSORY_FEATURE(OPT_SEQ_SYMMETRIC_LANES));
+	return type;
+}
+
 bool channel_type_has(const struct channel_type *type, int feature)
 {
 	return feature_offered(type->features, feature);
@@ -172,6 +183,7 @@ struct channel_type *channel_type_accept(const tal_t *ctx,
 		OPT_SEQ_CREDIT,
 		OPT_SEQ_SYMMETRIC,
 		OPT_SEQ_SYMMETRIC_FACTORY,
+		OPT_SEQ_SYMMETRIC_LANES,
 	};
 
 	/* BOLT #2:
@@ -216,7 +228,9 @@ struct channel_type *channel_type_accept(const tal_t *ctx,
 	    channel_type_eq(&proposed,
 			    channel_type_seq_symmetric(tmpctx)) ||
 	    channel_type_eq(&proposed,
-			    channel_type_seq_symmetric_factory(tmpctx))) {
+			    channel_type_seq_symmetric_factory(tmpctx)) ||
+	    channel_type_eq(&proposed,
+			    channel_type_seq_symmetric_lanes(tmpctx))) {
 		/* At this point we know it matches, and maybe has
 		 * a couple of extra options. So let's just reply
 		 * with their proposal. */

@@ -25,6 +25,7 @@
 #include <common/subdaemon.h>
 #include <common/sym_channel.h>
 #include <common/sym_factory.h>
+#include <common/sym_lanes.h>
 #include <common/wire_error.h>
 #include <hsmd/hsmd_wiregen.h>
 #include <inttypes.h>
@@ -119,6 +120,11 @@ struct state {
 	 * its factory (common/sym_factory.h). */
 	struct bitcoin_outpoint *factory_id;
 	struct sym_factory *factory;
+
+	/* SEQUENTIA: a channel of several assets: its other lanes, and the
+	 * peer's signature on each one's kickoff (common/sym_lanes.h). */
+	struct sym_lane *sym_lanes;
+	struct bitcoin_signature *sym_lane_sigs, *sym_lane_local_sigs;
 
 	/* Channel type we agreed on (even before channel populated) */
 	struct channel_type *channel_type;
@@ -497,6 +503,26 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags,
 						  sizeof(state->channel_asset), 0);
 	}
 
+	/* SEQUENTIA: a channel of several assets names its other lanes
+	 * (common/sym_lanes.h); only that channel type has them. */
+	if (channel_type_has(state->channel_type, OPT_SEQ_SYMMETRIC_LANES)) {
+		const char *why = tal_count(state->sym_lanes)
+			? sym_lanes_check(tmpctx, state->sym_lanes,
+					  state->channel_asset)
+			: "no lane beside the channel's own";
+		if (why) {
+			negotiation_aborted(state,
+					    tal_fmt(tmpctx, "Lanes: %s", why));
+			return NULL;
+		}
+		open_tlvs->seq_lanes = sym_lanes_open_blob(open_tlvs,
+							   state->sym_lanes);
+	} else if (tal_count(state->sym_lanes)) {
+		negotiation_aborted(state, "Lanes need the channel type of"
+				    " several assets");
+		return NULL;
+	}
+
 	msg = towire_open_channel(NULL,
 				  &chainparams->genesis_blockhash,
 				  &state->channel_id,
@@ -745,12 +771,43 @@ static void sym_sign_kickoff(const struct channel *channel,
 static void sym_sign_state(const struct channel *channel,
 			   struct sym_state *st)
 {
-	u8 *msg = towire_hsmd_sign_sym_state(NULL, &channel->funding,
-					     channel->opener == LOCAL,
-					     &channel->basepoints[REMOTE].delayed_payment,
-					     channel->channel_asset,
-					     sym_shared_delay(channel), st,
-					     NULL);
+	u8 *msg;
+
+	/* A channel of several assets: its states name their assets
+	 * (common/sym_lanes.h). */
+	if (channel->sym_lanes) {
+		size_t n = tal_count(channel->sym_lanes);
+		struct amount_sat *sats = tal_arr(tmpctx, struct amount_sat, n);
+		u8 *assets = tal_arr(tmpctx, u8, n * 33);
+
+		for (size_t i = 0; i < n; i++) {
+			sats[i] = channel->sym_lanes[i].funding_sats;
+			memcpy(assets + i * 33, channel->sym_lanes[i].asset, 33);
+		}
+		msg = towire_hsmd_sign_sym_lanes_state(NULL, &channel->funding,
+						       channel->opener == LOCAL,
+						       &channel->basepoints[REMOTE].delayed_payment,
+						       channel->channel_asset,
+						       channel->funding_sats,
+						       sym_shared_delay(channel),
+						       sats, assets, st, NULL, NULL);
+		wire_sync_write(HSM_FD, take(msg));
+		msg = wire_sync_read(tmpctx, HSM_FD);
+		if (!fromwire_hsmd_sign_sym_lanes_state_reply(msg,
+							      &st->sig[LOCAL]))
+			status_failed(STATUS_FAIL_HSM_IO,
+				      "Bad sign_sym_lanes_state reply %s",
+				      tal_hex(tmpctx, msg));
+		st->has_sig[LOCAL] = true;
+		return;
+	}
+
+	msg = towire_hsmd_sign_sym_state(NULL, &channel->funding,
+					 channel->opener == LOCAL,
+					 &channel->basepoints[REMOTE].delayed_payment,
+					 channel->channel_asset,
+					 sym_shared_delay(channel), st,
+					 NULL);
 	wire_sync_write(HSM_FD, take(msg));
 	msg = wire_sync_read(tmpctx, HSM_FD);
 	if (!fromwire_hsmd_sign_sym_state_reply(msg, &st->sig[LOCAL]))
@@ -759,12 +816,83 @@ static void sym_sign_state(const struct channel *channel,
 	st->has_sig[LOCAL] = true;
 }
 
+/* SEQUENTIA: a channel of several assets (common/sym_lanes.h): its other
+ * lanes, all the opener's at first. */
+static void sym_attach_lanes(struct state *state)
+{
+	struct channel *channel = state->channel;
+	size_t n = tal_count(state->sym_lanes);
+
+	if (!n)
+		return;
+	channel->sym_lanes = tal_dup_talarr(channel, struct sym_lane,
+					    state->sym_lanes);
+	channel->sym_lane_bal = tal_arrz(channel, struct sym_lane_balance, n);
+	for (size_t l = 0; l < n; l++) {
+		struct amount_msat all;
+
+		if (!amount_sat_to_msat(&all, state->sym_lanes[l].funding_sats))
+			abort();
+		for (enum side v = 0; v < NUM_SIDES; v++)
+			channel->sym_lane_bal[l].owed[v][channel->opener] = all;
+	}
+}
+
+/* Our signature on each other lane's kickoff. */
+static secp256k1_ecdsa_signature *sym_sign_lane_kickoffs(const tal_t *ctx,
+							 struct state *state)
+{
+	size_t n = tal_count(state->sym_lanes);
+	secp256k1_ecdsa_signature *sigs
+		= tal_arr(ctx, secp256k1_ecdsa_signature, n);
+
+	state->sym_lane_local_sigs = tal_arr(state, struct bitcoin_signature, n);
+	for (size_t l = 0; l < n; l++) {
+		const u8 *wscript;
+		struct bitcoin_tx *ko = sym_lane_kickoff_tx(tmpctx,
+							    state->channel,
+							    l + 1, &wscript);
+		sym_sign_kickoff(state->channel, ko,
+				 &state->sym_lane_local_sigs[l]);
+		sigs[l] = state->sym_lane_local_sigs[l].s;
+	}
+	return sigs;
+}
+
+/* The peer's signature on each other lane's kickoff, checked. */
+static void sym_check_lane_kickoffs(struct state *state,
+				    const secp256k1_ecdsa_signature *theirs)
+{
+	size_t n = tal_count(state->sym_lanes);
+
+	state->sym_lane_sigs = tal_arr(state, struct bitcoin_signature, n);
+	for (size_t l = 0; l < n; l++) {
+		const u8 *wscript;
+		struct bitcoin_tx *ko = sym_lane_kickoff_tx(tmpctx,
+							    state->channel,
+							    l + 1, &wscript);
+
+		state->sym_lane_sigs[l].s = theirs[l];
+		state->sym_lane_sigs[l].sighash_type
+			= SIGHASH_SINGLE | SIGHASH_ANYONECANPAY;
+		if (!check_tx_sig(ko, 0, NULL, wscript,
+				  &state->channel->funding_pubkey[REMOTE],
+				  &state->sym_lane_sigs[l]))
+			peer_failed_err(state->pps, &state->channel_id,
+					"Bad kickoff signature %s for lane"
+					" %zu: %s",
+					fmt_bitcoin_signature(tmpctx,
+							      &state->sym_lane_sigs[l]),
+					l + 1, fmt_bitcoin_tx(tmpctx, ko));
+	}
+}
+
 /* The peer's first state, signed by us; NULL if it cannot be paid. */
 static struct sym_state *sym_first_remote(struct state *state)
 {
 	const char *err;
 	struct sym_state *st = sym_channel_state(state, state->channel, REMOTE,
-						 0, NULL, &err);
+						 0, NULL, NULL, &err);
 	if (!st)
 		return NULL;
 	sym_sign_state(state->channel, st);
@@ -780,7 +908,7 @@ static void sym_first_local(struct state *state, const struct bip340sig *theirs)
 		peer_failed_err(state->pps, &state->channel_id,
 				"Symmetric channel: no update signature");
 	state->sym_local = sym_channel_state(state, state->channel, LOCAL, 0,
-					     NULL, &err);
+					     NULL, NULL, &err);
 	if (!state->sym_local)
 		peer_failed_err(state->pps, &state->channel_id,
 				"Symmetric channel: first state: %s", err);
@@ -875,6 +1003,7 @@ static bool funder_finalize_channel_setup(struct state *state,
 	 * below is built in it. */
 	memcpy(state->channel->channel_asset, state->channel_asset,
 	       sizeof(state->channel->channel_asset));
+	sym_attach_lanes(state);
 
 	/* BOLT #2:
 	 *
@@ -929,6 +1058,12 @@ static bool funder_finalize_channel_setup(struct state *state,
 		}
 		fc_tlvs->sym_sig = tal_dup(fc_tlvs, struct bip340sig,
 					   &state->sym_remote->sig[LOCAL]);
+		if (state->channel->sym_lanes)
+			fc_tlvs->seq_lanes
+				= sym_lanes_created_blob(fc_tlvs,
+							 state->sym_lanes,
+							 sym_sign_lane_kickoffs(tmpctx,
+										state));
 		msg = towire_funding_created(state, &state->channel_id,
 					     &state->funding.txid,
 					     state->funding.n,
@@ -1062,6 +1197,20 @@ wait_funding_signed:
 	else
 		validate_initial_commitment_signature(HSM_FD, *tx, sig);
 
+	/* SEQUENTIA: and their signature on each other lane's kickoff. */
+	if (state->channel->sym_lanes) {
+		secp256k1_ecdsa_signature *theirs;
+
+		if (!fs_tlvs->seq_lanes
+		    || !sym_lanes_from_signed_blob(tmpctx, fs_tlvs->seq_lanes,
+						   tal_count(state->sym_lanes),
+						   &theirs))
+			peer_failed_err(state->pps, &state->channel_id,
+					"funding_signed without each lane's"
+					" kickoff signature");
+		sym_check_lane_kickoffs(state, theirs);
+	}
+
 	/* SEQUENTIA: a factory channel has no kickoff, so no signature on
 	 * it: theirs is zero, and not kept on the transaction. */
 	if (channel_has(state->channel, OPT_SEQ_SYMMETRIC_FACTORY)) {
@@ -1145,7 +1294,10 @@ static u8 *funder_channel_complete(struct state *state)
 					   state->channel_asset,
 					   state->sym_kickoff_sig,
 					   state->sym_local,
-					   state->sym_remote);
+					   state->sym_remote,
+					   state->sym_lanes,
+					   state->sym_lane_sigs,
+					   state->sym_lane_local_sigs);
 }
 
 /*~ The peer sent us an `open_channel`, that means we're the fundee. */
@@ -1213,6 +1365,24 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 		}
 		memcpy(state->channel_asset, open_tlvs->asset_id,
 		       sizeof(state->channel_asset));
+	}
+
+	/* SEQUENTIA: a channel of several assets names its other lanes
+	 * (common/sym_lanes.h), and only that channel type has them. */
+	if (open_tlvs->seq_lanes) {
+		const char *why;
+
+		if (!sym_lanes_from_open_blob(state, open_tlvs->seq_lanes,
+					      &state->sym_lanes)) {
+			negotiation_failed(state, "Malformed lanes");
+			return NULL;
+		}
+		why = sym_lanes_check(tmpctx, state->sym_lanes,
+				      state->channel_asset);
+		if (why) {
+			negotiation_failed(state, "Lanes: %s", why);
+			return NULL;
+		}
 	}
 
 	/* The funder states its feerate in the channel asset's atoms (every
@@ -1619,6 +1789,38 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	memcpy(state->channel->channel_asset, state->channel_asset,
 	       sizeof(state->channel->channel_asset));
 
+	/* SEQUENTIA: a channel of several assets: where each other lane's
+	 * funding output is, and the funder's signature on its kickoff. */
+	if (channel_type_has(state->channel_type, OPT_SEQ_SYMMETRIC_LANES)) {
+		u32 *outnums;
+		secp256k1_ecdsa_signature *lane_sigs;
+
+		if (!tal_count(state->sym_lanes) || !fc_tlvs->seq_lanes
+		    || !sym_lanes_from_created_blob(tmpctx, fc_tlvs->seq_lanes,
+						    tal_count(state->sym_lanes),
+						    &outnums, &lane_sigs))
+			peer_failed_err(state->pps, &state->channel_id,
+					"funding_created without each lane's"
+					" output and kickoff signature");
+		for (size_t l = 0; l < tal_count(outnums); l++) {
+			if (outnums[l] == state->funding.n)
+				peer_failed_err(state->pps, &state->channel_id,
+						"Lane %zu at the channel's own"
+						" output", l + 1);
+			for (size_t m = 0; m < l; m++)
+				if (outnums[m] == outnums[l])
+					peer_failed_err(state->pps,
+							&state->channel_id,
+							"Lanes %zu and %zu at one"
+							" output", m + 1, l + 1);
+			state->sym_lanes[l].outnum = outnums[l];
+		}
+		sym_attach_lanes(state);
+		sym_check_lane_kickoffs(state, lane_sigs);
+	} else if (tal_count(state->sym_lanes))
+		peer_failed_err(state->pps, &state->channel_id,
+				"Lanes on a channel of one asset");
+
 	/* BOLT #2:
 	 *
 	 * The recipient:
@@ -1721,6 +1923,11 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 		}
 		fs_tlvs->sym_sig = tal_dup(fs_tlvs, struct bip340sig,
 					   &state->sym_remote->sig[LOCAL]);
+		if (state->channel->sym_lanes)
+			fs_tlvs->seq_lanes
+				= sym_lanes_signed_blob(fs_tlvs,
+							sym_sign_lane_kickoffs(tmpctx,
+									       state));
 		msg = towire_funding_signed(state, &state->channel_id, &sig.s,
 					    fs_tlvs);
 		pbase = NULL;
@@ -1784,7 +1991,10 @@ reply:
 				     state->sym_kickoff_sig,
 				     state->sym_local,
 				     state->sym_remote,
-				     state->factory);
+				     state->factory,
+				     state->sym_lanes,
+				     state->sym_lane_sigs,
+				     state->sym_lane_local_sigs);
 }
 
 /*~ Standard "peer sent a message, handle it" demuxer.  Though it really only
@@ -1851,6 +2061,7 @@ static u8 *handle_master_in(struct state *state)
 	u16 funding_txout;
 	u32 nonanchor_feerate, anchor_feerate;
 	struct channel_type *ctype;
+	u32 *lane_outnums;
 
 	switch (t) {
 	case WIRE_OPENINGD_FUNDER_START:
@@ -1866,7 +2077,8 @@ static u8 *handle_master_in(struct state *state)
 						    &state->reserve,
 						    &ctype,
 						    state->channel_asset,
-						    &state->factory_id))
+						    &state->factory_id,
+						    &state->sym_lanes))
 			master_badmsg(WIRE_OPENINGD_FUNDER_START, msg);
 		msg = funder_channel_start(state, channel_flags, nonanchor_feerate, anchor_feerate, ctype);
 		tal_free(ctype);
@@ -1880,10 +2092,16 @@ static u8 *handle_master_in(struct state *state)
 						       &funding_txid,
 						       &funding_txout,
 						       &state->channel_type,
-						       &state->factory))
+						       &state->factory,
+						       &lane_outnums))
 			master_badmsg(WIRE_OPENINGD_FUNDER_COMPLETE, msg);
 		state->funding.txid = funding_txid;
 		state->funding.n = funding_txout;
+		/* SEQUENTIA: each other lane's output (common/sym_lanes.h). */
+		if (tal_count(lane_outnums) != tal_count(state->sym_lanes))
+			master_badmsg(WIRE_OPENINGD_FUNDER_COMPLETE, msg);
+		for (size_t l = 0; l < tal_count(lane_outnums); l++)
+			state->sym_lanes[l].outnum = lane_outnums[l];
 		return funder_channel_complete(state);
 	case WIRE_OPENINGD_FUNDER_CANCEL:
 		/* We're aborting this, simple */
@@ -1974,6 +2192,8 @@ int main(int argc, char *argv[])
 	state->sym_local = state->sym_remote = NULL;
 	state->factory_id = NULL;
 	state->factory = NULL;
+	state->sym_lanes = NULL;
+	state->sym_lane_sigs = state->sym_lane_local_sigs = NULL;
 
 	/* Default this to zero, we only ever look at the local */
 	state->remoteconf.max_dust_htlc_exposure_msat = AMOUNT_MSAT(0);

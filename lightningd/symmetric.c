@@ -144,6 +144,11 @@ struct sym_spend {
 	u8 *spent_spk;
 	u8 **witness;
 	struct sym_state_out *outs;
+	/* A channel of several assets (lightningd/sym_lanes.h): input 0's
+	 * asset (NULL: the channel's), and the inputs after it, each of the
+	 * same script and with the same witness. */
+	u8 *in_asset;
+	struct sym_spend_in *extra;
 	u32 sequence, minblock, deadline_block;
 	/* What the last broadcast paid, in its fee asset, and the wallet
 	 * coins it spent (which it reserved, and may spend again). */
@@ -196,6 +201,17 @@ static bool sym_seen_spent(const struct channel *channel,
 	return false;
 }
 
+static bool sym_spends_out(const struct sym_spend *ss,
+			   const struct bitcoin_outpoint *out)
+{
+	if (bitcoin_outpoint_eq(&ss->out, out))
+		return true;
+	for (size_t i = 0; i < tal_count(ss->extra); i++)
+		if (bitcoin_outpoint_eq(&ss->extra[i].out, out))
+			return true;
+	return false;
+}
+
 void sym_note_spent(struct channel *channel,
 		    const struct bitcoin_outpoint *out)
 {
@@ -203,7 +219,7 @@ void sym_note_spent(struct channel *channel,
 
 	for (size_t i = 0; i < tal_count(sym_spends); i++) {
 		if (sym_spends[i]->channel == channel
-		    && bitcoin_outpoint_eq(&sym_spends[i]->out, out)) {
+		    && sym_spends_out(sym_spends[i], out)) {
 			ours = true;
 			if (!sym_spends[i]->spent) {
 				sym_spends[i]->spent = true;
@@ -288,10 +304,21 @@ static struct wally_psbt *sym_psbt_base(const tal_t *ctx,
 
 	psbt_append_input(psbt, &ss->out, ss->sequence, NULL, NULL, NULL);
 	psbt_input_set_wit_utxo_asset(psbt, 0, ss->spent_spk, ss->out_sats,
-				      asset);
+				      ss->in_asset ? ss->in_asset : asset);
+	for (size_t i = 0; i < tal_count(ss->extra); i++) {
+		psbt_append_input(psbt, &ss->extra[i].out, ss->sequence, NULL,
+				  NULL, NULL);
+		psbt_input_set_wit_utxo_asset(psbt, 1 + i,
+					      ss->extra[i].spk
+					      ? ss->extra[i].spk : ss->spent_spk,
+					      ss->extra[i].amount,
+					      ss->extra[i].asset);
+	}
 	for (size_t i = 0; i < tal_count(ss->outs); i++)
 		psbt_append_output_asset(psbt, ss->outs[i].spk,
-					 ss->outs[i].amount, asset);
+					 ss->outs[i].amount,
+					 ss->outs[i].asset ? ss->outs[i].asset
+					 : asset);
 	return psbt;
 }
 
@@ -310,6 +337,10 @@ static size_t sym_weight(const struct sym_spend *ss, struct utxo **coins,
 	psbt_append_output_asset(psbt, NULL, ss->out_sats, dummy);
 	tx = bitcoin_tx_with_psbt(tmpctx, psbt);
 	weight = bitcoin_tx_weight(tx) + sym_witness_weight(ss->witness);
+	for (size_t i = 0; i < tal_count(ss->extra); i++)
+		weight += sym_witness_weight(ss->extra[i].witness
+					     ? ss->extra[i].witness
+					     : ss->witness);
 	for (size_t i = 0; i < tal_count(coins); i++)
 		weight += 1 + bitcoin_tx_input_witness_weight(coins[i]->utxotype);
 	return weight;
@@ -422,14 +453,17 @@ static struct bitcoin_tx *sym_build(const tal_t *ctx, struct sym_spend *ss,
 	memcpy(ss->fee_asset, fee_asset, sizeof(ss->fee_asset));
 
 	tal_wally_start();
-	{
+	/* Input 0, then each extra input at its index after it. */
+	for (size_t in = 0; in <= tal_count(ss->extra); in++) {
 		struct wally_tx_witness_stack *stack;
+		u8 **wit = in && ss->extra[in - 1].witness
+			? ss->extra[in - 1].witness : ss->witness;
 
-		wally_tx_witness_stack_init_alloc(tal_count(ss->witness), &stack);
-		for (size_t i = 0; i < tal_count(ss->witness); i++)
-			wally_tx_witness_stack_add(stack, ss->witness[i],
-						   tal_bytelen(ss->witness[i]));
-		wally_psbt_input_set_final_witness(&psbt->inputs[0], stack);
+		wally_tx_witness_stack_init_alloc(tal_count(wit), &stack);
+		for (size_t i = 0; i < tal_count(wit); i++)
+			wally_tx_witness_stack_add(stack, wit[i],
+						   tal_bytelen(wit[i]));
+		wally_psbt_input_set_final_witness(&psbt->inputs[in], stack);
 		wally_tx_witness_stack_free(stack);
 	}
 	tal_wally_end(psbt);
@@ -545,10 +579,25 @@ void sym_spend_start(struct channel *channel,
 		     const struct sym_state_out *outs,
 		     u32 sequence, u32 minblock, u32 deadline)
 {
-	struct sym_spend *ss;
+	sym_spend_start_lanes(channel, out, amount, NULL, NULL, spent_spk,
+			      witness, outs, sequence, minblock, deadline);
+}
 
+void sym_spend_start_lanes(struct channel *channel,
+			   const struct bitcoin_outpoint *out,
+			   struct amount_sat amount, const u8 *asset,
+			   const struct sym_spend_in *extra,
+			   const u8 *spent_spk, u8 **witness TAKES,
+			   const struct sym_state_out *outs,
+			   u32 sequence, u32 minblock, u32 deadline)
+{
+	struct sym_spend *ss;
+	bool spent = sym_seen_spent(channel, out);
+
+	for (size_t i = 0; i < tal_count(extra); i++)
+		spent |= sym_seen_spent(channel, &extra[i].out);
 	/* Already spent on chain: onchaind proposed it before it heard. */
-	if (sym_seen_spent(channel, out)) {
+	if (spent) {
 		log_debug(channel->log, "symmetric spend of %s: already spent"
 			  " on chain, not attempted",
 			  fmt_bitcoin_outpoint(tmpctx, out));
@@ -573,6 +622,22 @@ void sym_spend_start(struct channel *channel,
 	for (size_t i = 0; i < tal_count(outs); i++) {
 		ss->outs[i].amount = outs[i].amount;
 		ss->outs[i].spk = tal_dup_talarr(ss->outs, u8, outs[i].spk);
+		ss->outs[i].asset = outs[i].asset
+			? tal_dup_arr(ss->outs, u8, outs[i].asset, 33, 0)
+			: NULL;
+	}
+	ss->in_asset = asset ? tal_dup_arr(ss, u8, asset, 33, 0) : NULL;
+	ss->extra = tal_dup_talarr(ss, struct sym_spend_in, extra);
+	for (size_t i = 0; i < tal_count(ss->extra); i++) {
+		ss->extra[i].spk = tal_dup_talarr(ss->extra, u8, extra[i].spk);
+		if (extra[i].witness) {
+			ss->extra[i].witness = tal_arr(ss->extra, u8 *,
+						       tal_count(extra[i].witness));
+			for (size_t j = 0; j < tal_count(extra[i].witness); j++)
+				ss->extra[i].witness[j]
+					= tal_dup_talarr(ss->extra[i].witness,
+							 u8, extra[i].witness[j]);
+		}
 	}
 	ss->sequence = sequence;
 	ss->minblock = minblock;
@@ -605,7 +670,7 @@ bool sym_broadcast_kickoff(struct lightningd *ld, struct channel *channel,
 	}
 	sym_channel_from(channel, &sc);
 	sym_kickoff_tree(tmpctx, &sc, &ko);
-	outs = tal_arr(tmpctx, struct sym_state_out, 1);
+	outs = tal_arrz(tmpctx, struct sym_state_out, 1);
 	outs[0].amount = channel->funding_sats;
 	outs[0].spk = sym_tree_spk(outs, &ko);
 	wscript = bitcoin_redeem_2of2(tmpctx, &channel->local_funding_pubkey,

@@ -75,6 +75,7 @@
 #include <lightningd/plugin_hook.h>
 #include <lightningd/runes.h>
 #include <lightningd/subd.h>
+#include <lightningd/sym_lanes.h>
 #include <sys/resource.h>
 #include <wallet/invoices.h>
 #include <wally_bip32.h>
@@ -760,6 +761,7 @@ void notify_new_block(struct lightningd *ld)
 	/* Inform our subcomponents individually. */
 	htlcs_notify_new_block(ld);
 	channel_notify_new_block(ld);
+	sym_lanes_notify_new_block(ld);
 	channel_gossip_notify_new_block(ld);
 	gossip_notify_new_block(ld);
 	waitblockheight_notify_new_block(ld);

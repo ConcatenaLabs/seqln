@@ -26,6 +26,7 @@
 #include <lightningd/peer_htlcs.h>
 #include <lightningd/plugin_hook.h>
 #include <lightningd/routehint.h>
+#include <lightningd/sym_lanes.h>
 #include <wallet/invoices.h>
 #include <wallet/walletrpc.h>
 
@@ -60,6 +61,12 @@ static const u8 *invoice_default_asset(const tal_t *ctx,
 		list_for_each(&peer->channels, c, list) {
 			if (!channel_state_can_add_htlc(c->state))
 				continue;
+			/* SEQUENTIA: a channel of several assets holds several
+			 * (lightningd/sym_lanes.h). */
+			if (channel_is_sym_lanes(c)) {
+				*several = true;
+				return NULL;
+			}
 			if (!found)
 				found = c->channel_asset;
 			else if (!memeq(found, 33, c->channel_asset, 33)) {
@@ -89,7 +96,9 @@ static const char *invoice_unfunded_asset(const tal_t *ctx,
 			if (!channel_state_can_add_htlc(c->state)
 			    && c->state != CHANNELD_AWAITING_LOCKIN)
 				continue;
-			if (memeq(asset, 33, c->channel_asset, 33))
+			/* SEQUENTIA: in any of its lanes
+			 * (lightningd/sym_lanes.h). */
+			if (channel_lane_of_asset(c, asset) >= 0)
 				return NULL;
 			tal_append_fmt(&others, "%s%s in %s",
 				       others[0] ? ", " : "",

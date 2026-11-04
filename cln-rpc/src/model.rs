@@ -568,6 +568,8 @@ pub mod requests {
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub amount_msat: Option<Amount>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub asset: Option<String>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub bolt11: Option<String>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub description: Option<String>,
@@ -1409,6 +1411,8 @@ pub mod requests {
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub amount_msat: Option<Amount>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub asset: Option<String>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub bolt11: Option<String>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub description: Option<String>,
@@ -1754,7 +1758,7 @@ pub mod requests {
 	        "waitsendpay"
 	    }
 	}
-	/// ['It specifies the type of address wanted; currently *bech32* (e.g. `tb1qu9j4lg5f9rgjyfhvfd905vw46eg39czmktxqgg` on bitcoin testnet or `bc1qwqdg6squsna38e46795at95yu9atm8azzmyvckulcc7kytlcckxswvvzej` on bitcoin mainnet), or *p2tr* taproot addresses. The special value *all* generates all known address types for the same underlying key.']
+	/// ['It specifies the type of address wanted; currently *bech32* (e.g. `tb1qu9j4lg5f9rgjyfhvfd905vw46eg39czmktxqgg` on bitcoin testnet or `bc1qwqdg6squsna38e46795at95yu9atm8azzmyvckulcc7kytlcckxswvvzej` on bitcoin mainnet), or *p2tr* taproot addresses. The special value *all* generates all known address types for the same underlying key. On an elements chain (Sequentia, Liquid) only *bech32* is given: *p2tr* is refused, and *all* answers the *bech32* address alone.']
 	#[derive(Copy, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 	#[allow(non_camel_case_types)]
 	pub enum NewaddrAddresstype {
@@ -2546,6 +2550,12 @@ pub mod requests {
 	    }
 	}
 	#[derive(Clone, Debug, Deserialize, Serialize)]
+	pub struct FundchannelLanes {
+	    pub amount: Amount,
+	    pub asset: String,
+	}
+
+	#[derive(Clone, Debug, Deserialize, Serialize)]
 	pub struct FundchannelRequest {
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub announce: Option<bool>,
@@ -2570,6 +2580,8 @@ pub mod requests {
 	    #[serde(skip_serializing_if = "crate::is_none_or_empty")]
 	    pub channel_type: Option<Vec<u32>>,
 	    #[serde(skip_serializing_if = "crate::is_none_or_empty")]
+	    pub lanes: Option<Vec<FundchannelLanes>>,
+	    #[serde(skip_serializing_if = "crate::is_none_or_empty")]
 	    pub utxos: Option<Vec<Outpoint>>,
 	    pub amount: AmountOrAll,
 	    pub id: PublicKey,
@@ -2592,6 +2604,12 @@ pub mod requests {
 	        "fundchannel"
 	    }
 	}
+	#[derive(Clone, Debug, Deserialize, Serialize)]
+	pub struct FundchannelStartLanes {
+	    pub amount: Amount,
+	    pub asset: String,
+	}
+
 	#[derive(Clone, Debug, Deserialize, Serialize)]
 	pub struct FundchannelStartRequest {
 	    #[serde(skip_serializing_if = "Option::is_none")]
@@ -2616,6 +2634,8 @@ pub mod requests {
 	    pub reserve: Option<Amount>,
 	    #[serde(skip_serializing_if = "crate::is_none_or_empty")]
 	    pub channel_type: Option<Vec<u32>>,
+	    #[serde(skip_serializing_if = "crate::is_none_or_empty")]
+	    pub lanes: Option<Vec<FundchannelStartLanes>>,
 	    pub amount: Amount,
 	    pub id: PublicKey,
 	}
@@ -3149,6 +3169,12 @@ pub mod requests {
 	    }
 	}
 	#[derive(Clone, Debug, Deserialize, Serialize)]
+	pub struct MultifundchannelDestinationsLanes {
+	    pub amount: Amount,
+	    pub asset: String,
+	}
+
+	#[derive(Clone, Debug, Deserialize, Serialize)]
 	pub struct MultifundchannelDestinations {
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub announce: Option<bool>,
@@ -3166,6 +3192,8 @@ pub mod requests {
 	    pub request_amt: Option<Amount>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub reserve: Option<Amount>,
+	    #[serde(skip_serializing_if = "crate::is_none_or_empty")]
+	    pub lanes: Option<Vec<MultifundchannelDestinationsLanes>>,
 	    pub amount: AmountOrAll,
 	    pub id: String,
 	}
@@ -7867,6 +7895,48 @@ pub mod responses {
 	    pub slot: u32,
 	}
 
+	/// ["Who sent it in a commitment: the side that took the other's request."]
+	#[derive(Copy, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+	#[allow(non_camel_case_types)]
+	pub enum ListpeerchannelsChannelsSeqSwapSender {
+	    #[serde(rename = "local")]
+	    LOCAL = 0,
+	    #[serde(rename = "remote")]
+	    REMOTE = 1,
+	}
+
+	impl TryFrom<i32> for ListpeerchannelsChannelsSeqSwapSender {
+	    type Error = anyhow::Error;
+	    fn try_from(c: i32) -> Result<ListpeerchannelsChannelsSeqSwapSender, anyhow::Error> {
+	        match c {
+	    0 => Ok(ListpeerchannelsChannelsSeqSwapSender::LOCAL),
+	    1 => Ok(ListpeerchannelsChannelsSeqSwapSender::REMOTE),
+	            o => Err(anyhow::anyhow!("Unknown variant {} for enum ListpeerchannelsChannelsSeqSwapSender", o)),
+	        }
+	    }
+	}
+
+	impl ToString for ListpeerchannelsChannelsSeqSwapSender {
+	    fn to_string(&self) -> String {
+	        match self {
+	            ListpeerchannelsChannelsSeqSwapSender::LOCAL => "LOCAL",
+	            ListpeerchannelsChannelsSeqSwapSender::REMOTE => "REMOTE",
+	        }.to_string()
+	    }
+	}
+
+	#[derive(Clone, Debug, Deserialize, Serialize)]
+	pub struct ListpeerchannelsChannelsSeqSwap {
+	    // Path `ListPeerChannels.channels[].seq_swap.sender`
+	    pub sender: ListpeerchannelsChannelsSeqSwapSender,
+	    pub give_asset: String,
+	    pub give_msat: Amount,
+	    pub id: u64,
+	    pub state: String,
+	    pub take_asset: String,
+	    pub take_msat: Amount,
+	}
+
 	#[derive(Clone, Debug, Deserialize, Serialize)]
 	pub struct ListpeerchannelsChannelsUpdatesRemote {
 	    pub cltv_expiry_delta: u32,
@@ -7950,6 +8020,15 @@ pub mod responses {
 	    pub our_funding_msat: Amount,
 	    pub splice_amount: i64,
 	    pub total_funding_msat: Amount,
+	}
+
+	#[derive(Clone, Debug, Deserialize, Serialize)]
+	pub struct ListpeerchannelsChannelsSeqLanes {
+	    pub asset: String,
+	    pub funding_outpoint: Outpoint,
+	    pub lane: u32,
+	    pub to_us_msat: Amount,
+	    pub total_msat: Amount,
 	}
 
 	/// ['What caused the change.']
@@ -8105,6 +8184,8 @@ pub mod responses {
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub seq_factory: Option<ListpeerchannelsChannelsSeqFactory>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub seq_swap: Option<ListpeerchannelsChannelsSeqSwap>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub short_channel_id: Option<ShortChannelId>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub spendable_msat: Option<Amount>,
@@ -8124,6 +8205,8 @@ pub mod responses {
 	    pub htlcs: Option<Vec<ListpeerchannelsChannelsHtlcs>>,
 	    #[serde(skip_serializing_if = "crate::is_none_or_empty")]
 	    pub inflight: Option<Vec<ListpeerchannelsChannelsInflight>>,
+	    #[serde(skip_serializing_if = "crate::is_none_or_empty")]
+	    pub seq_lanes: Option<Vec<ListpeerchannelsChannelsSeqLanes>>,
 	    #[serde(skip_serializing_if = "crate::is_none_or_empty")]
 	    pub state_changes: Option<Vec<ListpeerchannelsChannelsStateChanges>>,
 	    #[serde(skip_serializing_if = "crate::is_none_or_empty")]

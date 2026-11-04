@@ -663,6 +663,15 @@ mutual close, once the peer's update signature on it verifies. It claims a settl
 by its own leaf, to its own scripts, and signs a stage's fee coins when the outputs before them
 carry exactly the value of the channel output they spend.
 
+**Several assets in one channel.** A settlement output may name its own asset
+(`struct sym_state_out.asset`; NULL is the channel's), and SETTLE hashes each output's asset, so
+one state can settle several assets, each funded by its own output. A state that names no asset
+encodes exactly as before; one that names one sets 0x80 in its owner byte and follows each output
+with whether it names one and the 33 bytes (`common/sym_state.h`). hsmd signs such a state only
+through `hsmd_sign_sym_lanes_state`, which lists the channel's lanes, each asset and its funding
+value, and refuses a state that pays any lane other than its whole value or pays an asset outside
+them; `hsmd_sign_sym_state` refuses a state that names an asset.
+
 **The settle clock's scripts** (`sym_channel_set_clock`, for `option_seq_symmetric_clock`, bits
 180/181). They move the shared delay off the state output, so a late update no longer restarts
 it. The funding transaction issues one atom of a fresh asset, the marker, whose id derives from
@@ -782,6 +791,103 @@ chain with each negative case (a split moving value between slots, paying a slot
 reordered, short, taking its fee from a slot; one member's channel signatures over another's KO;
 the same keys in another slot or another factory) forced into a block;
 `tests/sequentia/test_sym_factory.py` (section 10).
+
+## 5g. Channels of several assets (`option_seq_symmetric_lanes`)
+
+A symmetric channel (section 5e) that holds several assets, one lane each. A payment in any of
+them crosses the channel in its own lane, and a swap of one asset for another between the two
+peers is one channel update: one state both sides sign, in which both lanes' balances have moved.
+It is applied whole or not at all, on chain as off it.
+
+**Enabling it.** `--symmetric-channels` offers feature bit 184/185 beside 178/179, and
+lightningd withdraws it unless hsmd signs `hsmd_sign_sym_lanes_state` (message 75). The opener
+runs `fundchannel id amount asset=<own> lanes=[{"asset": ..., "amount": ...}, ...]`: the channel's
+own asset and amount are lane 0, and each item another lane, at most eight. The channel type is
+`[12, 178, 184]` (`seq_symmetric_lanes/even` beside `seq_symmetric/even`), never announced, and
+every lane is the opener's at first. Underneath, `fundchannel_start` takes the same `lanes`, and
+`fundchannel_complete` finds one output to the funding script in each lane's asset, each other
+lane's for its amount, explicitly. `multifundchannel` funds a channel of several assets alone:
+each lane from coins of its own asset, with change, paying no fee, and the channel's own asset
+paying the fee for the whole transaction.
+
+**Transactions** (`common/sym_lanes.h`). Every lane is an output of the one funding transaction,
+to the same 2-of-2 script. Each lane's kickoff moves its funding output to KO at the same index,
+the same program for every lane, signed `SIGHASH_SINGLE|SIGHASH_ANYONECANPAY` by both funding
+keys over that pair alone; that sighash does not commit to the input's index, so each lane's
+kickoff is published on its own, with a fee coin. Every lane's state output is the same program
+`P(n)`, whose `SETTLE(n)` fixes the whole settlement: lane 0's outputs, then lane 1's, and so
+on, each in its lane's asset. One update signature per side covers every lane, so no lane's
+balance moves without both; each lane's output moves to `P(n)` by `UPD` on its own. One settle
+spends every lane's state output, each with the same witness: each asset's outputs balance only
+against its own lane's input, so no lane settles alone. The tag is the plain channel's, over
+lane 0's funding outpoint.
+
+**HTLCs.** An HTLC names its lane in `update_add_htlc`'s TLV 48044 `seq_lane` (absent: lane 0),
+its amount is in that lane's asset, and it settles in it. `sendpay` and `sendonion` take `asset`,
+which picks the first hop's lane; `pay` passes the invoice's asset, and counts a direct channel
+holding the asset in any lane. A forward takes the incoming HTLC's asset into the next channel's
+lane of that asset, and refuses a channel without one. An invoice in an asset is payable over a
+channel holding it in any lane. A lane other than lane 0 carries no reserve and pays no fee; the
+channel's own lane keeps both.
+
+**Swaps.** `symswap id give_asset give_msat take_asset take_msat [expiry_blocks]` asks the peer
+for a swap: we give `give_msat` of one lane's asset and take `take_msat` of another's. The request
+is saved before it goes, in the custom message 48045 (refusals 48047), and expires after
+`expiry_blocks` (default 6) and a grace of three. The peer's `sym_swap` hook decides
+(`{"result": "accept"}`, `"refuse"` with a `reason`, or `"continue"` to the next plugin); with no
+plugin a node refuses every swap. A peer that takes it sends the swap in its next
+`commitment_signed`, TLV 48046 `seq_swap`, and the requester's channeld takes it only as asked,
+while the request stands. From there it moves with the HTLCs through each commitment, both legs
+at once in a side's balances once that side has committed it, and each side checks, before it
+sends or takes one, that both legs are affordable beyond everything pending. `listpeerchannels`
+shows every lane under `seq_lanes` (its asset, funding outpoint, total and our balance) and a swap
+in flight under `seq_swap`.
+
+**On chain.** A unilateral close kicks off every lane, each with a fee coin; onchaind tracks each
+lane's KO and state outputs, replaces an older state on any lane by the best one it holds, and
+once every lane's output is at the same state, settles them in one transaction with each input's
+asset. A lane kicked off apart, by anyone, takes the channel to chain; lightningd keeps every such
+spend and hands it to onchaind whenever onchaind starts. An HTLC of another lane is claimed in its
+lane's asset.
+
+**Mutual close.** `close` with the peer there closes every lane in one transaction
+(`common/close_tx.h`, `create_close_tx_lanes`): input 0 is lane 0's funding output and each further
+input another lane's, in lane order, all to the same 2-of-2. Lane 0 pays as any close does, the fee
+the rest of lane 0 in the channel's own asset, taken from the opener's share; each further lane then
+pays each side its whole balance in its own asset, the lower (amount, script) first, the opener
+taking what rounding to whole atoms leaves. An output in an asset other than the fee's is never
+dust, so no lane's value is left to the fee. `closing_signed` carries the signature of input 0 as
+usual and, in TLV 48049 `seq_lane_sigs`, one for each further input in order; closingd checks each
+against the close the first is for and keeps that close with every further input's witness complete,
+so lightningd completes input 0 at broadcast as for any close. Once it is mined, its spend of the
+other lanes' funding outputs is the close's, not a lane kicked off: nothing is kicked off, and
+onchaind takes it as a mutual close (each side's script matched once per asset).
+
+**Signer.** `hsmd_sign_sym_lanes_state` names the channel's lanes, each asset and funding value,
+and each HTLC's lane, and signs a state only if each lane's outputs add up to that lane's whole
+value and no output is in an asset outside the lanes; `hsmd_sign_sym_state` refuses a state that
+names an asset. Before channeld asks for a swap or takes one, it sends the signer
+`hsmd_approve_sym_swap` (what this side gives and takes, each asset and amount), and refuses the
+swap if the signer does. `hsmd_sign_mutual_close_lanes_tx` signs every input of the mutual close
+with the funding key, and `hsmd_sign_commitment_tx` takes a close of several inputs, signing input
+0. lightningd offers the type only to a signer that has all three. The device signer holds every
+lane to the payments and swaps it approved (`contrib/seqln-signer/README.md`).
+
+Files: `common/sym_lanes.{c,h}`, `lightningd/sym_lanes.{c,h}`, and the lanes branches of
+`channeld/full_channel.c` (a balance per lane per view, the swap as a pending change),
+`channeld/channeld.c`, `openingd/openingd.c`, `onchaind/onchaind.c` (`onchaind_sym_anchor`'s
+lanes, `onchaind_spend_sym_lanes`), `lightningd/symmetric.c` (`sym_spend_start_lanes`: a spend
+of several inputs), `lightningd/opening_control.c`, `lightningd/peer_htlcs.c`,
+`lightningd/pay.c`, `lightningd/invoice.c`, `lightningd/routehint.c`,
+`lightningd/onchain_control.c`, `lightningd/watchtower_store.c`,
+`plugins/spender/multifundchannel.c`, `plugins/libplugin-pay.c`, `bitcoin/psbt.c` (fees are
+balanced in the fee asset alone), `common/close_tx.c` and `closingd/closingd.c` (the mutual
+close), and `wallet/wallet.c` (table `channel_sym_lanes`, column
+`channel_htlcs.sym_lane`). Tests: `common/test/run-sym_lanes.c` checks a settlement over two
+lanes against vectors from the builders that were spent on a Sequentia chain with each negative
+case (an update moving one lane without the other side's signature, a swap applied to one lane
+alone, lanes crossed, assets exchanged, one lane settled alone) forced into a block;
+`tests/sequentia/test_sym_lanes.py` (section 10).
 
 ## 6. Asset-aware gossip, routing, payments
 
@@ -1043,7 +1149,10 @@ published, so the record does not grow with the states. A reorg below what it sc
 the walk from the funding output. The settlement's HTLC outputs are left to the node, whose key
 claims them. A factory channel's record (section 5f) also carries its factory, and the walk
 starts from the factory output: the split that spends it pays the channel's KO at the output
-numbered as its slot, and from there the walk is a plain channel's.
+numbered as its slot, and from there the walk is a plain channel's. A channel of several
+assets' record (section 5g) also carries its other lanes: the tower walks from each lane's
+funding output and replaces a stale state on each in that lane's asset, and leaves the settle,
+which spends every lane at once, to the node.
 
 The Specula design note is not yet published in this repository; the header comment of
 `speculad/speculad.c` is the fullest description of the model.
@@ -1069,6 +1178,7 @@ The Specula design note is not yet published in this repository; the header comm
 | `channeld`, `closingd`, `onchaind`, `lightningd/credit.c`, `hsmd`, `contrib/credit-seq/`, `contrib/seqln-signer/` | Provider-signed credit: the CLAIM leaf on the provider's balance output, notes issued and held, the floor, the close and the claim (section 5d) |
 | `openingd`, `channeld`, `onchaind`, `lightningd/symmetric.c`, `hsmd` | Symmetric channels: the kickoff, update signatures per state, the replacement of older states and the settlement on chain, each with a fee coin (section 5e) |
 | `openingd`, `onchaind`, `lightningd/sym_factory.c`, `plugins/spender/multifundchannel.c` | Factory channels: one output for many symmetric channels, the split, each channel moving on to its own output (section 5f) |
+| `openingd`, `channeld`, `onchaind`, `lightningd/sym_lanes.c`, `lightningd/peer_htlcs.c`, `plugins/spender/multifundchannel.c`, `plugins/libplugin-pay.c`, `speculad` | Channels of several assets: a lane per asset, HTLCs in their lane's asset, a swap as one update, every lane settled at once (section 5g) |
 
 ## 9. libwally dependency
 
@@ -1230,7 +1340,14 @@ that member is away, replaced by the member's latest when it returns; and a spli
 block whose Bitcoin anchor is reorganised away, mined again, and the exit carried on from it;
 and, with the member offline, `speculad` holding only its store walking from the factory output
 to its KO, replacing the hub's stale state there by the latest and settling it, each with a fee
-coin from its own wallet (`test_sym_factory.py`). They need `sequentiad`, `sequentia-cli`
+coin from its own wallet (`test_sym_factory.py`); and channels of several assets (section 5g):
+a channel of GOLD and SILV, a payment in each and back, a swap of one for the other as one
+update that the peer's `sym_swap` plugin took, one it refused and one with no plugin to take it,
+and the balances kept over a restart; a unilateral close kicking off each lane, putting the
+latest state over each and settling both in one transaction; and, with the payee offline, the
+payer's stale state over both lanes, which `speculad` holding only the payee's store replaces on
+each lane in its own asset, before the payee, back online, settles both
+(`test_sym_lanes.py`). They need `sequentiad`, `sequentia-cli`
 and a Bitcoin Core `bitcoind` on `PATH`, and the keyless tests need the device signer built
 (`cargo build --release` in `contrib/seqln-signer`, or `SEQLN_SIGNER=/path/to/seqln-signer`).
 The test plugins run under the `python3` on `PATH`, which needs the `pyln` packages, so the

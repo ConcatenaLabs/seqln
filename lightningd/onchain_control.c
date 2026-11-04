@@ -28,6 +28,7 @@
 #include <lightningd/peer_htlcs.h>
 #include <lightningd/subd.h>
 #include <lightningd/sym_factory.h>
+#include <lightningd/sym_lanes.h>
 #include <lightningd/symmetric.h>
 #include <onchaind/onchaind_wiregen.h>
 #include <wallet/txfilter.h>
@@ -582,11 +583,12 @@ static void onchain_add_utxo(struct channel *channel, const u8 *msg)
 	struct amount_sat amount;
 	struct pubkey *commitment_point;
 	u8 *scriptPubkey;
+	u8 asset[33];
 
 	if (!fromwire_onchaind_add_utxo(
 		tmpctx, msg, &outpoint, &commitment_point,
 		&amount, &blockheight, &scriptPubkey,
-		&csv_lock)) {
+		&csv_lock, asset)) {
 		log_broken(channel->log,
 			   "onchaind gave invalid add_utxo message: %s",
 			   tal_hex(msg, msg));
@@ -604,7 +606,7 @@ static void onchain_add_utxo(struct channel *channel, const u8 *msg)
 				 &outpoint, scriptPubkey,
 				 blockheight, amount, channel,
 				 commitment_point,
-				 csv_lock);
+				 csv_lock, asset);
 
 	mvt = new_coin_wallet_deposit(msg, &outpoint, blockheight,
 			              amount, mk_mvt_tags(MVT_DEPOSIT));
@@ -1753,6 +1755,10 @@ struct tcov_spend {
 	struct bitcoin_outpoint *coins;
 	/* The output is spent on chain, by this spend or by the peer. */
 	bool spent;
+	/* SEQUENTIA: the output's asset, or NULL: the channel's.  A channel
+	 * of several assets settles an HTLC in its lane's
+	 * (lightningd/sym_lanes.h). */
+	const u8 *asset;
 
 	/* SEQUENTIA: a credit claim (common/credit_scripts.h): no signature
 	 * of ours on input 0, which takes the note; output 0 returns what
@@ -2084,7 +2090,7 @@ static struct bitcoin_tx *tcov_build(const tal_t *ctx,
 {
 	struct channel *channel = ts->channel;
 	struct lightningd *ld = channel->peer->ld;
-	const u8 *chan_asset = channel->channel_asset;
+	const u8 *chan_asset = ts->asset ? ts->asset : channel->channel_asset;
 	struct ext_key ext;
 	u8 *wallet_spk, *dest_spk;
 	struct wally_psbt *psbt;
@@ -2401,6 +2407,7 @@ static void handle_onchaind_spend_tcov(struct channel *channel,
 	ts->coins = NULL;
 	ts->channel = channel;
 	ts->credit_claim = false;
+	ts->asset = NULL;
 	ts->holder_spk = NULL;
 	tcov_spend_track(ts);
 	if (!fromwire_onchaind_spend_tcov(ts, msg, &ts->out, &ts->out_sats,
@@ -2418,6 +2425,10 @@ static void handle_onchaind_spend_tcov(struct channel *channel,
 		tal_free(ts);
 		return;
 	}
+	/* SEQUENTIA: an HTLC of another lane than a channel's own settles in
+	 * that lane's asset (lightningd/sym_lanes.h). */
+	if (channel_is_sym_lanes(channel))
+		ts->asset = sym_lanes_output_asset(ts, channel, ts->spent_spk);
 	ts->signer = signer;
 	if (tal_bytelen(ts->cov_program) == 0)
 		ts->cov_program = tal_free(ts->cov_program);
@@ -2525,8 +2536,65 @@ static void handle_onchaind_spend_sym(struct channel *channel, const u8 *msg)
 		      take(towire_onchaind_spend_created(NULL, true,
 				cast_const2(const struct onchain_witness_element **,
 					    welements))));
-	sym_spend_start(channel, &out, amount, spent_spk, wit, outs->outs,
-			sequence, minblock, deadline);
+	/* SEQUENTIA: an update keeps its input's asset: on a channel of
+	 * several assets, its lane's, which its one output names
+	 * (lightningd/sym_lanes.h). */
+	sym_spend_start_lanes(channel, &out, amount,
+			      tal_count(outs->outs) == 1 ? outs->outs[0].asset
+			      : NULL, NULL, spent_spk, wit, outs->outs,
+			      sequence, minblock, deadline);
+}
+
+/* SEQUENTIA: the settle of a channel of several assets: every lane's state
+ * output at once (lightningd/sym_lanes.h). */
+static void handle_onchaind_spend_sym_lanes(struct channel *channel,
+					    const u8 *msg)
+{
+	struct bitcoin_outpoint *ops;
+	struct amount_sat *amounts;
+	u8 *assets, *spent_spk;
+	struct onchain_witness_element **welements;
+	struct sym_state *outs;
+	u32 sequence, minblock, deadline;
+	struct sym_spend_in *extra;
+	u8 **wit;
+
+	if (!fromwire_onchaind_spend_sym_lanes(tmpctx, msg, &ops, &amounts,
+					       &assets, &spent_spk, &welements,
+					       &outs, &sequence, &minblock,
+					       &deadline)
+	    || tal_count(ops) == 0
+	    || tal_count(amounts) != tal_count(ops)
+	    || tal_bytelen(assets) != tal_count(ops) * 33) {
+		channel_internal_error(channel,
+				       "Invalid onchaind_spend_sym_lanes %s",
+				       tal_hex(tmpctx, msg));
+		return;
+	}
+	wit = tal_arr(tmpctx, u8 *, tal_count(welements));
+	for (size_t i = 0; i < tal_count(welements); i++)
+		wit[i] = welements[i]->witness;
+	extra = tal_arrz(tmpctx, struct sym_spend_in, tal_count(ops) - 1);
+	for (size_t i = 1; i < tal_count(ops); i++) {
+		extra[i - 1].out = ops[i];
+		extra[i - 1].amount = amounts[i];
+		memcpy(extra[i - 1].asset, assets + i * 33, 33);
+	}
+	subd_send_msg(channel->owner,
+		      take(towire_onchaind_spend_created(NULL, true,
+				cast_const2(const struct onchain_witness_element **,
+					    welements))));
+	sym_spend_start_lanes(channel, &ops[0], amounts[0], assets, extra,
+			      spent_spk, wit, outs->outs, sequence, minblock,
+			      deadline);
+}
+
+void onchaind_lane_spent(struct channel *channel, const struct bitcoin_tx *tx,
+			 size_t input_num, u32 blockheight)
+{
+	if (channel->onchaind_replay_watches)
+		replay_watch_tx(channel, blockheight, tx);
+	onchain_txo_spent(channel, tx, input_num, blockheight);
 }
 
 /* SEQUENTIA: claim a credit output with the note we hold
@@ -2544,6 +2612,7 @@ static void handle_onchaind_spend_credit_claim(struct channel *channel,
 	ts->coins = NULL;
 	ts->channel = channel;
 	ts->credit_claim = true;
+	ts->asset = NULL;
 	ts->cov_program = NULL;
 	ts->remote_point = NULL;
 	ts->revocation_secret = NULL;
@@ -2688,6 +2757,9 @@ static unsigned int onchain_msg(struct subd *sd, const u8 *msg, const int *fds U
 
 	case WIRE_ONCHAIND_SPEND_SYM:
 		handle_onchaind_spend_sym(sd->channel, msg);
+		break;
+	case WIRE_ONCHAIND_SPEND_SYM_LANES:
+		handle_onchaind_spend_sym_lanes(sd->channel, msg);
 		break;
 
 	/* We send these, not receive them */
@@ -2899,7 +2971,14 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 							      channel_is_sym_factory(channel)
 							      ? sym_factory_anchor(channel)
 							      : &channel->funding,
-							      channel_is_sym_factory(channel))));
+							      channel_is_sym_factory(channel),
+							      channel_is_sym_lanes(channel)
+							      ? channel->sym_lanes->lanes
+							      : NULL)));
+		/* SEQUENTIA: the other lanes' kickoffs seen so far
+		 * (lightningd/sym_lanes.h). */
+		if (channel_is_sym_lanes(channel))
+			sym_lanes_onchaind_started(channel, tx);
 	}
 
 	/* If we're replaying, we just watch this */
