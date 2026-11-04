@@ -1,7 +1,7 @@
 from bitcoin.rpc import JSONRPCError
 from decimal import Decimal
 from fixtures import *  # noqa: F401,F403
-from pyln.testing.utils import ELEMENTS_NETWORKS
+from pyln.testing.utils import ELEMENTS_NETWORKS, SEQUENTIA_NETWORKS
 from fixtures import TEST_NETWORK
 from pyln.client import RpcError, Millisatoshi
 from utils import (
@@ -872,6 +872,12 @@ def test_utxopsbt(node_factory, bitcoind, chainparams):
         assert is_psbt_v2
         # elements includes the fee as an output
         addl_fee = Millisatoshi((fee_val * start_weight + 999) // 1000 * 1000)
+        if TEST_NETWORK in SEQUENTIA_NETWORKS:
+            # Sequentia rounds the whole fee up (common/amount.c
+            # amount_tx_fee), so the extra is the difference of two totals.
+            w1 = funding['estimated_final_weight']
+            w2 = w1 + start_weight
+            addl_fee = Millisatoshi(((fee_val * w2 + 999) // 1000 - (fee_val * w1 + 999) // 1000) * 1000)
         assert psbt2['outputs'][0]['amount'] == psbt['outputs'][0]['amount'] + addl_fee.to_btc()
     else:
         assert psbt2['tx']['vout'] == psbt['tx']['vout']
@@ -985,7 +991,7 @@ def test_sign_signed_psbt(node_factory, bitcoind, chainparams):
     psbt = l1.rpc.txprepare([{l1.rpc.newaddr('bech32')['bech32']: 10000}])['psbt']
     signed_psbt = l1.rpc.signpsbt(psbt)['signed_psbt']
 
-    if TEST_NETWORK != 'liquid-regtest':
+    if TEST_NETWORK not in ELEMENTS_NETWORKS:
         # FIXME: ideally this would succeed, as a noop.  But it shouldn't crash
         with pytest.raises(RpcError):
             l1.rpc.signpsbt(signed_psbt)['signed_psbt']
@@ -1042,7 +1048,7 @@ def test_psbt_version(node_factory, bitcoind, chainparams):
             l1.rpc.setpsbtversion(v2_funding, i)
 
 
-@unittest.skipIf(TEST_NETWORK == 'liquid-regtest', 'Core/Elements need joinpsbt support for v2')
+@unittest.skipIf(TEST_NETWORK in ELEMENTS_NETWORKS, 'Core/Elements need joinpsbt support for v2')
 def test_sign_and_send_psbt(node_factory, bitcoind, chainparams):
     """
     Tests for the sign + send psbt RPCs
