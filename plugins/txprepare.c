@@ -217,7 +217,6 @@ static struct command_result *signpsbt_done(struct command *cmd,
 	 * only to its own scripts) returns it unsigned: release the inputs,
 	 * so they are not held reserved for a transaction that never goes. */
 	if (!psbt_finalize(utx->psbt)) {
-		struct out_req *req;
 		struct txprepare_cleanup *cleanup = tal(cmd, struct txprepare_cleanup);
 
 		cleanup->error_json = tal_fmt(cleanup,

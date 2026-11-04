@@ -1,6 +1,7 @@
 #include "config.h"
 #include <assert.h>
 #include <bitcoin/chainparams.h>
+#include <ccan/compiler/compiler.h>
 #include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
 #include <common/amount.h>
@@ -736,13 +737,58 @@ char *fmt_asset_id(const tal_t *ctx, const u8 *asset_tag)
 	return tal_hexstr(ctx, id, sizeof(id));
 }
 
+/* (a * b + add) / div by schoolbook arithmetic on 64-bit words: the product
+ * from four 32-bit partial products, then the 128-by-64 division a bit at a
+ * time. */
+static UNNEEDED u64 u64_mul_add_div_portable(u64 a, u64 b, u64 add, u64 div)
+{
+	u64 a_lo = a & 0xFFFFFFFF, a_hi = a >> 32;
+	u64 b_lo = b & 0xFFFFFFFF, b_hi = b >> 32;
+	u64 ll = a_lo * b_lo, lh = a_lo * b_hi, hl = a_hi * b_lo, hh = a_hi * b_hi;
+	u64 mid = (ll >> 32) + (lh & 0xFFFFFFFF) + (hl & 0xFFFFFFFF);
+	u64 lo = (ll & 0xFFFFFFFF) | (mid << 32);
+	u64 hi = hh + (lh >> 32) + (hl >> 32) + (mid >> 32);
+	u64 q = 0, r;
+
+	assert(div);
+	if (lo + add < lo)
+		hi++;
+	lo += add;
+	/* The quotient needs more than 64 bits. */
+	if (hi >= div)
+		return UINT64_MAX;
+	r = hi;
+	for (int i = 63; i >= 0; i--) {
+		bool carry = r >> 63;
+		r = (r << 1) | ((lo >> i) & 1);
+		if (carry || r >= div) {
+			r -= div;
+			q |= (u64)1 << i;
+		}
+	}
+	return q;
+}
+
+u64 u64_mul_add_div(u64 a, u64 b, u64 add, u64 div)
+{
+#ifdef __SIZEOF_INT128__
+	unsigned __int128 v = ((unsigned __int128)a * b + add) / div;
+
+	if (v > UINT64_MAX)
+		return UINT64_MAX;
+	return (u64)v;
+#else
+	return u64_mul_add_div_portable(a, b, add, div);
+#endif
+}
+
 u32 feerate_in_asset(u32 feerate_per_kw, u64 rate)
 {
-	__uint128_t v;
+	u64 v;
 
 	if (rate == 0 || rate == EXCHANGE_RATE_SCALE)
 		return feerate_per_kw;
-	v = ((__uint128_t)feerate_per_kw * EXCHANGE_RATE_SCALE + rate - 1) / rate;
+	v = u64_mul_add_div(feerate_per_kw, EXCHANGE_RATE_SCALE, rate - 1, rate);
 	if (v > UINT32_MAX)
 		return UINT32_MAX;
 	return (u32)v;
@@ -750,14 +796,9 @@ u32 feerate_in_asset(u32 feerate_per_kw, u64 rate)
 
 static u64 u64_in_asset(u64 ref, u64 rate)
 {
-	__uint128_t v;
-
 	if (rate == 0 || rate == EXCHANGE_RATE_SCALE)
 		return ref;
-	v = ((__uint128_t)ref * EXCHANGE_RATE_SCALE + rate - 1) / rate;
-	if (v > UINT64_MAX)
-		return UINT64_MAX;
-	return (u64)v;
+	return u64_mul_add_div(ref, EXCHANGE_RATE_SCALE, rate - 1, rate);
 }
 
 struct amount_sat amount_sat_in_asset(struct amount_sat ref, u64 rate)

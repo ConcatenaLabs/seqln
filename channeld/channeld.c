@@ -1739,14 +1739,23 @@ static void send_commit(struct peer *peer)
 	start_commit_timer(peer);
 }
 
+/* How long to wait before looking again while quiescing.  Never zero: a
+ * timer due at once fires on every pass of the main loop, which then never
+ * gets to read the peer, so the peer's STFU never arrives and the channel
+ * spins.  The commit delay itself may be zero (SeqLN's default). */
+#define STFU_COMMIT_RETRY_MSEC 10
+
 static void send_commit_if_not_stfu(struct peer *peer)
 {
 	if (!peer->stfu_sent[LOCAL]) {
 		send_commit(peer);
 	} else {
 		/* Timer now considered expired, you can add a new one. */
-		peer->commit_timer = NULL;
-		start_commit_timer(peer);
+		peer->commit_timer = new_reltimer(&peer->timers, peer,
+						  time_from_msec(peer->commit_msec > STFU_COMMIT_RETRY_MSEC
+								 ? peer->commit_msec
+								 : STFU_COMMIT_RETRY_MSEC),
+						  send_commit_if_not_stfu, peer);
 	}
 }
 

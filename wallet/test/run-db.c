@@ -570,6 +570,8 @@ int main(int argc, char *argv[])
 	struct lightningd *ld = tal(NULL, struct lightningd);
 
 	common_setup(argv[0]);
+	/* The migrations ask which network they run on. */
+	chainparams = chainparams_for_network("regtest");
 	ld->config = test_config;
 
 	/* We do a runtime test here, so we still check compile! */

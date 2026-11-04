@@ -143,6 +143,18 @@ void ecdh(const struct pubkey *point, struct secret *ss)
 		abort();
 }
 
+/* The fake peer's per-commitment point for commitment @n.  lightningd wants a
+ * valid point beside each commitment (for watchtower templates); nothing in
+ * this fake network checks it. */
+static struct pubkey *fake_commit_point(const struct info *info, u64 n)
+{
+	struct pubkey *p = tal(tmpctx, struct pubkey);
+
+	if (!per_commit_point(&info->peer_shaseed, p, n))
+		abort();
+	return p;
+}
+
 static void pretend_got_revoke(struct info *info, u64 htlc_id, enum htlc_state newstate)
 {
 	struct changed_htlc *changed;
@@ -166,7 +178,7 @@ static void pretend_got_revoke(struct info *info, u64 htlc_id, enum htlc_state n
 	msg = towire_channeld_got_revoke(NULL, info->commit_num - 1, &secret,
 					 &next_per_commit_point, info->fee_states,
 					 info->blockheight_states, changed,
-					 NULL, NULL);
+					 NULL, NULL, NULL, NULL);
 	daemon_conn_send(info->dc, take(msg));
 }
 
@@ -183,10 +195,12 @@ static void update_commitment_tx_added(struct info *info, u64 htlc_id)
 	/* Tell it we committed */
 	msg = towire_channeld_sending_commitsig(NULL,
 						info->commit_num,
+						fake_commit_point(info, info->commit_num),
 						NULL,
 						info->fee_states,
 						info->blockheight_states,
-						changed);
+						changed,
+						NULL);
 	daemon_conn_send(info->dc, take(msg));
 
 	channel_sending_commit(info->channel, &htlcs);
@@ -206,6 +220,9 @@ static void update_commitment_tx_added(struct info *info, u64 htlc_id)
 					    NULL,
 					    changed,
 					    info->commit_tx,
+					    NULL,
+					    fake_commit_point(info, info->commit_num),
+					    NULL,
 					    NULL);
 	daemon_conn_send(info->dc, take(msg));
 
@@ -405,6 +422,9 @@ static void fail(struct info *info,
 					    failed_arr,
 					    NULL,
 					    info->commit_tx,
+					    NULL,
+					    fake_commit_point(info, info->commit_num),
+					    NULL,
 					    NULL);
 	daemon_conn_send(info->dc, take(msg));
 
@@ -415,10 +435,12 @@ static void fail(struct info *info,
 	/* Tell it we committed, too */
 	msg = towire_channeld_sending_commitsig(NULL,
 						info->commit_num,
+						fake_commit_point(info, info->commit_num),
 						NULL,
 						info->fee_states,
 						info->blockheight_states,
-						changed);
+						changed,
+						NULL);
 	daemon_conn_send(info->dc, take(msg));
 
 	/* Tell it we got revoke & ack from them. */
@@ -536,6 +558,9 @@ static void succeed(struct info *info,
 					    NULL,
 					    NULL,
 					    info->commit_tx,
+					    NULL,
+					    fake_commit_point(info, info->commit_num),
+					    NULL,
 					    NULL);
 	daemon_conn_send(info->dc, take(msg));
 
@@ -546,10 +571,12 @@ static void succeed(struct info *info,
 	/* Tell it we committed, too */
 	msg = towire_channeld_sending_commitsig(NULL,
 						info->commit_num,
+						fake_commit_point(info, info->commit_num),
 						NULL,
 						info->fee_states,
 						info->blockheight_states,
-						changed);
+						changed,
+						NULL);
 	daemon_conn_send(info->dc, take(msg));
 
 	/* Tell it we got revoke & ack from them. */
@@ -876,6 +903,9 @@ static void handle_offer_htlc(struct info *info, const u8 *inmsg)
 	const char *failstr;
 	struct amount_sat htlc_fee;
 	struct pubkey *blinding;
+	/* SEQUENTIA: a point lock (common/point_lock.h); this fake network
+	 * locks every HTLC to its hash. */
+	struct pubkey *lock_point;
 	static u64 htlc_id;
 	struct fake_htlc *htlc = tal(info, struct fake_htlc);
 
@@ -883,7 +913,8 @@ static void handle_offer_htlc(struct info *info, const u8 *inmsg)
 	htlc->htlc_id = htlc_id;
 	if (!fromwire_channeld_offer_htlc(tmpctx, inmsg, &amount,
 					 &cltv_expiry, &htlc->payment_hash,
-					 onion_routing_packet, &blinding, &extratlvs))
+					 onion_routing_packet, &blinding, &extratlvs,
+					 &lock_point))
 		master_badmsg(WIRE_CHANNELD_OFFER_HTLC, inmsg);
 
 	e = channel_add_htlc(info->channel, LOCAL, htlc->htlc_id,
@@ -1054,7 +1085,7 @@ static struct channel *handle_init(struct info *info, const u8 *init_msg)
 	u8 *fwd_msg;
 	u32 minimum_depth, lease_expiry;
 	struct secret last_remote_per_commit_secret;
-	struct penalty_base *pbases;
+	struct penalty_base **pbases;
 	struct channel_type *channel_type;
 	u32 feerate_splice, feerate_min, feerate_max, feerate_penalty, feerate_opening;
 	struct pubkey remote_per_commit;
@@ -1082,6 +1113,7 @@ static struct channel *handle_init(struct info *info, const u8 *init_msg)
 	char *err_reason;
 	struct wally_tx_output *direct_outputs[NUM_SIDES];
 	struct htlc_map *htlc_map;
+	u8 channel_asset[33];
 
 	if (!fromwire_channeld_init(info, init_msg,
 				    &chainparams,
@@ -1090,6 +1122,7 @@ static struct channel *handle_init(struct info *info, const u8 *init_msg)
 				    &channel_id,
 				    &funding,
 				    &funding_sats,
+				    channel_asset,
 				    &minimum_depth,
 				    &info->current_block_height,
 				    &info->blockheight_states,
@@ -1242,6 +1275,7 @@ static struct io_plan *recv_req(struct io_conn *conn,
 	case WIRE_CHANNELD_SENDING_COMMITSIG:
 	case WIRE_CHANNELD_GOT_COMMITSIG:
 	case WIRE_CHANNELD_GOT_REVOKE:
+	case WIRE_CHANNELD_CREDIT_NOTE:
 	case WIRE_CHANNELD_GOT_CHANNEL_READY:
 	case WIRE_CHANNELD_GOT_SPLICE_LOCKED:
 	case WIRE_CHANNELD_GOT_ANNOUNCEMENT:

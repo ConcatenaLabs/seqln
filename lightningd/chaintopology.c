@@ -640,6 +640,8 @@ static void get_feeexchangerates_once(struct lightningd *ld,
 
 void topo_refresh_feeexchangerates(struct chain_topology *topo)
 {
+	if (!chainparams->is_elements)
+		return;
 	bitcoind_get_feeexchangerates(topo->request_ctx, topo->bitcoind,
 				      update_feeexchangerates, NULL);
 }
@@ -651,8 +653,7 @@ static void start_fee_estimate(struct chain_topology *topo)
 	bitcoind_estimate_fees(topo->request_ctx, topo->bitcoind, update_feerates_repeat, NULL);
 	/* ... and the any-asset fee exchange rates (used to size on-chain
 	 * funding fees denominated in a non-policy asset). */
-	bitcoind_get_feeexchangerates(topo->request_ctx, topo->bitcoind,
-				      update_feeexchangerates, NULL);
+	topo_refresh_feeexchangerates(topo);
 }
 
 u64 topo_asset_fee_rate(const struct chain_topology *topo, const u8 *asset_tag)

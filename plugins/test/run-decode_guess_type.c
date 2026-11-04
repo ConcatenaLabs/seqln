@@ -245,6 +245,8 @@ static void run_likely_tests(const struct likely_test *tests)
 int main(int argc, char *argv[])
 {
 	common_setup(argv[0]);
+	/* The invoice prefixes it knows include this node's own network's. */
+	chainparams = chainparams_for_network("regtest");
 
 	static const struct likely_test tests[] = {
 		/* BOLT-12 */

@@ -141,7 +141,8 @@ privileged fee asset), so a node returns no `estimatesmartfee`-style feerate:
   plain `bitcoind` backend yields an empty whitelist rather than an error.
 - `lightningd/bitcoind.c`, `lightningd/chaintopology.{c,h}`, `common/amount.{c,h}`: plumb and
   cache those exchange rates (`EXCHANGE_RATE_SCALE`, per-asset rate lookup), read once before any
-  channel starts and refreshed on the feerate poll. The policy asset, the Sequence token, is one
+  channel starts and refreshed on the feerate poll. Only an elements chain asks for them: on
+  Bitcoin a backend plugin need not register `getfeeexchangerates`, as upstream's does not. The policy asset, the Sequence token, is one
   asset among equals: `bcli` resolves the node's labels (its "bitcoin" among them) to hex ids, so
   it arrives at the rate its node gives it, and a node that does not list it does not accept it
   for fees. On Liquid the policy asset stays at par.

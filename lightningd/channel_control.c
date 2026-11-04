@@ -159,17 +159,14 @@ static struct amount_msat channel_dust_cap(struct lightningd *ld,
 {
 	struct amount_msat cap = channel->our_config.max_dust_htlc_exposure_msat;
 	u64 rate;
-	__uint128_t v;
 
 	if (!chainparams->has_anchor_header)
 		return cap;
 	rate = topo_asset_fee_rate(ld->topology, channel->channel_asset);
 	if (!rate)
 		return cap;
-	v = (__uint128_t)cap.millisatoshis * EXCHANGE_RATE_SCALE / rate; /* Raw: rescaled */
-	if (v > UINT64_MAX)
-		v = UINT64_MAX;
-	return amount_msat((u64)v);
+	return amount_msat(u64_mul_add_div(cap.millisatoshis, /* Raw: rescaled */
+					   EXCHANGE_RATE_SCALE, 0, rate));
 }
 
 static u32 default_feerate(struct lightningd *ld, const struct channel *channel,

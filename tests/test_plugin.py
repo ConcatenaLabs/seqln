@@ -460,6 +460,8 @@ def test_pay_plugin(node_factory):
     msg = 'pay invstring [amount_msat] [label] [riskfactor] [maxfeepercent] '\
           '[retry_for] [maxdelay] [exemptfee] [localinvreqid] [exclude] '\
           '[maxfee] [description] [partial_msat]'
+    # SeqLN: pay takes the asset to pay in.
+    msg += ' [asset]'
     # We run with --developer:
     msg += ' [dev_use_shadow]'
     assert only_one(l1.rpc.help('pay')['help'])['command'] == msg
@@ -472,8 +474,10 @@ def test_keysend_plugin(node_factory):
         l1.rpc.call('keysend')
 
     # Make sure usage messages are present.
-    msg = 'keysend (DEPRECATED!) destination amount_msat [label] [maxfeepercent] [retry_for] '\
-          '[maxdelay] [exemptfee] [extratlvs] [routehints] [maxfee]'
+    # SeqLN keeps keysend undeprecated (xpay's keysend knows no assets),
+    # and it takes the asset to pay in.
+    msg = 'keysend destination amount_msat [label] [maxfeepercent] [retry_for] '\
+          '[maxdelay] [exemptfee] [extratlvs] [routehints] [maxfee] [asset]'
     # We run with --developer:
     msg += ' [dev_use_shadow]'
     assert only_one(l1.rpc.help('keysend')['help'])['command'] == msg
@@ -3497,6 +3501,9 @@ def test_sql(node_factory, bitcoind):
                          'type': 'boolean'},
                         {'name': 'amount_msat',
                          'type': 'msat'},
+                        # SeqLN: the channel's asset.
+                        {'name': 'asset',
+                         'type': 'hex'},
                         {'name': 'message_flags',
                          'type': 'u8'},
                         {'name': 'channel_flags',
@@ -3700,6 +3707,9 @@ def test_sql(node_factory, bitcoind):
                          'type': 'u64'},
                         {'name': 'updated_index',
                          'type': 'u64'},
+                        # SeqLN: the asset the invoice is paid in.
+                        {'name': 'asset',
+                         'type': 'hex'},
                         {'name': 'pay_index',
                          'type': 'u64'},
                         {'name': 'amount_received_msat',
@@ -3929,6 +3939,23 @@ def test_sql(node_factory, bitcoind):
                          'type': 'msat'},
                         {'name': 'last_stable_connection',
                          'type': 'u64'},
+                        # SeqLN: the channel's asset and its factory slot.
+                        {'name': 'channel_asset',
+                         'type': 'hex'},
+                        {'name': 'seq_factory_nonce',
+                         'type': 'txid'},
+                        {'name': 'seq_factory_slot',
+                         'type': 'u32'},
+                        {'name': 'seq_factory_size',
+                         'type': 'u32'},
+                        {'name': 'seq_factory_factory_txid',
+                         'type': 'txid'},
+                        {'name': 'seq_factory_factory_outnum',
+                         'type': 'u32'},
+                        {'name': 'seq_factory_ko_txid',
+                         'type': 'txid'},
+                        {'name': 'seq_factory_ko_outnum',
+                         'type': 'u32'},
                         {'name': 'close_to_addr',
                          'type': 'string'},
                         {'name': 'last_tx_fee_msat',
@@ -3955,6 +3982,9 @@ def test_sql(node_factory, bitcoind):
                          'type': 'u32'},
                         {'name': 'payment_hash',
                          'type': 'hash'},
+                        # SeqLN: an HTLC's payment point, when it carries one.
+                        {'name': 'lock_point',
+                         'type': 'pubkey'},
                         {'name': 'local_trimmed',
                          'type': 'boolean'},
                         {'name': 'status',

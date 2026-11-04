@@ -631,10 +631,28 @@ void gossip_store_del(struct gossip_store *gs,
 					   type);
 
 	/* For a channel_announcement, we need to delete amount too */
-	if (type == WIRE_CHANNEL_ANNOUNCEMENT)
-		gossip_store_set_flag(gs, next_index,
-				      GOSSIP_STORE_DELETED_BIT,
-				      WIRE_GOSSIP_STORE_CHANNEL_AMOUNT);
+	if (type == WIRE_CHANNEL_ANNOUNCEMENT) {
+		struct gossip_hdr hdr;
+		be16 be_type;
+
+		next_index = gossip_store_set_flag(gs, next_index,
+						   GOSSIP_STORE_DELETED_BIT,
+						   WIRE_GOSSIP_STORE_CHANNEL_AMOUNT);
+
+		/* Sequentia: and the channel's asset record, which follows
+		 * the amount when the channel has one.  Left live, it would
+		 * outlast its channel through every compaction. */
+		if (next_index + sizeof(be_type) <= gs->len
+		    && pread(gs->fd, &hdr, sizeof(hdr),
+			     next_index - sizeof(hdr)) == sizeof(hdr)
+		    && pread(gs->fd, &be_type, sizeof(be_type),
+			     next_index) == sizeof(be_type)
+		    && be16_to_cpu(be_type) == WIRE_GOSSIP_STORE_CHANNEL_ASSET
+		    && !(be16_to_cpu(hdr.flags) & GOSSIP_STORE_DELETED_BIT))
+			gossip_store_set_flag(gs, next_index,
+					      GOSSIP_STORE_DELETED_BIT,
+					      WIRE_GOSSIP_STORE_CHANNEL_ASSET);
+	}
 }
 
 u32 gossip_store_get_timestamp(struct gossip_store *gs, u64 offset)

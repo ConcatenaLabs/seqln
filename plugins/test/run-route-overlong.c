@@ -69,6 +69,13 @@ struct out_req *jsonrpc_request_start_(struct command *cmd UNNEEDED,
 				       void *arg)
 
 { fprintf(stderr, "jsonrpc_request_start_ called!\n"); abort(); }
+/* Generated stub for jsonrpc_request_sync */
+const jsmntok_t *jsonrpc_request_sync(const tal_t *ctx UNNEEDED,
+				      struct command *cmd UNNEEDED,
+				      const char *method UNNEEDED,
+				      const struct json_out *params TAKES UNNEEDED,
+				      const char **resp UNNEEDED)
+{ fprintf(stderr, "jsonrpc_request_sync called!\n"); abort(); }
 /* Generated stub for jsonrpc_stream_fail */
 struct json_stream *jsonrpc_stream_fail(struct command *cmd UNNEEDED,
 					int code UNNEEDED,
