@@ -731,6 +731,9 @@ class ElementsD(BitcoinD):
 
 
 SEQUENTIA_NETWORKS = ('sequentia-regtest',)
+# Whether a node on a Sequentia network runs with the network's own timelock
+# defaults rather than the suite's test values (see LightningD).
+SEQUENTIA_NETWORK_DEFAULTS = False
 ELEMENTS_NETWORKS = ('liquid-regtest',) + SEQUENTIA_NETWORKS
 
 
@@ -1012,11 +1015,18 @@ class LightningD(TailableProc):
         for k, v in opts.items():
             self.opts[k] = v
 
-        # A Sequentia network has its own timelock and rescan defaults,
-        # sized for its block cadence and for reorgs that follow the Bitcoin
-        # anchor: test what a node really runs with.
+        # A Sequentia network has its own rescan default: the chain root is
+        # never pinned, so a reorg that follows the Bitcoin anchor, of any
+        # depth, is never fatal.  It also has its own timelock defaults,
+        # sized for its block cadence.  The upstream tests run with the
+        # same short test timelocks on every chain (on Bitcoin too they are
+        # far from the network's defaults); tests that check the network's
+        # own defaults set SEQUENTIA_NETWORK_DEFAULTS (tests/sequentia does).
         if TEST_NETWORK in SEQUENTIA_NETWORKS:
-            for k in ('cltv-delta', 'cltv-final', 'watchtime-blocks', 'rescan'):
+            keys = ['rescan']
+            if SEQUENTIA_NETWORK_DEFAULTS:
+                keys += ['cltv-delta', 'cltv-final', 'watchtime-blocks']
+            for k in keys:
                 del self.opts[k]
 
         if not os.path.exists(os.path.join(lightning_dir, TEST_NETWORK)):
@@ -1673,10 +1683,12 @@ class LightningNode(object):
         scid = [c['short_channel_id'] for c in self.rpc.listpeerchannels(dst_id)['channels']
                 if c['state'] == 'CHANNELD_NORMAL'][0]
 
+        # The payee's final CLTV: 5 on the test config, a network's own
+        # default where the harness leaves it (Sequentia).
         routestep = {
             'amount_msat': amt,
             'id': dst_id,
-            'delay': 5,
+            'delay': self.rpc.decode(inv['bolt11'])['min_final_cltv_expiry'],
             'channel': scid
         }
 
