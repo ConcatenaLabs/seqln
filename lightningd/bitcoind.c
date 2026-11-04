@@ -81,6 +81,11 @@ void bitcoind_check_commands(struct bitcoind *bitcoind)
 	struct plugin *p;
 
 	for (i = 0; i < ARRAY_SIZE(methods); i++) {
+		/* Fee exchange rates exist only on an elements chain: a backend
+		 * for Bitcoin need not offer them, and none is ever asked. */
+		if (!chainparams->is_elements
+		    && streq(methods[i], "getfeeexchangerates"))
+			continue;
 		p = find_plugin_for_command(bitcoind->ld, methods[i]);
 		if (p == NULL) {
 			/* For testing .. */
