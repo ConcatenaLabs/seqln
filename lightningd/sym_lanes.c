@@ -187,6 +187,50 @@ static bool onchaind_runs(const struct channel *channel)
 	return channel->owner && streq(channel->owner->name, "onchaind");
 }
 
+/* Whether @tx is the channel's mutual close (common/close_tx.h): it spends
+ * every lane's funding output, and every output but the fee pays one of the
+ * two shutdown scripts.  Spending several lanes is not enough: the kickoff
+ * signatures are SIGHASH_SINGLE|ANYONECANPAY, so either side can kick off
+ * several lanes in one transaction, which pays KO, not a shutdown script,
+ * and leaves the other lanes to kick off. */
+static bool is_lanes_mutual_close(const struct channel *channel,
+				  const struct bitcoin_tx *tx)
+{
+	const u8 *ours = channel->shutdown_scriptpubkey[LOCAL];
+	const u8 *theirs = channel->shutdown_scriptpubkey[REMOTE];
+
+	if (!ours || !theirs
+	    || tx->wtx->num_inputs != channel_num_lanes(channel))
+		return false;
+	for (size_t l = 0; l < channel_num_lanes(channel); l++) {
+		struct bitcoin_outpoint out;
+		struct amount_sat amount;
+		bool spent = false;
+
+		channel_lane_funding(channel, l, &out, &amount);
+		for (size_t i = 0; i < tx->wtx->num_inputs; i++) {
+			struct bitcoin_outpoint in;
+
+			bitcoin_tx_input_get_outpoint(tx, i, &in);
+			if (bitcoin_outpoint_eq(&in, &out))
+				spent = true;
+		}
+		if (!spent)
+			return false;
+	}
+	for (size_t i = 0; i < tx->wtx->num_outputs; i++) {
+		const struct wally_tx_output *o = &tx->wtx->outputs[i];
+
+		if (!o->script_len)
+			continue;
+		if (!memeq(o->script, o->script_len, ours, tal_bytelen(ours))
+		    && !memeq(o->script, o->script_len, theirs,
+			      tal_bytelen(theirs)))
+			return false;
+	}
+	return true;
+}
+
 static enum watch_result lane_funding_spent(struct channel *channel,
 					    const struct bitcoin_tx *tx,
 					    size_t inputnum,
@@ -200,6 +244,10 @@ static enum watch_result lane_funding_spent(struct channel *channel,
 	bitcoin_tx_input_get_outpoint(tx, inputnum, &out);
 	bitcoin_txid(tx, &txid);
 	sym_note_spent(channel, &out);
+	/* The mutual close spends every lane: lane 0's spend takes the channel
+	 * on, as for any close. */
+	if (is_lanes_mutual_close(channel, tx))
+		return KEEP_WATCHING;
 	for (size_t i = 0; i < tal_count(info->spends); i++) {
 		struct bitcoin_txid t;
 		bitcoin_txid(info->spends[i].tx, &t);
@@ -248,6 +296,9 @@ void sym_lanes_onchaind_started(struct channel *channel,
 	bitcoin_txid(tx, &txid);
 	tal_free(info->onchaind_txid);
 	info->onchaind_txid = tal_dup(info, struct bitcoin_txid, &txid);
+	/* The mutual close pays every lane out: nothing to kick off. */
+	if (is_lanes_mutual_close(channel, tx))
+		return;
 	for (size_t i = 0; i < tal_count(info->spends); i++) {
 		struct bitcoin_txid t;
 

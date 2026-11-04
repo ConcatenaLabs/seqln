@@ -2,6 +2,7 @@
 #include <bitcoin/tx.h>
 #include <common/bip32.h>
 #include <common/channel_id.h>
+#include <common/close_tx.h>
 #include <common/cryptomsg.h>
 #include <common/htlc_wire.h>
 #include <common/status_wire.h>
@@ -32,6 +33,10 @@ msgdata,closingd_init,fee_negotiation_step_unit,u8,
 msgdata,closingd_init,use_quickclose,bool,
 msgdata,closingd_init,shutdown_wrong_funding,?bitcoin_outpoint,
 msgdata,closingd_init,channel_asset,byte,33
+# A channel of several assets: each further lane, as the close pays it
+# (common/close_tx.h).
+msgdata,closingd_init,num_lanes,u16,
+msgdata,closingd_init,lanes,close_lane,num_lanes
 
 # Message for any commands waiting.
 msgtype,closingd_notification,2003

@@ -14286,7 +14286,7 @@
             "added": "v26.06",
             "type": "array",
             "description": [
-              "On a Sequentia network, open a channel of several assets: each item is another asset the channel holds beside its own, and the amount of it to fund. Each is its own output of the funding transaction, to the same 2-of-2 script, and all start as the opener's. A payment in any of them is carried by the channel, and **symswap** trades one for another in one channel update. Such a channel is unannounced and closes unilaterally."
+              "On a Sequentia network, open a channel of several assets: each item is another asset the channel holds beside its own, and the amount of it to fund. Each is its own output of the funding transaction, to the same 2-of-2 script, and all start as the opener's. A payment in any of them is carried by the channel, and **symswap** trades one for another in one channel update. Such a channel is unannounced, and **close** pays every lane out in one transaction, mutual or unilateral."
             ],
             "items": {
               "type": "object",
@@ -14821,7 +14821,7 @@
             "added": "v26.06",
             "type": "array",
             "description": [
-              "On a Sequentia network, open a channel of several assets: each item is another asset the channel holds beside its own, and the amount of it to fund. Each is its own output of the funding transaction, to the same 2-of-2 script, and all start as the opener's. A payment in any of them is carried by the channel, and **symswap** trades one for another in one channel update. Such a channel is unannounced and closes unilaterally."
+              "On a Sequentia network, open a channel of several assets: each item is another asset the channel holds beside its own, and the amount of it to fund. Each is its own output of the funding transaction, to the same 2-of-2 script, and all start as the opener's. A payment in any of them is carried by the channel, and **symswap** trades one for another in one channel update. Such a channel is unannounced, and **close** pays every lane out in one transaction, mutual or unilateral."
             ],
             "items": {
               "type": "object",
@@ -43973,6 +43973,116 @@
           }
         ]
       }
+    },
+    "sym_swap.json": {
+      "$schema": "../rpc-schema-draft.json",
+      "added": "v26.06",
+      "type": "object",
+      "hook": "sym_swap",
+      "title": "Hook for deciding the swaps a peer asks for",
+      "description": [
+        "On a Sequentia network, the **sym_swap** hook is called when the peer of a channel of several assets asks for a swap between two of the channel's lanes (see lightning-symswap(7)): the peer gives *give_msat* of *give_asset* and takes *take_msat* of *take_asset*.",
+        "",
+        "A plugin that takes it returns `{\"result\": \"accept\"}`: the node then sends the swap in its next commitment, as one channel update, if both legs are still affordable. One that refuses it returns `{\"result\": \"refuse\"}`, with a *reason* the peer is told. `{\"result\": \"continue\"}` leaves the decision to the next plugin; when every plugin continues, or none is registered, the swap is refused.",
+        "",
+        "This is a chained hook: the first plugin to accept or refuse decides."
+      ],
+      "request": {
+        "required": [
+          "sym_swap"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "sym_swap": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "peer_id",
+              "channel_id",
+              "id",
+              "expiry"
+            ],
+            "properties": {
+              "peer_id": {
+                "type": "pubkey",
+                "description": [
+                  "The peer that asks."
+                ]
+              },
+              "channel_id": {
+                "type": "hash",
+                "description": [
+                  "The channel."
+                ]
+              },
+              "id": {
+                "type": "u64",
+                "description": [
+                  "The swap's id."
+                ]
+              },
+              "give_asset": {
+                "type": "hex",
+                "description": [
+                  "The asset the peer gives, which this node takes."
+                ]
+              },
+              "give_msat": {
+                "type": "msat",
+                "description": [
+                  "How much of it."
+                ]
+              },
+              "take_asset": {
+                "type": "hex",
+                "description": [
+                  "The asset the peer takes, which this node gives."
+                ]
+              },
+              "take_msat": {
+                "type": "msat",
+                "description": [
+                  "How much of it."
+                ]
+              },
+              "expiry": {
+                "type": "u32",
+                "description": [
+                  "The block after which the peer takes the swap no more."
+                ]
+              }
+            }
+          }
+        }
+      },
+      "response": {
+        "required": [
+          "result"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "result": {
+            "type": "string",
+            "enum": [
+              "accept",
+              "refuse",
+              "continue"
+            ],
+            "description": [
+              "Take the swap, refuse it, or leave it to the next plugin."
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "description": [
+              "With `refuse`: what the peer is told."
+            ]
+          }
+        }
+      },
+      "see_also": [
+        "lightning-symswap(7)"
+      ]
     }
   }
 }

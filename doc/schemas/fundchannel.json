@@ -128,7 +128,7 @@
         "added": "v26.06",
         "type": "array",
         "description": [
-          "On a Sequentia network, open a channel of several assets: each item is another asset the channel holds beside its own, and the amount of it to fund. Each is its own output of the funding transaction, to the same 2-of-2 script, and all start as the opener's. A payment in any of them is carried by the channel, and **symswap** trades one for another in one channel update. Such a channel is unannounced and closes unilaterally."
+          "On a Sequentia network, open a channel of several assets: each item is another asset the channel holds beside its own, and the amount of it to fund. Each is its own output of the funding transaction, to the same 2-of-2 script, and all start as the opener's. A payment in any of them is carried by the channel, and **symswap** trades one for another in one channel update. Such a channel is unannounced, and **close** pays every lane out in one transaction, mutual or unilateral."
         ],
         "items": {
           "type": "object",
