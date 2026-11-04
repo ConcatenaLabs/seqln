@@ -850,12 +850,15 @@ def chainparams():
     """Return the chainparams for the TEST_NETWORK.
 
     - chain_hash is in network byte order, not the RPC return order.
+    - lightning_hrp is the invoices' prefix and coin movements' coin_type;
+      on Sequentia it differs from the addresses' bip173_prefix.
     - example_addr doesn't belong to any node in the test (randomly generated)
 
     """
     chainparams = {
         "regtest": {
             "bip173_prefix": "bcrt",
+            "lightning_hrp": "bcrt",
             "elements": False,
             "name": "regtest",
             "p2sh_prefix": "2",
@@ -865,6 +868,7 @@ def chainparams():
         },
         "liquid-regtest": {
             "bip173_prefix": "ert",
+            "lightning_hrp": "ert",
             "elements": True,
             "name": "liquid-regtest",
             "p2sh_prefix": "X",
@@ -874,6 +878,7 @@ def chainparams():
         },
         "sequentia-regtest": {
             "bip173_prefix": "bcrt",
+            "lightning_hrp": "sqrt",
             "elements": True,
             "name": "sequentia-regtest",
             "p2sh_prefix": "2",
