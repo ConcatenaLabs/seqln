@@ -4,7 +4,7 @@ from pyln.client import RpcError, Millisatoshi
 from utils import (
     only_one, wait_for, sync_blockheight, first_channel_id, calc_lease_fee, check_coin_moves
 )
-from pyln.testing.utils import FUNDAMOUNT
+from pyln.testing.utils import FUNDAMOUNT, SEQUENTIA_NETWORKS
 
 from pathlib import Path
 import pytest
@@ -2235,6 +2235,9 @@ def test_zeroreserve_alldust(node_factory):
     l1.rpc.fundchannel(l2.info['id'], minfunding + 1)
 
 
+@unittest.skipIf(TEST_NETWORK in SEQUENTIA_NETWORKS,
+                 "Sequentia's blocks come from its staking committee and pay no"
+                 " subsidy: there is no coinbase to mine to a node's address")
 def test_coinbase_unspendable(node_factory, bitcoind):
     """ A node should not be able to spend a coinbase output
         before it's mature """

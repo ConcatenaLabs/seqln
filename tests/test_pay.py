@@ -4,7 +4,7 @@ from hashlib import sha256
 from pathlib import Path
 from pyln.client import RpcError, Millisatoshi
 from pyln.proto.onion import TlvPayload
-from pyln.testing.utils import EXPERIMENTAL_DUAL_FUND, FUNDAMOUNT, scid_to_int
+from pyln.testing.utils import EXPERIMENTAL_DUAL_FUND, FUNDAMOUNT, scid_to_int, SEQUENTIA_NETWORKS
 from utils import (
     wait_for, only_one, sync_blockheight, TIMEOUT,
     mine_funding_to_announce, first_scid, serialize_payload_tlv, serialize_payload_final_tlv,
@@ -3799,9 +3799,16 @@ def test_pay_exemptfee(node_factory):
     )
 
     err = r'Could not find route without excessive cost'
+    if TEST_NETWORK in SEQUENTIA_NETWORKS:
+        # Sequentia keeps pay on its own, asset-aware route search rather
+        # than handing it to xpay (plugins/xpay/xpay.c): that one discards
+        # the route for its fee and runs out of routes.
+        err = r'Ran out of routes to try'
 
     with pytest.raises(RpcError, match=err):
         l1.dev_pay(l3.rpc.invoice(1, "lbl1", "desc")['bolt11'], dev_use_shadow=False)
+    if TEST_NETWORK in SEQUENTIA_NETWORKS:
+        l1.daemon.wait_for_log('Fee exceeds our fee budget: 5001msat > 5000msat')
 
     # If we tell our node that 5001msat is ok this should work
     l1.dev_pay(l3.rpc.invoice(1, "lbl2", "desc")['bolt11'], dev_use_shadow=False, exemptfee=5001)

@@ -1,7 +1,7 @@
 from fixtures import *  # noqa: F401,F403
 from fixtures import TEST_NETWORK
 from pyln.client import RpcError
-from pyln.testing.utils import FUNDAMOUNT, only_one
+from pyln.testing.utils import FUNDAMOUNT, only_one, SEQUENTIA_NETWORKS
 from utils import (
     TIMEOUT, first_scid, first_scidd, GenChannel, generate_gossip_store, wait_for,
     sync_blockheight,
@@ -1152,6 +1152,9 @@ def test_xpay_user_layers(node_factory):
     )
     node_factory.join_nodes([l1, l2, l3], wait_for_announce=True)
     node_factory.join_nodes([l2, l4], wait_for_announce=True)
+    # Sequentia keeps pay on its own, asset-aware route search whatever
+    # xpay-handle-pay says (plugins/xpay/xpay.c): use xpay itself there.
+    pay = l1.rpc.xpay if TEST_NETWORK in SEQUENTIA_NETWORKS else l1.rpc.pay
 
     layer = "disable-chan23"
     l1.rpc.askrene_create_layer(layer=layer, persistent=True)
@@ -1182,7 +1185,7 @@ def test_xpay_user_layers(node_factory):
         RpcError,
         match="We could not find a usable set of paths. All 1 channels to the destination are disabled.",
     ):
-        l1.rpc.pay(inv3)
+        pay(inv3)
     inv4 = l4.rpc.invoice(1000, "test-xpay-user-layer", "test-xpay-user-layer")[
         "bolt11"
     ]
@@ -1190,7 +1193,7 @@ def test_xpay_user_layers(node_factory):
         RpcError,
         match="We could not find a usable set of paths. All 1 channels to the destination are disabled.",
     ):
-        l1.rpc.pay(inv4)
+        pay(inv4)
 
     # Without those layers, the same payments should go through
     l1.stop()
@@ -1198,8 +1201,8 @@ def test_xpay_user_layers(node_factory):
     l1.start()
     l1.rpc.connect(l2.info["id"], "localhost", l2.port)
     l1.daemon.wait_for_log(f"channeld.*: billboard: Channel ready for use")
-    l1.rpc.pay(inv3)
-    l1.rpc.pay(inv4)
+    pay(inv3)
+    pay(inv4)
 
 
 def test_xpay_get_error_with_update(node_factory):

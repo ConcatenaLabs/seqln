@@ -541,7 +541,8 @@ def test_txprepare_feerate(node_factory, bitcoind, chainparams):
     out_addrs = l2.rpc.newaddr('all')
     wait_for(lambda: len(l1.rpc.listfunds()['outputs']) == 20)
 
-    for addrtype in ('bech32', 'p2tr'):
+    # An elements node gives no P2TR addresses (newaddr is bech32 only there).
+    for addrtype in ('bech32',) if chainparams['elements'] else ('bech32', 'p2tr'):
         for feerate in range(255, 1000, 250):
             prep = l1.rpc.txprepare([{out_addrs[addrtype]: Millisatoshi(9000)}], f"{feerate}perkw")
             actual_feerate = feerate_from_psbt(chainparams, bitcoind, l1, prep['psbt'])
@@ -2317,8 +2318,10 @@ def test_repro_4258(node_factory, bitcoind):
 
     tx = bitcoind.rpc.decoderawtransaction(tx['unsigned_tx'])
 
-    assert(len(tx['vout']) == 1)
-    o0 = tx['vout'][0]
+    # (An elements tx pays its fee in an output of its own.)
+    vout = [o for o in tx['vout'] if o['scriptPubKey'].get('type') != 'fee']
+    assert(len(vout) == 1)
+    o0 = vout[0]
     assert(scriptpubkey_addr(o0['scriptPubKey']) == addr)
 
     assert(len(tx['vin']) == 1)
