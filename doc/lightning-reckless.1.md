@@ -85,8 +85,9 @@ Available option flags:
 	request additional debug output
 
 **--network**=*network*
-	specify bitcoin, regtest, liquid, liquid-regtest, signet,
-	or testnet networks. (default: bitcoin)
+	specify bitcoin, regtest, liquid, liquid-regtest, signet, testnet,
+	testnet4, sequentia, sequentia-testnet or sequentia-regtest
+	networks. (default: bitcoin)
 
 NOTES
 -----
