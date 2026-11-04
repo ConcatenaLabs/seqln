@@ -40,6 +40,7 @@
  * v6 with tcov_htlc_locks (Sequentia point locks): d04dad9498fb8db4f6978f7ce4cc675a870976a6698f5d4aa0e17ab2ea44f25c
  * v6 with credit notes (Sequentia provider-signed credit): 12ad766083ec58c222bfc509d619f8eb6659ccdf2c06a1c3a1f821605a692444
  * v6 with sign_sym_* (Sequentia symmetric channels): 0fe54c3ab13d8fd2a71715aac9bee34815e8a72d658382d77f235fb2b7d1ccbc
+ * v6 with sign_sym_lanes_state (Sequentia several assets per channel): 87fa4c38733589532bfbc4a10d870a225b64f9b1b0315b3289c78071fb6ea1cb
  */
 #define HSM_MIN_VERSION 5
 #define HSM_MAX_VERSION 6

@@ -58,7 +58,8 @@
  *         (the last: OP_SHA256FINALIZE)
  *   <digest> OP_EQUAL
  *
- *   digest = SHA256 over each output of asset || 0x01 || value, 8 bytes LE ||
+ *   digest = SHA256 over each output of asset (its own, or the channel's
+ *   when it names none) || 0x01 || value, 8 bytes LE ||
  *   0x01 || SHA256(program || version), version empty for v0.  The script's
  *   hash makes every field of fixed length, so no other list of outputs
  *   hashes to the same digest.  The settlement's values add up to the state
@@ -207,6 +208,9 @@ struct sym_output {
 	enum side side;
 	struct amount_sat amount;
 	const u8 *spk;
+	/* Its asset (0x01 || 32-byte id), or NULL: the channel's.  A channel
+	 * that holds several assets settles each in its own. */
+	const u8 *asset;
 	/* SYM_OUT_HTLC: the caller's handle and its expiry. */
 	const void *htlc;
 	u32 cltv_expiry;

@@ -17,6 +17,9 @@ struct sym_state *sym_state_new(const tal_t *ctx, enum side owner,
 	for (size_t i = 0; i < tal_count(outs); i++) {
 		st->outs[i].amount = outs[i].amount;
 		st->outs[i].spk = tal_dup_talarr(st->outs, u8, outs[i].spk);
+		st->outs[i].asset = outs[i].asset
+			? tal_dup_arr(st->outs, u8, outs[i].asset, 33, 0)
+			: NULL;
 	}
 	st->has_sig[LOCAL] = st->has_sig[REMOTE] = false;
 	memset(st->sig, 0, sizeof(st->sig));
@@ -34,6 +37,7 @@ struct sym_output *sym_state_outputs(const tal_t *ctx,
 		outs[i].side = LOCAL;
 		outs[i].amount = st->outs[i].amount;
 		outs[i].spk = st->outs[i].spk;
+		outs[i].asset = st->outs[i].asset;
 		outs[i].htlc = NULL;
 		outs[i].cltv_expiry = 0;
 	}
@@ -68,9 +72,16 @@ struct amount_sat sym_state_total(const struct sym_state *st)
 	return t;
 }
 
+#define SYM_STATE_ASSETS 0x80
+
 void towire_sym_state(u8 **pptr, const struct sym_state *st)
 {
-	towire_u8(pptr, st->owner);
+	bool assets = false;
+
+	for (size_t i = 0; i < tal_count(st->outs); i++)
+		if (st->outs[i].asset)
+			assets = true;
+	towire_u8(pptr, st->owner | (assets ? SYM_STATE_ASSETS : 0));
 	towire_u64(pptr, st->commit_num);
 	towire_u64(pptr, (u64)st->num);
 	towire_u16(pptr, tal_count(st->outs));
@@ -79,6 +90,11 @@ void towire_sym_state(u8 **pptr, const struct sym_state *st)
 		towire_u16(pptr, tal_bytelen(st->outs[i].spk));
 		towire_u8_array(pptr, st->outs[i].spk,
 				tal_bytelen(st->outs[i].spk));
+		if (!assets)
+			continue;
+		towire_bool(pptr, st->outs[i].asset != NULL);
+		if (st->outs[i].asset)
+			towire_u8_array(pptr, st->outs[i].asset, 33);
 	}
 	for (enum side s = 0; s < NUM_SIDES; s++) {
 		towire_bool(pptr, st->has_sig[s]);
@@ -91,8 +107,10 @@ struct sym_state *fromwire_sym_state(const tal_t *ctx,
 {
 	struct sym_state *st = tal(ctx, struct sym_state);
 	u16 n;
+	u8 owner = fromwire_u8(pptr, max);
+	bool assets = owner & SYM_STATE_ASSETS;
 
-	st->owner = fromwire_u8(pptr, max);
+	st->owner = owner & ~SYM_STATE_ASSETS;
 	if (st->owner != LOCAL && st->owner != REMOTE)
 		fromwire_fail(pptr, max);
 	st->commit_num = fromwire_u64(pptr, max);
@@ -104,6 +122,13 @@ struct sym_state *fromwire_sym_state(const tal_t *ctx,
 		st->outs[i].amount = fromwire_amount_sat(pptr, max);
 		len = fromwire_u16(pptr, max);
 		st->outs[i].spk = fromwire_tal_arrn(st->outs, pptr, max, len);
+		st->outs[i].asset = NULL;
+		if (assets && fromwire_bool(pptr, max)) {
+			st->outs[i].asset = fromwire_tal_arrn(st->outs, pptr,
+							      max, 33);
+			if (st->outs[i].asset && st->outs[i].asset[0] != 0x01)
+				fromwire_fail(pptr, max);
+		}
 	}
 	for (enum side s = 0; s < NUM_SIDES; s++) {
 		st->has_sig[s] = fromwire_bool(pptr, max);
