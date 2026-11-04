@@ -1968,6 +1968,11 @@ static struct command_result *payment_createonion_success(struct command *cmd,
 
 	json_add_sha256(req->js, "payment_hash", payment_lock_hash(p));
 	json_add_amount_msat(req->js, "amount_msat", p->our_amount);
+	/* SEQUENTIA: the first hop's lane on a channel of several assets
+	 * (common/sym_lanes.h) is the payment's asset. */
+	if (root->asset)
+		json_add_string(req->js, "asset",
+				fmt_asset_id(tmpctx, root->asset));
 	if (root->point_lock) {
 		json_add_pubkey(req->js, "lock_point", &root->point_lock0);
 		p->point_locked = true;
@@ -3803,6 +3808,8 @@ REGISTER_PAYMENT_MODIFIER(shadowroute, struct shadow_route_data *,
 
 static bool listpeerchannels_asset(const char *buf, const jsmntok_t *chan,
 				   u8 tag[33]);
+static bool listpeerchannels_holds(const char *buf, const jsmntok_t *chan,
+				   const u8 *asset);
 
 /* Sequentia: the listpeerchannels entry of a parsed channel, by its
  * short_channel_id, else its local alias. */
@@ -3903,11 +3910,9 @@ static struct command_result *direct_pay_listpeerchannels(struct command *cmd,
 		/* Sequentia: a direct channel in another asset than the
 		 * payment's would carry it out of its asset. */
 		if (payment_root(p)->asset) {
-			u8 tag[33];
 			const jsmntok_t *ct = chantok_of(buffer, chantoks, chan);
-			if (!ct || !listpeerchannels_asset(buffer, ct, tag)
-			    || !memeq(tag, sizeof(tag),
-				      payment_root(p)->asset, 33))
+			if (!ct || !listpeerchannels_holds(buffer, ct,
+							   payment_root(p)->asset))
 				continue;
 		}
 
@@ -4333,6 +4338,35 @@ static bool listpeerchannels_asset(const char *buf, const jsmntok_t *chan,
 	return true;
 }
 
+/* SEQUENTIA: does a channel in listpeerchannels hold @asset: its own, or
+ * one of its lanes' (common/sym_lanes.h)? */
+static bool listpeerchannels_holds(const char *buf, const jsmntok_t *chan,
+				   const u8 *asset)
+{
+	const jsmntok_t *lanes = json_get_member(buf, chan, "seq_lanes"), *t;
+	u8 tag[33];
+	size_t i;
+
+	if (listpeerchannels_asset(buf, chan, tag) && memeq(tag, 33, asset, 33))
+		return true;
+	if (!lanes)
+		return false;
+	json_for_each_arr(i, t, lanes) {
+		const jsmntok_t *a = json_get_member(buf, t, "asset");
+		u8 id[32];
+
+		if (!a || !hex_decode(buf + a->start, a->end - a->start,
+				      id, sizeof(id)))
+			continue;
+		tag[0] = 0x01;
+		for (size_t k = 0; k < sizeof(id); k++)
+			tag[1 + k] = id[sizeof(id) - 1 - k];
+		if (memeq(tag, 33, asset, 33))
+			return true;
+	}
+	return false;
+}
+
 static void point_lock_add_scid(struct short_channel_id **scids,
 				const char *buf, const jsmntok_t *tok)
 {
@@ -4443,8 +4477,9 @@ const char *payment_asset_unsendable(const tal_t *ctx, struct command *cmd,
 			continue;
 		/* An open channel in the asset can carry the payment, now or
 		 * once its peer reconnects or its balance settles: the
-		 * payment's own attempts handle those. */
-		if (memeq(tag, sizeof(tag), asset, 33)
+		 * payment's own attempts handle those.  SEQUENTIA: in any of
+		 * its lanes (common/sym_lanes.h). */
+		if (listpeerchannels_holds(buf, t, asset)
 		    && state
 		    && (json_tok_streq(buf, state, "CHANNELD_NORMAL")
 			|| json_tok_streq(buf, state, "CHANNELD_AWAITING_SPLICE")))

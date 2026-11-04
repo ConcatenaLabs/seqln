@@ -52,6 +52,7 @@ json_fundchannel(struct command *cmd,
 	const jsmntok_t *reserve;
 	const jsmntok_t *channel_type;
 	const jsmntok_t *asset;
+	const jsmntok_t *lanes;
 
 	struct out_req *req;
 
@@ -70,6 +71,7 @@ json_fundchannel(struct command *cmd,
 		   p_opt("reserve", param_tok, &reserve),
 		   p_opt("channel_type", param_tok, &channel_type),
 		   p_opt("asset", param_tok, &asset),
+		   p_opt("lanes", param_tok, &lanes),
 		   NULL))
 		return command_param_failed();
 
@@ -107,6 +109,9 @@ json_fundchannel(struct command *cmd,
 	/* Asset-aware channels: fund this channel in an issued asset. */
 	if (asset)
 		json_add_tok(req->js, "asset", asset, buf);
+	/* SEQUENTIA: a channel of several assets (common/sym_lanes.h). */
+	if (lanes)
+		json_add_tok(req->js, "lanes", lanes, buf);
 
 	json_object_end(req->js);
 	json_array_end(req->js);

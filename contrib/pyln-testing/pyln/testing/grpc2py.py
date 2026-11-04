@@ -983,6 +983,28 @@ def listpeerchannels_channels_seq_factory2py(m):
     })
 
 
+def listpeerchannels_channels_seq_lanes2py(m):
+    return remove_default({
+        "asset": hexlify(m.asset),  # PrimitiveField in generate_composite
+        "funding_outpoint": m.funding_outpoint,  # PrimitiveField in generate_composite
+        "lane": m.lane,  # PrimitiveField in generate_composite
+        "to_us_msat": amount2msat(m.to_us_msat),  # PrimitiveField in generate_composite
+        "total_msat": amount2msat(m.total_msat),  # PrimitiveField in generate_composite
+    })
+
+
+def listpeerchannels_channels_seq_swap2py(m):
+    return remove_default({
+        "sender": str(m.sender),  # EnumField in generate_composite
+        "give_asset": hexlify(m.give_asset),  # PrimitiveField in generate_composite
+        "give_msat": amount2msat(m.give_msat),  # PrimitiveField in generate_composite
+        "id": m.id,  # PrimitiveField in generate_composite
+        "state": m.state,  # PrimitiveField in generate_composite
+        "take_asset": hexlify(m.take_asset),  # PrimitiveField in generate_composite
+        "take_msat": amount2msat(m.take_msat),  # PrimitiveField in generate_composite
+    })
+
+
 def listpeerchannels_channels_state_changes2py(m):
     return remove_default({
         "cause": str(m.cause),  # EnumField in generate_composite
@@ -1025,6 +1047,7 @@ def listpeerchannels_channels2py(m):
         "htlcs": [listpeerchannels_channels_htlcs2py(i) for i in m.htlcs],  # ArrayField[composite] in generate_composite
         "inflight": [listpeerchannels_channels_inflight2py(i) for i in m.inflight],  # ArrayField[composite] in generate_composite
         "opener": str(m.opener),  # EnumField in generate_composite
+        "seq_lanes": [listpeerchannels_channels_seq_lanes2py(i) for i in m.seq_lanes],  # ArrayField[composite] in generate_composite
         "state": str(m.state),  # EnumField in generate_composite
         "state_changes": [listpeerchannels_channels_state_changes2py(i) for i in m.state_changes],  # ArrayField[composite] in generate_composite
         "status": [m.status for i in m.status], # ArrayField[primitive] in generate_composite

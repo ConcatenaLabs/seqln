@@ -46,6 +46,7 @@ LIGHTNINGD_SRC :=				\
 	lightningd/runes.c			\
 	lightningd/subd.c			\
 	lightningd/sym_factory.c		\
+	lightningd/sym_lanes.c			\
 	lightningd/symmetric.c			\
 	lightningd/wait.c			\
 	lightningd/watch.c			\

@@ -146,6 +146,41 @@ enum channel_add_err channel_add_htlc(struct channel *channel,
 				      struct tlv_field *extra_tlvs,
 				      bool err_immediate_failures);
 
+/* SEQUENTIA: channel_add_htlc in lane @lane of a channel of several assets
+ * (common/sym_lanes.h); lane 0 is the channel's own. */
+enum channel_add_err channel_add_lane_htlc(struct channel *channel,
+					   enum side sender,
+					   u64 id,
+					   struct amount_msat msatoshi,
+					   u32 cltv_expiry,
+					   const struct sha256 *payment_hash,
+					   const u8 routing[TOTAL_PACKET_SIZE(ROUTING_INFO_SIZE)],
+					   const struct pubkey *blinding TAKES,
+					   struct htlc **htlcp,
+					   struct amount_sat *htlc_fee,
+					   struct tlv_field *extra_tlvs,
+					   bool err_immediate_failures,
+					   u16 lane);
+
+/* SEQUENTIA: swaps between lanes (common/sym_lanes.h).
+ *
+ * channel_sym_swap_check: can @swap (state SENT_ADD_HTLC if we send it,
+ * RCVD_ADD_HTLC if they do) be added: no other in flight, two lanes of the
+ * channel, and each leg affordable in both views beyond everything already
+ * pending?  NULL if so, else why not.
+ *
+ * channel_sym_swap_add: add it (checked); it then advances with the HTLCs
+ * through each commitment, moving both legs in a view once committed there.
+ *
+ * channel_sym_swap_done: if the swap has reached its last state, forget it
+ * (true): it is in both sides' balances. */
+struct sym_swap;
+const char *channel_sym_swap_check(const tal_t *ctx,
+				   const struct channel *channel,
+				   const struct sym_swap *swap);
+void channel_sym_swap_add(struct channel *channel, const struct sym_swap *swap);
+bool channel_sym_swap_done(struct channel *channel);
+
 /**
  * channel_get_htlc: find an HTLC
  * @channel: The channel

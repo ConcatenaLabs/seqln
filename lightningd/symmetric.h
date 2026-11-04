@@ -68,6 +68,27 @@ void sym_spend_start(struct channel *channel,
 		     const struct sym_state_out *outs,
 		     u32 sequence, u32 minblock, u32 deadline);
 
+/* SEQUENTIA: sym_spend_start with more inputs: input 0 holds @asset (NULL:
+ * the channel's), and @extra (NULL: none) follow it at indices 1 .. k,
+ * before any fee coin, each with its own script, asset and witness (NULL:
+ * input 0's).  A channel of several assets (lightningd/sym_lanes.h) settles
+ * every lane's state output at once, each with input 0's witness. */
+struct sym_spend_in {
+	struct bitcoin_outpoint out;
+	struct amount_sat amount;
+	u8 asset[33];
+	/* NULL: input 0's script and witness. */
+	u8 *spk;
+	u8 **witness;
+};
+void sym_spend_start_lanes(struct channel *channel,
+			   const struct bitcoin_outpoint *out,
+			   struct amount_sat amount, const u8 *asset,
+			   const struct sym_spend_in *extra,
+			   const u8 *spent_spk, u8 **witness TAKES,
+			   const struct sym_state_out *outs,
+			   u32 sequence, u32 minblock, u32 deadline);
+
 /* An output of the channel is spent on chain: a spend of ours of it stops
  * and frees its fee coins, and one onchaind proposes later never starts. */
 void sym_note_spent(struct channel *channel,

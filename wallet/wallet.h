@@ -540,7 +540,9 @@ bool wallet_add_onchaind_utxo(struct wallet *w,
 			      /* NULL if option_static_remotekey */
 			      const struct pubkey *commitment_point,
 			      /* option_will_fund makes the csv_lock variable */
-			      u32 csv_lock);
+			      u32 csv_lock,
+			      /* SEQUENTIA: its asset (33 bytes) */
+			      const u8 asset[33]);
 
 /**
  * wallet_reserve_utxo - set a reservation on a UTXO.
@@ -850,6 +852,9 @@ void wallet_sym_load(struct wallet *w, struct channel *channel);
 /* A factory channel's factory and KO (lightningd/sym_factory.h). */
 void wallet_sym_factory_save(struct wallet *w, const struct channel *channel);
 void wallet_sym_factory_load(struct wallet *w, struct channel *channel);
+/* SEQUENTIA: a channel of several assets (lightningd/sym_lanes.h). */
+void wallet_sym_lanes_save(struct wallet *w, const struct channel *channel);
+void wallet_sym_lanes_load(struct wallet *w, struct channel *channel);
 
 /* SEQUENTIA: credit notes (lightningd/credit.h). */
 struct credit_note;

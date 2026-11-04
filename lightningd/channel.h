@@ -239,6 +239,9 @@ struct channel {
 	 * output then, as F was before (lightningd/sym_factory.h). */
 	struct sym_factory *sym_factory;
 	struct bitcoin_outpoint *sym_factory_ko;
+	/* A channel of several assets: its other lanes, our balance in each
+	 * and its swaps (lightningd/sym_lanes.h); NULL on every other. */
+	struct sym_lanes_info *sym_lanes;
 
 	/* Watch we have on funding output. */
 	struct txowatch *funding_spend_watch;

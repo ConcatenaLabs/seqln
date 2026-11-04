@@ -120,6 +120,14 @@ struct multifundchannel_destination {
 	/* SEQUENTIA: in a factory, this destination's slot. */
 	unsigned int factory_slot;
 
+	/* SEQUENTIA: a channel of several assets (common/sym_lanes.h): each
+	 * lane beside its own, which this transaction funds too. */
+	struct mfc_lane {
+		const char *asset;
+		u8 tag[33];
+		struct amount_sat amount;
+	} *lanes;
+
 	/* whether the channel to this destination will
 	be announced.
 	*/
@@ -228,6 +236,12 @@ struct multifundchannel_command {
 	 * output; and that factory's nonce, fresh for each attempt. */
 	bool factory;
 	struct bitcoin_txid factory_nonce;
+
+	/* SEQUENTIA: the lanes' inputs and change, one PSBT per lane, each
+	 * paying no fee of its own: the main fundpsbt pays for their weight,
+	 * in the channel's asset. */
+	struct wally_psbt **lane_psbts;
+	size_t lane_weight;
 	/* The expected weight of the PSBT after adding in all the outputs.
 	 * In weight units (sipa).  */
 	u32 estimated_final_weight;

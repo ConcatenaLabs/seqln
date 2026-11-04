@@ -184,4 +184,9 @@ struct feature_set *feature_set_dup(const tal_t *ctx,
  * beside OPT_SEQ_SYMMETRIC. */
 #define OPT_SEQ_SYMMETRIC_FACTORY		182
 
+/* SEQUENTIA: a symmetric channel holding several assets, one lane each
+ * (common/sym_lanes.h), where a swap between them is one update.  Offered
+ * with --symmetric-channels, beside OPT_SEQ_SYMMETRIC. */
+#define OPT_SEQ_SYMMETRIC_LANES			184
+
 #endif /* LIGHTNING_COMMON_FEATURES_H */

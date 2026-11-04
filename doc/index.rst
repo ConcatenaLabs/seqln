@@ -102,6 +102,7 @@ Core Lightning Documentation
    hook-rbf_channel <hook-rbf_channel.7.md>
    hook-recover <hook-recover.7.md>
    hook-rpc_command <hook-rpc_command.7.md>
+   hook-sym_swap <hook-sym_swap.7.md>
    injectonionmessage <injectonionmessage.7.md>
    injectpaymentonion <injectpaymentonion.7.md>
    invoice <invoice.7.md>
@@ -205,6 +206,7 @@ Core Lightning Documentation
    sql <sql.7.md>
    staticbackup <staticbackup.7.md>
    stop <stop.7.md>
+   symswap <symswap.7.md>
    txdiscard <txdiscard.7.md>
    txprepare <txprepare.7.md>
    txsend <txsend.7.md>

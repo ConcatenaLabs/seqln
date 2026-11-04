@@ -66,6 +66,9 @@ struct channel *new_initial_channel(const tal_t *ctx,
 
 	channel->opener = opener;
 	channel->credit_floor = AMOUNT_SAT(0);
+	channel->sym_lanes = NULL;
+	channel->sym_lane_bal = NULL;
+	channel->sym_swap = channel->sym_swap_req = NULL;
 	channel->config[LOCAL] = *local;
 	channel->config[REMOTE] = *remote;
 	channel->funding_pubkey[LOCAL] = *local_funding_pubkey;
@@ -304,6 +307,8 @@ struct channel_type *channel_desired_type(const tal_t *ctx,
 	 * has. */
 	if (channel_has(channel, OPT_SEQ_SYMMETRIC_FACTORY))
 		return channel_type_seq_symmetric_factory(ctx);
+	if (channel_has(channel, OPT_SEQ_SYMMETRIC_LANES))
+		return channel_type_seq_symmetric_lanes(ctx);
 	if (channel_has(channel, OPT_SEQ_SYMMETRIC))
 		return channel_type_seq_symmetric(ctx);
 	/* SEQUENTIA: nor the taproot-covenant type, whose outputs no other

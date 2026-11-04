@@ -1340,6 +1340,34 @@ impl From<responses::ListpeerchannelsChannelsSeqFactory> for pb::Listpeerchannel
 }
 
 #[allow(unused_variables)]
+impl From<responses::ListpeerchannelsChannelsSeqLanes> for pb::ListpeerchannelsChannelsSeqLanes {
+    fn from(c: responses::ListpeerchannelsChannelsSeqLanes) -> Self {
+        Self {
+            asset: hex::decode(&c.asset).unwrap(), // Rule #2 for type hex
+            funding_outpoint: Some(c.funding_outpoint.into()), // Rule #2 for type outpoint
+            lane: c.lane, // Rule #2 for type u32
+            to_us_msat: Some(c.to_us_msat.into()), // Rule #2 for type msat
+            total_msat: Some(c.total_msat.into()), // Rule #2 for type msat
+        }
+    }
+}
+
+#[allow(unused_variables)]
+impl From<responses::ListpeerchannelsChannelsSeqSwap> for pb::ListpeerchannelsChannelsSeqSwap {
+    fn from(c: responses::ListpeerchannelsChannelsSeqSwap) -> Self {
+        Self {
+            give_asset: hex::decode(&c.give_asset).unwrap(), // Rule #2 for type hex
+            give_msat: Some(c.give_msat.into()), // Rule #2 for type msat
+            id: c.id, // Rule #2 for type u64
+            sender: c.sender as i32,
+            state: c.state, // Rule #2 for type string
+            take_asset: hex::decode(&c.take_asset).unwrap(), // Rule #2 for type hex
+            take_msat: Some(c.take_msat.into()), // Rule #2 for type msat
+        }
+    }
+}
+
+#[allow(unused_variables)]
 impl From<responses::ListpeerchannelsChannelsStateChanges> for pb::ListpeerchannelsChannelsStateChanges {
     fn from(c: responses::ListpeerchannelsChannelsStateChanges) -> Self {
         Self {
@@ -1447,6 +1475,9 @@ impl From<responses::ListpeerchannelsChannels> for pb::ListpeerchannelsChannels 
             reestablished: c.reestablished, // Rule #2 for type boolean?
             scratch_txid: c.scratch_txid.map(|v| hex::decode(v).unwrap()), // Rule #2 for type txid?
             seq_factory: c.seq_factory.map(|v| v.into()),
+            // Field: ListPeerChannels.channels[].seq_lanes[]
+            seq_lanes: c.seq_lanes.map(|arr| arr.into_iter().map(|i| i.into()).collect()).unwrap_or(vec![]), // Rule #3
+            seq_swap: c.seq_swap.map(|v| v.into()),
             short_channel_id: c.short_channel_id.map(|v| v.to_string()), // Rule #2 for type short_channel_id?
             spendable_msat: c.spendable_msat.map(|f| f.into()), // Rule #2 for type msat?
             state: c.state as i32,
@@ -5403,6 +5434,7 @@ impl From<requests::SendpayRequest> for pb::SendpayRequest {
     fn from(c: requests::SendpayRequest) -> Self {
         Self {
             amount_msat: c.amount_msat.map(|f| f.into()), // Rule #2 for type msat?
+            asset: c.asset.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
             bolt11: c.bolt11, // Rule #2 for type string?
             description: c.description, // Rule #2 for type string?
             groupid: c.groupid, // Rule #2 for type u64?
@@ -5741,6 +5773,7 @@ impl From<requests::SendonionRequest> for pb::SendonionRequest {
     fn from(c: requests::SendonionRequest) -> Self {
         Self {
             amount_msat: c.amount_msat.map(|f| f.into()), // Rule #2 for type msat?
+            asset: c.asset.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
             bolt11: c.bolt11, // Rule #2 for type string?
             description: c.description, // Rule #2 for type string?
             destination: c.destination.map(|v| v.serialize().to_vec()), // Rule #2 for type pubkey?
@@ -6165,6 +6198,16 @@ impl From<requests::FundchannelCompleteRequest> for pb::FundchannelCompleteReque
 }
 
 #[allow(unused_variables)]
+impl From<requests::FundchannelLanes> for pb::FundchannelLanes {
+    fn from(c: requests::FundchannelLanes) -> Self {
+        Self {
+            amount: Some(c.amount.into()), // Rule #2 for type sat
+            asset: hex::decode(&c.asset).unwrap(), // Rule #2 for type hex
+        }
+    }
+}
+
+#[allow(unused_variables)]
 impl From<requests::FundchannelRequest> for pb::FundchannelRequest {
     fn from(c: requests::FundchannelRequest) -> Self {
         Self {
@@ -6177,6 +6220,8 @@ impl From<requests::FundchannelRequest> for pb::FundchannelRequest {
             compact_lease: c.compact_lease, // Rule #2 for type string?
             feerate: c.feerate.map(|o|o.into()), // Rule #2 for type feerate?
             id: c.id.serialize().to_vec(), // Rule #2 for type pubkey
+            // Field: FundChannel.lanes[]
+            lanes: c.lanes.map(|arr| arr.into_iter().map(|i| i.into()).collect()).unwrap_or(vec![]), // Rule #3
             minconf: c.minconf, // Rule #2 for type u32?
             mindepth: c.mindepth, // Rule #2 for type u32?
             push_msat: c.push_msat.map(|f| f.into()), // Rule #2 for type msat?
@@ -6184,6 +6229,16 @@ impl From<requests::FundchannelRequest> for pb::FundchannelRequest {
             reserve: c.reserve.map(|f| f.into()), // Rule #2 for type sat?
             // Field: FundChannel.utxos[]
             utxos: c.utxos.map(|arr| arr.into_iter().map(|i| i.into()).collect()).unwrap_or(vec![]), // Rule #3
+        }
+    }
+}
+
+#[allow(unused_variables)]
+impl From<requests::FundchannelStartLanes> for pb::FundchannelStartLanes {
+    fn from(c: requests::FundchannelStartLanes) -> Self {
+        Self {
+            amount: Some(c.amount.into()), // Rule #2 for type sat
+            asset: hex::decode(&c.asset).unwrap(), // Rule #2 for type hex
         }
     }
 }
@@ -6203,6 +6258,8 @@ impl From<requests::FundchannelStartRequest> for pb::FundchannelStartRequest {
             factory_slot: c.factory_slot, // Rule #2 for type u32?
             feerate: c.feerate.map(|o|o.into()), // Rule #2 for type feerate?
             id: c.id.serialize().to_vec(), // Rule #2 for type pubkey
+            // Field: FundChannel_Start.lanes[]
+            lanes: c.lanes.map(|arr| arr.into_iter().map(|i| i.into()).collect()).unwrap_or(vec![]), // Rule #3
             mindepth: c.mindepth, // Rule #2 for type u32?
             push_msat: c.push_msat.map(|f| f.into()), // Rule #2 for type msat?
             reserve: c.reserve.map(|f| f.into()), // Rule #2 for type sat?
@@ -6331,6 +6388,16 @@ impl From<requests::ListhtlcsRequest> for pb::ListhtlcsRequest {
 }
 
 #[allow(unused_variables)]
+impl From<requests::MultifundchannelDestinationsLanes> for pb::MultifundchannelDestinationsLanes {
+    fn from(c: requests::MultifundchannelDestinationsLanes) -> Self {
+        Self {
+            amount: Some(c.amount.into()), // Rule #2 for type sat
+            asset: hex::decode(&c.asset).unwrap(), // Rule #2 for type hex
+        }
+    }
+}
+
+#[allow(unused_variables)]
 impl From<requests::MultifundchannelDestinations> for pb::MultifundchannelDestinations {
     fn from(c: requests::MultifundchannelDestinations) -> Self {
         Self {
@@ -6340,6 +6407,8 @@ impl From<requests::MultifundchannelDestinations> for pb::MultifundchannelDestin
             close_to: c.close_to, // Rule #2 for type string?
             compact_lease: c.compact_lease, // Rule #2 for type string?
             id: c.id, // Rule #2 for type string
+            // Field: MultiFundChannel.destinations[].lanes[]
+            lanes: c.lanes.map(|arr| arr.into_iter().map(|i| i.into()).collect()).unwrap_or(vec![]), // Rule #3
             mindepth: c.mindepth, // Rule #2 for type u32?
             push_msat: c.push_msat.map(|f| f.into()), // Rule #2 for type msat?
             request_amt: c.request_amt.map(|f| f.into()), // Rule #2 for type sat?
@@ -7558,6 +7627,7 @@ impl From<pb::SendpayRequest> for requests::SendpayRequest {
     fn from(c: pb::SendpayRequest) -> Self {
         Self {
             amount_msat: c.amount_msat.map(|a| a.into()), // Rule #1 for type msat?
+            asset: c.asset.map(|v| hex::encode(v)), // Rule #1 for type hex?
             bolt11: c.bolt11, // Rule #1 for type string?
             description: c.description, // Rule #1 for type string?
             groupid: c.groupid, // Rule #1 for type u64?
@@ -7886,6 +7956,7 @@ impl From<pb::SendonionRequest> for requests::SendonionRequest {
     fn from(c: pb::SendonionRequest) -> Self {
         Self {
             amount_msat: c.amount_msat.map(|a| a.into()), // Rule #1 for type msat?
+            asset: c.asset.map(|v| hex::encode(v)), // Rule #1 for type hex?
             bolt11: c.bolt11, // Rule #1 for type string?
             description: c.description, // Rule #1 for type string?
             destination: c.destination.map(|v| PublicKey::from_slice(&v).unwrap()), // Rule #1 for type pubkey?
@@ -8279,6 +8350,16 @@ impl From<pb::FundchannelCompleteRequest> for requests::FundchannelCompleteReque
 }
 
 #[allow(unused_variables)]
+impl From<pb::FundchannelLanes> for requests::FundchannelLanes {
+    fn from(c: pb::FundchannelLanes) -> Self {
+        Self {
+            amount: c.amount.unwrap().into(), // Rule #1 for type sat
+            asset: hex::encode(&c.asset), // Rule #1 for type hex
+        }
+    }
+}
+
+#[allow(unused_variables)]
 impl From<pb::FundchannelRequest> for requests::FundchannelRequest {
     fn from(c: pb::FundchannelRequest) -> Self {
         Self {
@@ -8290,12 +8371,23 @@ impl From<pb::FundchannelRequest> for requests::FundchannelRequest {
             compact_lease: c.compact_lease, // Rule #1 for type string?
             feerate: c.feerate.map(|a| a.into()), // Rule #1 for type feerate?
             id: PublicKey::from_slice(&c.id).unwrap(), // Rule #1 for type pubkey
+            lanes: Some(c.lanes.into_iter().map(|s| s.into()).collect()), // Rule #4
             minconf: c.minconf, // Rule #1 for type u32?
             mindepth: c.mindepth, // Rule #1 for type u32?
             push_msat: c.push_msat.map(|a| a.into()), // Rule #1 for type msat?
             request_amt: c.request_amt.map(|a| a.into()), // Rule #1 for type sat?
             reserve: c.reserve.map(|a| a.into()), // Rule #1 for type sat?
             utxos: Some(c.utxos.into_iter().map(|s| s.into()).collect()), // Rule #4
+        }
+    }
+}
+
+#[allow(unused_variables)]
+impl From<pb::FundchannelStartLanes> for requests::FundchannelStartLanes {
+    fn from(c: pb::FundchannelStartLanes) -> Self {
+        Self {
+            amount: c.amount.unwrap().into(), // Rule #1 for type sat
+            asset: hex::encode(&c.asset), // Rule #1 for type hex
         }
     }
 }
@@ -8314,6 +8406,7 @@ impl From<pb::FundchannelStartRequest> for requests::FundchannelStartRequest {
             factory_slot: c.factory_slot, // Rule #1 for type u32?
             feerate: c.feerate.map(|a| a.into()), // Rule #1 for type feerate?
             id: PublicKey::from_slice(&c.id).unwrap(), // Rule #1 for type pubkey
+            lanes: Some(c.lanes.into_iter().map(|s| s.into()).collect()), // Rule #4
             mindepth: c.mindepth, // Rule #1 for type u32?
             push_msat: c.push_msat.map(|a| a.into()), // Rule #1 for type msat?
             reserve: c.reserve.map(|a| a.into()), // Rule #1 for type sat?
@@ -8433,6 +8526,16 @@ impl From<pb::ListhtlcsRequest> for requests::ListhtlcsRequest {
 }
 
 #[allow(unused_variables)]
+impl From<pb::MultifundchannelDestinationsLanes> for requests::MultifundchannelDestinationsLanes {
+    fn from(c: pb::MultifundchannelDestinationsLanes) -> Self {
+        Self {
+            amount: c.amount.unwrap().into(), // Rule #1 for type sat
+            asset: hex::encode(&c.asset), // Rule #1 for type hex
+        }
+    }
+}
+
+#[allow(unused_variables)]
 impl From<pb::MultifundchannelDestinations> for requests::MultifundchannelDestinations {
     fn from(c: pb::MultifundchannelDestinations) -> Self {
         Self {
@@ -8442,6 +8545,7 @@ impl From<pb::MultifundchannelDestinations> for requests::MultifundchannelDestin
             close_to: c.close_to, // Rule #1 for type string?
             compact_lease: c.compact_lease, // Rule #1 for type string?
             id: c.id, // Rule #1 for type string
+            lanes: Some(c.lanes.into_iter().map(|s| s.into()).collect()), // Rule #4
             mindepth: c.mindepth, // Rule #1 for type u32?
             push_msat: c.push_msat.map(|a| a.into()), // Rule #1 for type msat?
             request_amt: c.request_amt.map(|a| a.into()), // Rule #1 for type sat?

@@ -14,6 +14,7 @@
 #include <lightningd/channel.h>
 #include <lightningd/invoice.h>
 #include <lightningd/notification.h>
+#include <lightningd/opening_control.h>
 #include <lightningd/pay.h>
 #include <lightningd/peer_htlcs.h>
 #include <wallet/invoices.h>
@@ -780,6 +781,7 @@ static const u8 *send_onion(const tal_t *ctx, struct lightningd *ld,
 			    u64 groupid,
 			    struct channel *channel,
 			    const struct pubkey *lock_point,
+			    const u8 *asset,
 			    struct htlc_out **hout)
 {
 	const u8 *onion;
@@ -792,7 +794,7 @@ static const u8 *send_onion(const tal_t *ctx, struct lightningd *ld,
 			     base_expiry + first_hop->delay,
 			     final_amount, payment_hash,
 			     path_key, NULL, partid, groupid, onion, NULL,
-			     lock_point, hout);
+			     lock_point, asset, hout);
 	}
 
 static struct command_result *check_invoice_request_usage(struct command *cmd,
@@ -1098,7 +1100,8 @@ send_payment_core(struct lightningd *ld,
 		  struct short_channel_id *route_channels TAKES,
 		  struct secret *path_secrets,
 		  const struct sha256 *local_invreq_id,
-		  const struct pubkey *lock_point)
+		  const struct pubkey *lock_point,
+		  const u8 *asset)
 {
 	struct channel *channel;
 	const u8 *failmsg;
@@ -1172,7 +1175,7 @@ send_payment_core(struct lightningd *ld,
 
 	failmsg = send_onion(tmpctx, ld, packet, first_hop, msat,
 			     rhash, NULL, partid,
-			     group, channel, lock_point, &hout);
+			     group, channel, lock_point, asset, &hout);
 
 	if (failmsg) {
 		fail = immediate_routing_failure(
@@ -1227,7 +1230,8 @@ send_payment(struct lightningd *ld,
 	     const struct sha256 *local_invreq_id,
 	     const struct secret *payment_secret,
 	     const u8 *payment_metadata,
-	     bool dev_legacy_hop)
+	     bool dev_legacy_hop,
+	     const u8 *asset)
 {
 	unsigned int base_expiry;
 	struct onionpacket *packet;
@@ -1296,7 +1300,8 @@ send_payment(struct lightningd *ld,
 				 msat, total_msat,
 				 label, invstring, description,
 				 packet, &ids[n_hops - 1], ids,
-				 channels, path_secrets, local_invreq_id, NULL);
+				 channels, path_secrets, local_invreq_id, NULL,
+				 asset);
 }
 
 static struct command_result *
@@ -1372,6 +1377,7 @@ static struct command_result *json_sendonion(struct command *cmd,
 	u64 *partid, *group;
 	struct sha256 *local_invreq_id = NULL;
 	struct pubkey *lock_point;
+	const u8 *asset;
 
 	if (!param_check(cmd, buffer, params,
 			 p_req("onion", param_bin_from_hex, &onion),
@@ -1390,6 +1396,9 @@ static struct command_result *json_sendonion(struct command *cmd,
 			 p_opt_def("total_amount_msat", param_msat, &total_msat, AMOUNT_MSAT(0)),
 			 /* SEQUENTIA: the first HTLC's lock point. */
 			 p_opt("lock_point", param_pubkey, &lock_point),
+			 /* SEQUENTIA: the asset the first hop pays in, on a
+			  * channel of several assets (lightningd/sym_lanes.h). */
+			 p_opt("asset", param_asset_tag, &asset),
 			 NULL))
 		return command_param_failed();
 
@@ -1416,7 +1425,8 @@ static struct command_result *json_sendonion(struct command *cmd,
 				 first_hop, *msat, *total_msat,
 				 label, invstring, description,
 				 packet, destination, NULL, NULL,
-				 path_secrets, local_invreq_id, lock_point);
+				 path_secrets, local_invreq_id, lock_point,
+				 asset);
 }
 
 static const struct json_command sendonion_command = {
@@ -1611,6 +1621,7 @@ static struct command_result *json_sendpay(struct command *cmd,
 	struct sha256 *local_invreq_id;
 	u8 *payment_metadata;
 	bool *dev_legacy_hop;
+	const u8 *asset;
 
 	if (!param_check(cmd, buffer, params,
 			 p_req("route", param_route_hops, &route),
@@ -1625,6 +1636,9 @@ static struct command_result *json_sendpay(struct command *cmd,
 			 p_opt("groupid", param_u64, &group),
 			 p_opt("payment_metadata", param_bin_from_hex, &payment_metadata),
 			 p_opt("description", param_string, &description),
+			 /* SEQUENTIA: the asset the first hop pays in, on a
+			  * channel of several assets (lightningd/sym_lanes.h). */
+			 p_opt("asset", param_asset_tag, &asset),
 			 p_opt_dev("dev_legacy_hop", param_bool, &dev_legacy_hop, false),
 		   NULL))
 		return command_param_failed();
@@ -1688,7 +1702,8 @@ static struct command_result *json_sendpay(struct command *cmd,
 			    final_amount,
 			    msat ? *msat : final_amount,
 			    label, invstring, description, local_invreq_id,
-			    payment_secret, payment_metadata, *dev_legacy_hop);
+			    payment_secret, payment_metadata, *dev_legacy_hop,
+			    asset);
 }
 
 static const struct json_command sendpay_command = {
@@ -2153,7 +2168,7 @@ static struct command_result *json_injectpaymentonion(struct command *cmd,
 				payment_hash,
 				next_path_key, NULL, *partid, *groupid,
 				serialize_onionpacket(tmpctx, rs->next),
-				NULL, NULL, &hout);
+				NULL, NULL, NULL, &hout);
 	if (failmsg) {
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 				    "Could not send to first peer: %s",

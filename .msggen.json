@@ -356,6 +356,10 @@
             "local": 0,
             "remote": 1
         },
+        "ListpeerchannelsChannelsSeqSwapSender": {
+            "local": 0,
+            "remote": 1
+        },
         "ListpeerchannelsChannelsState": {
             "AWAITING_UNILATERAL": 6,
             "CHANNELD_AWAITING_LOCKIN": 1,
@@ -2033,6 +2037,10 @@
             "FundChannel_Complete.channel_id": 1,
             "FundChannel_Complete.commitments_secured": 2
         },
+        "FundchannelLanes": {
+            "FundChannel.lanes[].amount": 1,
+            "FundChannel.lanes[].asset": 2
+        },
         "FundchannelRequest": {
             "FundChannel.amount": 1,
             "FundChannel.announce": 3,
@@ -2042,6 +2050,7 @@
             "FundChannel.compact_lease": 8,
             "FundChannel.feerate": 2,
             "FundChannel.id": 9,
+            "FundChannel.lanes[]": 16,
             "FundChannel.minconf": 10,
             "FundChannel.minconf[]": 4,
             "FundChannel.mindepth": 12,
@@ -2063,6 +2072,10 @@
             "FundChannel_Start.channel_type.bits[]": 1,
             "FundChannel_Start.channel_type.names[]": 2
         },
+        "FundchannelStartLanes": {
+            "FundChannel_Start.lanes[].amount": 1,
+            "FundChannel_Start.lanes[].asset": 2
+        },
         "FundchannelStartRequest": {
             "FundChannel_Start.amount": 2,
             "FundChannel_Start.announce": 4,
@@ -2074,6 +2087,7 @@
             "FundChannel_Start.factory_slot": 13,
             "FundChannel_Start.feerate": 3,
             "FundChannel_Start.id": 1,
+            "FundChannel_Start.lanes[]": 14,
             "FundChannel_Start.mindepth": 7,
             "FundChannel_Start.push_msat": 6,
             "FundChannel_Start.reserve": 8
@@ -3296,6 +3310,8 @@
             "ListPeerChannels.channels[].reestablished": 58,
             "ListPeerChannels.channels[].scratch_txid": 4,
             "ListPeerChannels.channels[].seq_factory": 65,
+            "ListPeerChannels.channels[].seq_lanes[]": 66,
+            "ListPeerChannels.channels[].seq_swap": 67,
             "ListPeerChannels.channels[].short_channel_id": 8,
             "ListPeerChannels.channels[].spendable_msat": 33,
             "ListPeerChannels.channels[].state": 3,
@@ -3361,6 +3377,22 @@
             "ListPeerChannels.channels[].seq_factory.nonce": 5,
             "ListPeerChannels.channels[].seq_factory.size": 6,
             "ListPeerChannels.channels[].seq_factory.slot": 7
+        },
+        "ListpeerchannelsChannelsSeqLanes": {
+            "ListPeerChannels.channels[].seq_lanes[].asset": 1,
+            "ListPeerChannels.channels[].seq_lanes[].funding_outpoint": 2,
+            "ListPeerChannels.channels[].seq_lanes[].lane": 3,
+            "ListPeerChannels.channels[].seq_lanes[].to_us_msat": 4,
+            "ListPeerChannels.channels[].seq_lanes[].total_msat": 5
+        },
+        "ListpeerchannelsChannelsSeqSwap": {
+            "ListPeerChannels.channels[].seq_swap.give_asset": 1,
+            "ListPeerChannels.channels[].seq_swap.give_msat": 2,
+            "ListPeerChannels.channels[].seq_swap.id": 3,
+            "ListPeerChannels.channels[].seq_swap.sender": 4,
+            "ListPeerChannels.channels[].seq_swap.state": 5,
+            "ListPeerChannels.channels[].seq_swap.take_asset": 6,
+            "ListPeerChannels.channels[].seq_swap.take_msat": 7
         },
         "ListpeerchannelsChannelsStateChanges": {
             "ListPeerChannels.channels[].state_changes[].cause": 4,
@@ -3609,6 +3641,7 @@
             "MultiFundChannel.destinations[].close_to": 5,
             "MultiFundChannel.destinations[].compact_lease": 7,
             "MultiFundChannel.destinations[].id": 1,
+            "MultiFundChannel.destinations[].lanes[]": 11,
             "MultiFundChannel.destinations[].mindepth": 8,
             "MultiFundChannel.destinations[].push_msat": 4,
             "MultiFundChannel.destinations[].request_amt": 6,
@@ -3622,6 +3655,10 @@
             "multifundchannel.destinations[].push_msat": 4,
             "multifundchannel.destinations[].request_amt": 6,
             "multifundchannel.destinations[].reserve": 9
+        },
+        "MultifundchannelDestinationsLanes": {
+            "MultiFundChannel.destinations[].lanes[].amount": 1,
+            "MultiFundChannel.destinations[].lanes[].asset": 2
         },
         "MultifundchannelFailed": {
             "MultiFundChannel.failed[].error": 3,
@@ -4056,6 +4093,7 @@
         },
         "SendonionRequest": {
             "SendOnion.amount_msat": 12,
+            "SendOnion.asset": 17,
             "SendOnion.bolt11": 7,
             "SendOnion.description": 14,
             "SendOnion.destination": 9,
@@ -4128,6 +4166,7 @@
         },
         "SendpayRequest": {
             "SendPay.amount_msat": 10,
+            "SendPay.asset": 14,
             "SendPay.bolt11": 5,
             "SendPay.description": 13,
             "SendPay.groupid": 9,
@@ -8310,6 +8349,18 @@
             "added": "pre-v0.10.1",
             "deprecated": null
         },
+        "FundChannel.lanes[]": {
+            "added": "v26.06",
+            "deprecated": null
+        },
+        "FundChannel.lanes[].amount": {
+            "added": "v26.06",
+            "deprecated": null
+        },
+        "FundChannel.lanes[].asset": {
+            "added": "v26.06",
+            "deprecated": null
+        },
         "FundChannel.minconf": {
             "added": "pre-v0.10.1",
             "deprecated": null
@@ -8440,6 +8491,18 @@
         },
         "FundChannel_Start.id": {
             "added": "pre-v0.10.1",
+            "deprecated": null
+        },
+        "FundChannel_Start.lanes[]": {
+            "added": "v26.06",
+            "deprecated": null
+        },
+        "FundChannel_Start.lanes[].amount": {
+            "added": "v26.06",
+            "deprecated": null
+        },
+        "FundChannel_Start.lanes[].asset": {
+            "added": "v26.06",
             "deprecated": null
         },
         "FundChannel_Start.mindepth": {
@@ -12082,6 +12145,62 @@
             "added": "v26.06",
             "deprecated": null
         },
+        "ListPeerChannels.channels[].seq_lanes[]": {
+            "added": "v26.06",
+            "deprecated": null
+        },
+        "ListPeerChannels.channels[].seq_lanes[].asset": {
+            "added": "v26.06",
+            "deprecated": null
+        },
+        "ListPeerChannels.channels[].seq_lanes[].funding_outpoint": {
+            "added": "v26.06",
+            "deprecated": null
+        },
+        "ListPeerChannels.channels[].seq_lanes[].lane": {
+            "added": "v26.06",
+            "deprecated": null
+        },
+        "ListPeerChannels.channels[].seq_lanes[].to_us_msat": {
+            "added": "v26.06",
+            "deprecated": null
+        },
+        "ListPeerChannels.channels[].seq_lanes[].total_msat": {
+            "added": "v26.06",
+            "deprecated": null
+        },
+        "ListPeerChannels.channels[].seq_swap": {
+            "added": "v26.06",
+            "deprecated": null
+        },
+        "ListPeerChannels.channels[].seq_swap.give_asset": {
+            "added": "v26.06",
+            "deprecated": null
+        },
+        "ListPeerChannels.channels[].seq_swap.give_msat": {
+            "added": "v26.06",
+            "deprecated": null
+        },
+        "ListPeerChannels.channels[].seq_swap.id": {
+            "added": "v26.06",
+            "deprecated": null
+        },
+        "ListPeerChannels.channels[].seq_swap.sender": {
+            "added": "v26.06",
+            "deprecated": null
+        },
+        "ListPeerChannels.channels[].seq_swap.state": {
+            "added": "v26.06",
+            "deprecated": null
+        },
+        "ListPeerChannels.channels[].seq_swap.take_asset": {
+            "added": "v26.06",
+            "deprecated": null
+        },
+        "ListPeerChannels.channels[].seq_swap.take_msat": {
+            "added": "v26.06",
+            "deprecated": null
+        },
         "ListPeerChannels.channels[].short_channel_id": {
             "added": "v23.02",
             "deprecated": null
@@ -12859,6 +12978,18 @@
             "deprecated": null
         },
         "MultiFundChannel.destinations[].id": {
+            "added": "pre-v0.10.1",
+            "deprecated": null
+        },
+        "MultiFundChannel.destinations[].lanes[]": {
+            "added": "pre-v0.10.1",
+            "deprecated": null
+        },
+        "MultiFundChannel.destinations[].lanes[].amount": {
+            "added": "pre-v0.10.1",
+            "deprecated": null
+        },
+        "MultiFundChannel.destinations[].lanes[].asset": {
             "added": "pre-v0.10.1",
             "deprecated": null
         },
@@ -13822,6 +13953,10 @@
             "added": "pre-v0.10.1",
             "deprecated": null
         },
+        "SendOnion.asset": {
+            "added": "v26.06",
+            "deprecated": null
+        },
         "SendOnion.bolt11": {
             "added": "pre-v0.10.1",
             "deprecated": null
@@ -13952,6 +14087,10 @@
         },
         "SendPay.amount_sent_msat": {
             "added": "pre-v0.10.1",
+            "deprecated": null
+        },
+        "SendPay.asset": {
+            "added": "v26.06",
             "deprecated": null
         },
         "SendPay.bolt11": {
