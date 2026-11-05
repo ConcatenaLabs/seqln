@@ -83,3 +83,44 @@ bool sym_clock_funding_found(struct channel *channel,
 		 " output %u", outnum);
 	return true;
 }
+
+void sym_clock_marker_of(const struct channel *channel, u8 asset[33])
+{
+	struct sym_channel sc;
+
+	sym_channel_from(channel, &sc);
+	sym_clock_marker_asset(&sc, asset);
+}
+
+void sym_clock_input(const tal_t *ctx, const struct channel *channel,
+		     const struct bitcoin_outpoint *clock,
+		     struct sym_spend_in *in)
+{
+	struct sym_channel sc;
+
+	sym_channel_from(channel, &sc);
+	in->out = *clock;
+	in->amount = channel->funding_sats;
+	memcpy(in->asset, channel->channel_asset, sizeof(in->asset));
+	in->spk = sym_clock_spk(ctx, &sc, NULL);
+	in->witness = sym_clock_witness(ctx, &sc);
+	in->sequence = sc.delay;
+}
+
+bool sym_clock_seed_input(const tal_t *ctx, const struct channel *channel,
+			  struct sym_spend_in *in)
+{
+	struct sym_channel sc;
+
+	if (!channel->sym_clock || !channel->sym_clock->seed_known)
+		return false;
+	sym_channel_from(channel, &sc);
+	in->out.txid = channel->funding.txid;
+	in->out.n = channel->sym_clock->seed_outnum;
+	in->amount = AMOUNT_SAT(1);
+	sym_clock_marker_asset(&sc, in->asset);
+	in->spk = sym_seed_spk(ctx, &sc, NULL, NULL);
+	in->witness = sym_seed_witness(ctx, &sc);
+	in->sequence = 0;
+	return true;
+}

@@ -39,4 +39,21 @@ u8 *sym_clock_seed_of(const tal_t *ctx, const struct channel *channel);
 bool sym_clock_funding_found(struct channel *channel,
 			     const struct bitcoin_tx *tx);
 
+/* The marker of @channel, as an output asset (0x01 || id). */
+void sym_clock_marker_of(const struct channel *channel, u8 asset[33]);
+
+/* The clock @clock of @channel's kickoff, as a settle's input after the
+ * state output: the capacity in the channel asset, the clock's leaf as its
+ * witness, the shared delay as its sequence. */
+struct sym_spend_in;
+void sym_clock_input(const tal_t *ctx, const struct channel *channel,
+		     const struct bitcoin_outpoint *clock,
+		     struct sym_spend_in *in);
+
+/* The seed, as the kickoff's input after the funding: its one atom of the
+ * marker, and the KICK leaf as its witness.  False if the seed's output in
+ * the funding is not known yet. */
+bool sym_clock_seed_input(const tal_t *ctx, const struct channel *channel,
+			  struct sym_spend_in *in);
+
 #endif /* LIGHTNING_LIGHTNINGD_SYM_CLOCK_H */

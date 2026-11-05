@@ -514,7 +514,9 @@ accepts from a peer: a state settles that many blocks after the update
 that published it. Every output waits, HTLCs included, so an HTLC on such
 a channel must outlive twice this delay and 12 blocks more; the node
 refuses one that would not, and goes on chain that long before an HTLC
-expires. The default is 72 blocks on the Sequentia networks.
+expires. On a channel with the settle clock the delay runs once, from the
+kickoff, and an HTLC must outlive it and 12 blocks more. The default is 72
+blocks on the Sequentia networks.
 
 * (deprecated in v23.05) **max-locktime-blocks**=*BLOCKS*
 

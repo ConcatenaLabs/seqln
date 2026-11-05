@@ -43,7 +43,7 @@ bool fromwire_onchaind_spend_created(const tal_t *ctx UNNEEDED, const void *p UN
 bool fromwire_onchaind_spent(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, struct tx_parts **tx UNNEEDED, u32 *input_num UNNEEDED, u32 *blockheight UNNEEDED)
 { fprintf(stderr, "fromwire_onchaind_spent called!\n"); abort(); }
 /* Generated stub for fromwire_onchaind_sym_anchor */
-bool fromwire_onchaind_sym_anchor(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, struct bitcoin_outpoint *anchor UNNEEDED, bool *factory UNNEEDED, struct sym_lane **lanes UNNEEDED)
+bool fromwire_onchaind_sym_anchor(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, struct bitcoin_outpoint *anchor UNNEEDED, bool *factory UNNEEDED, struct sym_lane **lanes UNNEEDED, struct bitcoin_outpoint **clock_issuer UNNEEDED)
 { fprintf(stderr, "fromwire_onchaind_sym_anchor called!\n"); abort(); }
 /* Generated stub for fromwire_onchaind_sym_init */
 bool fromwire_onchaind_sym_init(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, struct bitcoin_outpoint *funding UNNEEDED, u16 *shared_delay UNNEEDED, struct sym_state **local UNNEEDED, struct sym_state **remote UNNEEDED, struct sym_state **remote_pending UNNEEDED)
@@ -106,7 +106,7 @@ u8 *towire_onchaind_spend_htlc_timeout(const tal_t *ctx UNNEEDED, const struct b
 u8 *towire_onchaind_spend_penalty(const tal_t *ctx UNNEEDED, const struct bitcoin_outpoint *outpoint UNNEEDED, struct amount_sat outpoint_amount UNNEEDED, const struct secret *remote_per_commitment_secret UNNEEDED, const u8 *stack_elem UNNEEDED, const u8 *wscript UNNEEDED)
 { fprintf(stderr, "towire_onchaind_spend_penalty called!\n"); abort(); }
 /* Generated stub for towire_onchaind_spend_sym */
-u8 *towire_onchaind_spend_sym(const tal_t *ctx UNNEEDED, const struct bitcoin_outpoint *outpoint UNNEEDED, struct amount_sat outpoint_amount UNNEEDED, const u8 *spent_scriptpubkey UNNEEDED, const struct onchain_witness_element **witness UNNEEDED, const struct sym_state *outs UNNEEDED, u32 sequence UNNEEDED, u32 minblock UNNEEDED, u32 deadline UNNEEDED)
+u8 *towire_onchaind_spend_sym(const tal_t *ctx UNNEEDED, const struct bitcoin_outpoint *outpoint UNNEEDED, struct amount_sat outpoint_amount UNNEEDED, const u8 *spent_scriptpubkey UNNEEDED, const struct onchain_witness_element **witness UNNEEDED, const struct sym_state *outs UNNEEDED, u32 sequence UNNEEDED, u32 locktime UNNEEDED, const struct bitcoin_outpoint *clock UNNEEDED, u32 minblock UNNEEDED, u32 deadline UNNEEDED)
 { fprintf(stderr, "towire_onchaind_spend_sym called!\n"); abort(); }
 /* Generated stub for towire_onchaind_spend_sym_lanes */
 u8 *towire_onchaind_spend_sym_lanes(const tal_t *ctx UNNEEDED, const struct bitcoin_outpoint *outpoints UNNEEDED, const struct amount_sat *amounts UNNEEDED, const u8 *assets UNNEEDED, const u8 *spent_scriptpubkey UNNEEDED, const struct onchain_witness_element **witness UNNEEDED, const struct sym_state *outs UNNEEDED, u32 sequence UNNEEDED, u32 minblock UNNEEDED, u32 deadline UNNEEDED)

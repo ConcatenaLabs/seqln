@@ -645,7 +645,9 @@ last acknowledgement can publish the state it holds just before the delay runs o
 it once. So an HTLC on a symmetric channel must outlive twice the shared delay and 12 blocks
 more: lightningd refuses to offer or accept one that would not, and goes on chain that long
 before an HTLC expires (`sym_htlc_margin()`). Forwarding over a symmetric channel therefore
-needs that doubled delay inside the route's lock times.
+needs that doubled delay inside the route's lock times. With the settle clock (below) the delay
+runs once, from the kickoff, whatever is published when, so the margin is one delay and 12
+blocks.
 
 **Signers.** hsmd signs the type with three messages (`hsmd/hsmd_wire.csv`):
 `hsmd_sign_sym_kickoff` (the funding key, `SIGHASH_SINGLE|SIGHASH_ANYONECANPAY`, answered by
@@ -710,8 +712,18 @@ zero-conf and waits at least one block. `fundchannel_start` takes the issuer as 
 answers with the seed's script and the marker; **multifundchannel** gives each settle-clock
 channel an input of the funding of its own. The channel keeps its issuer and its seed's output
 (`lightningd/sym_clock.h`, table `channel_sym_clock`). The clock is offered with
-`--dev-symmetric-clock`; a settle-clock channel's kickoff, states and close are those of the base
-type, and only its funding differs.
+`--dev-symmetric-clock`.
+
+**The settle clock on chain.** Each state is signed over the clock's leaves, through
+`hsmd_sign_sym_clock_state` (72), which rebuilds the clock and the seed from the issuer, the
+capacity and the peer's funding key. A unilateral close broadcasts the kickoff with the seed
+beside the funding, the seed spent by its KICK leaf, paying KO the marker's one atom and the
+clock the capacity. onchaind publishes its best state over KO or over an older one, holding the
+marker, at the lock time floor; once the delay has passed since the kickoff it settles whichever
+state is on chain, if it knows its settlement: the state output and the clock in, the clock's
+sequence the delay and the lock time 0, the marker back to the state's script at output 0 and
+the settlement after it. A mutual close leaves the seed and its marker atom where they are, and
+`speculad` and the device signer (section 7b) do not take settle-clock channels.
 
 **Developers.** `dev-sym-snapshot id` freezes the best state a node holds; its next unilateral
 close then publishes that one as though it held nothing newer, which is how the tests make a
@@ -1347,7 +1359,11 @@ fee coins of a unilateral close, and, holding an HTLC it received, its claim by 
 refusing nothing (`test_symmetric.py`), and its settle clock: a funding whose issuer input
 issues one atom of the marker, no token, into the seed, which the accepter checks once mined
 before the channel opens and is paid both ways, and a funding issuing two atoms, which the
-accepter refuses, forgetting the channel before it locks in (`test_symmetric_clock.py`), and
+accepter refuses, forgetting the channel before it locks in; on chain, a unilateral close by the
+kickoff with the seed, an update holding the marker at the lock time floor and the settle with
+the clock once the delay since the kickoff has passed; a stale state replaced by the latest
+before the clock runs out; an HTLC that must outlive one delay and 12 blocks, and one claimed
+from a clock settle's settlement by its SUCCESS leaf (`test_symmetric_clock.py`), and
 factory channels (section 5f): one output opening
 four channels, two of them paid both ways while the other two members are offline, one member's
 unilateral exit (the split, its state over its KO, the settlement, each with a fee coin in
