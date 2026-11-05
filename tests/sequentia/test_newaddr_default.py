@@ -24,7 +24,7 @@ def test_newaddr_default_is_spendable(node_factory, bitcoind):
     assert list(plain) == ['bech32'], plain
     every = l1.rpc.newaddr('all')
     assert list(every) == ['bech32'], every
-    with pytest.raises(RpcError, match="should be 'p2tr', 'bech32', or 'all'"):
+    with pytest.raises(RpcError, match="should be 'bech32' or 'all' on sequentia-regtest, not 'p2tr'"):
         l1.rpc.newaddr('p2tr')
 
     txid = bitcoind.send_and_mine_block(plain['bech32'], 10**7)
