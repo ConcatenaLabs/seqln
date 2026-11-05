@@ -121,11 +121,6 @@ pub struct Signer {
     /// reason into `Outcome::Reject`; the host takes the rest
     /// (`take_refusal`) to log it.
     refusal: std::cell::RefCell<Option<String>>,
-    /// The txids of the withdrawals whose fee this device charged to the
-    /// payment limits in this session, so signing the same transaction
-    /// again charges it once. Not persisted: after a restart a transaction
-    /// signed again is charged again, which can only overstate.
-    charged_withdrawals: std::collections::HashSet<[u8; 32]>,
     /// Scripts the host named as this wallet's own for a cooperative close
     /// (`approve_close_destination`): a close may pay this side's balance to
     /// one of them as to the node's own wallet. Not persisted.
@@ -186,7 +181,6 @@ impl Signer {
             limits: Limits::default(),
             now: 0,
             refusal: std::cell::RefCell::new(None),
-            charged_withdrawals: std::collections::HashSet::new(),
             close_destinations: std::collections::HashSet::new(),
             swaps: Vec::new(),
             genesis: None,
@@ -3268,11 +3262,13 @@ impl Signer {
         let (out, charge) =
             self.sign_wallet_inputs_into_psbt("SIGN_WITHDRAWAL", &utxos, psbt, Bound::Period, 0)?;
         if let Some((txid, losses)) = charge {
-            if self.charged_withdrawals.insert(txid) && losses.values().any(|&v| v > 0) {
+            // Once per transaction, across restarts (`Ledger::charged_txids`).
+            if !self.store.ledger.is_charged_txid(&txid) && losses.values().any(|&v| v > 0) {
                 self.store.ledger.prune(self.now, self.limits.period_secs);
                 for (asset, atoms) in losses {
                     self.store.ledger.charge(asset, atoms.saturating_mul(1000), self.now);
                 }
+                self.store.ledger.mark_charged_txid(txid);
                 self.store_dirty = true;
             }
         }
@@ -3703,14 +3699,14 @@ impl Signer {
 
     /// Whether what a transaction lets leave fits the payment limits:
     /// [`Bound::Period`] against what the period has left (a transaction this
-    /// device already charged in this session is not counted twice),
+    /// device already charged is not counted twice),
     /// [`Bound::Each`] against the limit itself.
     fn losses_fit(&self, txid: &[u8; 32], losses: &Losses, bound: Bound) -> Result<(), String> {
         for (asset, &atoms) in losses {
             match bound {
                 Bound::Each => self.within_limit(asset, atoms, "what it lets leave this device")?,
                 Bound::Period => {
-                    if atoms == 0 || self.charged_withdrawals.contains(txid) {
+                    if atoms == 0 || self.store.ledger.is_charged_txid(txid) {
                         continue;
                     }
                     let Some(limit) = self.limits.limit_msat(asset) else { continue };
@@ -5563,8 +5559,18 @@ mod close_and_revocation_tests {
         assert!(matches!(revoke(&mut s, 0), Outcome::Reply(_)));
         assert!(s.store.record_close([0x99; 32]));
         assert!(!s.store.record_close([0x99; 32]));
-        let v14 = policy::encode_channel_store(&s.store);
-        assert_eq!(v14[4], 14);
+        s.store.ledger.mark_charged_txid([0x77; 32]);
+        let v15 = policy::encode_channel_store(&s.store);
+        assert_eq!(v15[4], 15);
+        let (_, l15, _) = policy::decode_channel_store(&v15).unwrap();
+        assert_eq!(l15.charged_txids, vec![[0x77; 32]]);
+        // A version-14 payload: the same, without the charged txids (the
+        // record after the close record).
+        s.store.ledger.charged_txids.clear();
+        let mut v14 = v15[..v15.len() - (2 + 32)].to_vec();
+        v14[4] = 14;
+        let (_, l14, _) = policy::decode_channel_store(&v14).unwrap();
+        assert_eq!(l14, s.store.ledger);
         // A version-13 payload: the same, without the entry's settle-clock
         // flag, issuer flag and seed flag (the three bytes before the
         // ledger and the close record; no clock).
@@ -7267,9 +7273,12 @@ mod close_and_revocation_tests {
         for n in 0..2 {
             assert!(matches!(validate(&mut s, n, 300_000, 699_000, 1_000), Outcome::Reply(_)));
         }
-        let full = policy::encode_channel_store(&s.store);
-        // Version 14 less the entry's ten flags, its lane count and the
-        // close record: version 6.
+        let v15 = policy::encode_channel_store(&s.store);
+        // Version 15 less its record of charged txids (none, two bytes) is
+        // version 14; less the entry's ten flags, its lane count and the
+        // close record, version 6.
+        assert_eq!(&v15[v15.len() - 2..], &[0, 0]);
+        let full = &v15[..v15.len() - 2];
         let mut payload = [&full[..full.len() - 2 - 4 - 11], &full[full.len() - 2 - 4..full.len() - 2]].concat();
         payload[4] = 6;
         let mac = s.chstore_mac(&payload);
@@ -7930,6 +7939,15 @@ mod close_output_spend_tests {
         let blob = s.export_channels();
         let mut t = signer(Policy::Enforce);
         t.import_channels(&blob).unwrap();
+        assert_eq!(t.store.ledger.spent_msat(&gold, 1_000 + 86_400, 86_400), 2_000_000);
+        // So does the record of what was charged: a restarted device asked
+        // again for a signature the host never received (a lost link) signs
+        // it without charging it again.
+        gold_limit(&mut t, 5_000);
+        t.set_now(1_000 + 86_400);
+        let (ins, psbt) = &signed[1];
+        assert_ne!(reply_psbt(t.handle(&req(withdrawal(ins, psbt)))), *psbt);
+        assert_eq!(t.take_refusal(), None);
         assert_eq!(t.store.ledger.spent_msat(&gold, 1_000 + 86_400, 86_400), 2_000_000);
     }
 

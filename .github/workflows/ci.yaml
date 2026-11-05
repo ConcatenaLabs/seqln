@@ -249,6 +249,14 @@ jobs:
         env:
           RUSTC_WRAPPER: sccache
         run: cargo test --all
+      - name: Check the device signer
+        # Its own workspace, which `cargo test --all` does not reach: its
+        # tests, and the browser build (contrib/seqln-signer/wasm).
+        env:
+          RUSTC_WRAPPER: sccache
+        run: |
+          cargo test --release --locked --manifest-path contrib/seqln-signer/Cargo.toml
+          cargo check --locked --manifest-path contrib/seqln-signer/wasm/Cargo.toml
 
   check-units:
     # The unit test checks are not in the critical path (not dependent

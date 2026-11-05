@@ -104,6 +104,8 @@ pub const MAX_APPROVALS: usize = 256;
 /// At most this many charges are kept; beyond it the two oldest merge into one
 /// that expires with the later of them, which can only overstate what was spent.
 pub const MAX_SPENDS: usize = 512;
+/// At most this many charged transactions are remembered (the oldest go).
+pub const MAX_CHARGED_TXIDS: usize = 256;
 
 /// The allowance for routing fees on top of a payment's amount when checking
 /// it against the limit at approval: `pay`'s default fee budget, half a
@@ -281,6 +283,13 @@ pub struct Approval {
 pub struct Ledger {
     pub approvals: Vec<Approval>,
     pub spends: Vec<Spend>,
+    /// The txids of the wallet transactions (withdrawals, channel fundings)
+    /// whose losses were charged, oldest first, so a transaction signed again
+    /// is charged once: after a lost link the host asks again for the
+    /// signature it never received, often from a restarted device. Kept past
+    /// the period, since signing the same transaction again spends nothing
+    /// more.
+    pub charged_txids: Vec<[u8; 32]>,
 }
 
 fn within(at: u64, now: u64, period: u64) -> bool {
@@ -369,9 +378,28 @@ impl Ledger {
         }
     }
 
-    /// Fold in a persisted ledger (a blob import): keep every approval and
-    /// every charge either side knows of.
+    /// Whether the wallet transaction `txid` has been charged.
+    pub fn is_charged_txid(&self, txid: &[u8; 32]) -> bool {
+        self.charged_txids.contains(txid)
+    }
+
+    /// Record the wallet transaction `txid` as charged.
+    pub fn mark_charged_txid(&mut self, txid: [u8; 32]) {
+        if self.is_charged_txid(&txid) {
+            return;
+        }
+        self.charged_txids.push(txid);
+        while self.charged_txids.len() > MAX_CHARGED_TXIDS {
+            self.charged_txids.remove(0);
+        }
+    }
+
+    /// Fold in a persisted ledger (a blob import): keep every approval,
+    /// every charge and every charged transaction either side knows of.
     pub fn merge_from(&mut self, other: &Ledger) {
+        for t in &other.charged_txids {
+            self.mark_charged_txid(*t);
+        }
         for a in &other.approvals {
             match self.approvals.iter_mut().find(|x| x.hash == a.hash) {
                 Some(x) => x.at = x.at.max(a.at),

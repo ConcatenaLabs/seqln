@@ -150,6 +150,10 @@ fn channel(k: &Kernel) -> ChannelState {
         option_credit: false,
         credit: None,
         option_sym: false,
+        lanes: Vec::new(),
+        option_sym_clock: false,
+        clock_issuer: None,
+        clock_seed: None,
     }
 }
 

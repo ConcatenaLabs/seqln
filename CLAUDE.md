@@ -95,7 +95,9 @@ ELEMCLI=/path/to/sequentia-cli python3 tests/sequentia/verify_anchor_burial.py
 ELEMCLI=/path/to/sequentia-cli python3 tests/sequentia/verify_block_parse.py
 ```
 
-The device signer has its own workspace: `cargo test` in `contrib/seqln-signer/`.
+The device signer has its own workspace: `cargo test` in `contrib/seqln-signer/`, and
+`cargo check` in `contrib/seqln-signer/wasm/` for its browser build. CI runs both in its
+`check-compiled-source` job.
 
 **CI (`.github/workflows/ci.yaml`) is upstream CLN's workflow.** It runs on every pull request,
 on every push to `sequentia-stable`, and by hand on any branch

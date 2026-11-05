@@ -157,7 +157,7 @@ def store_as_version(device, version):
     blob = open(path, 'rb').read()
     payload, mac = blob[:-32], blob[-32:]
     assert hmac.compare_digest(store_mac(payload), mac)
-    assert payload[:4] == b'SQCH' and payload[4] in (6, 7, 8, 9, 10, 11, 12, 13, 14), payload[:5]
+    assert payload[:4] == b'SQCH' and payload[4] in (6, 7, 8, 9, 10, 11, 12, 13, 14, 15), payload[:5]
     v = payload[4]
     count = struct.unpack('<I', payload[5:9])[0]
     o, entries = 9, []
