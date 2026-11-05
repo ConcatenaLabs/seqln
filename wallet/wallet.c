@@ -28,8 +28,8 @@
 #include <lightningd/notification.h>
 #include <lightningd/peer_htlcs.h>
 #include <lightningd/runes.h>
-#include <lightningd/sym_lanes.h>
 #include <lightningd/sym_clock.h>
+#include <lightningd/sym_lanes.h>
 #include <lightningd/symmetric.h>
 #include <onchaind/onchaind_wiregen.h>
 #include <wallet/datastore.h>
