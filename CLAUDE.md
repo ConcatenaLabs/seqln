@@ -70,6 +70,13 @@ make check-units
 make pytest                       # or: uv run python -m pytest -v tests/
 ```
 
+Before merging to `sequentia-stable`, run `make check-source` and `make check-units` and fix
+what they report: CI runs both, and a branch that skips them breaks the default branch for
+everyone after it. A change to a wire message or a mock needs its stubs regenerated with
+`make update-mocks/<test>.c`. A change to the device store version, a database migration or
+`listpeerchannels` also updates `tests/test_keyless_start.py`, `tests/test_asset_withdraw.py` and
+`test_sql`, which read them.
+
 The Sequentia network tests run the same harness on a local anchored chain (a `sequentiad`
 custom chain with a Bitcoin Core regtest parent; `doc/sequentia-fork.md` section 10). They need
 both daemons on `PATH`:
