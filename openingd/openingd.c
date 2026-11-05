@@ -128,6 +128,8 @@ struct state {
 	/* SEQUENTIA: a settle-clock channel's issuer, the funding input whose
 	 * issuance makes its marker (common/sym_scripts.h). */
 	struct bitcoin_outpoint *sym_issuer;
+	/* The opener's settle-clock funding transaction, for the signer. */
+	struct bitcoin_tx *sym_funding_tx;
 
 	/* Channel type we agreed on (even before channel populated) */
 	struct channel_type *channel_type;
@@ -1050,6 +1052,24 @@ static bool funder_finalize_channel_setup(struct state *state,
 		status_failed(STATUS_FAIL_HSM_IO, "Bad setup_channel_reply %s",
 			      tal_hex(tmpctx, msg));
 
+	/* SEQUENTIA: a settle-clock channel's funding, which lightningd
+	 * checked, goes to the signer before it signs a state that pays us
+	 * (lightningd/sym_clock.h). */
+	if (state->sym_issuer && state->sym_funding_tx) {
+		msg = towire_hsmd_check_sym_clock_funding(NULL, NULL, 0,
+							  linearize_tx(tmpctx,
+								       state->sym_funding_tx),
+							  &state->funding,
+							  state->sym_issuer);
+		wire_sync_write(HSM_FD, take(msg));
+		msg = wire_sync_read(tmpctx, HSM_FD);
+		if (!fromwire_hsmd_check_sym_clock_funding_reply(msg)) {
+			negotiation_failed(state, "The signer refused the"
+					   " settle clock's funding");
+			return false;
+		}
+	}
+
 	/*~ Now we can initialize the `struct channel`.  This represents
 	 * the current channel state and is how we can generate the current
 	 * commitment transaction.
@@ -1133,6 +1153,17 @@ static bool funder_finalize_channel_setup(struct state *state,
 			= tlv_funding_created_tlvs_new(tmpctx);
 
 		*pbase = tal_free(*pbase);
+		/* A settle-clock channel's first state goes to the signer
+		 * before its kickoff: the state names the issuer, whose marker
+		 * the kickoff's KO holds. */
+		if (state->channel->sym_issuer) {
+			state->sym_remote = sym_first_remote(state);
+			if (!state->sym_remote) {
+				negotiation_failed(state, "Could not build their"
+						   " first state");
+				goto fail;
+			}
+		}
 		/* A factory channel has no kickoff: the split takes no
 		 * signature.  It sends the factory instead. */
 		if (channel_has(state->channel, OPT_SEQ_SYMMETRIC_FACTORY)) {
@@ -1145,7 +1176,8 @@ static bool funder_finalize_channel_setup(struct state *state,
 			sym_sign_kickoff(state->channel, *tx, sig);
 		state->sym_kickoff_sig = tal_dup(state, struct bitcoin_signature,
 						 sig);
-		state->sym_remote = sym_first_remote(state);
+		if (!state->sym_remote)
+			state->sym_remote = sym_first_remote(state);
 		if (!state->sym_remote) {
 			negotiation_failed(state, "Could not build their first"
 					   " state");
@@ -2038,13 +2070,17 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 		struct tlv_funding_signed_tlvs *fs_tlvs
 			= tlv_funding_signed_tlvs_new(tmpctx);
 
+		/* A settle-clock channel's first state first, as above. */
+		if (state->channel->sym_issuer)
+			state->sym_remote = sym_first_remote(state);
 		if (channel_has(state->channel, OPT_SEQ_SYMMETRIC_FACTORY))
 			factory_zero_sig(&sig);
 		else
 			sym_sign_kickoff(state->channel, remote_commit, &sig);
 		state->sym_kickoff_sig = tal_dup(state, struct bitcoin_signature,
 						 &sig);
-		state->sym_remote = sym_first_remote(state);
+		if (!state->channel->sym_issuer)
+			state->sym_remote = sym_first_remote(state);
 		if (!state->sym_remote) {
 			negotiation_failed(state, "Could not build their first"
 					   " state");
@@ -2224,7 +2260,8 @@ static u8 *handle_master_in(struct state *state)
 						       &funding_txout,
 						       &state->channel_type,
 						       &state->factory,
-						       &lane_outnums))
+						       &lane_outnums,
+						       &state->sym_funding_tx))
 			master_badmsg(WIRE_OPENINGD_FUNDER_COMPLETE, msg);
 		state->funding.txid = funding_txid;
 		state->funding.n = funding_txout;
@@ -2326,6 +2363,7 @@ int main(int argc, char *argv[])
 	state->sym_lanes = NULL;
 	state->sym_lane_sigs = state->sym_lane_local_sigs = NULL;
 	state->sym_issuer = NULL;
+	state->sym_funding_tx = NULL;
 
 	/* Default this to zero, we only ever look at the local */
 	state->remoteconf.max_dust_htlc_exposure_msat = AMOUNT_MSAT(0);

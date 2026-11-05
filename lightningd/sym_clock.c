@@ -3,7 +3,9 @@
 #include <common/memleak.h>
 #include <common/sym_scripts.h>
 #include <common/timeout.h>
+#include <hsmd/hsmd_wiregen.h>
 #include <lightningd/channel.h>
+#include <lightningd/hsm_control.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/log.h>
 #include <lightningd/sym_clock.h>
@@ -79,9 +81,28 @@ bool sym_clock_funding_found(struct channel *channel,
 	c->seed_known = true;
 	c->seed_outnum = outnum;
 	wallet_sym_clock_save(ld->wallet, channel);
+	if (!sym_clock_show_signer(ld, &channel->peer->id, channel->dbid, tx,
+				   &channel->funding, &c->issuer))
+		log_broken(channel->log, "The signer refused the funding %s: it"
+			   " signs no state that pays us",
+			   fmt_bitcoin_txid(tmpctx, &channel->funding.txid));
 	log_info(channel->log, "Funding issues the marker into the seed,"
 		 " output %u", outnum);
 	return true;
+}
+
+bool sym_clock_show_signer(struct lightningd *ld, const struct node_id *peer,
+			   u64 dbid, const struct bitcoin_tx *tx,
+			   const struct bitcoin_outpoint *funding,
+			   const struct bitcoin_outpoint *issuer)
+{
+	const u8 *msg;
+
+	msg = towire_hsmd_check_sym_clock_funding(NULL, peer, dbid,
+						  linearize_tx(tmpctx, tx),
+						  funding, issuer);
+	msg = hsm_sync_req(tmpctx, ld, take(msg));
+	return fromwire_hsmd_check_sym_clock_funding_reply(msg);
 }
 
 void sym_clock_marker_of(const struct channel *channel, u8 asset[33])

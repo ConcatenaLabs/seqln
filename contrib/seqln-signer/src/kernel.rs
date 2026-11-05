@@ -852,6 +852,11 @@ pub struct TxInput {
     pub index: u32,
     pub sequence: u32,
     pub is_issuance: bool,
+    /// An Elements issuance as serialized: blinding nonce (32), entropy
+    /// (32), amount and inflation keys (each a confidential value, a null
+    /// one its single 0x00), and Sequentia's denomination byte. The node's
+    /// signature hashes cover all of it.
+    pub issuance: Option<Vec<u8>>,
 }
 
 /// A parsed output.
@@ -933,14 +938,16 @@ pub fn elements_sighash_sw_v0(
         m.extend_from_slice(&sha256d(&b));
     }
 
-    // hashIssuances (Elements). Our txs carry no issuances -> 0x00 per input.
+    // hashIssuances (Elements): each input's whole issuance, or 0x00.
     if acp {
         m.extend_from_slice(&zero);
     } else {
         let mut b = Vec::new();
         for i in &tx.inputs {
-            assert!(!i.is_issuance, "issuance inputs not supported in M2b sighash");
-            b.push(0u8);
+            match &i.issuance {
+                Some(iss) => b.extend_from_slice(iss),
+                None => b.push(0u8),
+            }
         }
         m.extend_from_slice(&sha256d(&b));
     }
@@ -953,6 +960,10 @@ pub fn elements_sighash_sw_v0(
     m.extend_from_slice(scriptcode);
     m.extend_from_slice(value);
     m.extend_from_slice(&inp.sequence.to_le_bytes());
+    // An input that issues: its issuance follows.
+    if let Some(iss) = &inp.issuance {
+        m.extend_from_slice(iss);
+    }
 
     // hashOutputs
     if none || (single && index >= tx.outputs.len()) {
@@ -1180,6 +1191,7 @@ mod tests {
                 index: 0,
                 sequence: 0xffff_ffff,
                 is_issuance: false,
+                issuance: None,
             }],
             outputs: vec![TxOutput {
                 asset: Vec::new(),
@@ -1206,5 +1218,64 @@ mod tests {
         tx.outputs[0].nonce = vec![0x00];
         let ele = elements_sighash_sw_v0(&tx, 0, &sc, &val9, 0x01);
         assert_ne!(btc, ele);
+    }
+}
+
+
+#[cfg(test)]
+mod issuance_sighash_tests {
+    use super::*;
+
+    /// A transaction a Sequentia node mined, whose input 0 issues one atom
+    /// (the funding of the settle clock's marker), signed by the node's
+    /// wallet (segwit v0, SIGHASH_ALL): `l51m_wally.py`'s vector. This
+    /// device's signature hash must be the one that signature is over, and
+    /// it covers the whole issuance, the denomination byte included.
+    const TX: &str = "020000000101f0a77d42f909993ce83c47ab30728a9a7347ccb2d3b1c495731836131b8fe76a0100008000ffffffff00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000001000803010b11f93cd30fae7559317ceeb25708e51f5c769131acae637601b0eb9d49b083010000000000000001001600140cacf212be285fb1016827f537f26e1a7e13c57b01230f4f5d4b7c6fa845806ee4f67713459e1b69e8e60fcee2e4940c7a0d5de1b20100000000000301880016001449f0739e677f0fd26c9a2fa2a416e86125e5b76101230f4f5d4b7c6fa845806ee4f67713459e1b69e8e60fcee2e4940c7a0d5de1b2010000000000000bb80000000000000000024730440220444f262f3858b5ef4b7ca6936015d46bad6ea067abe7ab0a672fae1db1b484fc022069146d4c3965d961591eb1ed6cb61f1c41c00496929f89eeb7e1427302ecfe780121032ad332cf1f38c872fc913a2ede489af35d345b93ed2ab5d01351711b85863e8b00000000000000";
+    const PREVOUT_SPK: &str = "001403b11dba1287ed387981c1f40fc0e92e6f840016";
+    const PREVOUT_VALUE: u64 = 200000;
+    const SIG: &str = "30440220444f262f3858b5ef4b7ca6936015d46bad6ea067abe7ab0a672fae1db1b484fc022069146d4c3965d961591eb1ed6cb61f1c41c00496929f89eeb7e1427302ecfe78";
+    const PUBKEY: &str = "032ad332cf1f38c872fc913a2ede489af35d345b93ed2ab5d01351711b85863e8b";
+
+    fn h(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    fn verifies(tx: &ElementsTx) -> bool {
+        let spk = h(PREVOUT_SPK);
+        let mut code = vec![0x76, 0xa9, 0x14];
+        code.extend_from_slice(&spk[2..]);
+        code.extend_from_slice(&[0x88, 0xac]);
+        let mut value = vec![0x01];
+        value.extend_from_slice(&PREVOUT_VALUE.to_be_bytes());
+        let digest = elements_sighash_sw_v0(tx, 0, &code, &value, 1);
+        let secp = secp256k1::Secp256k1::verification_only();
+        let msg = secp256k1::Message::from_digest(digest);
+        let sig = secp256k1::ecdsa::Signature::from_der(&h(SIG)).unwrap();
+        let key = secp256k1::PublicKey::from_slice(&h(PUBKEY)).unwrap();
+        secp.verify_ecdsa(&msg, &sig, &key).is_ok()
+    }
+
+    #[test]
+    fn the_nodes_signature_over_an_issuance_verifies() {
+        let tx = crate::wire::parse_elements_tx(&h(TX)).unwrap();
+        let iss = tx.inputs[0].issuance.clone().expect("input 0 issues");
+        assert!(tx.inputs[0].is_issuance);
+        assert_eq!(tx.inputs[0].index, 1, "the outpoint's index, without the flag");
+        assert!(verifies(&tx));
+        // Without the issuance, as this device hashed before: refused.
+        let mut none = crate::wire::parse_elements_tx(&h(TX)).unwrap();
+        none.inputs[0].issuance = None;
+        assert!(!verifies(&none));
+        // Another denomination byte: refused, so the byte is hashed.
+        let mut denom = crate::wire::parse_elements_tx(&h(TX)).unwrap();
+        let mut other = iss.clone();
+        *other.last_mut().unwrap() ^= 1;
+        denom.inputs[0].issuance = Some(other);
+        assert!(!verifies(&denom));
+        // Its txid, rebuilt without the witnesses, is the chain's.
+        let mut txid = h("f3da423012cf8e064129dfbbcc250ed4adb672ff59367543d0f946d72a53f497");
+        txid.reverse();
+        assert_eq!(crate::wire::unsigned_txid(&tx).unwrap().to_vec(), txid);
     }
 }

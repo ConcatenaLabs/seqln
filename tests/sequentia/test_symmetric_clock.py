@@ -397,3 +397,104 @@ def test_sym_clock_keyless_watcher(node_factory, bitcoind, directory):
     wait_for(lambda: any(o['txid'] == settle['txid'] and o['asset'] == gold
                          and o['amount_msat'] == 70_000_000_000
                          for o in l2.rpc.listfunds()['outputs']))
+
+
+def test_sym_clock_keyless_device(node_factory, bitcoind, directory):
+    """A keyless node, its keys on a device in enforce mode, accepts a
+    settle-clock channel.  Its first state pays it nothing and names the
+    issuer, which the device keeps; the kickoff's KO must hold one atom of
+    that marker.  Once the funding is mined lightningd shows it to the
+    device (CHECK_SYM_CLOCK_FUNDING), which checks the one marker atom in
+    the seed, and only then signs states that pay the node.  The node is
+    paid, then closes unilaterally over the clock while the opener is away;
+    the device refuses nothing."""
+    from test_keyless_close import keyless_node, answers
+    gold = bitcoind.issue_asset(1000)
+    silv = bitcoind.issue_asset(1000)
+    bitcoind.set_fee_rates({bitcoind.POLICY_ASSET: PAR, gold: PAR, silv: 2 * PAR})
+    device, l2 = keyless_node(node_factory, directory, options=dict(CLOCK))
+    try:
+        l1 = node_factory.get_node(options=CLOCK, may_reconnect=True)
+        fund_node(bitcoind, l1, gold, PAR + 50_000)
+        fund_node(bitcoind, l1, silv, 5 * PAR)
+        fund_node(bitcoind, l2, silv, 5 * PAR)
+        l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+        res = l1.rpc.call('fundchannel', {'id': l2.info['id'], 'amount': PAR,
+                                          'asset': gold})
+        assert {SYM_BIT, CLOCK_BIT} <= set(res['channel_type']['bits'])
+        d, iss = issuances(bitcoind, res['txid'])
+        marker = only_one(iss)['issuance']['asset']
+        seed = (res['txid'], only_one([o for o in d['vout'] if o.get('asset') == marker])['n'])
+        bitcoind.generate_block(1, wait_for_mempool=res['txid'])
+        l2.daemon.wait_for_log(r'Funding issues the marker into the seed')
+        for a, b in ((l1, l2), (l2, l1)):
+            wait_for(lambda: only_one(a.rpc.listpeerchannels(b.info['id'])['channels'])['state']
+                     == 'CHANNELD_NORMAL')
+        pay(l1, l2, 30_000_000_000, gold)
+        pay(l2, l1, 5_000_000_000, gold)
+        wait_for(lambda: only_one(l2.rpc.listpeerchannels(l1.info['id'])['channels'])['htlcs'] == [])
+        assert 'POLICY REJECT' not in device.output()
+        assert l2.daemon.is_in_log('WIRE_HSMD_CHECK_SYM_CLOCK_FUNDING')
+        assert l2.daemon.is_in_log('WIRE_HSMD_SIGN_SYM_CLOCK_STATE')
+
+        l1.stop()
+        scid = only_one(l2.rpc.listpeerchannels(l1.info['id'])['channels'])['short_channel_id']
+        l2.rpc.close(scid, unilateraltimeout=1)
+        kickoff, i, c = check_kickoff(bitcoind, l2, l1, gold, marker, seed)
+        update, j = mined_spender(bitcoind, kickoff['txid'], i)
+        check_update(update, j, marker)
+        settle, s = mined_spender(bitcoind, update['txid'], j)
+        check_settle(bitcoind, settle, s, update, j, kickoff, c, marker)
+        gold_out = sorted(atoms(o) for o in settle['vout'] if o.get('asset') == gold)
+        print("keyless clock close: kickoff {} vB, update {} vB (state {}),"
+              " settle {} vB, settlement (GOLD atoms) {}".format(
+                  kickoff['vsize'], update['vsize'], update_n(update, j),
+                  settle['vsize'], gold_out))
+        assert gold_out == [25_000_000, 75_000_000]
+        wait_for(lambda: any(o['txid'] == settle['txid'] and o['asset'] == gold
+                             and o['amount_msat'] == 25_000_000_000
+                             for o in l2.rpc.listfunds()['outputs']))
+        assert 'POLICY REJECT' not in device.output()
+    finally:
+        if answers(l2, timeout=2):
+            l2.stop()
+        device.stop()
+
+
+def test_sym_clock_keyless_opener(node_factory, bitcoind, directory):
+    """A keyless node opens a settle-clock channel: its device is shown the
+    funding before it signs a state that pays it, and signs the funding's
+    wallet inputs, the one that issues the marker included (its signature
+    hash covers the issuance), and the seed it checked.  The funding is
+    mined and the channel pays both ways; the device refuses nothing."""
+    from test_keyless_close import keyless_node, answers
+    gold = bitcoind.issue_asset(1000)
+    silv = bitcoind.issue_asset(1000)
+    bitcoind.set_fee_rates({bitcoind.POLICY_ASSET: PAR, gold: PAR, silv: 2 * PAR})
+    device, l1 = keyless_node(node_factory, directory, options=dict(CLOCK))
+    try:
+        l2 = node_factory.get_node(options=CLOCK)
+        fund_node(bitcoind, l1, gold, PAR + 50_000)
+        fund_node(bitcoind, l1, silv, 5 * PAR)
+        l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+        res = l1.rpc.call('fundchannel', {'id': l2.info['id'], 'amount': PAR,
+                                          'asset': gold})
+        assert {SYM_BIT, CLOCK_BIT} <= set(res['channel_type']['bits'])
+        d, iss = issuances(bitcoind, res['txid'])
+        assert int(round(float(only_one(iss)['issuance']['assetamount']) * 10**8)) == 1
+        bitcoind.generate_block(1, wait_for_mempool=res['txid'])
+        l2.daemon.wait_for_log(r'Funding issues the marker into the seed')
+        for a, b in ((l1, l2), (l2, l1)):
+            wait_for(lambda: only_one(a.rpc.listpeerchannels(b.info['id'])['channels'])['state']
+                     == 'CHANNELD_NORMAL')
+        pay(l1, l2, 30_000_000_000, gold)
+        pay(l2, l1, 5_000_000_000, gold)
+        wait_for(lambda: only_one(l1.rpc.listpeerchannels(l2.info['id'])['channels'])
+                 ['to_us_msat'] == (PAR - 25_000_000) * 1000)
+        assert l1.daemon.is_in_log('WIRE_HSMD_CHECK_SYM_CLOCK_FUNDING')
+        assert 'POLICY REJECT' not in device.output()
+        print("keyless opener's funding:", res['txid'], "vsize", d['vsize'])
+    finally:
+        if answers(l1, timeout=2):
+            l1.stop()
+        device.stop()

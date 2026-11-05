@@ -46,7 +46,7 @@ const SWEEP_KEY_SCAN: u32 = 5000;
 /// The capabilities array from `hsmd_init()`, in the exact order libhsmd emits
 /// it, followed by the two preapprove-check caps (`dev_no_preapprove_check` is
 /// false in a normal, non-dev node).
-const CAPABILITIES: [u32; 24] = [
+const CAPABILITIES: [u32; 26] = [
     28,  // WIRE_HSMD_CHECK_PUBKEY
     56,  // WIRE_HSMD_CHECK_BIP86_PUBKEY
     142, // WIRE_HSMD_SIGN_ANY_DELAYED_PAYMENT_TO_US
@@ -65,6 +65,8 @@ const CAPABILITIES: [u32; 24] = [
     67,  // WIRE_HSMD_CREDIT_NOTE
     69,  // WIRE_HSMD_SIGN_SYM_KICKOFF
     70,  // WIRE_HSMD_SIGN_SYM_STATE
+    72,  // WIRE_HSMD_SIGN_SYM_CLOCK_STATE
+    73,  // WIRE_HSMD_CHECK_SYM_CLOCK_FUNDING
     71,  // WIRE_HSMD_SIGN_SYM_HTLC
     75,  // WIRE_HSMD_SIGN_SYM_LANES_STATE
     77,  // WIRE_HSMD_SIGN_MUTUAL_CLOSE_LANES_TX
@@ -307,8 +309,12 @@ impl Signer {
             // The symmetric channel type (option_seq_symmetric): its kickoff,
             // its states and the claims of its settlement's HTLCs.
             msg::HSMD_SIGN_SYM_KICKOFF => self.sign_sym_kickoff_checked(req),
-            msg::HSMD_SIGN_SYM_STATE => self.sign_sym_state_checked(req),
+            msg::HSMD_SIGN_SYM_STATE => self.sign_sym_state_checked(req, false),
             msg::HSMD_SIGN_SYM_HTLC => opt(self.h_sign_sym_htlc(&req.hsmd_msg)),
+            // Its settle clock (option_seq_symmetric_clock): the states over
+            // the clock, and the funding that issued the marker.
+            msg::HSMD_SIGN_SYM_CLOCK_STATE => self.sign_sym_state_checked(req, true),
+            msg::HSMD_CHECK_SYM_CLOCK_FUNDING => self.check_sym_clock_funding(req),
             msg::HSMD_SIGN_SYM_LANES_STATE => self.sign_sym_lanes_state_checked(req),
             msg::HSMD_APPROVE_SYM_SWAP => self.approve_sym_swap(req),
             msg::HSMD_SIGN_MUTUAL_CLOSE_LANES_TX => self.sign_mutual_close_lanes_checked(req),
@@ -2088,10 +2094,37 @@ impl Signer {
         if asset[0] != 0x01 {
             return Err("output 0's asset is not explicit".to_string());
         }
+        // (A settle-clock channel's KO holds its marker: below.)
         if let Some(funding_asset) = wire::psbt_input_asset(&bt.psbt, 0) {
-            if funding_asset != o.asset {
+            if funding_asset != o.asset && !st.option_sym_clock {
                 return Err("output 0 is not in the funding output's asset".to_string());
             }
+        }
+        // A settle-clock channel's KO holds the marker's one atom instead,
+        // its funds going to the clock that the seed's KICK leaf binds: the
+        // marker is the one its first state named.
+        if st.option_sym_clock {
+            if i.txhash != st.funding_txid || i.index != st.funding_txout as u32 || i.is_issuance {
+                return Err("its input is not the channel's funding output".to_string());
+            }
+            let issuer = st.clock_issuer.ok_or("no state named the settle clock's issuer yet")?;
+            let chan_asset = wire::psbt_input_asset(&bt.psbt, 0)
+                .and_then(|a| <[u8; 33]>::try_from(a.as_slice()).ok())
+                .or_else(|| st.pay.asset.map(|a| a.encode()))
+                .ok_or("the channel asset is unknown")?;
+            let ch = self.sym_channel(&req.node_id, req.dbid, st, &chan_asset)?;
+            let ch = self.with_sym_clock(&req.node_id, req.dbid, st, ch, &issuer);
+            let mut one = [0u8; 9];
+            one[0] = 0x01;
+            one[8] = 1;
+            if Some(asset) != ch.marker_asset() || o.value != one {
+                return Err("output 0 is not one atom of the channel's marker".to_string());
+            }
+            let ko = ch.kickoff_spk(self.kernel().secp()).ok_or("cannot build KO")?;
+            if o.script != ko {
+                return Err(format!("output 0 pays {}, not this channel's KO", hexbytes(&o.script)));
+            }
+            return Ok(None);
         }
         let mut lane = None;
         if i.txhash == st.funding_txid && i.index != st.funding_txout as u32 && !i.is_issuance {
@@ -2148,17 +2181,18 @@ impl Signer {
     /// payments this device approved, as a commitment's split is. A state of
     /// our own counts as validated, for the revocations and for the balance
     /// a mutual close is held to, once the peer's signature on it verifies.
-    fn sign_sym_state_checked(&mut self, req: &Request) -> Outcome {
+    fn sign_sym_state_checked(&mut self, req: &Request, clock: bool) -> Outcome {
+        let name = if clock { "SIGN_SYM_CLOCK_STATE" } else { "SIGN_SYM_STATE" };
         if let Some(reason) = self.predating(&req.node_id, req.dbid) {
-            return Outcome::Reject(format!("SIGN_SYM_STATE refused: {reason}"));
+            return Outcome::Reject(format!("{name} refused: {reason}"));
         }
-        let checked = self.check_sym_state(req);
+        let checked = self.check_sym_state(req, clock);
         if self.policy.is_enforce() {
             match &checked {
-                Err(reason) => return Outcome::Reject(format!("SIGN_SYM_STATE refused: {reason}")),
+                Err(reason) => return Outcome::Reject(format!("{name} refused: {reason}")),
                 Ok(c) => {
                     if let Err(reason) = self.check_plan(&c.plan) {
-                        return Outcome::Reject(format!("SIGN_SYM_STATE refused: {reason}"));
+                        return Outcome::Reject(format!("{name} refused: {reason}"));
                     }
                 }
             }
@@ -2166,7 +2200,7 @@ impl Signer {
         let c = match checked {
             Ok(c) => c,
             // Permissive: sign what the request names, recording nothing.
-            Err(_) => return opt(self.h_sign_sym_state_unchecked(req)),
+            Err(_) => return opt(self.h_sign_sym_state_unchecked(req, clock)),
         };
         let sk = self.kernel().channel_secrets(&req.node_id, req.dbid).delayed;
         let sig = taproot::sign(self.kernel().secp(), &c.msg, &sk);
@@ -2184,15 +2218,20 @@ impl Signer {
             } else if st.remote_split.map_or(true, |(m, _)| c.commit_num >= m) {
                 st.remote_split = Some((c.commit_num, split));
             }
+            // The settle clock's issuer, from the first state that names
+            // it (check_sym_state refuses another).
+            if let Some(issuer) = c.clock_issuer {
+                st.clock_issuer.get_or_insert(issuer);
+            }
             self.store_dirty = true;
         }
         self.apply_plan(&req.node_id, req.dbid, c.plan);
-        let mut w = Writer::new(msg::HSMD_SIGN_SYM_STATE_REPLY);
+        let mut w = Writer::new(if clock { msg::HSMD_SIGN_SYM_CLOCK_STATE_REPLY } else { msg::HSMD_SIGN_SYM_STATE_REPLY });
         w.bytes(&sig);
         Outcome::Reply(w.into_vec())
     }
 
-    fn check_sym_state(&self, req: &Request) -> Result<SymChecked, String> {
+    fn check_sym_state(&self, req: &Request, clock: bool) -> Result<SymChecked, String> {
         let st = self
             .store
             .get(&req.node_id, req.dbid)
@@ -2200,7 +2239,34 @@ impl Signer {
         if !st.option_sym {
             return Err("the channel is not a symmetric channel".to_string());
         }
-        let q = parse_sym_state(&req.hsmd_msg).ok_or("malformed request")?;
+        // A settle-clock channel's states are signed over its clock, and
+        // only its states are.
+        if st.option_sym_clock != clock {
+            return Err(if clock {
+                "the channel has no settle clock".to_string()
+            } else {
+                "a settle-clock channel's state is signed over its clock (SIGN_SYM_CLOCK_STATE)".to_string()
+            });
+        }
+        let (q, ck) = if clock {
+            let (q, ck) = parse_sym_clock_state(&req.hsmd_msg).ok_or("malformed request")?;
+            (q, Some(ck))
+        } else {
+            (parse_sym_state(&req.hsmd_msg).ok_or("malformed request")?, None)
+        };
+        if let Some(ck) = &ck {
+            if ck.remote_funding != st.remote_funding {
+                return Err("the peer's funding key differs from setup_channel".to_string());
+            }
+            if ck.funding_sats != st.funding_sats {
+                return Err(format!("capacity {} is not the channel's {}", ck.funding_sats, st.funding_sats));
+            }
+            if let Some(pin) = st.clock_issuer {
+                if pin != ck.issuer {
+                    return Err("the request names another issuer than the channel's".to_string());
+                }
+            }
+        }
         if q.funding_txid != st.funding_txid || q.funding_vout != st.funding_txout as u32 {
             return Err("the request names another funding output".to_string());
         }
@@ -2256,7 +2322,10 @@ impl Signer {
             &htlcs,
             &q.outs,
         )?;
-        let ch = self.sym_channel(&req.node_id, req.dbid, st, &q.asset)?;
+        let mut ch = self.sym_channel(&req.node_id, req.dbid, st, &q.asset)?;
+        if let Some(ck) = &ck {
+            ch = self.with_sym_clock(&req.node_id, req.dbid, st, ch, &ck.issuer);
+        }
         let (program, rest) = ch.state(secp, q.num, &q.outs).ok_or("cannot build the state's output")?;
         let msg = ch.upd_msg(q.num, &program, &rest);
         // The peer's signature, when the request carries it, must be on
@@ -2279,19 +2348,157 @@ impl Signer {
         // it offered (an offered HTLC below the dust limit is in the
         // balance already).
         let value = paid.ours.saturating_add(paid.offered);
+        // A settle-clock channel pays this side only once this device has
+        // seen its funding issue the one marker atom into the seed: a spare
+        // atom could take the clock early (CHECK_SYM_CLOCK_FUNDING).
+        if clock && value > 0 && st.clock_seed.is_none() {
+            return Err("its funding is not checked yet: no state may pay this side".to_string());
+        }
         let plan = st.pay.plan(local, q.commit_num, asset, value, offered, htlcs.len());
-        Ok(SymChecked { local, commit_num: q.commit_num, paid, msg, peer_signed, plan })
+        Ok(SymChecked {
+            local,
+            commit_num: q.commit_num,
+            paid,
+            msg,
+            peer_signed,
+            plan,
+            clock_issuer: ck.map(|c| c.issuer),
+        })
+    }
+
+    /// `ch` with its settle clock: the marker `issuer` makes, this channel's
+    /// funding 2-of-2 and capacity.
+    fn with_sym_clock(&self, node_id: &[u8; 33], dbid: u64, st: &ChannelState, ch: sym::Channel, issuer: &([u8; 32], u32)) -> sym::Channel {
+        let s = self.kernel().channel_secrets(node_id, dbid);
+        let local_funding = self.kernel().pubkey_of(&s.funding);
+        let wscript = self.kernel().funding_wscript(&local_funding, &st.remote_funding);
+        ch.with_clock(&issuer.0, issuer.1, &wscript, st.funding_sats)
+    }
+
+    /// CHECK_SYM_CLOCK_FUNDING (73): a settle-clock channel's funding
+    /// transaction. Input `issuer` must issue one explicit atom of the marker
+    /// with no token, and exactly one output must hold it, explicitly, paying
+    /// the seed; the funding output must be the channel's. Then states may
+    /// pay this side. Sent by the channel's own daemon (no peer id) or by the
+    /// host for a channel it names.
+    fn check_sym_clock_funding(&mut self, req: &Request) -> Outcome {
+        let checked = (|| -> Result<([u8; 33], u64, ([u8; 32], u32), u32), String> {
+            let mut r = wire::Reader::new(&req.hsmd_msg);
+            r.u16().ok_or("malformed request")?;
+            let (node_id, dbid) = if r.bool().ok_or("malformed request")? {
+                let id = r.arr33().ok_or("malformed request")?;
+                (id, r.u64().ok_or("malformed request")?)
+            } else {
+                r.u64().ok_or("malformed request")?;
+                (req.node_id, req.dbid)
+            };
+            let len = r.u32().ok_or("malformed request")? as usize;
+            let raw = r.take_bytes(len).ok_or("malformed request")?;
+            let (tx, txid) = wire::parse_tx_with_txid(&raw, kernel::Network::Elements).ok_or("malformed transaction")?;
+            let funding_txid = r.arr32().ok_or("malformed request")?;
+            let funding_vout = r.u32().ok_or("malformed request")?;
+            let issuer = (r.arr32().ok_or("malformed request")?, r.u32().ok_or("malformed request")?);
+            let st = self.store.get(&node_id, dbid).ok_or_else(|| self.untracked(&node_id, dbid))?;
+            if !st.option_sym_clock {
+                return Err("the channel has no settle clock".to_string());
+            }
+            if funding_txid != st.funding_txid || funding_vout != st.funding_txout as u32 {
+                return Err("the request names another funding output".to_string());
+            }
+            if txid != st.funding_txid {
+                return Err("the transaction is not the channel's funding".to_string());
+            }
+            if let Some(pin) = st.clock_issuer {
+                if pin != issuer {
+                    return Err("the request names another issuer than the channel's".to_string());
+                }
+            }
+            let fo = tx.outputs.get(funding_vout as usize).ok_or("the funding output is missing")?;
+            let s = self.kernel().channel_secrets(&node_id, dbid);
+            let local_funding = self.kernel().pubkey_of(&s.funding);
+            let wscript = self.kernel().funding_wscript(&local_funding, &st.remote_funding);
+            let asset: [u8; 33] = fo.asset.as_slice().try_into().map_err(|_| "the funding output's asset is not explicit")?;
+            if asset[0] != 0x01 || fo.script != policy::p2wsh_spk(&wscript) || explicit_amount(&fo.value) != Some(st.funding_sats) {
+                return Err(format!("output {funding_vout} is not the channel's funding"));
+            }
+            if let Some(chan) = st.pay.asset {
+                if explicit_asset(&asset) != Some(chan) {
+                    return Err("the funding output is not in the channel's asset".to_string());
+                }
+            }
+            // The issuer's input: a new issuance (no blinding nonce, no
+            // contract) of one explicit atom, and no token.
+            let inp = tx
+                .inputs
+                .iter()
+                .find(|i| i.txhash == issuer.0 && i.index == issuer.1)
+                .ok_or("no input spends the issuer")?;
+            let iss = inp.issuance.as_ref().ok_or("the issuer's input issues nothing")?;
+            if iss.len() < 64 + 9 + 1 + 1 || iss[..64].iter().any(|b| *b != 0) {
+                return Err("the issuer's input is not a new issuance with no contract".to_string());
+            }
+            let mut one = [0u8; 9];
+            one[0] = 0x01;
+            one[8] = 1;
+            if iss[64..73] != one {
+                return Err("the issuer's input does not issue one explicit atom".to_string());
+            }
+            if iss[73] != 0x00 {
+                return Err("the issuer's input issues a reissuance token".to_string());
+            }
+            // That atom pays the seed, explicitly, and no other output
+            // holds the marker in the clear.
+            let ch = self.sym_channel(&node_id, dbid, st, &asset)?;
+            let ch = ch.with_clock(&issuer.0, issuer.1, &wscript, st.funding_sats);
+            let marker = ch.marker_asset().ok_or("no marker")?;
+            let seed = ch.seed_spk(self.kernel().secp()).ok_or("cannot build the seed")?;
+            let mut found = None;
+            for (i, o) in tx.outputs.iter().enumerate() {
+                if o.asset != marker {
+                    continue;
+                }
+                if o.value != one || o.script != seed || found.is_some() {
+                    return Err(format!("output {i} holds the marker but is not the one seed"));
+                }
+                found = Some(i as u32);
+            }
+            let seed_out = found.ok_or("no output holds the marker in the clear")?;
+            Ok((node_id, dbid, issuer, seed_out))
+        })();
+        match checked {
+            Err(reason) => {
+                if self.policy.is_enforce() {
+                    return Outcome::Reject(format!("CHECK_SYM_CLOCK_FUNDING refused: {reason}"));
+                }
+            }
+            Ok((node_id, dbid, issuer, seed_out)) => {
+                if let Some(st) = self.store.get_mut(&node_id, dbid) {
+                    st.clock_issuer = Some(issuer);
+                    st.clock_seed = Some(seed_out);
+                    self.store_dirty = true;
+                }
+            }
+        }
+        Outcome::Reply(Writer::new(msg::HSMD_CHECK_SYM_CLOCK_FUNDING_REPLY).into_vec())
     }
 
     /// Permissive mode only: the update signature on what the request names.
-    fn h_sign_sym_state_unchecked(&self, req: &Request) -> Option<Vec<u8>> {
-        let q = parse_sym_state(&req.hsmd_msg)?;
+    fn h_sign_sym_state_unchecked(&self, req: &Request, clock: bool) -> Option<Vec<u8>> {
+        let (q, ck) = if clock {
+            let (q, ck) = parse_sym_clock_state(&req.hsmd_msg)?;
+            (q, Some(ck))
+        } else {
+            (parse_sym_state(&req.hsmd_msg)?, None)
+        };
         let st = self.store.get(&req.node_id, req.dbid)?;
-        let ch = self.sym_channel(&req.node_id, req.dbid, st, &q.asset).ok()?;
+        let mut ch = self.sym_channel(&req.node_id, req.dbid, st, &q.asset).ok()?;
+        if let Some(ck) = &ck {
+            ch = self.with_sym_clock(&req.node_id, req.dbid, st, ch, &ck.issuer);
+        }
         let (program, rest) = ch.state(self.kernel().secp(), q.num, &q.outs)?;
         let sk = self.kernel().channel_secrets(&req.node_id, req.dbid).delayed;
         let sig = taproot::sign(self.kernel().secp(), &ch.upd_msg(q.num, &program, &rest), &sk);
-        let mut w = Writer::new(msg::HSMD_SIGN_SYM_STATE_REPLY);
+        let mut w = Writer::new(if clock { msg::HSMD_SIGN_SYM_CLOCK_STATE_REPLY } else { msg::HSMD_SIGN_SYM_STATE_REPLY });
         w.bytes(&sig);
         Some(w.into_vec())
     }
@@ -2934,6 +3141,53 @@ impl Signer {
         if utxos.iter().any(|u| u.txid == i0.txhash && u.vout == i0.index) {
             return;
         }
+        // A settle-clock channel's kickoff and settle spend two channel
+        // outputs in two assets (the funding or a state's marker, and the
+        // seed or the clock): the leading outputs must carry, asset by
+        // asset, exactly what the inputs that are not wallet coins bring.
+        if st.option_sym_clock {
+            let mut owed: Vec<(Vec<u8>, u64)> = Vec::new();
+            for (j, inp) in tx.inputs.iter().enumerate() {
+                if utxos.iter().any(|u| u.txid == inp.txhash && u.vout == inp.index) {
+                    continue;
+                }
+                let Some((a, v, _)) = wire::psbt_input_elements_prevout(psbt, j) else {
+                    return;
+                };
+                let (Some(_), Some(v)) = (explicit_asset(&a), explicit_amount(&v)) else {
+                    return;
+                };
+                match owed.iter_mut().find(|(x, _)| *x == a) {
+                    Some((_, t)) => *t = t.saturating_add(v),
+                    None => owed.push((a, v)),
+                }
+            }
+            let mut m = 0;
+            while owed.iter().any(|(_, t)| *t > 0) {
+                let Some(o) = tx.outputs.get(m) else {
+                    return;
+                };
+                let Some(v) = explicit_amount(&o.value) else {
+                    return;
+                };
+                let Some((_, t)) = owed.iter_mut().find(|(x, _)| *x == o.asset) else {
+                    return;
+                };
+                if o.script.is_empty() || o.nonce != [0x00] || v > *t {
+                    return;
+                }
+                *t -= v;
+                m += 1;
+            }
+            let mut claims = self.tcov_claims.borrow_mut();
+            for o in &tx.outputs[..m] {
+                if claims.len() >= TCOV_CLAIMS {
+                    claims.pop_front();
+                }
+                claims.push_back((txid, o.script.clone()));
+            }
+            return;
+        }
         let (Some(_), Some(v0)) = (explicit_asset(&in_asset), explicit_amount(&in_value)) else {
             return;
         };
@@ -3336,6 +3590,14 @@ impl Signer {
                 || self.close_destinations.contains(&o.script)
                 || self.tcov_claim_pays(txid, &o.script)
             {
+                continue;
+            }
+            // The seed of a settle-clock channel this side is opening, as
+            // CHECK_SYM_CLOCK_FUNDING found it: one atom of the marker the
+            // same transaction issues.
+            if self.store.entries_sorted().iter().any(|(_, st)| {
+                st.option_sym_clock && st.funding_txid == *txid && st.clock_seed == Some(i as u32)
+            }) {
                 continue;
             }
             match self.funding_output(txid, i, o, network) {
@@ -3961,6 +4223,9 @@ fn parse_setup_channel(m: &[u8]) -> Option<ChannelState> {
         credit: None,
         option_sym: policy::channel_type_has_sym(&features),
         lanes: Vec::new(),
+        option_sym_clock: policy::channel_type_has_sym_clock(&features),
+        clock_issuer: None,
+        clock_seed: None,
     })
 }
 
@@ -4230,6 +4495,58 @@ struct SymChecked {
     msg: [u8; 32],
     peer_signed: bool,
     plan: Plan,
+    /// A settle-clock state's issuer, to pin.
+    clock_issuer: Option<([u8; 32], u32)>,
+}
+
+/// What a settle-clock state request adds (`hsmd_sign_sym_clock_state`).
+struct SymClockReq {
+    issuer: ([u8; 32], u32),
+    funding_sats: u64,
+    remote_funding: [u8; 33],
+}
+
+/// Parse `hsmd_sign_sym_clock_state`: `hsmd_sign_sym_state`'s fields with
+/// the issuer, the capacity and the peer's funding key after the delay.
+fn parse_sym_clock_state(m: &[u8]) -> Option<(SymRequest, SymClockReq)> {
+    let mut r = wire::Reader::new(m);
+    r.u16()?;
+    let funding_txid = r.arr32()?;
+    let funding_vout = r.u32()?;
+    let we_opened = r.bool()?;
+    let remote_update_key = r.arr33()?;
+    let asset = r.arr33()?;
+    let delay = r.u16()?;
+    let issuer = (r.arr32()?, r.u32()?);
+    let funding_sats = r.u64()?;
+    let remote_funding = r.arr33()?;
+    let (owner, commit_num, num, outs, assets, sigs) = read_sym_state(&mut r)?;
+    if assets.iter().any(|a| a.is_some()) {
+        return None;
+    }
+    let nh = r.u16()? as usize;
+    let htlcs = read_htlcs(&mut r, nh)?;
+    if r.remaining() != 0 {
+        return None;
+    }
+    Some((
+        SymRequest {
+            funding_txid,
+            funding_vout,
+            we_opened,
+            remote_update_key,
+            asset,
+            delay,
+            owner,
+            commit_num,
+            num,
+            outs,
+            assets,
+            sig_remote: sigs[1],
+            htlcs,
+        },
+        SymClockReq { issuer, funding_sats, remote_funding },
+    ))
 }
 
 /// Parse `hsmd_validate_commitment_tx` -> (tx, htlcs, commit_num).
@@ -5246,8 +5563,18 @@ mod close_and_revocation_tests {
         assert!(matches!(revoke(&mut s, 0), Outcome::Reply(_)));
         assert!(s.store.record_close([0x99; 32]));
         assert!(!s.store.record_close([0x99; 32]));
-        let v13 = policy::encode_channel_store(&s.store);
-        assert_eq!(v13[4], 13);
+        let v14 = policy::encode_channel_store(&s.store);
+        assert_eq!(v14[4], 14);
+        // A version-13 payload: the same, without the entry's settle-clock
+        // flag, issuer flag and seed flag (the three bytes before the
+        // ledger and the close record; no clock).
+        let l = &s.store.ledger;
+        let at14 = v14.len() - (2 + 32) - (2 + 40 * l.approvals.len() + 2 + 49 * l.spends.len()) - 3;
+        assert_eq!(&v14[at14..at14 + 3], &[0, 0, 0]);
+        let mut v13 = [&v14[..at14], &v14[at14 + 3..]].concat();
+        v13[4] = 13;
+        let (back, _, _) = policy::decode_channel_store(&v13).unwrap();
+        assert!(!back[0].1.option_sym_clock && back[0].1.clock_issuer.is_none());
         // A version-12 payload: the same, without the entry's lane count
         // (the byte before the ledger and the close record; no lanes).
         let l = &s.store.ledger;
@@ -6941,9 +7268,9 @@ mod close_and_revocation_tests {
             assert!(matches!(validate(&mut s, n, 300_000, 699_000, 1_000), Outcome::Reply(_)));
         }
         let full = policy::encode_channel_store(&s.store);
-        // Version 13 less the entry's seven flags, its lane count and the
+        // Version 14 less the entry's ten flags, its lane count and the
         // close record: version 6.
-        let mut payload = [&full[..full.len() - 2 - 4 - 8], &full[full.len() - 2 - 4..full.len() - 2]].concat();
+        let mut payload = [&full[..full.len() - 2 - 4 - 11], &full[full.len() - 2 - 4..full.len() - 2]].concat();
         payload[4] = 6;
         let mac = s.chstore_mac(&payload);
         payload.extend_from_slice(&mac);
@@ -7872,6 +8199,9 @@ mod close_output_spend_tests {
             option_credit: false,
             option_sym: false,
             lanes: Vec::new(),
+            option_sym_clock: false,
+            clock_issuer: None,
+            clock_seed: None,
             credit: None,
         }
     }
@@ -7953,6 +8283,9 @@ mod tcov_tests {
             option_credit: false,
             option_sym: false,
             lanes: Vec::new(),
+            option_sym_clock: false,
+            clock_issuer: None,
+            clock_seed: None,
             credit: None,
         }
     }
@@ -8932,6 +9265,270 @@ mod sym_tests {
         let sig1 = taproot::sign(s.kernel().secp(), &msg_of(&s, 2, &outs), &secret(4));
         assert!(matches!(s.handle(&req(state_msg(&s, 0, 1, 2, &outs, Some(sig1)))), Outcome::Reply(_)));
         assert!(matches!(revoke(&mut s, 0), Outcome::Reply(_)));
+    }
+
+    // ---- The settle clock (option_seq_symmetric_clock) ----
+
+    const ISSUER: ([u8; 32], u32) = ([0x77; 32], 1);
+
+    /// setup_channel for a settle-clock channel we opened (bits 12, 178 and
+    /// 180), its funding output `txid`:0.
+    fn track_clock(s: &mut Signer, txid: &[u8; 32]) {
+        let mut w = Writer::new(msg::HSMD_SETUP_CHANNEL);
+        w.bool(true);
+        w.u64(FUNDING);
+        w.u64(0);
+        w.bytes(txid);
+        w.u16(0);
+        w.u16(144);
+        w.u16(0);
+        w.bool(false);
+        for k in 1..=5u8 {
+            w.bytes(&point(s, k));
+        }
+        w.u16(144);
+        w.u16(0);
+        let mut ct = vec![0u8; 23];
+        ct[21] = 0x10;
+        ct[0] = 0x14;
+        w.u16(ct.len() as u16);
+        w.bytes(&ct);
+        assert!(matches!(s.handle(&req(w.into_vec())), Outcome::Reply(_)));
+        assert!(st(s).option_sym && st(s).option_sym_clock);
+    }
+
+    fn funding_wscript(s: &Signer) -> Vec<u8> {
+        let local = s.kernel().pubkey_of(&s.kernel().channel_secrets(&PEER, DBID).funding);
+        s.kernel().funding_wscript(&local, &point(s, 5))
+    }
+
+    fn clock_channel(s: &Signer, txid: &[u8; 32]) -> sym::Channel {
+        let ours = s.kernel().channel_basepoints(&PEER, DBID)[3];
+        sym::Channel::new(&GENESIS, txid, 0, &ours, &point(s, 4), &asset(), 144).with_clock(
+            &ISSUER.0,
+            ISSUER.1,
+            &funding_wscript(s),
+            FUNDING,
+        )
+    }
+
+    /// A funding transaction: input ISSUER issuing `atoms` of the marker
+    /// (`token`: its reissuance token amount, 0 for none), output 0 the
+    /// funding, output 1 the marker to `seed` (None: the channel's seed).
+    fn clock_funding(s: &Signer, atoms: u64, token: u64, seed: Option<Vec<u8>>) -> (Vec<u8>, [u8; 32]) {
+        let c = clock_channel(s, &[0; 32]);
+        let seed = seed.unwrap_or_else(|| c.seed_spk(s.kernel().secp()).unwrap());
+        let mut t = Vec::new();
+        t.extend_from_slice(&2u32.to_le_bytes());
+        t.push(0x00);
+        t.push(0x01);
+        t.extend_from_slice(&ISSUER.0);
+        t.extend_from_slice(&(ISSUER.1 | 0x8000_0000).to_le_bytes());
+        t.push(0x00);
+        t.extend_from_slice(&0xffff_fffdu32.to_le_bytes());
+        t.extend_from_slice(&[0u8; 64]);
+        t.push(0x01);
+        t.extend_from_slice(&atoms.to_be_bytes());
+        if token == 0 {
+            t.push(0x00);
+        } else {
+            t.push(0x01);
+            t.extend_from_slice(&token.to_be_bytes());
+        }
+        t.push(0x00);
+        t.push(0x02);
+        let outs = [
+            (asset(), FUNDING, crate::policy::p2wsh_spk(&funding_wscript(s))),
+            (c.marker_asset().unwrap(), 1, seed),
+        ];
+        for (a, v, script) in &outs {
+            t.extend_from_slice(a);
+            t.push(0x01);
+            t.extend_from_slice(&v.to_be_bytes());
+            t.push(0x00);
+            t.push(script.len() as u8);
+            t.extend_from_slice(script);
+        }
+        t.extend_from_slice(&0u32.to_le_bytes());
+        let txid = { use bitcoin::hashes::Hash; bitcoin::hashes::sha256d::Hash::hash(&t).to_byte_array() };
+        (t, txid)
+    }
+
+    fn check_funding_msg(tx: &[u8], txid: &[u8; 32], issuer: ([u8; 32], u32)) -> Vec<u8> {
+        let mut w = Writer::new(msg::HSMD_CHECK_SYM_CLOCK_FUNDING);
+        w.bool(false);
+        w.u64(0);
+        w.u32(tx.len() as u32);
+        w.bytes(tx);
+        w.bytes(txid);
+        w.u32(0);
+        w.bytes(&issuer.0);
+        w.u32(issuer.1);
+        w.into_vec()
+    }
+
+    fn clock_state_msg(s: &Signer, txid: &[u8; 32], issuer: ([u8; 32], u32), owner: u8, commit_num: u64, num: i64, outs: &[sym::Out]) -> Vec<u8> {
+        let mut w = Writer::new(msg::HSMD_SIGN_SYM_CLOCK_STATE);
+        w.bytes(txid);
+        w.u32(0);
+        w.bool(true);
+        w.bytes(&point(s, 4));
+        w.bytes(&asset());
+        w.u16(144);
+        w.bytes(&issuer.0);
+        w.u32(issuer.1);
+        w.u64(FUNDING);
+        w.bytes(&point(s, 5));
+        w.u8(owner);
+        w.u64(commit_num);
+        w.u64(num as u64);
+        w.u16(outs.len() as u16);
+        for o in outs {
+            w.u64(o.amount);
+            w.u16(o.spk.len() as u16);
+            w.bytes(&o.spk);
+        }
+        for _ in 0..2 {
+            w.bool(false);
+            w.bytes(&[0; 64]);
+        }
+        w.u16(0);
+        w.into_vec()
+    }
+
+    fn clock_kickoff_msg(s: &Signer, txid: &[u8; 32], out: (Vec<u8>, [u8; 33], u64)) -> Vec<u8> {
+        let mut t = Vec::new();
+        t.extend_from_slice(&2u32.to_le_bytes());
+        t.push(0x00);
+        t.push(0x01);
+        t.extend_from_slice(txid);
+        t.extend_from_slice(&0u32.to_le_bytes());
+        t.push(0x00);
+        t.extend_from_slice(&0xffff_fffdu32.to_le_bytes());
+        t.push(0x01);
+        t.extend_from_slice(&out.1);
+        t.push(0x01);
+        t.extend_from_slice(&out.2.to_be_bytes());
+        t.push(0x00);
+        t.push(out.0.len() as u8);
+        t.extend_from_slice(&out.0);
+        t.extend_from_slice(&0u32.to_le_bytes());
+        // The funding input's witness UTXO, which its signature hash takes.
+        let mut wu = asset().to_vec();
+        wu.push(0x01);
+        wu.extend_from_slice(&FUNDING.to_be_bytes());
+        wu.push(0x00);
+        let spk = crate::policy::p2wsh_spk(&funding_wscript(s));
+        wu.push(spk.len() as u8);
+        wu.extend_from_slice(&spk);
+        let mut p = b"psbt\xff".to_vec();
+        p.push(0x00);
+        p.extend_from_slice(&[0x01, 0x01]);
+        p.push(wu.len() as u8);
+        p.extend_from_slice(&wu);
+        p.push(0x00);
+        let mut w = Writer::new(msg::HSMD_SIGN_SYM_KICKOFF);
+        w.u32(t.len() as u32);
+        w.bytes(&t);
+        w.u32(p.len() as u32);
+        w.bytes(&p);
+        w.bytes(&point(s, 5));
+        w.into_vec()
+    }
+
+    #[test]
+    fn clock_funding_is_checked_before_a_state_pays_this_side() {
+        let mut s = signer();
+        let (tx, txid) = clock_funding(&s, 1, 0, None);
+        track_clock(&mut s, &txid);
+        let outs = split(&s, 600_000);
+        // The base type's state message is not this channel's.
+        refused(s.handle(&req(state_msg(&s, 1, 0, 1, &outs, None))), "signed over its clock");
+        // No kickoff before a state named the issuer.
+        let c = clock_channel(&s, &txid);
+        let ko = c.kickoff_spk(s.kernel().secp()).unwrap();
+        refused(
+            s.handle(&req(clock_kickoff_msg(&s, &txid, (ko.clone(), c.marker_asset().unwrap(), 1)))),
+            "no state named",
+        );
+        // A state paying us, before the funding was shown.
+        refused(
+            s.handle(&req(clock_state_msg(&s, &txid, ISSUER, 1, 0, 1, &outs))),
+            "funding is not checked yet",
+        );
+        // Fundings that are not the channel's.
+        let (two, two_id) = clock_funding(&s, 2, 0, None);
+        refused(s.handle(&req(check_funding_msg(&two, &two_id, ISSUER))), "another funding output");
+        refused(s.handle(&req(check_funding_msg(&two, &txid, ISSUER))), "not the channel's funding");
+        let mut t = signer();
+        let (two, two_id) = clock_funding(&t, 2, 0, None);
+        track_clock(&mut t, &two_id);
+        refused(t.handle(&req(check_funding_msg(&two, &two_id, ISSUER))), "one explicit atom");
+        let mut t = signer();
+        let (tok, tok_id) = clock_funding(&t, 1, 1, None);
+        track_clock(&mut t, &tok_id);
+        refused(t.handle(&req(check_funding_msg(&tok, &tok_id, ISSUER))), "reissuance token");
+        let mut t = signer();
+        let (away, away_id) = clock_funding(&t, 1, 0, Some(taproot::p2wpkh(&point(&s, 9))));
+        track_clock(&mut t, &away_id);
+        refused(t.handle(&req(check_funding_msg(&away, &away_id, ISSUER))), "not the one seed");
+        let mut t = signer();
+        track_clock(&mut t, &txid);
+        refused(t.handle(&req(check_funding_msg(&tx, &txid, ([0x78; 32], 1)))), "no input spends the issuer");
+
+        // The channel's funding: its seed is recorded, and states pay us.
+        assert!(matches!(s.handle(&req(check_funding_msg(&tx, &txid, ISSUER))), Outcome::Reply(_)));
+        assert_eq!(st(&s).clock_issuer, Some(ISSUER));
+        assert_eq!(st(&s).clock_seed, Some(1));
+        refused(
+            s.handle(&req(clock_state_msg(&s, &txid, ([0x78; 32], 1), 1, 0, 1, &outs))),
+            "another issuer",
+        );
+        let reply = match s.handle(&req(clock_state_msg(&s, &txid, ISSUER, 1, 0, 1, &outs))) {
+            Outcome::Reply(r) => r,
+            _ => panic!("the first state must be signed"),
+        };
+        assert_eq!(&reply[..2], &msg::HSMD_SIGN_SYM_CLOCK_STATE_REPLY.to_be_bytes());
+        let sig: [u8; 64] = reply[2..].try_into().unwrap();
+        let (program, rest) = c.state(s.kernel().secp(), 1, &outs).unwrap();
+        let ours = s.kernel().channel_basepoints(&PEER, DBID)[3];
+        assert!(sym::verify(s.kernel().secp(), &c.upd_msg(1, &program, &rest), &sig, &ours));
+        // The base type's message over the same settlement differs.
+        assert_ne!(c.upd_msg(1, &program, &rest), msg_of(&s, 1, &outs));
+
+        // The kickoff: KO with one atom of the marker, nothing else.
+        refused(
+            s.handle(&req(clock_kickoff_msg(&s, &txid, (ko.clone(), asset(), FUNDING)))),
+            "not one atom of the channel's marker",
+        );
+        refused(
+            s.handle(&req(clock_kickoff_msg(&s, &txid, (ko.clone(), c.marker_asset().unwrap(), 2)))),
+            "not one atom of the channel's marker",
+        );
+        refused(
+            s.handle(&req(clock_kickoff_msg(
+                &s,
+                &txid,
+                (channel(&s).kickoff_spk(s.kernel().secp()).unwrap(), c.marker_asset().unwrap(), 1),
+            ))),
+            "not this channel's KO",
+        );
+        match s.handle(&req(clock_kickoff_msg(&s, &txid, (ko, c.marker_asset().unwrap(), 1)))) {
+            Outcome::Reply(r) => assert_eq!(r[r.len() - 1], 0x83, "SIGHASH_SINGLE|ANYONECANPAY"),
+            _ => panic!("the channel's kickoff must be signed"),
+        }
+        // A repeated setup_channel (channeld at every start) keeps the
+        // clock's issuer and its checked seed.
+        track_clock(&mut s, &txid);
+        assert_eq!(st(&s).clock_issuer, Some(ISSUER));
+        assert_eq!(st(&s).clock_seed, Some(1));
+        // The store keeps the clock.
+        let blob = crate::policy::encode_channel_store(&s.store);
+        let (back, _, _) = crate::policy::decode_channel_store(&blob).unwrap();
+        let (_, kept) = back.iter().find(|(k, _)| *k == (PEER, DBID)).unwrap();
+        assert!(kept.option_sym_clock);
+        assert_eq!(kept.clock_issuer, Some(ISSUER));
+        assert_eq!(kept.clock_seed, Some(1));
     }
 
     #[test]

@@ -154,6 +154,9 @@ msgdata,openingd_funder_complete,factory,?sym_factory,
 # SEQUENTIA: each other lane's output in the funding transaction.
 msgdata,openingd_funder_complete,num_sym_lane_outnums,u16,
 msgdata,openingd_funder_complete,sym_lane_outnums,u32,num_sym_lane_outnums
+# SEQUENTIA: a settle-clock channel's funding transaction, which openingd
+# shows the signer (hsmd_check_sym_clock_funding) before it signs a state.
+msgdata,openingd_funder_complete,sym_funding_tx,?bitcoin_tx,
 
 #master->openingd: cancel channel establishment for a funding
 msgtype,openingd_funder_cancel,6013

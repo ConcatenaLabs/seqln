@@ -685,6 +685,25 @@ msgdata,hsmd_sign_sym_clock_state,htlcs,hsm_htlc,num_htlcs
 msgtype,hsmd_sign_sym_clock_state_reply,172
 msgdata,hsmd_sign_sym_clock_state_reply,sig,bip340sig,
 
+# A settle-clock channel's funding transaction, shown before any state that
+# pays this side is signed: by the opener's openingd right after
+# hsmd_setup_channel (peerid absent: the client's own channel), by
+# lightningd once the accepter's is mined (peerid and channel_dbid name
+# it).  A signer that holds a balance checks that input `issuer` issues one
+# explicit atom of the marker, with no token, and that one output pays it to
+# the channel's seed, beside the funding output (common/sym_scripts.h,
+# sym_clock_check_funding).
+msgtype,hsmd_check_sym_clock_funding,73
+msgdata,hsmd_check_sym_clock_funding,peerid,?node_id,
+msgdata,hsmd_check_sym_clock_funding,channel_dbid,u64,
+# The transaction serialized, without a PSBT.
+msgdata,hsmd_check_sym_clock_funding,tx_len,u32,
+msgdata,hsmd_check_sym_clock_funding,tx,u8,tx_len
+msgdata,hsmd_check_sym_clock_funding,funding,bitcoin_outpoint,
+msgdata,hsmd_check_sym_clock_funding,issuer,bitcoin_outpoint,
+
+msgtype,hsmd_check_sym_clock_funding_reply,173
+
 # The same signature for a channel that holds several assets, one funding
 # output per asset: lane 0 is channel_asset at the channel's funding value,
 # and each further lane its asset and value.  Each settlement output names
