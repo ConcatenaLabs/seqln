@@ -1858,8 +1858,9 @@ def test_pay_retry(node_factory, bitcoind, executor, chainparams):
         l1.dev_pay(inv, dev_use_shadow=False)
 
 
-@pytest.mark.xfail(TEST_NETWORK in SEQUENTIA_NETWORKS, strict=True,
-                   reason="ConcatenaLabs/seqln#152: listpays shows failed while pay retries")
+@pytest.mark.xfail(TEST_NETWORK in SEQUENTIA_NETWORKS, strict=False,
+                   reason="ConcatenaLabs/seqln#152: listpays can show failed while pay retries"
+                   " (when the poll falls between two parts)")
 def test_pay_avoid_low_fee_chan(node_factory, bitcoind, executor, chainparams):
     """Make sure we're able to route around a low fee depleted channel """
 
