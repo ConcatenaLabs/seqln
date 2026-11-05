@@ -703,6 +703,10 @@ const struct sym_state *sym_best_state(const struct channel *channel UNNEEDED)
 bool sym_broadcast_kickoff(struct lightningd *ld UNNEEDED, struct channel *channel UNNEEDED,
 			   const char *cmd_id UNNEEDED)
 { fprintf(stderr, "sym_broadcast_kickoff called!\n"); abort(); }
+/* Generated stub for sym_clock_funding_found */
+bool sym_clock_funding_found(struct channel *channel UNNEEDED,
+			     const struct bitcoin_tx *tx UNNEEDED)
+{ fprintf(stderr, "sym_clock_funding_found called!\n"); abort(); }
 /* Generated stub for sym_factory_close */
 bool sym_factory_close(struct lightningd *ld UNNEEDED, struct channel *channel UNNEEDED)
 { fprintf(stderr, "sym_factory_close called!\n"); abort(); }

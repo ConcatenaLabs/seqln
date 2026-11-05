@@ -247,6 +247,13 @@ void sym_channel_init(struct sym_channel *sc UNNEEDED,
 		      const struct pubkey *accepter_upd_key UNNEEDED,
 		      const u8 *asset_tag UNNEEDED, u16 delay UNNEEDED)
 { fprintf(stderr, "sym_channel_init called!\n"); abort(); }
+/* Generated stub for sym_channel_set_clock */
+void sym_channel_set_clock(struct sym_channel *sc UNNEEDED, const u8 marker[32] UNNEEDED,
+			   const u8 *funding_wscript UNNEEDED, struct amount_sat capacity UNNEEDED)
+{ fprintf(stderr, "sym_channel_set_clock called!\n"); abort(); }
+/* Generated stub for sym_clock_marker_asset */
+void sym_clock_marker_asset(const struct sym_channel *sc UNNEEDED, u8 asset[33] UNNEEDED)
+{ fprintf(stderr, "sym_clock_marker_asset called!\n"); abort(); }
 /* Generated stub for sym_htlc_tree */
 void sym_htlc_tree(const tal_t *ctx UNNEEDED,
 		   const struct pubkey *offerer_key UNNEEDED,
@@ -258,6 +265,9 @@ void sym_htlc_tree(const tal_t *ctx UNNEEDED,
 void sym_kickoff_tree(const tal_t *ctx UNNEEDED, const struct sym_channel *sc UNNEEDED,
 		      struct sym_tree *tree UNNEEDED)
 { fprintf(stderr, "sym_kickoff_tree called!\n"); abort(); }
+/* Generated stub for sym_marker_id */
+void sym_marker_id(const struct bitcoin_outpoint *issuer UNNEEDED, u8 marker[32])
+{ fprintf(stderr, "sym_marker_id called!\n"); abort(); }
 /* Generated stub for sym_parse_update_witness */
 bool sym_parse_update_witness(const u8 **wit UNNEEDED, s64 *n UNNEEDED, struct sha256 *rest UNNEEDED)
 { fprintf(stderr, "sym_parse_update_witness called!\n"); abort(); }
