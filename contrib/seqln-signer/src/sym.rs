@@ -20,6 +20,7 @@ pub const TAG_PREFIX: &[u8] = b"SeqLN symmetric update v1";
 
 const OP_0: u8 = 0x00;
 const OP_1: u8 = 0x51;
+const OP_1SUB: u8 = 0x8c;
 const OP_VERIFY: u8 = 0x69;
 const OP_DROP: u8 = 0x75;
 const OP_OVER: u8 = 0x78;
@@ -42,10 +43,12 @@ const OP_SHA256UPDATE: u8 = 0xc5;
 const OP_SHA256FINALIZE: u8 = 0xc6;
 const OP_INSPECTINPUTASSET: u8 = 0xc8;
 const OP_INSPECTINPUTVALUE: u8 = 0xc9;
+const OP_INSPECTINPUTSCRIPTPUBKEY: u8 = 0xca;
 const OP_PUSHCURRENTINPUTINDEX: u8 = 0xcd;
 const OP_INSPECTOUTPUTASSET: u8 = 0xce;
 const OP_INSPECTOUTPUTVALUE: u8 = 0xcf;
 const OP_INSPECTOUTPUTSCRIPTPUBKEY: u8 = 0xd1;
+const OP_INSPECTLOCKTIME: u8 = 0xd3;
 const OP_GREATERTHAN64: u8 = 0xde;
 
 fn push(s: &mut Vec<u8>, b: &[u8]) {
@@ -90,6 +93,23 @@ pub struct Out {
     pub spk: Vec<u8>,
 }
 
+/// The floor every settle-clock update's lock time must reach.
+pub const CLOCK_LOCKTIME_FLOOR: u32 = 500_000_001;
+
+/// The settle clock (`option_seq_symmetric_clock`, `sym_channel_set_clock`):
+/// the funding transaction issues one atom of a fresh asset, the marker, into
+/// a seed output; the kickoff spends the seed beside the funding and creates
+/// the clock, which holds the capacity and waits the shared delay, once.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Clock {
+    /// The marker's asset id (internal byte order).
+    pub marker: [u8; 32],
+    /// The funding output's P2WSH program.
+    pub funding_prog: [u8; 32],
+    /// The capacity, in the channel asset.
+    pub capacity: u64,
+}
+
 /// A channel's constants.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Channel {
@@ -99,6 +119,38 @@ pub struct Channel {
     /// The channel asset: 0x01 || 32-byte id.
     pub asset: [u8; 33],
     pub delay: u16,
+    /// The settle clock, or none.
+    pub clock: Option<Clock>,
+}
+
+/// The asset a new issuance (contract hash zero) on `txid:vout` creates
+/// (`sym_marker_id`): Elements' entropy and asset id, each a SHA256 midstate
+/// of two 32-byte leaves. `txid` in internal byte order.
+pub fn marker_id(txid: &[u8; 32], vout: u32) -> [u8; 32] {
+    use bitcoin::hashes::sha256d;
+    let mut prevout = [0u8; 36];
+    prevout[..32].copy_from_slice(txid);
+    prevout[32..].copy_from_slice(&vout.to_le_bytes());
+    let leaf = sha256d::Hash::hash(&prevout).to_byte_array();
+    let mut e = sha256::Hash::engine();
+    e.input(&leaf);
+    e.input(&[0u8; 32]);
+    let entropy = e.midstate().0;
+    let mut e = sha256::Hash::engine();
+    e.input(&entropy);
+    e.input(&[0u8; 32]);
+    e.midstate().0
+}
+
+/// `tr(H, root)` with the NUMS internal key, as (output key, parity).
+fn nums_output(secp: &Secp256k1<All>, root: &[u8; 32]) -> Option<([u8; 32], bool)> {
+    let internal = XOnlyPublicKey::from_slice(&NUMS[1..]).ok()?;
+    let mut m = [0u8; 64];
+    m[..32].copy_from_slice(&NUMS[1..]);
+    m[32..].copy_from_slice(root);
+    let tweak = Scalar::from_be_bytes(tagged_hash("TapTweak/elements", &m)).ok()?;
+    let (out, parity) = internal.add_tweak(secp, &tweak).ok()?;
+    Some((out.serialize(), parity == secp256k1::Parity::Odd))
 }
 
 impl Channel {
@@ -122,13 +174,103 @@ impl Channel {
             keys: [*opener_key, *accepter_key],
             asset: *asset,
             delay,
+            clock: None,
         }
+    }
+
+    /// The channel with its settle clock: the marker `issuer` makes, the
+    /// funding output's 2-of-2 `funding_wscript`, and the capacity.
+    pub fn with_clock(mut self, issuer_txid: &[u8; 32], issuer_vout: u32, funding_wscript: &[u8], capacity: u64) -> Channel {
+        self.clock = Some(Clock {
+            marker: marker_id(issuer_txid, issuer_vout),
+            funding_prog: sha256::Hash::hash(funding_wscript).to_byte_array(),
+            capacity,
+        });
+        self
+    }
+
+    /// The marker as an output asset (0x01 || id).
+    pub fn marker_asset(&self) -> Option<[u8; 33]> {
+        let c = self.clock.as_ref()?;
+        let mut a = [0u8; 33];
+        a[0] = 0x01;
+        a[1..].copy_from_slice(&c.marker);
+        Some(a)
+    }
+
+    /// CLOCK: the delay, lock time 0, and the marker in the input before it.
+    pub fn leaf_clock(&self) -> Option<Vec<u8>> {
+        let c = self.clock.as_ref()?;
+        let mut s = Vec::new();
+        push_num(&mut s, self.delay as u32);
+        s.extend_from_slice(&[OP_CHECKSEQUENCEVERIFY, OP_DROP, OP_INSPECTLOCKTIME]);
+        push(&mut s, &[0u8; 4]);
+        s.extend_from_slice(&[OP_EQUALVERIFY, OP_PUSHCURRENTINPUTINDEX, OP_1SUB, OP_INSPECTINPUTASSET, OP_1, OP_EQUALVERIFY]);
+        push(&mut s, &c.marker);
+        s.push(OP_EQUAL);
+        Some(s)
+    }
+
+    /// The clock's output, `tr(H, CLOCK)`.
+    pub fn clock_spk(&self, secp: &Secp256k1<All>) -> Option<Vec<u8>> {
+        let (out, _) = nums_output(secp, &leaf_hash(&self.leaf_clock()?))?;
+        Some(taproot::p2tr(&out))
+    }
+
+    /// KICK: the input before it is the funding output with the capacity in
+    /// the channel asset, and the output at its own index is the clock.
+    pub fn leaf_kick(&self, secp: &Secp256k1<All>) -> Option<Vec<u8>> {
+        let c = self.clock.as_ref()?;
+        let cap = c.capacity.to_le_bytes();
+        let clock = self.clock_spk(secp)?;
+        let mut s = vec![OP_PUSHCURRENTINPUTINDEX, OP_1SUB, OP_INSPECTINPUTSCRIPTPUBKEY, OP_0, OP_EQUALVERIFY];
+        push(&mut s, &c.funding_prog);
+        s.push(OP_EQUALVERIFY);
+        let explicit = |s: &mut Vec<u8>, before: bool, inspect: u8, v: &[u8]| {
+            s.push(OP_PUSHCURRENTINPUTINDEX);
+            if before {
+                s.push(OP_1SUB);
+            }
+            s.extend_from_slice(&[inspect, OP_1, OP_EQUALVERIFY]);
+            push(s, v);
+            s.push(OP_EQUALVERIFY);
+        };
+        explicit(&mut s, true, OP_INSPECTINPUTVALUE, &cap);
+        explicit(&mut s, true, OP_INSPECTINPUTASSET, &self.asset[1..]);
+        explicit(&mut s, false, OP_INSPECTOUTPUTASSET, &self.asset[1..]);
+        explicit(&mut s, false, OP_INSPECTOUTPUTVALUE, &cap);
+        s.extend_from_slice(&[OP_PUSHCURRENTINPUTINDEX, OP_INSPECTOUTPUTSCRIPTPUBKEY, OP_1, OP_EQUALVERIFY]);
+        push(&mut s, &clock[2..]);
+        s.push(OP_EQUAL);
+        Some(s)
+    }
+
+    /// RETIRE: both update keys (a mutual close takes the marker).
+    pub fn leaf_retire(&self) -> Vec<u8> {
+        let mut s = Vec::new();
+        push(&mut s, &self.keys[0][1..]);
+        s.push(OP_CHECKSIGVERIFY);
+        push(&mut s, &self.keys[1][1..]);
+        s.push(OP_CHECKSIG);
+        s
+    }
+
+    /// The seed, `tr(H, {KICK, RETIRE})`.
+    pub fn seed_spk(&self, secp: &Secp256k1<All>) -> Option<Vec<u8>> {
+        let root = taproot::branch_hash(&leaf_hash(&self.leaf_kick(secp)?), &leaf_hash(&self.leaf_retire()));
+        let (out, _) = nums_output(secp, &root)?;
+        Some(taproot::p2tr(&out))
     }
 
     /// UPD(k): spends this output into a state n > k signed by both keys,
     /// keeping its value and asset.
     pub fn leaf_upd(&self, k: i64) -> Vec<u8> {
-        let mut s = Vec::with_capacity(140);
+        let mut s = Vec::with_capacity(148);
+        // The settle clock: every update's lock time is at the floor.
+        if self.clock.is_some() {
+            push_num(&mut s, CLOCK_LOCKTIME_FLOOR);
+            s.extend_from_slice(&[OP_CHECKLOCKTIMEVERIFY, OP_DROP]);
+        }
         s.push(OP_OVER);
         push(&mut s, &(k as u64).to_le_bytes());
         s.extend_from_slice(&[
@@ -194,14 +336,29 @@ impl Channel {
             return None;
         }
         let mut s = Vec::new();
-        push_num(&mut s, self.delay as u32);
-        s.extend_from_slice(&[OP_CHECKSEQUENCEVERIFY, OP_DROP]);
-        for i in 0..m {
+        // The settle clock: no delay here (the clock has it); the marker
+        // stays where it is, and the settlement follows it.
+        let first = if self.clock.is_some() {
+            for (o, i) in [
+                (OP_INSPECTOUTPUTSCRIPTPUBKEY, OP_INSPECTINPUTSCRIPTPUBKEY),
+                (OP_INSPECTOUTPUTASSET, OP_INSPECTINPUTASSET),
+                (OP_INSPECTOUTPUTVALUE, OP_INSPECTINPUTVALUE),
+            ] {
+                s.extend_from_slice(&[OP_PUSHCURRENTINPUTINDEX, o, OP_PUSHCURRENTINPUTINDEX, i, OP_ROT, OP_EQUALVERIFY, OP_EQUALVERIFY]);
+            }
+            1
+        } else {
+            push_num(&mut s, self.delay as u32);
+            s.extend_from_slice(&[OP_CHECKSEQUENCEVERIFY, OP_DROP]);
+            0
+        };
+        for j in 0..m {
+            let i = first + j;
             push_num(&mut s, i as u32);
             s.extend_from_slice(&[
                 OP_INSPECTOUTPUTASSET,
                 OP_CAT,
-                if i == 0 { OP_SHA256INITIALIZE } else { OP_SHA256UPDATE },
+                if j == 0 { OP_SHA256INITIALIZE } else { OP_SHA256UPDATE },
             ]);
             push_num(&mut s, i as u32);
             s.extend_from_slice(&[OP_INSPECTOUTPUTVALUE, OP_CAT, OP_SHA256UPDATE]);
@@ -210,7 +367,7 @@ impl Channel {
                 OP_INSPECTOUTPUTSCRIPTPUBKEY,
                 OP_CAT,
                 OP_SHA256,
-                if i == m - 1 { OP_SHA256FINALIZE } else { OP_SHA256UPDATE },
+                if j == m - 1 { OP_SHA256FINALIZE } else { OP_SHA256UPDATE },
             ]);
         }
         push(&mut s, &self.settle_digest_in(outs, assets)?);
@@ -239,14 +396,8 @@ impl Channel {
 
     /// KO, the kickoff's output: `tr(H, UPD(-1))`.
     pub fn kickoff_spk(&self, secp: &Secp256k1<All>) -> Option<Vec<u8>> {
-        let root = leaf_hash(&self.leaf_upd(-1));
-        let internal = XOnlyPublicKey::from_slice(&NUMS[1..]).ok()?;
-        let mut m = [0u8; 64];
-        m[..32].copy_from_slice(&NUMS[1..]);
-        m[32..].copy_from_slice(&root);
-        let tweak = Scalar::from_be_bytes(tagged_hash("TapTweak/elements", &m)).ok()?;
-        let (out, _) = internal.add_tweak(secp, &tweak).ok()?;
-        Some(taproot::p2tr(&out.serialize()))
+        let (out, _) = nums_output(secp, &leaf_hash(&self.leaf_upd(-1)))?;
+        Some(taproot::p2tr(&out))
     }
 
     /// The message both update keys sign for state `n` (program P, R).
@@ -590,5 +741,28 @@ mod tests {
         assert_eq!(state_num(0, false), Some(1));
         assert_eq!(state_num(4, false), Some(9));
         assert_eq!(state_num(1 << 61, true), None);
+    }
+
+    #[test]
+    fn clock_scripts_match_the_vectors() {
+        let secp = Secp256k1::new();
+        let c = channel(&secp).with_clock(&a32("969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5"), 2, &h("5221021617d38ed8d8657da4d4761e8057bc396ea9e4b9d29776d4be096016dbd2509b21037962d45b38e8bcf82fa8efa8432a01f20c9a53e24c7d3f11df197cb8e70926da52ae"), 1000000);
+        assert_eq!(c.clock.as_ref().unwrap().marker, a32("2a8fed4e5a860d6fcc32d3d3ded7054bbc1eec558ae9aecf02a320a69d0b39d0"));
+        assert_eq!(c.leaf_upd(-1), h("040165cd1db1757808ffffffffffffffffde69cdd151887b7c7e7c7e200024c7c2c240711314eabeb83cbd701c1006bb9ae113510065b2402329239ae47c7ea87d204f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aac220466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27c2cdcfcdc97b8888cdcecdc87b8887"));
+        assert_eq!(c.leaf_upd(7), h("040165cd1db17578080700000000000000de69cdd151887b7c7e7c7e200024c7c2c240711314eabeb83cbd701c1006bb9ae113510065b2402329239ae47c7ea87d204f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aac220466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27c2cdcfcdc97b8888cdcecdc87b8887"));
+        assert_eq!(c.kickoff_spk(&secp).unwrap(), h("5120d20e1a2ae0c4a46c58f434e15571c7cb59fc96778ac89d59af5ab7d19355e855"));
+        let outs = settlement(&secp);
+        assert_eq!(c.leaf_settle(&outs).unwrap(), h("cdd1cdca7b8888cdcecdc87b8888cdcfcdc97b888851ce7ec451cf7ec551d17ea8c552ce7ec552cf7ec552d17ea8c553ce7ec553cf7ec553d17ea8c6201373c90544bf1aaea227d6fe0ba96a23eb0c43d14fbd35bd265826594e69fc7787"));
+        let (program, rest) = c.state(&secp, 7, &outs).unwrap();
+        assert_eq!(taproot::p2tr(&program), h("5120cc513bad30e6c007fa2579816c5c24c1cdf388df884411a1e98f0f8d405dc512"));
+        assert_eq!(rest, a32("2f6ed17286edffb658c9bcb4f04f92e71406144f453e2d42d7952394e4d904c2"));
+        assert_eq!(c.upd_msg(7, &program, &rest), a32("13e24eb9c21d08e0e8275b1422026aa2acb572706698c4406cfc6dbe0ed933f8"));
+        assert_eq!(c.leaf_clock().unwrap(), h("029000b275d3040000000088cd8cc85188202a8fed4e5a860d6fcc32d3d3ded7054bbc1eec558ae9aecf02a320a69d0b39d087"));
+        assert_eq!(c.clock_spk(&secp).unwrap(), h("512073561ab4a4ea576c5d94deddee005669cccb2029ae7cf65ab1f9b3c168deac18"));
+        assert_eq!(c.leaf_kick(&secp).unwrap(), h("cd8cca00882050275a37f200ec18c1467fa641b2d7218ece69fcb8a6910555495eab59de877688cd8cc951880840420f000000000088cd8cc8518820c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e788cdce518820c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e788cdcf51880840420f000000000088cdd151882073561ab4a4ea576c5d94deddee005669cccb2029ae7cf65ab1f9b3c168deac1887"));
+        assert_eq!(c.leaf_retire(), h("204f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aaad20466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27ac"));
+        assert_eq!(c.seed_spk(&secp).unwrap(), h("5120cc93d8506b88be6b8955b5fb81391cd7ccac979009ed435ccf8a369a94b1b518"));
+        // The base type's leaves are unchanged by the clock's existence.
+        assert_eq!(channel(&secp).clock, None);
     }
 }

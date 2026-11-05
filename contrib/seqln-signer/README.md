@@ -207,6 +207,16 @@ What enforce mode checks:
   The fee coins of the kickoff, an update or a settle (`SIGN_HTLC_TX_MINGLE`) pay only the fee and
   their change: the outputs before them carry exactly the value of the channel output they spend,
   in its asset.
+- **The settle clock** (`option_seq_symmetric_clock`): the funding issues one atom of a fresh
+  asset, the marker, into a seed; KO and every state output hold that atom, and a clock created at
+  the kickoff holds the capacity (`common/sym_scripts.h`). The device keeps the funding input that
+  issued the marker from the first state that names it (`SIGN_SYM_CLOCK_STATE`, 72) and refuses a
+  request naming another. It signs no state that pays this side until it has been shown the
+  funding (`CHECK_SYM_CLOCK_FUNDING`, 73) and found there one explicit atom of the marker, no
+  token, in exactly one output, the channel's seed, beside the funding output. It signs the
+  kickoff only over KO holding one atom of that marker, and refuses `SIGN_SYM_STATE` on such a
+  channel. Its signature hash covers an input's issuance, Sequentia's denomination byte included,
+  so it signs a wallet input that issues the marker.
 - **Channels of several assets** (`option_seq_symmetric_lanes`): a further lane is another output
   of the funding transaction in its own asset. The device learns each lane once, from the first
   request that names it (a lane's kickoff, which also gives its output, or a state), and refuses
@@ -331,7 +341,7 @@ any channel.
 | `src/noise.rs` | BOLT-8 Noise_XK transport state machine (no sockets). |
 | `src/policy.rs` | Enforce-mode commitment validation. |
 | `src/taproot.rs` | The taproot-covenant channel type's leaves and trees, the credit channel's CLAIM leaf, trees and note check, and the Elements taproot signature hash and BIP340 signing (tested against `common/test/tcov_vectors.h` and `common/test/credit_vectors.h`). |
-| `src/sym.rs` | The symmetric channel type's leaves, trees, update message and settlement check (tested against `common/test/sym_vectors.h`). |
+| `src/sym.rs` | The symmetric channel type's leaves, trees, update message and settlement check, and the settle clock's (tested against `common/test/sym_vectors.h` and `sym_m_vectors.h`). |
 | `src/payments.rs` | Payment approval, the per-asset payment limits and their accounting, BOLT 11 decoding. |
 | `src/dispatch.rs` | Request -> reply dispatch; channel-state tracking for the policy. |
 | `src/hsm_secret.rs` | On-disk mnemonic `hsm_secret` parsing. |

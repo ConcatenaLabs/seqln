@@ -188,6 +188,10 @@ bool hsmd_check_client_capabilities(struct hsmd_client *client,
 	case WIRE_HSMD_SIGN_SYM_HTLC:
 		return (client->capabilities & HSM_PERM_MASTER) != 0;
 
+	case WIRE_HSMD_CHECK_SYM_CLOCK_FUNDING:
+		return (client->capabilities
+			& (HSM_PERM_MASTER | HSM_PERM_SIGN_REMOTE_TX)) != 0;
+
 	/*~ These are messages sent by the HSM so we should never receive them. */
 	/* FIXME: Since we autogenerate these, we should really generate separate
 	 * enums for replies to avoid this kind of clutter! */
@@ -237,6 +241,7 @@ bool hsmd_check_client_capabilities(struct hsmd_client *client,
 	case WIRE_HSMD_CREDIT_NOTE_REPLY:
 	case WIRE_HSMD_SIGN_SYM_STATE_REPLY:
 	case WIRE_HSMD_SIGN_SYM_CLOCK_STATE_REPLY:
+	case WIRE_HSMD_CHECK_SYM_CLOCK_FUNDING_REPLY:
 	case WIRE_HSMD_SIGN_SYM_LANES_STATE_REPLY:
 	case WIRE_HSMD_SIGN_MUTUAL_CLOSE_LANES_TX_REPLY:
 	case WIRE_HSMD_APPROVE_SYM_SWAP_REPLY:
@@ -2685,6 +2690,24 @@ static u8 *handle_sign_sym_clock_state(struct hsmd_client *c, const u8 *msg_in)
 	return towire_hsmd_sign_sym_clock_state_reply(NULL, &sig);
 }
 
+/* A settle-clock channel's funding (option_seq_symmetric_clock): this
+ * signer keeps no state and lightningd ran the check, so it answers once the
+ * request parses. */
+static u8 *handle_check_sym_clock_funding(struct hsmd_client *c,
+					  const u8 *msg_in)
+{
+	struct node_id *peer_id;
+	u64 dbid;
+	u8 *tx;
+	struct bitcoin_outpoint funding, issuer;
+
+	if (!fromwire_hsmd_check_sym_clock_funding(tmpctx, msg_in, &peer_id,
+						   &dbid, &tx, &funding,
+						   &issuer))
+		return hsmd_status_malformed_request(c, msg_in);
+	return towire_hsmd_check_sym_clock_funding_reply(NULL);
+}
+
 /* A state of a channel that holds several assets: lane 0 the channel's
  * asset at its funding value, and each further lane its own.  The
  * settlement must pay each lane's asset exactly that lane's value, and no
@@ -2966,6 +2989,8 @@ u8 *hsmd_handle_client_message(const tal_t *ctx, struct hsmd_client *client,
 		return handle_sign_sym_state(client, msg);
 	case WIRE_HSMD_SIGN_SYM_CLOCK_STATE:
 		return handle_sign_sym_clock_state(client, msg);
+	case WIRE_HSMD_CHECK_SYM_CLOCK_FUNDING:
+		return handle_check_sym_clock_funding(client, msg);
 	case WIRE_HSMD_SIGN_SYM_LANES_STATE:
 		return handle_sign_sym_lanes_state(client, msg);
 	case WIRE_HSMD_SIGN_SYM_HTLC:
@@ -3018,6 +3043,7 @@ u8 *hsmd_handle_client_message(const tal_t *ctx, struct hsmd_client *client,
 	case WIRE_HSMD_CREDIT_NOTE_REPLY:
 	case WIRE_HSMD_SIGN_SYM_STATE_REPLY:
 	case WIRE_HSMD_SIGN_SYM_CLOCK_STATE_REPLY:
+	case WIRE_HSMD_CHECK_SYM_CLOCK_FUNDING_REPLY:
 	case WIRE_HSMD_SIGN_SYM_LANES_STATE_REPLY:
 	case WIRE_HSMD_SIGN_MUTUAL_CLOSE_LANES_TX_REPLY:
 	case WIRE_HSMD_APPROVE_SYM_SWAP_REPLY:
@@ -3123,6 +3149,7 @@ u8 *hsmd_init(const u8 *secret_data, size_t secret_len, const u64 hsmd_version,
 		WIRE_HSMD_SIGN_SYM_KICKOFF,
 		WIRE_HSMD_SIGN_SYM_STATE,
 		WIRE_HSMD_SIGN_SYM_CLOCK_STATE,
+		WIRE_HSMD_CHECK_SYM_CLOCK_FUNDING,
 		WIRE_HSMD_SIGN_SYM_HTLC,
 		WIRE_HSMD_SIGN_SYM_LANES_STATE,
 		WIRE_HSMD_SIGN_MUTUAL_CLOSE_LANES_TX,

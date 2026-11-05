@@ -723,8 +723,19 @@ marker, at the lock time floor; once the delay has passed since the kickoff it s
 state is on chain, if it knows its settlement: the state output and the clock in, the clock's
 sequence the delay and the lock time 0, the marker back to the state's script at output 0 and
 the settlement after it. A mutual close leaves the seed and its marker atom where they are.
-`speculad` watches a settle-clock channel from its store record (section 7b); the device signer
-does not take settle-clock channels.
+`speculad` watches a settle-clock channel from its store record (section 7b).
+
+A signer that holds a balance must know the funding issued exactly one marker atom into the
+seed before a state pays it, so it is shown the funding transaction through
+`hsmd_check_sym_clock_funding` (73): the opener's openingd shows it right after
+`hsmd_setup_channel`, and lightningd shows the accepter's once it is mined. On a settle-clock
+channel openingd has the first state signed before the kickoff, so the signer knows the issuer,
+and so the marker, that KO must hold. lightningd offers the clock only to a signer that has both
+messages. The device signer keeps the issuer from the first state that names it and refuses
+another; signs no state that pays this side before it has checked the funding; signs the
+kickoff only over KO with one atom of that marker; and refuses `hsmd_sign_sym_state` on such a
+channel. Its signature hash covers an issuance, Sequentia's denomination byte included, so it
+signs a funding whose input issues the marker.
 
 **Developers.** `dev-sym-snapshot id` freezes the best state a node holds; its next unilateral
 close then publishes that one as though it held nothing newer, which is how the tests make a

@@ -223,6 +223,18 @@ pub struct ChannelState {
     /// lane's kickoff, which also gives its output, or a state) and never
     /// replaced: a later request naming other lanes is refused.
     pub lanes: Vec<Lane>,
+    /// `option_seq_symmetric_clock`: the symmetric type with its settle
+    /// clock (`crate::sym::Clock`): KO and every state output hold one atom
+    /// of a marker the funding issued, and a clock holds the capacity.
+    pub option_sym_clock: bool,
+    /// The funding input whose issuance made the marker (txid in internal
+    /// order, vout), from the first request that names it, and never
+    /// replaced: a later request naming another is refused.
+    pub clock_issuer: Option<([u8; 32], u32)>,
+    /// The seed's output in the funding transaction, once this device
+    /// checked that the funding issues one atom of the marker into it
+    /// (`CHECK_SYM_CLOCK_FUNDING`). Until then no state may pay this side.
+    pub clock_seed: Option<u32>,
 }
 
 /// The most further lanes a channel may have (`SYM_MAX_LANES`).
@@ -348,6 +360,13 @@ impl ChannelState {
         // The lanes are learnt once and never replaced.
         if self.lanes.is_empty() {
             self.lanes = old.lanes.clone();
+        }
+        // So are the settle clock's issuer and its checked seed.
+        if self.clock_issuer.is_none() {
+            self.clock_issuer = old.clock_issuer;
+        }
+        if self.clock_seed.is_none() {
+            self.clock_seed = old.clock_seed;
         }
     }
 }
@@ -569,7 +588,7 @@ pub const CHSTORE_MAGIC: [u8; 4] = *b"SQCH";
 /// Versions 1 to 9 still import (the fields they lack unknown); each channel of a store older
 /// than version 6, written by a device that validated nothing, predates
 /// validation.
-pub const CHSTORE_VERSION: u8 = 13;
+pub const CHSTORE_VERSION: u8 = 14;
 
 /// The first store version a validating device wrote.
 pub const CHSTORE_FIRST_VALIDATING: u8 = 6;
@@ -747,6 +766,22 @@ pub fn encode_channel_store(store: &ChannelStore) -> Vec<u8> {
             }
             push_pay(&mut out, &l.pay);
         }
+        out.push(st.option_sym_clock as u8);
+        match st.clock_issuer {
+            None => out.push(0),
+            Some((txid, vout)) => {
+                out.push(1);
+                out.extend_from_slice(&txid);
+                out.extend_from_slice(&vout.to_le_bytes());
+            }
+        }
+        match st.clock_seed {
+            None => out.push(0),
+            Some(n) => {
+                out.push(1);
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+        }
     }
     push_ledger(&mut out, &store.ledger);
     out.extend_from_slice(&(store.close_txids.len() as u16).to_le_bytes());
@@ -922,6 +957,9 @@ pub fn decode_channel_store(bytes: &[u8]) -> Result<DecodedStore, String> {
             option_sym: false,
             credit: None,
             lanes: Vec::new(),
+            option_sym_clock: false,
+            clock_issuer: None,
+            clock_seed: None,
         };
         if version >= 2 {
             st.is_outbound = r.opt_bool()?;
@@ -1033,6 +1071,27 @@ pub fn decode_channel_store(bytes: &[u8]) -> Result<DecodedStore, String> {
                 st.lanes.push(Lane { asset, sats, outnum, pay });
             }
         }
+        if version >= 14 {
+            st.option_sym_clock = match r.u8()? {
+                0 => false,
+                1 => true,
+                v => return Err(format!("bad settle-clock flag {v} in channel-store blob")),
+            };
+            st.clock_issuer = match r.u8()? {
+                0 => None,
+                1 => {
+                    let txid: [u8; 32] = r.take(32)?.try_into().unwrap();
+                    let vout = u32::from_le_bytes(r.take(4)?.try_into().unwrap());
+                    Some((txid, vout))
+                }
+                v => return Err(format!("bad clock issuer flag {v} in channel-store blob")),
+            };
+            st.clock_seed = match r.u8()? {
+                0 => None,
+                1 => Some(u32::from_le_bytes(r.take(4)?.try_into().unwrap())),
+                v => return Err(format!("bad clock seed flag {v} in channel-store blob")),
+            };
+        }
         out.push(((node_id, dbid), st));
     }
     let ledger = if version >= 5 { r.ledger()? } else { Ledger::default() };
@@ -1086,6 +1145,18 @@ pub fn channel_type_has_credit(features: &[u8]) -> bool {
         (features[features.len() - 1 - byte_from_end] >> (n % 8)) & 1 == 1
     };
     bit(176) || bit(177)
+}
+
+/// Whether a channel_type names the settle clock (bit 180/181).
+pub fn channel_type_has_sym_clock(features: &[u8]) -> bool {
+    let bit = |n: usize| -> bool {
+        let byte_from_end = n / 8;
+        if byte_from_end >= features.len() {
+            return false;
+        }
+        (features[features.len() - 1 - byte_from_end] >> (n % 8)) & 1 == 1
+    };
+    bit(180) || bit(181)
 }
 
 /// Whether a channel_type names the symmetric channel type (bit 178/179).
@@ -1882,6 +1953,7 @@ pub fn validate_lanes_close(
             index: tx.inputs[0].index,
             sequence: tx.inputs[0].sequence,
             is_issuance: tx.inputs[0].is_issuance,
+            issuance: tx.inputs[0].issuance.clone(),
         }],
         outputs: tx
             .outputs

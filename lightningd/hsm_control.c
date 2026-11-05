@@ -226,6 +226,18 @@ struct ext_key *hsm_init(struct lightningd *ld)
 				feature_set_for_feature(tmpctx,
 							OPTIONAL_FEATURE(OPT_SEQ_SYMMETRIC_CLOCK)));
 	}
+	/* SEQUENTIA: a settle-clock channel's states are signed over its clock,
+	 * and the signer checks its funding first (lightningd/sym_clock.h). */
+	if (feature_offered(ld->our_features->bits[INIT_FEATURE],
+			    OPT_SEQ_SYMMETRIC_CLOCK)
+	    && !(hsm_capable(ld, WIRE_HSMD_SIGN_SYM_CLOCK_STATE)
+		 && hsm_capable(ld, WIRE_HSMD_CHECK_SYM_CLOCK_FUNDING))) {
+		log_unusual(ld->log, "The signer cannot sign settle-clock"
+			    " channel states: not offering the settle clock");
+		feature_set_sub(ld->our_features,
+				feature_set_for_feature(tmpctx,
+							OPTIONAL_FEATURE(OPT_SEQ_SYMMETRIC_CLOCK)));
+	}
 	/* SEQUENTIA: a lanes channel's states name their assets
 	 * (common/sym_lanes.h), which only hsmd_sign_sym_lanes_state signs; its
 	 * close spends every lane (hsmd_sign_mutual_close_lanes_tx); and a swap

@@ -157,7 +157,7 @@ def store_as_version(device, version):
     blob = open(path, 'rb').read()
     payload, mac = blob[:-32], blob[-32:]
     assert hmac.compare_digest(store_mac(payload), mac)
-    assert payload[:4] == b'SQCH' and payload[4] in (6, 7, 8, 9, 10, 11, 12, 13), payload[:5]
+    assert payload[:4] == b'SQCH' and payload[4] in (6, 7, 8, 9, 10, 11, 12, 13, 14), payload[:5]
     v = payload[4]
     count = struct.unpack('<I', payload[5:9])[0]
     o, entries = 9, []
@@ -229,6 +229,12 @@ def store_as_version(device, version):
                 side()
                 side()
                 skip(8)
+        if v >= 14:                    # the settle clock (14)
+            skip(1)                    # option_sym_clock
+            if u8():                   # its issuer
+                skip(36)
+            if u8():                   # the seed, once checked
+                skip(4)
         entries.append(entry)
     old = b'SQCH' + bytes([version]) + struct.pack('<I', count) + b''.join(entries)
     with open(path + '.tmp', 'wb') as f:

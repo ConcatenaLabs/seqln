@@ -39,6 +39,14 @@ u8 *sym_clock_seed_of(const tal_t *ctx, const struct channel *channel);
 bool sym_clock_funding_found(struct channel *channel,
 			     const struct bitcoin_tx *tx);
 
+/* Show the signer a settle-clock channel's funding transaction @tx, whose
+ * input @issuer issues its marker: a signer that holds a balance checks it
+ * before it signs a state that pays this side.  False if it refuses. */
+bool sym_clock_show_signer(struct lightningd *ld, const struct node_id *peer,
+			   u64 dbid, const struct bitcoin_tx *tx,
+			   const struct bitcoin_outpoint *funding,
+			   const struct bitcoin_outpoint *issuer);
+
 /* The marker of @channel, as an output asset (0x01 || id). */
 void sym_clock_marker_of(const struct channel *channel, u8 asset[33]);
 

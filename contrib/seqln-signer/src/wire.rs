@@ -57,6 +57,8 @@ pub mod msg {
     pub const HSMD_SIGN_SYM_KICKOFF: u16 = 69;
     pub const HSMD_SIGN_SYM_STATE: u16 = 70;
     pub const HSMD_SIGN_SYM_HTLC: u16 = 71;
+    pub const HSMD_SIGN_SYM_CLOCK_STATE: u16 = 72;
+    pub const HSMD_CHECK_SYM_CLOCK_FUNDING: u16 = 73;
     pub const HSMD_SIGN_SYM_LANES_STATE: u16 = 75;
     pub const HSMD_APPROVE_SYM_SWAP: u16 = 76;
     pub const HSMD_SIGN_MUTUAL_CLOSE_LANES_TX: u16 = 77;
@@ -94,6 +96,8 @@ pub mod msg {
     pub const HSMD_SIGN_TCOV_REPLY: u16 = 161;
     pub const HSMD_CREDIT_NOTE_REPLY: u16 = 167;
     pub const HSMD_SIGN_SYM_STATE_REPLY: u16 = 170;
+    pub const HSMD_SIGN_SYM_CLOCK_STATE_REPLY: u16 = 172;
+    pub const HSMD_CHECK_SYM_CLOCK_FUNDING_REPLY: u16 = 173;
     pub const HSMD_SIGN_SYM_LANES_STATE_REPLY: u16 = 175;
     pub const HSMD_APPROVE_SYM_SWAP_REPLY: u16 = 176;
     pub const HSMD_SIGN_MUTUAL_CLOSE_LANES_TX_REPLY: u16 = 177;
@@ -454,20 +458,27 @@ fn parse_elements_tx_span(d: &[u8]) -> Option<(ElementsTx, usize)> {
         p += 4;
         let is_issuance = (index & WALLY_TX_ISSUANCE_FLAG) != 0;
         let is_pegin = (index & WALLY_TX_PEGIN_FLAG) != 0;
+        let mut issuance = None;
         if is_issuance {
             // nonce(32) || entropy(32) || issuance_amount(value) || inflation_keys(value)
             // || Sequentia asset-denomination byte(1).
+            let start = p;
             p += 32 + 32;
             commit_field(d, &mut p, true)?;
             commit_field(d, &mut p, true)?;
             p += 1;
+            issuance = Some(d.get(start..p)?.to_vec());
         }
         let _ = is_pegin;
+        // The outpoint's own index, without the issuance and peg-in flags
+        // (the signature hashes take the outpoint as the node does).
+        let index = index & !(WALLY_TX_ISSUANCE_FLAG | WALLY_TX_PEGIN_FLAG);
         inputs.push(TxInput {
             txhash,
             index,
             sequence,
             is_issuance,
+            issuance,
         });
     }
 
@@ -566,6 +577,7 @@ fn parse_bitcoin_tx_span(d: &[u8]) -> Option<(ElementsTx, BitcoinSpans)> {
             index,
             sequence,
             is_issuance: false,
+            issuance: None,
         });
     }
 
@@ -698,7 +710,7 @@ pub fn read_bitcoin_tx(r: &mut Reader) -> Option<BitcoinTx> {
 /// its txid: SHA256d of the serialization without witnesses (Elements:
 /// version, a clear flag byte, inputs, outputs, locktime; Bitcoin: version,
 /// inputs, outputs, locktime).
-fn parse_tx_with_txid(lin: &[u8], network: Network) -> Option<(ElementsTx, [u8; 32])> {
+pub fn parse_tx_with_txid(lin: &[u8], network: Network) -> Option<(ElementsTx, [u8; 32])> {
     let mut ser = Vec::with_capacity(lin.len());
     ser.extend_from_slice(lin.get(0..4)?);
     let tx = match network {
@@ -751,13 +763,21 @@ pub fn unsigned_txid(tx: &ElementsTx) -> Option<[u8; 32]> {
     }
     varint(&mut ser, tx.inputs.len());
     for i in &tx.inputs {
-        if i.is_issuance {
-            return None;
-        }
+        // An issuance: the index carries its flag, and the issuance follows
+        // the sequence, as the chain serializes it.
+        let iss = match (&i.issuance, i.is_issuance) {
+            (Some(iss), true) if elements => Some(iss),
+            (None, false) => None,
+            _ => return None,
+        };
         ser.extend_from_slice(&i.txhash);
-        ser.extend_from_slice(&i.index.to_le_bytes());
+        let index = if iss.is_some() { i.index | WALLY_TX_ISSUANCE_FLAG } else { i.index };
+        ser.extend_from_slice(&index.to_le_bytes());
         ser.push(0x00); // empty scriptSig
         ser.extend_from_slice(&i.sequence.to_le_bytes());
+        if let Some(iss) = iss {
+            ser.extend_from_slice(iss);
+        }
     }
     varint(&mut ser, tx.outputs.len());
     for o in &tx.outputs {
@@ -1292,11 +1312,48 @@ pub fn reconstruct_elements_tx_from_pset(psbt: &[u8]) -> Option<ElementsTx> {
             any_required_locktime = true;
             max_required_locktime = max_required_locktime.max(v);
         }
+        // An Elements issuance (PSET_IN_ISSUANCE_*): its amount (0x00
+        // explicit, 0x01 a commitment) and token count (0x0a, 0x0b), each
+        // null when absent or zero, its blinding nonce (0x0c) and entropy
+        // (0x0d), zero when absent. A PSET carries no denomination: the
+        // transaction extracted from it carries 0, as libwally's does.
+        let issued = |explicit: u8, commit: u8| -> Option<Vec<u8>> {
+            if let Some(c) = map_pset(&m, commit) {
+                return Some(c.to_vec());
+            }
+            let v = map_pset(&m, explicit)?;
+            let n = u64::from_le_bytes(v.get(0..8)?.try_into().ok()?);
+            if n == 0 {
+                return None;
+            }
+            let mut e = vec![0x01];
+            e.extend_from_slice(&n.to_be_bytes());
+            Some(e)
+        };
+        let amount = issued(0x00, 0x01);
+        let keys = issued(0x0a, 0x0b);
+        let issuance = if amount.is_none() && keys.is_none() {
+            None
+        } else {
+            let mut b = Vec::with_capacity(32 + 32 + 9 + 9 + 1);
+            for t in [0x0c, 0x0d] {
+                match map_pset(&m, t) {
+                    Some(v) if v.len() == 32 => b.extend_from_slice(v),
+                    Some(_) => return None,
+                    None => b.extend_from_slice(&[0u8; 32]),
+                }
+            }
+            b.extend_from_slice(&amount.unwrap_or_else(|| vec![0x00]));
+            b.extend_from_slice(&keys.unwrap_or_else(|| vec![0x00]));
+            b.push(0x00);
+            Some(b)
+        };
         inputs.push(TxInput {
             txhash,
             index,
             sequence,
-            is_issuance: false,
+            is_issuance: issuance.is_some(),
+            issuance,
         });
     }
 

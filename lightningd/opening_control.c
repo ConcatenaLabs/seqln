@@ -1377,6 +1377,7 @@ static struct command_result *json_fundchannel_complete(struct command *cmd,
 	u32 *funding_txout_num = NULL;
 	struct funding_channel *fc;
 	bool *withhold;
+	struct bitcoin_tx *sym_funding_tx;
 
 	if (!param_check(cmd, buffer, params,
 			 p_req("id", param_node_id, &id),
@@ -1442,7 +1443,7 @@ static struct command_result *json_fundchannel_complete(struct command *cmd,
 						      &fc->factory_id->txid,
 						      fc->factory_id->n,
 						      fc->channel_type,
-						      fc->factory, NULL);
+						      fc->factory, NULL, NULL);
 		subd_send_msg(peer->uncommitted_channel->open_daemon,
 			      take(msg));
 		return command_still_pending(cmd);
@@ -1498,6 +1499,7 @@ static struct command_result *json_fundchannel_complete(struct command *cmd,
 
 	funding_txid = tal(cmd, struct bitcoin_txid);
 	psbt_txid(NULL, funding_psbt, funding_txid, NULL);
+	sym_funding_tx = NULL;
 
 	/* SEQUENTIA: a settle-clock channel's funding issues one atom of its
 	 * marker, no token, into the seed: checked before we sign it, as the
@@ -1530,6 +1532,9 @@ static struct command_result *json_fundchannel_complete(struct command *cmd,
 				    " funding anyway: %s", err);
 		else
 			fc->sym_seed_checked = true;
+		/* openingd shows it to the signer before it signs a state
+		 * that pays us. */
+		sym_funding_tx = tx;
 	}
 
 	/* Fun fact: our wire protocol only allows 16 bits for outnum.
@@ -1555,7 +1560,7 @@ static struct command_result *json_fundchannel_complete(struct command *cmd,
 						      funding_txid,
 						      *funding_txout_num,
 						      peer->uncommitted_channel->fc->channel_type,
-						      NULL, outnums);
+						      NULL, outnums, sym_funding_tx);
 	}
 	subd_send_msg(peer->uncommitted_channel->open_daemon, take(msg));
 	return command_still_pending(cmd);
