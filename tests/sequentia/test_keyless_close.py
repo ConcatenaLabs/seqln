@@ -134,6 +134,14 @@ def keyless_node(node_factory, directory, trace=False, pay_limit=TEST_PAY_LIMIT,
     device = Device(directory, port, dev_priv, host_pub, trace, pay_limit, pay_limits, close_to, rates)
     device.start()
     options = dict(node_opts.pop('options', {}), subdaemon='hsmd:' + PROXY)
+    # Every signature the node asks for waits on the device's link, so under
+    # load a request that signs (signpsbt, a withdrawal) can pass lightningd's
+    # five-second mark ("That's weird: Request signpsbt took 8062
+    # milliseconds" in CI): expected of a keyless node, as upstream allows it
+    # of a slow psbt.
+    slow = r"That's weird: Request \S+ took [0-9]+ milliseconds"
+    node_opts['broken_log'] = (node_opts['broken_log'] + '|' + slow
+                               if node_opts.get('broken_log') else slow)
     node = node_factory.get_node(start=False, may_fail=True, options=options, **node_opts)
     if not dev_fail:
         node.daemon.opts.pop('dev-fail-on-subdaemon-fail', None)
