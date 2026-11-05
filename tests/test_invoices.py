@@ -15,7 +15,8 @@ def test_invoice(node_factory, chainparams):
     l1, l2 = node_factory.line_graph(2, fundchannel=False, opts={'log-level': 'io'})
 
     addr1 = l2.rpc.newaddr('bech32')['bech32']
-    addr2 = '2MxqzNANJNAdMjHQq8ZLkwzooxAFiRzXvEz' if not chainparams['elements'] else 'XGx1E2JSTLZLmqYMAo3CGpsco85aS7so33'
+    # Sequentia shares Bitcoin's address prefixes; Liquid has its own.
+    addr2 = 'XGx1E2JSTLZLmqYMAo3CGpsco85aS7so33' if TEST_NETWORK == 'liquid-regtest' else '2MxqzNANJNAdMjHQq8ZLkwzooxAFiRzXvEz'
     before = int(time.time())
     inv = l1.rpc.invoice(123000, 'label', 'description', 3700, [addr1, addr2])
 
@@ -26,7 +27,7 @@ def test_invoice(node_factory, chainparams):
     after = int(time.time())
     b11 = l1.rpc.decode(inv['bolt11'])
     assert b11['type'] == 'bolt11 invoice'
-    assert b11['currency'] == chainparams['bip173_prefix']
+    assert b11['currency'] == chainparams['lightning_hrp']
     assert b11['created_at'] >= before
     assert b11['created_at'] <= after
     assert b11['payment_hash'] == inv['payment_hash']
@@ -52,7 +53,7 @@ def test_invoice(node_factory, chainparams):
     b11 = inv['bolt11']
     # Amount usually comes after currency (bcrt in our case),
     # but an any-amount invoices will have no amount
-    assert b11.startswith("ln" + chainparams['bip173_prefix'])
+    assert b11.startswith("ln" + chainparams['lightning_hrp'])
     # By bech32 rules, the last '1' digit is the separator
     # between the human-readable and data parts. We want
     # to match the "lnbcrt1" above with the '1' digit as the

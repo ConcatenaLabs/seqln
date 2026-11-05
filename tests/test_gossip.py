@@ -269,11 +269,7 @@ def test_announce_dns_without_port(node_factory, bitcoind):
     assert info['address'][0]['type'] == 'dns'
     assert info['address'][0]['address'] == 'example.com'
 
-    if TEST_NETWORK == 'regtest':
-        default_port = 19846
-    else:
-        assert TEST_NETWORK == 'liquid-regtest'
-        default_port = 20735
+    default_port = default_ln_port(TEST_NETWORK)
     assert info['address'][0]['port'] == default_port
 
 
@@ -1087,11 +1083,7 @@ def test_gossip_addresses(node_factory, bitcoind):
                            .format(l1.info['id']))
 
     nodes = l2.rpc.listnodes(l1.info['id'])['nodes']
-    if TEST_NETWORK == 'regtest':
-        default_port = 19846
-    else:
-        assert TEST_NETWORK == 'liquid-regtest'
-        default_port = 20735
+    default_port = default_ln_port(TEST_NETWORK)
 
     assert len(nodes) == 1 and nodes[0]['addresses'] == [
         {'type': 'ipv4', 'address': '127.0.0.1', 'port': 2},

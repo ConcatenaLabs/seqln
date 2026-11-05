@@ -23,4 +23,10 @@ def gettxout(plugin, **kwargs):
     return {}
 
 
+@plugin.method("getfeeexchangerates")
+def getfeeexchangerates(plugin, **kwargs):
+    time.sleep(1)
+    return {}
+
+
 plugin.run()

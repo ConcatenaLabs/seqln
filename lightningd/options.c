@@ -773,6 +773,21 @@ static char *opt_set_crash_timeout(const char *arg, struct lightningd *ld)
 	return NULL;
 }
 
+/* A display asset id (32-byte hex) as the 33-byte elements asset tag. */
+static char *opt_set_dev_invoice_asset(const char *arg, struct lightningd *ld)
+{
+	u8 id[32], *tag;
+
+	if (!hex_decode(arg, strlen(arg), id, sizeof(id)))
+		return "expected a 32-byte hex asset id";
+	tag = tal_arr(ld, u8, 33);
+	tag[0] = 0x01;
+	for (size_t i = 0; i < sizeof(id); i++)
+		tag[1 + i] = id[sizeof(id) - 1 - i];
+	ld->dev_invoice_asset = tag;
+	return NULL;
+}
+
 static void dev_register_opts(struct lightningd *ld)
 {
 	/* We might want to debug plugins, which are started before normal
@@ -789,6 +804,11 @@ static void dev_register_opts(struct lightningd *ld)
 		     opt_set_bool,
 		     &ld->plugins->dev_builtin_plugins_unimportant,
 		     "Make builtin plugins unimportant so you can plugin stop them.");
+	clnopt_witharg("--dev-invoice-asset", OPT_DEV,
+		       opt_set_dev_invoice_asset, NULL, ld,
+		       "On a Sequentia network, the asset of an invoice that names"
+		       " none and that no channel decides, made even with no"
+		       " channel in it (for tests written for a single-asset chain)");
 	clnopt_noarg("--dev-no-reconnect", OPT_DEV,
 		     opt_set_invbool,
 		     &ld->reconnect,
@@ -2132,5 +2152,6 @@ bool is_known_opt_cb_arg(char *(*cb_arg)(const char *, void *))
 		|| cb_arg == (void *)opt_force_bip32_seed
 		|| cb_arg == (void *)opt_force_channel_secrets
 		|| cb_arg == (void *)opt_force_tmp_channel_id
+		|| cb_arg == (void *)opt_set_dev_invoice_asset
 		|| cb_arg == (void *)opt_set_hsm_passphrase;
 }

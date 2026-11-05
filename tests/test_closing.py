@@ -1,4 +1,5 @@
 from fixtures import *  # noqa: F401,F403
+from pyln.testing.utils import ELEMENTS_NETWORKS
 from pyln.client import RpcError, Millisatoshi
 from shutil import copyfile
 from pyln.testing.utils import SLOW_MACHINE, VALGRIND
@@ -29,7 +30,14 @@ def test_closing_simple(node_factory, bitcoind, chainparams):
     l1, l2 = node_factory.line_graph(2, opts={'plugin': coin_mvt_plugin})
     chan = l1.get_channel_scid(l2)
     channel_id = first_channel_id(l1, l2)
-    fee = closing_fee(3750, 2) if not chainparams['elements'] else 4278
+    if not chainparams['elements']:
+        fee = closing_fee(3750, 2)
+    elif TEST_NETWORK == 'liquid-regtest':
+        fee = 4278
+    else:
+        # Sequentia rounds a fee up (common/amount.c amount_tx_fee): the same
+        # 1141-weight close at 3750/kw is 4278.75 sat.
+        fee = 4279
 
     l1.pay(l2, 200000000)
 
@@ -442,7 +450,7 @@ def closing_negotiation_step(node_factory, bitcoind, chainparams, opts):
     assert opts['expected_close_fee'] == fee_mempool
 
 
-@unittest.skipIf(TEST_NETWORK == 'liquid-regtest', "Different closing fees")
+@unittest.skipIf(TEST_NETWORK in ELEMENTS_NETWORKS, "Bitcoin closing fees: an elements close tx weighs more")
 def test_closing_negotiation_step_30pct(node_factory, bitcoind, chainparams):
     """Test that the closing fee negotiation step works, 30%"""
     opts = {}
@@ -457,7 +465,7 @@ def test_closing_negotiation_step_30pct(node_factory, bitcoind, chainparams):
     closing_negotiation_step(node_factory, bitcoind, chainparams, opts)
 
 
-@unittest.skipIf(TEST_NETWORK == 'liquid-regtest', "Different closing fees")
+@unittest.skipIf(TEST_NETWORK in ELEMENTS_NETWORKS, "Bitcoin closing fees: an elements close tx weighs more")
 def test_closing_negotiation_step_100pct(node_factory, bitcoind, chainparams):
     """Test that the closing fee negotiation step works, 100%"""
     opts = {}
@@ -477,7 +485,7 @@ def test_closing_negotiation_step_100pct(node_factory, bitcoind, chainparams):
     closing_negotiation_step(node_factory, bitcoind, chainparams, opts)
 
 
-@unittest.skipIf(TEST_NETWORK == 'liquid-regtest', "Different closing fees")
+@unittest.skipIf(TEST_NETWORK in ELEMENTS_NETWORKS, "Bitcoin closing fees: an elements close tx weighs more")
 def test_closing_negotiation_step_1sat(node_factory, bitcoind, chainparams):
     """Test that the closing fee negotiation step works, 1sat"""
     opts = {}
@@ -492,7 +500,7 @@ def test_closing_negotiation_step_1sat(node_factory, bitcoind, chainparams):
     closing_negotiation_step(node_factory, bitcoind, chainparams, opts)
 
 
-@unittest.skipIf(TEST_NETWORK == 'liquid-regtest', "Different closing fees")
+@unittest.skipIf(TEST_NETWORK in ELEMENTS_NETWORKS, "Bitcoin closing fees: an elements close tx weighs more")
 def test_closing_negotiation_step_700sat(node_factory, bitcoind, chainparams):
     """Test that the closing fee negotiation step works, 700sat"""
     opts = {}
@@ -3549,7 +3557,7 @@ def test_you_forgot_closed_channel_onchain(node_factory, bitcoind, executor):
     fut.result(TIMEOUT)
 
 
-@unittest.skipIf(TEST_NETWORK == 'liquid-regtest', "Uses regtest addresses")
+@unittest.skipIf(TEST_NETWORK in ELEMENTS_NETWORKS, "An elements chain refuses v1+ shutdown scripts (closing_control.c)")
 def test_segwit_anyshutdown(node_factory, bitcoind, executor):
     """Try a range of future segwit versions for shutdown"""
     l1, l2 = node_factory.line_graph(2, fundchannel=False)
@@ -3580,7 +3588,7 @@ def test_segwit_anyshutdown(node_factory, bitcoind, executor):
         wait_for(lambda: all([c['state'] == 'ONCHAIN' for c in l1.rpc.listpeerchannels()['channels']]))
 
 
-@unittest.skipIf(TEST_NETWORK == 'liquid-regtest', "Uses regtest addresses")
+@unittest.skipIf(TEST_NETWORK in ELEMENTS_NETWORKS, "An elements chain refuses v1+ shutdown scripts (closing_control.c)")
 def test_anysegwit_close_needs_feature(node_factory, bitcoind):
     """Rather than have peer reject our shutdown, we should refuse to shutdown toa v1+ address if they don't support it"""
     # L2 says "no option_shutdown_anysegwit"
@@ -3619,10 +3627,15 @@ def test_close_feerate_range(node_factory, bitcoind, chainparams):
     if not chainparams['elements']:
         l1_range = [151, 4500]
         l2_range = [1125, 1000000]
-    else:
+    elif TEST_NETWORK == 'liquid-regtest':
         # That fee output is a little chunky.
         l1_range = [221, 6577]
         l2_range = [1644, 1000000]
+    else:
+        # Liquid's figures, each rounded up as Sequentia rounds a fee
+        # (common/amount.c amount_tx_fee).
+        l1_range = [222, 6578]
+        l2_range = [1645, 1000000]
 
     l1.daemon.wait_for_log('Negotiating closing fee between {}sat and {}sat satoshi'.format(l1_range[0], l1_range[1]))
     l2.daemon.wait_for_log('Negotiating closing fee between {}sat and {}sat satoshi'.format(l2_range[0], l2_range[1]))
@@ -4145,7 +4158,7 @@ def test_onchain_p2tr_missed_txs(node_factory, bitcoind):
         assert len(l2.rpc.listfunds()['outputs']) == 1
 
 
-@unittest.skipIf(TEST_NETWORK == 'liquid-regtest', "Uses regtest addresses")
+@unittest.skipIf(TEST_NETWORK in ELEMENTS_NETWORKS, "An elements chain refuses v1+ shutdown scripts (closing_control.c)")
 def test_closing_no_anysegwit_retry(node_factory, bitcoind):
     """Sure, we reject the first time, but let them try again!"""
     # L2 says "no option_shutdown_anysegwit"

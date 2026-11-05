@@ -2,13 +2,14 @@ import base64
 from bitcoin.rpc import RawProxy
 from decimal import Decimal
 from fixtures import *  # noqa: F401,F403
+from pyln.testing.utils import ELEMENTS_NETWORKS
 from fixtures import LightningNode, TEST_NETWORK
 from pathlib import Path
 from pyln.client import RpcError, Millisatoshi
 from threading import Event
 from pyln.testing.utils import (
     TIMEOUT, VALGRIND, sync_blockheight, only_one,
-    wait_for, TailableProc, env, mine_funding_to_announce,
+    wait_for, TailableProc, env, mine_funding_to_announce, SEQUENTIA_NETWORKS,
 )
 from utils import (
     account_balance, scriptpubkey_addr, check_coin_moves, first_scid,
@@ -174,8 +175,7 @@ def test_bitcoin_pruned(node_factory, bitcoind):
         nonlocal fetched_peerblock
         if fetched_peerblock:
             fetched_peerblock = False
-            conf_file = os.path.join(bitcoind.bitcoin_dir, "bitcoin.conf")
-            brpc = RawProxy(btc_conf_file=conf_file)
+            brpc = RawProxy(btc_conf_file=bitcoind.conf_file)
             return {
                 "result": brpc._call(r["method"], *r["params"]),
                 "error": None,
@@ -566,7 +566,7 @@ def test_htlc_in_timeout(node_factory, bitcoind, executor):
     l2.daemon.wait_for_log('onchaind complete, forgetting peer')
 
 
-@unittest.skipIf(TEST_NETWORK == 'liquid-regtest', 'must be on bitcoin network')
+@unittest.skipIf(TEST_NETWORK in ELEMENTS_NETWORKS, 'must be on bitcoin network')
 def test_p2tr_funding(node_factory, chainparams):
     # Don't get any funds from previous runs.
     l1, l2 = node_factory.line_graph(2, opts={'random_hsm': True}, fundchannel=False)
@@ -590,7 +590,7 @@ def test_p2tr_funding(node_factory, chainparams):
     assert only_one(fundingtx['vin'])['txid'] == res['wallettxid']
 
 
-@unittest.skipIf(TEST_NETWORK == 'liquid-regtest', "P2TR not yet supported on Elements")
+@unittest.skipIf(TEST_NETWORK in ELEMENTS_NETWORKS, "P2TR not yet supported on Elements")
 def test_withdraw_misc(node_factory, bitcoind, chainparams):
     def dont_spend_outputs(n, txid):
         """Reserve both outputs (we assume there are two!) in case any our ours, so we don't spend change: wrecks accounting checks"""
@@ -1166,7 +1166,8 @@ def test_cli(node_factory):
     assert only_one(j['invoices'])['label'] == 'l"[]{}'
 
     # For those using shell scripts (you know who you are Rene), make sure we're maintaining whitespace
-    lines = [l for l in out.splitlines() if '"bolt11"' not in l and '"payment_hash"' not in l and '"expires_at"' not in l]
+    # (SeqLN lists the asset of an invoice made in a named one.)
+    lines = [l for l in out.splitlines() if '"bolt11"' not in l and '"payment_hash"' not in l and '"expires_at"' not in l and '"asset"' not in l]
     assert lines == ['{',
                      '   "invoices": [',
                      '      {',
@@ -1385,7 +1386,8 @@ def test_blockchaintrack(node_factory, bitcoind):
     """Check that we track the blockchain correctly across reorgs
     """
     l1 = node_factory.get_node(random_hsm=True)
-    addr = l1.rpc.newaddr(addresstype='all')['p2tr']
+    # An elements node gives no P2TR addresses (newaddr is bech32 only there).
+    addr = l1.rpc.newaddr(addresstype='all')['bech32' if TEST_NETWORK in ELEMENTS_NETWORKS else 'p2tr']
 
     ######################################################################
     # First failure scenario: rollback on startup doesn't work,
@@ -1422,7 +1424,16 @@ def test_blockchaintrack(node_factory, bitcoind):
     # Our funds got reorged out, we should not have any funds that are confirmed
     # NOTE: sendtoaddress() sets locktime=103 and the reorg at 102 invalidates that tx
     # and deletes it from mempool
-    assert [o for o in l1.rpc.listfunds()['outputs'] if o['status'] != "unconfirmed"] == []
+    confirmed = [o for o in l1.rpc.listfunds()['outputs'] if o['status'] != "unconfirmed"]
+    if TEST_NETWORK in SEQUENTIA_NETWORKS:
+        # sequentiad's send sets no such locktime, so the payment stays valid
+        # and is mined again on the new branch: the node follows it there.
+        for o in confirmed:
+            blockhash = bitcoind.rpc.getrawtransaction(o['txid'], True)['blockhash']
+            assert blockhash in hashes
+            assert o['blockheight'] == bitcoind.rpc.getblockheader(blockhash)['height']
+    else:
+        assert confirmed == []
 
 
 @pytest.mark.openchannel('v1')
@@ -1789,7 +1800,7 @@ def test_ipv4_and_ipv6(node_factory):
         assert int(bind[0]['port']) == port
 
 
-@unittest.skipIf(TEST_NETWORK == 'liquid-regtest', "Fees on elements are different")
+@unittest.skipIf(TEST_NETWORK in ELEMENTS_NETWORKS, "Fees on elements are different")
 @pytest.mark.parametrize("anchors", [False, True])
 def test_feerates(node_factory, anchors):
     opts = {'log-level': 'io',
@@ -2233,7 +2244,11 @@ def test_newaddr(node_factory, chainparams):
     both = l1.rpc.newaddr('all')
     assert 'p2sh-segwit' not in both
     assert both['bech32'].startswith(chainparams['bip173_prefix'])
-    assert both['p2tr'].startswith(chainparams['bip173_prefix'])
+    # An elements node gives no P2TR addresses (newaddr is bech32 only there).
+    if chainparams['elements']:
+        assert 'p2tr' not in both
+    else:
+        assert both['p2tr'].startswith(chainparams['bip173_prefix'])
 
 
 def test_bitcoind_fail_first(node_factory, bitcoind):
@@ -2258,7 +2273,7 @@ def test_bitcoind_fail_first(node_factory, bitcoind):
     assert l1.daemon.is_in_stderr('bad response to getrawblockbyheight')
 
 
-@unittest.skipIf(TEST_NETWORK == 'liquid-regtest', "Fees on elements are different")
+@unittest.skipIf(TEST_NETWORK in ELEMENTS_NETWORKS, "Fees on elements are different")
 @pytest.mark.parametrize("anchors", [False, True])
 def test_bitcoind_feerate_floor(node_factory, bitcoind, anchors):
     """Don't return a feerate less than minrelaytxfee/mempoolminfee."""
@@ -2571,7 +2586,7 @@ def test_signmessagewithkey(node_factory, chainparams):
     message = "a test message"
     addr_bech32 = l1.rpc.newaddr("bech32")["bech32"]
     addr_other = l2.rpc.newaddr("bech32")["bech32"]
-    if TEST_NETWORK != "liquid-regtest":
+    if TEST_NETWORK not in ELEMENTS_NETWORKS:
         # refuse to sign if the address is not a P2WPKH
         addr_p2tr = l1.rpc.newaddr("p2tr")["p2tr"]
         with pytest.raises(
@@ -3069,7 +3084,7 @@ def test_emergencyrecover_old_format_handling(node_factory, bitcoind):
     l1.stop()
 
 
-@unittest.skipIf(TEST_NETWORK == 'liquid-regtest', "Txid on elements is different")
+@unittest.skipIf(TEST_NETWORK in ELEMENTS_NETWORKS, "Txid on elements is different")
 @unittest.skipIf(os.getenv('TEST_DB_PROVIDER', 'sqlite3') != 'sqlite3', "deletes database, which is assumed sqlite3")
 def test_emergencyrecoverpenaltytxn(node_factory, bitcoind):
     """
@@ -4142,21 +4157,22 @@ def test_field_filter(node_factory, chainparams):
     l1, l2 = node_factory.get_nodes(2)
 
     addr1 = l1.rpc.newaddr('bech32')['bech32']
-    addr2 = '2MxqzNANJNAdMjHQq8ZLkwzooxAFiRzXvEz' if not chainparams['elements'] else 'XGx1E2JSTLZLmqYMAo3CGpsco85aS7so33'
+    # Sequentia shares Bitcoin's address prefixes; Liquid has its own.
+    addr2 = 'XGx1E2JSTLZLmqYMAo3CGpsco85aS7so33' if TEST_NETWORK == 'liquid-regtest' else '2MxqzNANJNAdMjHQq8ZLkwzooxAFiRzXvEz'
     inv = l1.rpc.invoice(123000, 'label', 'description', 3700, [addr1, addr2])
 
     # Simple case: single field
     dec = l1.rpc.call('decode', {'string': inv['bolt11']}, filter={"currency": True})
-    assert dec == {"currency": chainparams['bip173_prefix']}
+    assert dec == {"currency": chainparams['lightning_hrp']}
 
     # Use context manager:
     with l1.rpc.reply_filter({"currency": True}):
         dec = l1.rpc.decode(string=inv['bolt11'])
-    assert dec == {"currency": chainparams['bip173_prefix']}
+    assert dec == {"currency": chainparams['lightning_hrp']}
 
     # Two fields
     dec = l1.rpc.call('decode', {'string': inv['bolt11']}, filter={"currency": True, "payment_hash": True})
-    assert dec == {"currency": chainparams['bip173_prefix'],
+    assert dec == {"currency": chainparams['lightning_hrp'],
                    "payment_hash": inv['payment_hash']}
 
     # Nested fields
@@ -4164,7 +4180,7 @@ def test_field_filter(node_factory, chainparams):
                       filter={"currency": True,
                               "payment_hash": True,
                               "fallbacks": [{"type": True}]})
-    assert dec == {"currency": chainparams['bip173_prefix'],
+    assert dec == {"currency": chainparams['lightning_hrp'],
                    "payment_hash": inv['payment_hash'],
                    "fallbacks": [{"type": 'P2WPKH'}, {"type": 'P2SH'}]}
 
@@ -4183,7 +4199,7 @@ def test_field_filter(node_factory, chainparams):
     # C plugins implement filters!
     res = l1.rpc.call('decode', {'string': inv['bolt11']},
                       filter={"currency": True})
-    assert res == {"currency": chainparams['bip173_prefix']}
+    assert res == {"currency": chainparams['lightning_hrp']}
 
 
 def test_checkmessage_pubkey_not_found(node_factory):
@@ -4907,6 +4923,11 @@ def test_set_feerate_offset(node_factory, bitcoind):
     if 'anchors/even' in only_one(l1.rpc.listpeerchannels()['channels'])['channel_type']['names']:
         feerate = 3850
         min_feerate = 253
+    elif TEST_NETWORK in SEQUENTIA_NETWORKS:
+        # A Sequentia node's lowest commitment feerate is the relay floor,
+        # as an anchor channel's is (chaintopology.c peer_commitment_feerate_min).
+        feerate = 11100
+        min_feerate = 253
     else:
         feerate = 11100
         min_feerate = 1875
@@ -5081,7 +5102,7 @@ def test_badparam_discretion(node_factory):
     assert err.value.error['message'] == "rune: should be base64 string: invalid token '\"THIS IS NOT ACTUALLY A RUNE\"'"
 
 
-@unittest.skipIf(TEST_NETWORK == 'liquid-regtest', "P2TR not yet supported on Elements")
+@unittest.skipIf(TEST_NETWORK in ELEMENTS_NETWORKS, "P2TR not yet supported on Elements")
 def test_listaddresses(node_factory):
     """Test listaddresses command."""
     l1 = node_factory.get_node()

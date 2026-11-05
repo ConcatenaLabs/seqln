@@ -190,9 +190,13 @@ The same binary, database format, plugins, and RPC surface apply; see the upstre
 
 ## Testing
 
-- **Upstream suites** (Bitcoin regtest / liquid-regtest): `make check-units` for unit tests,
-  `make pytest` (or `uv run python -m pytest -v tests/`) for integration tests. See
+- **Upstream suites**: `make check-units` for unit tests, `make pytest` (or
+  `uv run python -m pytest -v tests/`) for integration tests on Bitcoin regtest. See
   [doc/contribute-to-core-lightning/testing.md](doc/contribute-to-core-lightning/testing.md).
+  The same integration tests run on a local Sequentia chain with `TEST_NETWORK=sequentia-regtest`
+  and the tools listed below; CI runs them on both networks. A test that cannot apply to
+  Sequentia says why in its skip, and one that meets a known defect there is marked as an
+  expected failure naming its issue.
 - **Sequentia network tests** (`tests/sequentia/test_*.py`): the same harness on a local
   Sequentia chain with anchored headers, a proof-of-stake committee and a Bitcoin Core regtest
   parent (`--network=sequentia-regtest`). They need `sequentiad`, `sequentia-cli` and a Bitcoin

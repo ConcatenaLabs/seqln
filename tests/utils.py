@@ -1,4 +1,4 @@
-from pyln.testing.utils import TEST_NETWORK, TIMEOUT, VALGRIND, DEPRECATED_APIS  # noqa: F401
+from pyln.testing.utils import TEST_NETWORK, TIMEOUT, VALGRIND, DEPRECATED_APIS, SEQUENTIA_NETWORKS  # noqa: F401
 from pyln.testing.utils import env, only_one, wait_for, write_config, TailableProc, sync_blockheight, wait_channel_quiescent, get_tx_p2wsh_outnum, mine_funding_to_announce, scid_to_int  # noqa: F401
 import bitstring
 from pyln.client import Millisatoshi
@@ -151,8 +151,8 @@ def check_coin_moves(n, account_id, expected_moves, chainparams):
             raise ValueError(f'node_id not: {mv}')
         if mv['timestamp'] <= 0:
             raise ValueError(f'timestamp invalid: {mv}')
-        if mv['coin_type'] != chainparams['bip173_prefix']:
-            raise ValueError(f'coin_type not {chainparams["bip173_prefix"]}: {mv}')
+        if mv['coin_type'] != chainparams['lightning_hrp']:
+            raise ValueError(f'coin_type not {chainparams["lightning_hrp"]}: {mv}')
         # chain moves should have blockheights
         if mv['type'] == 'chain_mvt' and mv['account_id'] != 'external' and 'blockheight' not in mv:
             raise ValueError(f'blockheight not set: {mv}')
@@ -474,6 +474,17 @@ def closing_fee(feerate, num_outputs):
     # Assumes p2tr outputs
     weight = 428 + (8 + 1 + 1 + 1 + 32) * 4 * num_outputs
     return (weight * feerate) // 1000
+
+
+def pay_refusal(xpay_refusal):
+    """What `pay` says when it cannot pay.
+
+    `pay` is xpay's on Bitcoin, which says why.  On a Sequentia network pay
+    keeps its own, asset-aware route search (plugins/xpay/xpay.c), which
+    refuses the same payments by running out of routes."""
+    if TEST_NETWORK in SEQUENTIA_NETWORKS:
+        return r'Ran out of routes to try'
+    return xpay_refusal
 
 
 def scriptpubkey_addr(scriptpubkey):

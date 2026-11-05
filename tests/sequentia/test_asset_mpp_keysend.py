@@ -150,7 +150,7 @@ def test_keysend_in_asset(node_factory, bitcoind):
         l1.rpc.call('keysend', {'destination': l3.info['id'], 'amount_msat': 7000,
                                 'asset': gold})
     assert len(l1.rpc.listsendpays()['payments']) == sendpays
+    # (The SILV payment's HTLCs may still be settling.)
     for n in (l1, l2, l3):
-        for c in n.rpc.listpeerchannels()['channels']:
-            assert c['htlcs'] == [], c
+        wait_for(lambda: all(c['htlcs'] == [] for c in n.rpc.listpeerchannels()['channels']))
     assert l2.rpc.listforwards(status='failed')['forwards'] == []

@@ -1,4 +1,5 @@
 from fixtures import *  # noqa: F401,F403
+from pyln.testing.utils import ELEMENTS_NETWORKS
 from fixtures import TEST_NETWORK
 from decimal import Decimal
 from pathlib import Path
@@ -13,7 +14,7 @@ from utils import (
     mine_funding_to_announce, first_scid,
     CHANNEL_SIZE
 )
-from pyln.testing.utils import VALGRIND, EXPERIMENTAL_DUAL_FUND, FUNDAMOUNT, RUST, SLOW_MACHINE
+from pyln.testing.utils import VALGRIND, EXPERIMENTAL_DUAL_FUND, FUNDAMOUNT, RUST, SLOW_MACHINE, SEQUENTIA_NETWORKS
 
 import os
 import pytest
@@ -1107,7 +1108,9 @@ def test_funding_all_too_much(node_factory):
 @pytest.mark.openchannel('v2')
 def test_funding_fail(node_factory, bitcoind):
     """Add some funds, fund a channel without enough funds"""
-    max_locktime = 2016
+    # max_htlc_cltv, 2016 by the spec; a Sequentia network scales it to its block cadence
+    # (bitcoin/chainparams.c chainparams_max_htlc_cltv).
+    max_locktime = 20160 if TEST_NETWORK in SEQUENTIA_NETWORKS else 2016
     l1 = node_factory.get_node()
     l2 = node_factory.get_node(options={'watchtime-blocks': max_locktime + 1})
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
@@ -2079,7 +2082,7 @@ def test_multifunding_wumbo(node_factory):
     l1.rpc.multifundchannel(destinations)
 
 
-@unittest.skipIf(TEST_NETWORK == 'liquid-regtest', "Fees on elements are different")
+@unittest.skipIf(TEST_NETWORK in ELEMENTS_NETWORKS, "Fees on elements are different")
 @pytest.mark.openchannel('v1')  # v2 the weight calculation is off by 3
 @pytest.mark.parametrize("anchors", [False, True])
 def test_multifunding_feerates(node_factory, bitcoind, anchors):
@@ -2506,6 +2509,12 @@ def test_fee_limits(node_factory, bitcoind):
 
     if 'anchors/even' in only_one(l1.rpc.listpeerchannels()['channels'])['channel_type']['names']:
         fee = 1255
+    elif TEST_NETWORK in SEQUENTIA_NETWORKS:
+        # How far l1's smoothed feerate has come down towards the floor when
+        # it sends update_fee depends on its fee polls during a start that
+        # rescans from block 1: take the rate it sent.
+        line = l1.daemon.wait_for_log(r'Setting REMOTE feerate to [0-9]+')
+        fee = int(re.search(r'Setting REMOTE feerate to ([0-9]+)', line).group(1))
     else:
         fee = 258
     l1.daemon.wait_for_log(f'Received WARNING .*: update_fee {fee} outside range 2000-75000')
@@ -2536,10 +2545,14 @@ def test_fee_limits(node_factory, bitcoind):
     bitcoind.generate_block(1)
     sync_blockheight(bitcoind, [l1, l2])
 
-    # Trying to open a channel with too low a fee-rate is denied
-    l1.rpc.connect(l4.info['id'], 'localhost', l4.port)
-    with pytest.raises(RpcError, match='They sent (ERROR|WARNING) .* feerate_per_kw .* below minimum'):
-        l1.fundchannel(l4, 10**6)
+    # Trying to open a channel with too low a fee-rate is denied.  (Not on
+    # Sequentia: there a node takes any commitment feerate from the relay
+    # floor up (chaintopology.c peer_commitment_feerate_min), and l4 kept
+    # the floor l1's rate is above.)
+    if TEST_NETWORK not in SEQUENTIA_NETWORKS:
+        l1.rpc.connect(l4.info['id'], 'localhost', l4.port)
+        with pytest.raises(RpcError, match='They sent (ERROR|WARNING) .* feerate_per_kw .* below minimum'):
+            l1.fundchannel(l4, 10**6)
 
     # Restore to normal.
     l1.stop()
@@ -3417,7 +3430,7 @@ def test_change_chaining(node_factory, bitcoind):
     l1.rpc.fundchannel(l3.info['id'], 10**7, minconf=0)
 
 
-@unittest.skipIf(TEST_NETWORK == 'liquid-regtest', "Fees on elements are different")
+@unittest.skipIf(TEST_NETWORK in ELEMENTS_NETWORKS, "Fees on elements are different")
 def test_feerate_spam(node_factory, chainparams):
     l1, l2 = node_factory.line_graph(2)
 

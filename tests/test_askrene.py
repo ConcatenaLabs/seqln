@@ -1,7 +1,7 @@
 from fixtures import *  # noqa: F401,F403
 from hashlib import sha256
 from pyln.client import RpcError
-from pyln.testing.utils import SLOW_MACHINE
+from pyln.testing.utils import SLOW_MACHINE, SEQUENTIA_NETWORKS
 from utils import (
     only_one, first_scid, first_scidd, GenChannel, generate_gossip_store,
     sync_blockheight, wait_for, TEST_NETWORK, TIMEOUT, mine_funding_to_announce
@@ -14,6 +14,12 @@ import time
 import tempfile
 import unittest
 from concurrent import futures as concurrent_futures
+
+
+# The most delay a route may carry (bitcoin/chainparams.c
+# chainparams_max_htlc_cltv): 2016 blocks, or on Sequentia two weeks of its
+# one-minute blocks.
+MAX_DELAY = 20160 if TEST_NETWORK in SEQUENTIA_NETWORKS else 2016
 
 
 def direction(src, dst):
@@ -693,7 +699,7 @@ def test_getroutes(node_factory):
                                              GenChannel(0, 2, capacity_sats=9000),
                                              GenChannel(1, 3, forward=GenChannel.Half(propfee=20000)),
                                              GenChannel(0, 2, capacity_sats=10000),
-                                             GenChannel(2, 4, forward=GenChannel.Half(delay=2000))])
+                                             GenChannel(2, 4, forward=GenChannel.Half(delay=MAX_DELAY - 16))])
 
     # Set up l1 with this as the gossip_store
     l1 = node_factory.get_node(gossip_store_file=gsfile.name)
@@ -986,7 +992,7 @@ def test_getroutes_auto_sourcefree(node_factory):
                                              GenChannel(0, 2, capacity_sats=9000),
                                              GenChannel(1, 3, forward=GenChannel.Half(propfee=20000)),
                                              GenChannel(0, 2, capacity_sats=10000),
-                                             GenChannel(2, 4, forward=GenChannel.Half(delay=2000))])
+                                             GenChannel(2, 4, forward=GenChannel.Half(delay=MAX_DELAY - 16))])
 
     # Set up l1 with this as the gossip_store
     l1 = node_factory.get_node(gossip_store_file=gsfile.name)
@@ -1125,14 +1131,14 @@ def test_getroutes_maxdelay(node_factory):
                                                                     'cltv_out': 99}]}]}
 
     # Excessive maxdelay parameter
-    with pytest.raises(RpcError, match="maximum delay allowed is 2016"):
+    with pytest.raises(RpcError, match=f"maximum delay allowed is {MAX_DELAY}"):
         l1.rpc.getroutes(source=nodemap[0],
                          destination=nodemap[1],
                          amount_msat=100000,
                          layers=[],
                          maxfee_msat=100,
                          final_cltv=99,
-                         maxdelay=2017)
+                         maxdelay=MAX_DELAY + 1)
 
 
 def test_getroutes_auto_localchans(node_factory):

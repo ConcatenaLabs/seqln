@@ -4,11 +4,11 @@ from hashlib import sha256
 from pathlib import Path
 from pyln.client import RpcError, Millisatoshi
 from pyln.proto.onion import TlvPayload
-from pyln.testing.utils import EXPERIMENTAL_DUAL_FUND, FUNDAMOUNT, scid_to_int
+from pyln.testing.utils import EXPERIMENTAL_DUAL_FUND, FUNDAMOUNT, scid_to_int, SEQUENTIA_NETWORKS
 from utils import (
     wait_for, only_one, sync_blockheight, TIMEOUT,
     mine_funding_to_announce, first_scid, serialize_payload_tlv, serialize_payload_final_tlv,
-    tu64_encode
+    tu64_encode, pay_refusal
 )
 import copy
 import os
@@ -168,7 +168,7 @@ def test_pay_exclude_node(node_factory, bitcoind):
 
     inv = l3.rpc.invoice(amount, "test1", 'description')['bolt11']
     # It should have eliminated route hint.
-    with pytest.raises(RpcError, match=r"Failed after 1 attempts. We got a weird error \(temporary_node_failure\) for the invoice's route hint \([0-9x]*/0\): disabling it for this payment. Then routing failed: We could not find a usable set of paths. All 1 channels to the destination are disabled."):
+    with pytest.raises(RpcError, match=pay_refusal(r"Failed after 1 attempts. We got a weird error \(temporary_node_failure\) for the invoice's route hint \([0-9x]*/0\): disabling it for this payment. Then routing failed: We could not find a usable set of paths. All 1 channels to the destination are disabled.")):
         l1.rpc.pay(inv)
 
     # Get a fresh invoice, but do it before other routes exist, so routehint
@@ -259,7 +259,10 @@ def test_pay_disconnect(node_factory, bitcoind):
     l1.set_feerates((10**6, 10**6, 10**6, 10**6), False)
 
     # Wait for l1 notice
-    if 'anchors/even' in only_one(l1.rpc.listpeerchannels()['channels'])['channel_type']['names']:
+    # (A Sequentia commitment's lowest feerate is the relay floor, as an
+    # anchor channel's is: chaintopology.c peer_commitment_feerate_min.)
+    if ('anchors/even' in only_one(l1.rpc.listpeerchannels()['channels'])['channel_type']['names']
+            or TEST_NETWORK in SEQUENTIA_NETWORKS):
         l1.daemon.wait_for_log(r'WARNING .*: update_fee \d+ outside range 253-75000')
     else:
         l1.daemon.wait_for_log(r'WARNING .*: update_fee \d+ outside range 1875-75000')
@@ -282,6 +285,8 @@ def test_pay_disconnect(node_factory, bitcoind):
     l1.daemon.wait_for_log('ONCHAIN')
 
 
+@pytest.mark.xfail(TEST_NETWORK in SEQUENTIA_NETWORKS, strict=True,
+                   reason="ConcatenaLabs/seqln#151: pay retries a route hint at its stale fee")
 def test_pay_error_update_fees(node_factory):
     """We should process an update inside a temporary_channel_failure"""
     l1, l2, l3 = node_factory.line_graph(3, fundchannel=True, wait_for_announce=True)
@@ -1849,10 +1854,13 @@ def test_pay_retry(node_factory, bitcoind, executor, chainparams):
     # It will try l1->l2->l3->l4->l5, which fails.
     # Finally, fails to find a route.
     inv = l5.rpc.invoice(10**8, 'test_retry2', 'test_retry2')['bolt11']
-    with pytest.raises(RpcError, match=r'Failed after [0-9]* attempts'):
+    with pytest.raises(RpcError, match=pay_refusal(r'Failed after [0-9]* attempts')):
         l1.dev_pay(inv, dev_use_shadow=False)
 
 
+@pytest.mark.xfail(TEST_NETWORK in SEQUENTIA_NETWORKS, strict=False,
+                   reason="ConcatenaLabs/seqln#152: listpays can show failed while pay retries"
+                   " (when the poll falls between two parts)")
 def test_pay_avoid_low_fee_chan(node_factory, bitcoind, executor, chainparams):
     """Make sure we're able to route around a low fee depleted channel """
 
@@ -2318,7 +2326,7 @@ def test_setchannel_routing(node_factory, bitcoind):
                          label='test_setchannel_1',
                          description='desc',
                          dev_routes=[])
-    with pytest.raises(RpcError, match=f'The shortest path is [0-9x]*->{scid}, but {scid}/0 exceeds htlc_maximum_msat ~4001792msat'):
+    with pytest.raises(RpcError, match=pay_refusal(f'The shortest path is [0-9x]*->{scid}, but {scid}/0 exceeds htlc_maximum_msat ~4001792msat')):
         l1.dev_pay(inv['bolt11'], dev_use_shadow=False)
 
     # 1337 + 4000000 * 137 / 1000000 = 1885
@@ -3437,7 +3445,7 @@ def test_excluded_adjacent_routehint(node_factory, bitcoind):
     wait_for(lambda: 'remote' in only_one(l1.rpc.listpeerchannels()['channels'])['updates'])
 
     # This will make it reject the routehint.
-    err = 'Failed: Could not find route without excessive cost'
+    err = pay_refusal('Failed: Could not find route without excessive cost')
     with pytest.raises(RpcError, match=err):
         l1.rpc.pay(bolt11=inv['bolt11'], maxfeepercent=0, exemptfee=0)
 
@@ -3799,9 +3807,16 @@ def test_pay_exemptfee(node_factory):
     )
 
     err = r'Could not find route without excessive cost'
+    if TEST_NETWORK in SEQUENTIA_NETWORKS:
+        # Sequentia keeps pay on its own, asset-aware route search rather
+        # than handing it to xpay (plugins/xpay/xpay.c): that one discards
+        # the route for its fee and runs out of routes.
+        err = r'Ran out of routes to try'
 
     with pytest.raises(RpcError, match=err):
         l1.dev_pay(l3.rpc.invoice(1, "lbl1", "desc")['bolt11'], dev_use_shadow=False)
+    if TEST_NETWORK in SEQUENTIA_NETWORKS:
+        l1.daemon.wait_for_log('Fee exceeds our fee budget: 5001msat > 5000msat')
 
     # If we tell our node that 5001msat is ok this should work
     l1.dev_pay(l3.rpc.invoice(1, "lbl2", "desc")['bolt11'], dev_use_shadow=False, exemptfee=5001)
@@ -4632,8 +4647,12 @@ def test_fetchinvoice(node_factory, bitcoind):
 
     l1.rpc.pay(inv1['invoice'])
 
-    # We can't pay the other one now.
-    with pytest.raises(RpcError, match="Destination said it doesn't know invoice: incorrect_or_unknown_payment_details"):
+    # We can't pay the other one now.  (Sequentia keeps pay on its own
+    # route search rather than xpay, which words the refusal its own way.)
+    refusal = ("Destination said it doesn't know invoice: incorrect_or_unknown_payment_details"
+               if TEST_NETWORK not in SEQUENTIA_NETWORKS
+               else "WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS")
+    with pytest.raises(RpcError, match=refusal):
         l1.rpc.pay(inv2['invoice'])
 
     # We can't reuse the offer, either.
@@ -5337,7 +5356,7 @@ def test_pay_bolt11_metadata(node_factory, chainparams):
     inv_with_metadata = subprocess.check_output(['devtools/bolt11-cli', 'encode',
                                                  # l2's private key (old_hsmsecret, WIF byte stripped)
                                                  '0c633a7c17c701a0980158f5483035e01fa8bd091b47fadf2e86e589a9f93fca',
-                                                 f"currency={chainparams['bip173_prefix']}",
+                                                 f"currency={chainparams['lightning_hrp']}",
                                                  f"p={inv['payment_hash']}",
                                                  f"s={inv['payment_secret']}",
                                                  "d=desc",
@@ -6016,6 +6035,9 @@ def test_offer_path_self(node_factory):
     l2.rpc.pay(inv)
 
     # We can also handle it if invoice has next hop specified by real scid, or alias.
+    # (Sequentia keeps pay on its own route search; the hop mapping below is
+    # xpay's, which it uses for this.)
+    pay = l2.rpc.xpay if TEST_NETWORK in SEQUENTIA_NETWORKS else l2.rpc.pay
     scid = only_one(l2.rpc.listpeerchannels(l3.info['id'])['channels'])['alias']['local']
 
     l3.stop()
@@ -6026,7 +6048,7 @@ def test_offer_path_self(node_factory):
     inv = l2.rpc.fetchinvoice(offer['bolt12'])['invoice']
 
     # And can pay it!
-    l2.rpc.pay(inv)
+    pay(inv)
 
     # It should have mapped the hop.
     l2.daemon.wait_for_log(f"injectpaymentonion: sending to channel {scid}")
@@ -6038,7 +6060,12 @@ def test_offer_selfpay(node_factory):
 
     offer = l1.rpc.offer(amount='2msat', description='test_offer_path_self')['bolt12']
     inv = l1.rpc.fetchinvoice(offer)['invoice']
-    l1.rpc.pay(inv)
+    # Sequentia keeps pay on its own route search, which pays only over a
+    # channel; xpay pays this node itself (plugins/xpay/xpay.c).
+    if TEST_NETWORK in SEQUENTIA_NETWORKS:
+        l1.rpc.xpay(inv)
+    else:
+        l1.rpc.pay(inv)
 
 
 def test_decryptencrypteddata(node_factory):

@@ -448,6 +448,44 @@ class SimpleBitcoinProxy:
         return f
 
 
+class SequentiaProxy(SimpleBitcoinProxy):
+    """A SimpleBitcoinProxy that names the fee asset the way a wallet does.
+
+    On Sequentia's open fee market every transaction names the asset its
+    fee is paid in, and `sequentiad` refuses a send that does not.  The
+    upstream tests call `sendtoaddress` and `sendmany` as on Bitcoin, so
+    this fills in the asset being sent (the policy asset unless the call
+    names one) as the fee asset, unless the call names a fee asset itself.
+    """
+    def __init__(self, btc_conf_file, fee_asset, *args, **kwargs):
+        SimpleBitcoinProxy.__init__(self, btc_conf_file, *args, **kwargs)
+        self.__fee_asset__ = fee_asset
+
+    def __getattr__(self, name):
+        f = SimpleBitcoinProxy.__getattr__(self, name)
+        # Position of the asset sent and of the fee asset in each call.
+        positions = {'sendtoaddress': (9, 12), 'sendmany': (8, 11)}
+        if name not in positions:
+            return f
+        asset_pos, fee_pos = positions[name]
+
+        def with_fee_asset(*args):
+            args = list(args) + [None] * (fee_pos + 1 - len(args))
+            if args[fee_pos] is None:
+                sent = args[asset_pos]
+                if isinstance(sent, dict):
+                    # sendmany's output_assets: one asset for every output.
+                    sent = set(sent.values())
+                    sent = sent.pop() if len(sent) == 1 else None
+                args[fee_pos] = sent or self.__fee_asset__
+            while len(args) > 2 and args[-1] is None:
+                args.pop()
+            return f(*args)
+
+        with_fee_asset.__name__ = name
+        return with_fee_asset
+
+
 class BitcoinD(TailableProc):
 
     def __init__(self, bitcoin_dir="/tmp/bitcoind-test", rpcport=None):
@@ -693,6 +731,13 @@ class ElementsD(BitcoinD):
 
 
 SEQUENTIA_NETWORKS = ('sequentia-regtest',)
+# Whether the running test is written for Sequentia (tests/sequentia sets it).
+# The upstream tests know one chain asset and the suite's short test
+# timelocks; on a Sequentia network the harness keeps both for them (see
+# LightningD and PrettyPrintingLightningRpc).  A test written for Sequentia
+# gets the network as it is run: its own timelock defaults, and no asset
+# named on its behalf.
+SEQUENTIA_NATIVE = False
 ELEMENTS_NETWORKS = ('liquid-regtest',) + SEQUENTIA_NETWORKS
 
 
@@ -792,11 +837,14 @@ class SequentiaD(BitcoinD):
         ] + ['-staker={}:1'.format(pub) for _, pub in self.STAKERS]
         write_config(self.conf_file, config, {'rpcport': self.rpcport},
                      section_name=self.CHAIN)
-        self.rpc = SimpleBitcoinProxy(btc_conf_file=self.conf_file)
+        self.rpc = SequentiaProxy(btc_conf_file=self.conf_file,
+                                  fee_asset=self.POLICY_ASSET)
         self.prefix = 'sequentiad'
 
     def start(self, wallet_file=None):
-        self.parent.start()
+        # A test may restart this node alone, leaving the parent running.
+        if getattr(self.parent, 'proc', None) is None or self.parent.proc.poll() is not None:
+            self.parent.start()
         self.mine_parent(1)
 
         TailableProc.start(self)
@@ -812,8 +860,12 @@ class SequentiaD(BitcoinD):
                              .format(genesis, policy, self.GENESIS, self.POLICY_ASSET))
 
         # A legacy wallet counts the anyone-can-spend pre-mine as its own.
-        self.rpc.createwallet("lightningd-tests", False, False, "", False, False)
-        self.rpc.rescanblockchain()
+        # A restart finds it already made.
+        try:
+            self.rpc.createwallet("lightningd-tests", False, False, "", False, False)
+            self.rpc.rescanblockchain()
+        except JSONRPCError:
+            self.rpc.loadwallet("lightningd-tests")
 
     def stop(self):
         try:
@@ -824,7 +876,11 @@ class SequentiaD(BitcoinD):
             except Exception:
                 self.parent.proc.kill()
             self.parent.proc.wait()
-            self.parent.cleanup_files()
+
+    def cleanup_files(self):
+        # Only once the test is over: stop() may be followed by start().
+        BitcoinD.cleanup_files(self)
+        self.parent.cleanup_files()
 
     def mine_parent(self, numblocks=1, spacing=None):
         """Mine parent-chain blocks.  With `spacing` (seconds), each block is
@@ -859,9 +915,11 @@ class SequentiaD(BitcoinD):
     def generate_block(self, numblocks=1, wait_for_mempool=0, to_addr=None,
                        needfeerate=None, advance_parent=None):
         """Produce `numblocks` committee-certified blocks.  `to_addr` is
-        ignored: a block's fees go to the leader that produced it."""
-        if needfeerate is not None:
-            raise NotImplementedError("needfeerate is not supported on {}".format(self.CHAIN))
+        ignored: a block's fees go to the leader that produced it.
+
+        With `needfeerate`, as on BitcoinD: if any transaction (with its
+        ancestors) pays at least that feerate, mine the mempool; otherwise
+        mine a block without any of it."""
         if wait_for_mempool:
             if isinstance(wait_for_mempool, str):
                 wait_for_mempool = [wait_for_mempool]
@@ -871,6 +929,25 @@ class SequentiaD(BitcoinD):
                 wait_for(lambda: len(self.rpc.getrawmempool()) >= wait_for_mempool)
         if advance_parent is None:
             advance_parent = self.advance_parent
+
+        if needfeerate is not None:
+            assert numblocks == 1
+            mempool = self.rpc.getrawmempool(True)
+            for txid, details in mempool.items():
+                feerate = float(details['fees']['ancestor']) * 100_000_000 / (float(details['ancestorsize']) * 4 / 1000)
+                if feerate >= needfeerate:
+                    return self.generate_block(1, advance_parent=advance_parent)
+                print(f"Feerate {feerate} for {txid} below {needfeerate}")
+            # generateposblock takes no transaction list: hold every
+            # transaction back by its priority for this one block.
+            hold = 10**8
+            for txid in mempool:
+                self.rpc.prioritisetransaction(txid, None, -hold)
+            try:
+                return self.generate_block(1, advance_parent=advance_parent)
+            finally:
+                for txid in mempool:
+                    self.rpc.prioritisetransaction(txid, None, hold)
 
         hashes = []
         for _ in range(numblocks):
@@ -973,12 +1050,22 @@ class LightningD(TailableProc):
         for k, v in opts.items():
             self.opts[k] = v
 
-        # A Sequentia network has its own timelock and rescan defaults,
-        # sized for its block cadence and for reorgs that follow the Bitcoin
-        # anchor: test what a node really runs with.
-        if TEST_NETWORK in SEQUENTIA_NETWORKS:
+        # A Sequentia network has its own timelock defaults, sized for its
+        # block cadence, and its own rescan default: the chain root is never
+        # pinned, so a reorg that follows the Bitcoin anchor, of any depth,
+        # is never fatal.  The upstream tests run with the suite's short test
+        # values on every chain (on Bitcoin too they are far from the
+        # network's defaults); a test written for Sequentia
+        # (SEQUENTIA_NATIVE) gets the network's own.
+        if TEST_NETWORK in SEQUENTIA_NETWORKS and SEQUENTIA_NATIVE:
             for k in ('cltv-delta', 'cltv-final', 'watchtime-blocks', 'rescan'):
                 del self.opts[k]
+        # A Sequentia node refuses an invoice that names no asset when no
+        # channel decides it (no asset is privileged, so none is assumed),
+        # and one no channel could pay.  The upstream tests know only the
+        # chain's one asset and upstream's invoices, so name it for them.
+        if TEST_NETWORK in SEQUENTIA_NETWORKS and not SEQUENTIA_NATIVE:
+            self.opts['dev-invoice-asset'] = SequentiaD.POLICY_ASSET
 
         if not os.path.exists(os.path.join(lightning_dir, TEST_NETWORK)):
             os.makedirs(os.path.join(lightning_dir, TEST_NETWORK))
@@ -1634,10 +1721,12 @@ class LightningNode(object):
         scid = [c['short_channel_id'] for c in self.rpc.listpeerchannels(dst_id)['channels']
                 if c['state'] == 'CHANNELD_NORMAL'][0]
 
+        # The payee's final CLTV: 5 on the test config, a network's own
+        # default where the harness leaves it (Sequentia).
         routestep = {
             'amount_msat': amt,
             'id': dst_id,
-            'delay': 5,
+            'delay': self.rpc.decode(inv['bolt11'])['min_final_cltv_expiry'],
             'channel': scid
         }
 

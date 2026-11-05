@@ -1215,7 +1215,21 @@ produces, transparent addresses by default, no block subsidy, and a fee whitelis
 the policy asset at par until a test lists more. `generate_block` mines one parent block before
 each Sequentia block (pass `advance_parent=False` to hold the parent still);
 `generate_uncertified_block` produces a block below quorum once `mine_parent(spacing=600)` has
-opened the escaping stall. Lightning nodes run the network's own timelock and `rescan` defaults.
+opened the escaping stall. The tests in `tests/sequentia/` set `SEQUENTIA_NATIVE`
+(`tests/sequentia/conftest.py`), so their Lightning nodes run the network's own timelock and
+`rescan` defaults and the harness names nothing on their behalf.
+
+The upstream tests in `tests/` run on the same chain (CI runs them there as well as on Bitcoin
+regtest). For them the harness keeps what they were written against: the suite's short test
+timelocks (`cltv-delta`, `cltv-final`, `watchtime-blocks`) and its one-block `rescan`, which are
+far from Bitcoin's own defaults too; the policy asset as the fee asset of `sendtoaddress` and `sendmany`, the asset being
+sent, since every Sequentia transaction names its fee asset; and `--dev-invoice-asset` set to the
+policy asset, so that an invoice naming no asset, which no channel decides, is in that asset and
+is made even with no channel in it, as upstream makes any invoice (a node otherwise refuses it:
+no asset is assumed). `devtools/bolt11-cli encode` takes the asset as `a=<id>`. A test that cannot apply to Sequentia says why in its skip (no P2TR
+or v1+ shutdown scripts on an elements chain; a coinbase cannot be mined to a node's address on a
+staked chain; Bitcoin-specific fee figures), and one that meets a known SeqLN defect there is an
+expected failure (`strict`) naming its issue.
 The tests cover an asset channel opened, paid over and mutually closed, the anchor-burial gate,
 the certified-frontier clamp, a Bitcoin reorg unwinding Sequentia blocks under a running node,
 the network defaults, the output a peer's commitment pays this node listed and spent in the

@@ -4,7 +4,7 @@ from pyln.client import RpcError, Millisatoshi
 from utils import (
     only_one, wait_for, sync_blockheight, first_channel_id, calc_lease_fee, check_coin_moves
 )
-from pyln.testing.utils import FUNDAMOUNT
+from pyln.testing.utils import FUNDAMOUNT, SEQUENTIA_NETWORKS
 
 from pathlib import Path
 import pytest
@@ -1695,7 +1695,10 @@ def test_zeroconf_public(bitcoind, node_factory, chainparams):
     assert('short_channel_id' not in l2chan)
 
     # Channel is "proposed"
-    chan_val = 993888000 if chainparams['elements'] else 970073000
+    # (Sequentia rounds a fee up, common/amount.c amount_tx_fee: one sat less.)
+    chan_val = (970073000 if not chainparams['elements']
+                else 993887000 if TEST_NETWORK in SEQUENTIA_NETWORKS
+                else 993888000)
     l1_mvts = [
         {'type': 'chain_mvt', 'credit_msat': chan_val, 'debit_msat': 0, 'tags': ['channel_proposed', 'opener']},
         {'type': 'channel_mvt', 'credit_msat': 0, 'debit_msat': 20000000, 'tags': ['pushed'], 'fees_msat': '0msat'},
@@ -2184,7 +2187,14 @@ def test_zeroreserve_mixed(node_factory, bitcoind):
     l1.connect(l2)
     l3.connect(l1)
 
-    l1.rpc.fundchannel(l2.info['id'], 10**6, reserve='0sat')
+    if TEST_NETWORK in SEQUENTIA_NETWORKS:
+        # A Sequentia node that allows no dust reserve keeps its dust limit
+        # at or below the reserve asked of it, lowering it only so far
+        # (openingd.c), so l2 refuses l1's zero reserve.
+        with pytest.raises(RpcError, match=r'channel_reserve_satoshis 0sat is below our dust limit'):
+            l1.rpc.fundchannel(l2.info['id'], 10**6, reserve='0sat')
+    else:
+        l1.rpc.fundchannel(l2.info['id'], 10**6, reserve='0sat')
     l3.rpc.fundchannel(l1.info['id'], 10**6)
 
 
@@ -2235,6 +2245,9 @@ def test_zeroreserve_alldust(node_factory):
     l1.rpc.fundchannel(l2.info['id'], minfunding + 1)
 
 
+@unittest.skipIf(TEST_NETWORK in SEQUENTIA_NETWORKS,
+                 "Sequentia's blocks come from its staking committee and pay no"
+                 " subsidy: there is no coinbase to mine to a node's address")
 def test_coinbase_unspendable(node_factory, bitcoind):
     """ A node should not be able to spend a coinbase output
         before it's mature """

@@ -92,9 +92,12 @@ The device signer has its own workspace: `cargo test` in `contrib/seqln-signer/`
 
 **CI (`.github/workflows/ci.yaml`) is upstream CLN's workflow.** It runs on every pull request,
 on every push to `sequentia-stable`, and by hand on any branch
-(`gh workflow run ci.yaml --ref <branch>`). Its integration tests run on Bitcoin regtest, so
-nothing in CI tests anything Sequentia-specific: whatever you do not run locally is not run at
-all.
+(`gh workflow run ci.yaml --ref <branch>`). Its first integration jobs run the whole of `tests/`,
+`tests/sequentia/` included, on both Bitcoin regtest and Sequentia regtest (`sequentiad` from the
+testnet's download page, pinned by version and checksum in `.github/scripts/install-bitcoind.sh`;
+the device signer built in the job). The valgrind, sanitizer, postgres, dual-fund and Liquid jobs
+run on Bitcoin regtest or Liquid only. How the harness runs upstream tests on Sequentia, and how a
+test that does not apply there says so: `doc/sequentia-fork.md`, section 10.
 
 ## One binary, not two
 

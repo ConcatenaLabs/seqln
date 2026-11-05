@@ -10,15 +10,16 @@ plugin = Plugin()
 
 
 network = os.environ.get("TEST_NETWORK", "regtest")
-cli = "bitcoin-cli" if network == "regtest" else "elements-cli"
+cli = {"regtest": ["bitcoin-cli"],
+       "sequentia-regtest": ["sequentia-cli", "-chain=sequentia-regtest"]}.get(network, ["elements-cli"])
 
 
 def bcli(plugin, cmd):
-    ret = subprocess.run([cli,
-                          '-datadir={}'.format(plugin.get_option("bitcoin-datadir")),
-                          '-rpcuser={}'.format(plugin.get_option("bitcoin-rpcuser")),
-                          '-rpcpassword={}'.format(plugin.get_option("bitcoin-rpcpassword")),
-                          '-rpcport={}'.format(plugin.get_option("bitcoin-rpcport"))]
+    ret = subprocess.run(cli
+                         + ['-datadir={}'.format(plugin.get_option("bitcoin-datadir")),
+                            '-rpcuser={}'.format(plugin.get_option("bitcoin-rpcuser")),
+                            '-rpcpassword={}'.format(plugin.get_option("bitcoin-rpcpassword")),
+                            '-rpcport={}'.format(plugin.get_option("bitcoin-rpcport"))]
                          + cmd, stdout=subprocess.PIPE)
     if ret.returncode != 0:
         return None
@@ -84,6 +85,17 @@ def getutxout(plugin, txid, vout, *kwargs):
     txout = json.loads(txoutstr)
     return {"amount": txout['value'],
             "script": txout['scriptPubKey']['hex']}
+
+
+@plugin.method("getfeeexchangerates")
+def getfeeexchangerates(plugin, **kwargs):
+    """The node's fee whitelist, its labels resolved to asset ids, as bcli
+    gives it (lightningd asks for it on an elements chain only)."""
+    rates = bcli(plugin, ["getfeeexchangerates"])
+    if rates is None:
+        return {"rates": {}}
+    labels = json.loads(bcli(plugin, ["dumpassetlabels"]) or "{}")
+    return {"rates": {labels.get(k, k): v for k, v in json.loads(rates).items()}}
 
 
 plugin.add_option("bitcoin-rpcuser", '', '')
