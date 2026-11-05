@@ -309,6 +309,8 @@ struct channel_type *channel_desired_type(const tal_t *ctx,
 		return channel_type_seq_symmetric_factory(ctx);
 	if (channel_has(channel, OPT_SEQ_SYMMETRIC_LANES))
 		return channel_type_seq_symmetric_lanes(ctx);
+	if (channel_has(channel, OPT_SEQ_SYMMETRIC_CLOCK))
+		return channel_type_seq_symmetric_clock(ctx);
 	if (channel_has(channel, OPT_SEQ_SYMMETRIC))
 		return channel_type_seq_symmetric(ctx);
 	/* SEQUENTIA: nor the taproot-covenant type, whose outputs no other

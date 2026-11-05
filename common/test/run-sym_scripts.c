@@ -36,6 +36,121 @@ static u8 *unhex(const tal_t *ctx, const char *h)
 	return b;
 }
 
+/* A settle-clock funding, and the ways one can be wrong. */
+struct clock_funding {
+	bool issue;		/* input 0 carries an issuance */
+	bool other_issuer;	/* input 0 spends another output of the issuer's tx */
+	u64 atoms;		/* issued, and paid to the seed */
+	u64 token;		/* reissuance tokens, 0 for a null count */
+	bool contract;		/* a contract hash (entropy) */
+	bool nonce;		/* a blinding nonce: a reissuance */
+	bool blinded;		/* the issued amount is a commitment */
+	bool hidden_marker;	/* the seed's asset is a commitment */
+	u64 cap;		/* the funding output's value */
+	const u8 *seed_spk;
+};
+
+static void explicit_val(u8 v[9], u64 n)
+{
+	v[0] = 0x01;
+	for (size_t i = 0; i < 8; i++)
+		v[8 - i] = n >> (8 * i);
+}
+
+/* Input 0 spends @issuer, input 1 another coin; output 0 the funding,
+ * output 1 the marker, output 2 change. */
+static struct bitcoin_tx *clock_funding_tx(const tal_t *ctx,
+					   const struct clock_funding *f,
+					   const struct bitcoin_outpoint *issuer,
+					   const u8 *funding_spk,
+					   const u8 asset[33],
+					   const u8 marker[32])
+{
+	struct bitcoin_tx *tx = bitcoin_tx(ctx, chainparams, 2, 3, 0);
+	u8 zero[32], one[32], amount[33], token[9], value[9], masset[33];
+	u8 other[32];
+
+	memset(zero, 0, sizeof(zero));
+	memset(one, 1, sizeof(one));
+	memset(other, 7, sizeof(other));
+	explicit_val(amount, f->atoms);
+	if (f->blinded) {
+		amount[0] = 0x08;
+		memset(amount + 1, 2, 32);
+	}
+	explicit_val(token, f->token);
+	tal_wally_start();
+	for (size_t i = 0; i < 2; i++) {
+		bool issues = f->issue && i == 0;
+		const u8 *txid = i == 0 ? issuer->txid.shad.sha.u.u8 : other;
+		u32 n = i == 0 ? issuer->n + f->other_issuer : 5;
+
+		assert(wally_tx_add_elements_raw_input(
+			tx->wtx, txid, 32,
+			n | (issues ? WALLY_TX_ISSUANCE_FLAG : 0), 0xFFFFFFFD,
+			NULL, 0, NULL,
+			issues ? (f->nonce ? one : zero) : NULL, issues ? 32 : 0,
+			issues ? (f->contract ? one : zero) : NULL, issues ? 32 : 0,
+			issues ? amount : NULL,
+			issues ? (f->blinded ? 33 : 9) : 0,
+			issues && f->token ? token : NULL,
+			issues && f->token ? 9 : 0,
+			NULL, 0, NULL, 0, NULL, 0) == WALLY_OK);
+	}
+	explicit_val(value, f->cap);
+	assert(wally_tx_add_elements_raw_output(
+		tx->wtx, funding_spk, tal_bytelen(funding_spk), asset, 33,
+		value, 9, NULL, 0, NULL, 0, NULL, 0, 0) == WALLY_OK);
+	masset[0] = f->hidden_marker ? 0x0a : 0x01;
+	memcpy(masset + 1, marker, 32);
+	explicit_val(value, f->atoms);
+	assert(wally_tx_add_elements_raw_output(
+		tx->wtx, f->seed_spk, tal_bytelen(f->seed_spk), masset, 33,
+		value, 9, NULL, 0, NULL, 0, NULL, 0, 0) == WALLY_OK);
+	explicit_val(value, 12345);
+	assert(wally_tx_add_elements_raw_output(
+		tx->wtx, funding_spk, tal_bytelen(funding_spk), asset, 33,
+		value, 9, NULL, 0, NULL, 0, NULL, 0, 0) == WALLY_OK);
+	tal_wally_end(tx->wtx);
+	return tx;
+}
+
+/* NULL, or the start of the reason the check gives. */
+static void check_funding(const char *name, const struct sym_channel *sc,
+			  const struct clock_funding *f,
+			  const struct bitcoin_outpoint *issuer,
+			  const u8 *ws, const u8 marker[32],
+			  bool wrong_txid, const char *expect)
+{
+	u8 *fspk = scriptpubkey_p2wsh(tmpctx, ws);
+	struct bitcoin_tx *tx = clock_funding_tx(tmpctx, f, issuer, fspk,
+						 sc->asset, marker);
+	struct bitcoin_outpoint funding;
+	const char *err;
+	u32 seed_outnum = 99;
+
+	bitcoin_txid(tx, &funding.txid);
+	if (wrong_txid)
+		funding.txid.shad.sha.u.u8[0] ^= 1;
+	funding.n = 0;
+	err = sym_clock_check_funding(tmpctx, tx, &funding, fspk, sc->asset,
+				      amount_sat(V_M_CAP), issuer,
+				      sym_clock_seed(tmpctx, sc, issuer, ws,
+						     amount_sat(V_M_CAP)),
+				      &seed_outnum);
+	if (!expect) {
+		if (err) {
+			fprintf(stderr, "%s: refused: %s\n", name, err);
+			abort();
+		}
+		assert(seed_outnum == 1);
+	} else if (!err || !strstarts(err, expect)) {
+		fprintf(stderr, "%s: %s, expected \"%s\"\n", name,
+			err ? err : "accepted", expect);
+		abort();
+	}
+}
+
 static void privkey_of(const char *h, struct privkey *p)
 {
 	assert(hex_decode(h, strlen(h), p->secret.data, sizeof(p->secret.data)));
@@ -362,6 +477,54 @@ int main(int argc, char *argv[])
 		      V_M_SEED_SPK);
 		check("seed cb KICK", kick_cb, V_M_SEED_CB_KICK);
 		check("seed cb RETIRE", retire_cb, V_M_SEED_CB_RETIRE);
+
+		/* The funding: input 0 spends the issuer and issues one atom
+		 * with no token, output 1 pays it to the seed. */
+		{
+			const u8 *seed = unhex(tmpctx, V_M_SEED_SPK);
+			const struct clock_funding good = {
+				.issue = true, .atoms = 1, .cap = V_M_CAP,
+				.seed_spk = seed };
+			struct clock_funding f;
+
+			check_funding("clock funding", &sc, &good, &issuer, ws,
+				      marker, false, NULL);
+			f = good, f.atoms = 2;
+			check_funding("two atoms", &sc, &f, &issuer, ws, marker,
+				      false, "the issuer's input issues 2 atoms");
+			f = good, f.token = 1;
+			check_funding("a token", &sc, &f, &issuer, ws, marker,
+				      false, "the issuer's input issues a reissuance");
+			f = good, f.contract = true;
+			check_funding("a contract", &sc, &f, &issuer, ws, marker,
+				      false, "the issuer's input is not a new");
+			f = good, f.nonce = true;
+			check_funding("a reissuance", &sc, &f, &issuer, ws, marker,
+				      false, "the issuer's input is not a new");
+			f = good, f.blinded = true;
+			check_funding("blinded amount", &sc, &f, &issuer, ws,
+				      marker, false,
+				      "the issuer's input issues a blinded");
+			f = good, f.issue = false;
+			check_funding("no issuance", &sc, &f, &issuer, ws, marker,
+				      false, "the issuer's input issues nothing");
+			f = good, f.other_issuer = true;
+			check_funding("issuer unspent", &sc, &f, &issuer, ws,
+				      marker, false, "no input spends the issuer");
+			f = good, f.seed_spk = scriptpubkey_p2wsh(tmpctx, ws);
+			check_funding("marker elsewhere", &sc, &f, &issuer, ws,
+				      marker, false,
+				      "output 1 holds the marker but is not the seed");
+			f = good, f.hidden_marker = true;
+			check_funding("marker blinded", &sc, &f, &issuer, ws,
+				      marker, false, "0 outputs hold the marker");
+			f = good, f.cap = V_M_CAP - 1;
+			check_funding("capacity short", &sc, &f, &issuer, ws,
+				      marker, false,
+				      "output 0 is not the channel's funding");
+			check_funding("another transaction", &sc, &good, &issuer,
+				      ws, marker, true, "the transaction is");
+		}
 
 		/* The base type's leaves are untouched by it. */
 		check("UPD(7) again", sym_leaf_upd(tmpctx, &sc, 7), V_UPD_7);

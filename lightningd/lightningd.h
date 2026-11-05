@@ -384,6 +384,12 @@ struct lightningd {
 
 	/* Tell openingd/dualopend to accept all, allow sending any. */
 	bool dev_any_channel_type;
+	/* SEQUENTIA: offer the symmetric type's settle clock. */
+	bool dev_symmetric_clock;
+	/* SEQUENTIA: fund a settle-clock channel with a marker of two atoms,
+	 * which its own check only logs (for the accepter's refusal in
+	 * tests). */
+	bool dev_symmetric_clock_bad_funding;
 
 	/* Allow changing of shutdown output point even if dangerous */
 	bool dev_allow_shutdown_destination_change;

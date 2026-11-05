@@ -27,6 +27,7 @@
 #include <lightningd/peer_fd.h>
 #include <lightningd/plugin_hook.h>
 #include <lightningd/subd.h>
+#include <lightningd/sym_clock.h>
 #include <lightningd/sym_factory.h>
 #include <lightningd/sym_lanes.h>
 #include <lightningd/symmetric.h>
@@ -333,6 +334,21 @@ static void funding_started_success(struct funding_channel *fc)
 		if (fc->our_upfront_shutdown_script)
 			json_add_hex_talarr(response, "close_to", fc->our_upfront_shutdown_script);
 		json_add_channel_type(response, "channel_type", fc->channel_type);
+		/* SEQUENTIA: a settle-clock channel's funding also issues one
+		 * atom of the marker into the seed (lightningd/sym_clock.h). */
+		if (fc->sym_seed_scriptpubkey) {
+			u8 marker[32], display[32];
+
+			sym_marker_id(fc->sym_issuer, marker);
+			for (size_t i = 0; i < sizeof(marker); i++)
+				display[i] = marker[sizeof(marker) - 1 - i];
+			json_add_hex_talarr(response, "sym_seed_scriptpubkey",
+					    fc->sym_seed_scriptpubkey);
+			json_add_hex(response, "sym_marker", display,
+				     sizeof(display));
+			if (cmd->ld->dev_symmetric_clock_bad_funding)
+				json_add_u32(response, "dev_sym_marker_atoms", 2);
+		}
 		json_add_string(response, "warning_usage",
 				"The funding transaction MUST NOT be broadcast until after channel establishment has been successfully completed by running `fundchannel_complete`");
 	}
@@ -355,7 +371,8 @@ static void opening_funder_start_replied(struct subd *openingd, const u8 *resp,
 	if (!fromwire_openingd_funder_start_reply(fc, resp,
 						  &fc->funding_scriptpubkey,
 						  &supports_shutdown_script,
-						  &fc->channel_type)) {
+						  &fc->channel_type,
+						  &fc->sym_seed_scriptpubkey)) {
 		log_broken(fc->uc->log,
 			   "bad OPENING_FUNDER_REPLY %s",
 			   tal_hex(resp, resp));
@@ -364,6 +381,9 @@ static void opening_funder_start_replied(struct subd *openingd, const u8 *resp,
 					 tal_hex(fc->cmd, resp)));
 		goto failed;
 	}
+
+	if (tal_bytelen(fc->sym_seed_scriptpubkey) == 0)
+		fc->sym_seed_scriptpubkey = tal_free(fc->sym_seed_scriptpubkey);
 
 	/* If we're not using the upfront shutdown script, forget it */
 	if (!supports_shutdown_script)
@@ -493,6 +513,12 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 	/* SEQUENTIA: a channel of several assets (lightningd/sym_lanes.h). */
 	if (tal_count(lanes))
 		sym_lanes_attach(channel, lanes, lane_sigs, lane_local_sigs);
+	/* SEQUENTIA: a settle-clock channel's issuer and seed, before its
+	 * funding is watched (lightningd/sym_clock.h). */
+	if (fc->sym_issuer)
+		sym_clock_attach(channel, fc->sym_issuer,
+				 fc->sym_seed_checked ? &fc->sym_seed_outnum
+				 : NULL);
 
 	/* Watch for funding confirms */
 	channel_watch_funding(ld, channel);
@@ -547,6 +573,7 @@ static void opening_fundee_finished(struct subd *openingd,
 	struct sym_factory *factory;
 	struct sym_lane *lanes;
 	struct bitcoin_signature *lane_sigs, *lane_local_sigs;
+	struct bitcoin_outpoint *sym_issuer;
 
 	log_debug(uc->log, "Got opening_fundee_finish_response");
 
@@ -583,7 +610,8 @@ static void opening_fundee_finished(struct subd *openingd,
 				     &factory,
 				     &lanes,
 				     &lane_sigs,
-				     &lane_local_sigs)) {
+				     &lane_local_sigs,
+				     &sym_issuer)) {
 		log_broken(uc->log, "bad OPENING_FUNDEE_REPLY %s",
 			   tal_hex(reply, reply));
 		uncommitted_channel_disconnect(uc, LOG_BROKEN,
@@ -602,6 +630,11 @@ static void opening_fundee_finished(struct subd *openingd,
 	 * openingd did (sym_delay_ok). */
 	if (channel_type_has(type, OPT_SEQ_SYMMETRIC))
 		uc->our_config.to_self_delay = ld->config.symmetric_delay;
+
+	/* SEQUENTIA: a settle-clock channel locks in only on a mined funding
+	 * we checked, as openingd told the peer (lightningd/sym_clock.h). */
+	if (sym_issuer && uc->minimum_depth == 0)
+		uc->minimum_depth = 1;
 
 	/* SEQUENTIA: a factory's nonce stands where a funding txid would: we
 	 * take none that is the funding txid of a channel of ours, so a tag
@@ -660,6 +693,10 @@ static void opening_fundee_finished(struct subd *openingd,
 	/* SEQUENTIA: a channel of several assets (lightningd/sym_lanes.h). */
 	if (tal_count(lanes))
 		sym_lanes_attach(channel, lanes, lane_sigs, lane_local_sigs);
+	/* SEQUENTIA: a settle-clock channel's issuer: we check its funding
+	 * once mined, before it locks in (lightningd/sym_clock.h). */
+	if (sym_issuer)
+		sym_clock_attach(channel, sym_issuer, NULL);
 
 	channel_watch_funding(ld, channel);
 
@@ -1462,6 +1499,39 @@ static struct command_result *json_fundchannel_complete(struct command *cmd,
 	funding_txid = tal(cmd, struct bitcoin_txid);
 	psbt_txid(NULL, funding_psbt, funding_txid, NULL);
 
+	/* SEQUENTIA: a settle-clock channel's funding issues one atom of its
+	 * marker, no token, into the seed: checked before we sign it, as the
+	 * peer checks it once mined (lightningd/sym_clock.h). */
+	fc->sym_seed_checked = false;
+	if (fc->sym_seed_scriptpubkey) {
+		struct bitcoin_tx *tx = bitcoin_tx_with_psbt(tmpctx,
+							     funding_psbt);
+		struct bitcoin_outpoint funding;
+		const char *err;
+
+		if (!tx)
+			return command_fail(cmd, FUNDING_PSBT_INVALID,
+					    "Cannot build the funding"
+					    " transaction from the PSBT");
+		funding.txid = *funding_txid;
+		funding.n = *funding_txout_num;
+		err = sym_clock_check_funding(tmpctx, tx, &funding,
+					      fc->funding_scriptpubkey,
+					      fc->channel_asset,
+					      fc->funding_sats, fc->sym_issuer,
+					      fc->sym_seed_scriptpubkey,
+					      &fc->sym_seed_outnum);
+		if (err && !cmd->ld->dev_symmetric_clock_bad_funding)
+			return command_fail(cmd, FUNDING_PSBT_INVALID,
+					    "The settle clock's marker: %s",
+					    err);
+		if (err)
+			log_unusual(cmd->ld->log, "dev-symmetric-clock-bad-funding:"
+				    " funding anyway: %s", err);
+		else
+			fc->sym_seed_checked = true;
+	}
+
 	/* Fun fact: our wire protocol only allows 16 bits for outnum.
 	 * That is reflected in our encoding scheme for short_channel_id. */
 	if (*funding_txout_num > UINT16_MAX)
@@ -1686,6 +1756,9 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 	fc->factory_size = 0;
 	fc->factory = NULL;
 	fc->sym_lanes = NULL;
+	fc->sym_issuer = NULL;
+	fc->sym_seed_scriptpubkey = NULL;
+	fc->sym_seed_checked = false;
 
 	if (!param_check(fc->cmd, buffer, params,
 			 p_req("id", param_node_id, &id),
@@ -1702,8 +1775,28 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 			 p_opt("factory_slot", param_u32, &factory_slot),
 			 p_opt("factory_size", param_u32, &factory_size),
 			 p_opt("lanes", param_sym_lanes, &lanes),
+			 p_opt("sym_issuer", param_outpoint, &fc->sym_issuer),
 			 NULL))
 		return command_param_failed();
+
+	/* SEQUENTIA: a settle-clock channel's issuer, the funding input that
+	 * issues its marker (lightningd/sym_clock.h): the clock type needs
+	 * one, and nothing else takes one. */
+	if (fc->sym_issuer) {
+		fc->sym_issuer = tal_steal(fc, fc->sym_issuer);
+		if (ctype && !channel_type_has(ctype, OPT_SEQ_SYMMETRIC_CLOCK))
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "sym_issuer is for a settle-clock"
+					    " channel");
+		if (factory_nonce)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "A factory slot has no settle"
+					    " clock");
+	} else if (ctype && channel_type_has(ctype, OPT_SEQ_SYMMETRIC_CLOCK))
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "A settle-clock channel needs sym_issuer,"
+				    " the funding input that issues its"
+				    " marker");
 
 	/* SEQUENTIA: a slot of a factory (lightningd/sym_factory.h): all
 	 * three, a factory of at least two, the slot inside it. */
@@ -1925,8 +2018,23 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 		 * it (common/sym_scripts.h). */
 		else if (feature_negotiated(cmd->ld->our_features,
 					    peer->their_features,
-					    OPT_SEQ_SYMMETRIC))
-			fc->channel_type = channel_type_seq_symmetric(fc);
+					    OPT_SEQ_SYMMETRIC)) {
+			/* With its settle clock, when both offer it and the
+			 * funding names an issuer (lightningd/sym_clock.h). */
+			if (fc->sym_issuer
+			    && feature_negotiated(cmd->ld->our_features,
+						  peer->their_features,
+						  OPT_SEQ_SYMMETRIC_CLOCK))
+				fc->channel_type
+					= channel_type_seq_symmetric_clock(fc);
+			else
+				fc->channel_type
+					= channel_type_seq_symmetric(fc);
+		}
+		/* An issuer the chosen type does not use. */
+		if (!channel_type_has(fc->channel_type,
+				      OPT_SEQ_SYMMETRIC_CLOCK))
+			fc->sym_issuer = tal_free(fc->sym_issuer);
 	} else if (channel_type_has(fc->channel_type, OPT_SEQ_CREDIT)
 		   && !cmd->ld->credit_issuer)
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
@@ -1973,7 +2081,8 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 			fc->channel_type,
 			fc->channel_asset,
 			fc->factory_id,
-			fc->sym_lanes);
+			fc->sym_lanes,
+			fc->sym_issuer);
 
 	if (!topology_synced(cmd->ld->topology)) {
 		struct fundchannel_start_info *info

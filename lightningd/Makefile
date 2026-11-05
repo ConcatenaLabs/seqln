@@ -45,6 +45,7 @@ LIGHTNINGD_SRC :=				\
 	lightningd/routehint.c			\
 	lightningd/runes.c			\
 	lightningd/subd.c			\
+	lightningd/sym_clock.c			\
 	lightningd/sym_factory.c		\
 	lightningd/sym_lanes.c			\
 	lightningd/symmetric.c			\

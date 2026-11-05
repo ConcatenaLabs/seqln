@@ -103,7 +103,8 @@
                 "seq_credit/even",
                 "seq_symmetric/even",
                 "seq_symmetric_factory/even",
-                "seq_symmetric_lanes/even"
+                "seq_symmetric_lanes/even",
+                "seq_symmetric_clock/even"
               ],
               "description": [
                 "Name of feature bit."

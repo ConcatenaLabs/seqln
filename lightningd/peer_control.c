@@ -37,6 +37,7 @@
 #include <lightningd/peer_fd.h>
 #include <lightningd/peer_htlcs.h>
 #include <lightningd/plugin_hook.h>
+#include <lightningd/sym_clock.h>
 #include <lightningd/sym_factory.h>
 #include <lightningd/sym_lanes.h>
 #include <lightningd/symmetric.h>
@@ -2647,6 +2648,10 @@ static void channel_funding_found(struct lightningd *ld,
 			return;
 		}
 	}
+	/* SEQUENTIA: a settle-clock channel locks in only on a funding that
+	 * issues its marker into the seed (lightningd/sym_clock.h). */
+	if (!sym_clock_funding_found(channel, tx))
+		return;
 
 	/* Closes channel if it doesn't fit in an scid! */
 	if (depthcb_update_scid(channel, &channel->funding, loc)) {

@@ -2241,6 +2241,7 @@ message FundchannelStartRequest {
 	optional uint32 factory_size = 12;
 	optional uint32 factory_slot = 13;
 	repeated FundchannelStartLanes lanes = 14;
+	optional Outpoint sym_issuer = 15;
 }
 
 message FundchannelStartResponse {
@@ -2250,6 +2251,9 @@ message FundchannelStartResponse {
 	optional bytes close_to = 4;
 	string warning_usage = 5;
 	optional uint32 mindepth = 6;
+	optional uint32 dev_sym_marker_atoms = 7;
+	optional bytes sym_marker = 8;
+	optional bytes sym_seed_scriptpubkey = 9;
 }
 
 message FundchannelStartLanes {

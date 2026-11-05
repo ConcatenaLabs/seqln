@@ -222,6 +222,9 @@ struct ext_key *hsm_init(struct lightningd *ld)
 		feature_set_sub(ld->our_features,
 				feature_set_for_feature(tmpctx,
 							OPTIONAL_FEATURE(OPT_SEQ_SYMMETRIC_LANES)));
+		feature_set_sub(ld->our_features,
+				feature_set_for_feature(tmpctx,
+							OPTIONAL_FEATURE(OPT_SEQ_SYMMETRIC_CLOCK)));
 	}
 	/* SEQUENTIA: a lanes channel's states name their assets
 	 * (common/sym_lanes.h), which only hsmd_sign_sym_lanes_state signs; its

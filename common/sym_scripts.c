@@ -5,8 +5,11 @@
 #include <ccan/asort/asort.h>
 #include <ccan/crypto/sha256/sha256.h>
 #include <ccan/endian/endian.h>
+#include <ccan/mem/mem.h>
+#include <ccan/tal/str/str.h>
 #include <common/sym_scripts.h>
 #include <common/utils.h>
+#include <inttypes.h>
 #include <wally_core.h>
 #include <wally_script.h>
 #include <wally_transaction.h>
@@ -527,6 +530,121 @@ u8 *sym_seed_spk(const tal_t *ctx, const struct sym_channel *sc,
 	if (retire_cb)
 		*retire_cb = tal_steal(ctx, *retire_cb);
 	return spk;
+}
+
+/* An explicit confidential value (0x01 || 8 bytes big-endian). */
+static bool explicit_value(const u8 *v, size_t len, u64 *out)
+{
+	if (len != 9 || v[0] != 0x01)
+		return false;
+	*out = 0;
+	for (size_t i = 1; i < 9; i++)
+		*out = (*out << 8) | v[i];
+	return true;
+}
+
+static bool all_zero(const u8 *p, size_t len)
+{
+	for (size_t i = 0; i < len; i++)
+		if (p[i])
+			return false;
+	return true;
+}
+
+u8 *sym_clock_seed(const tal_t *ctx, const struct sym_channel *sc,
+		   const struct bitcoin_outpoint *issuer,
+		   const u8 *funding_wscript, struct amount_sat capacity)
+{
+	struct sym_channel withclock = *sc;
+	u8 marker[32];
+
+	sym_marker_id(issuer, marker);
+	sym_channel_set_clock(&withclock, marker, funding_wscript, capacity);
+	return sym_seed_spk(ctx, &withclock, NULL, NULL);
+}
+
+const char *sym_clock_check_funding(const tal_t *ctx,
+				    const struct bitcoin_tx *tx,
+				    const struct bitcoin_outpoint *funding,
+				    const u8 *funding_spk, const u8 asset[33],
+				    struct amount_sat capacity,
+				    const struct bitcoin_outpoint *issuer,
+				    const u8 *seed_spk, u32 *seed_outnum)
+{
+	struct bitcoin_txid txid;
+	const struct wally_tx_input *in = NULL;
+	const struct wally_tx_output *fo;
+	struct amount_asset a;
+	u8 marker[32];
+	size_t seeds = 0;
+	u64 v;
+
+	bitcoin_txid(tx, &txid);
+	if (!bitcoin_txid_eq(&txid, &funding->txid))
+		return tal_fmt(ctx, "the transaction is %s, not the funding %s",
+			       fmt_bitcoin_txid(tmpctx, &txid),
+			       fmt_bitcoin_txid(tmpctx, &funding->txid));
+	if (funding->n >= tx->wtx->num_outputs)
+		return tal_fmt(ctx, "it has no output %u", funding->n);
+	fo = &tx->wtx->outputs[funding->n];
+	a = wally_tx_output_get_amount(fo);
+	if (!memeq(fo->script, fo->script_len, funding_spk,
+		   tal_bytelen(funding_spk))
+	    || !amount_asset_is(&a, asset)
+	    || a.value != capacity.satoshis) /* Raw: an explicit value */
+		return tal_fmt(ctx, "output %u is not the channel's funding",
+			       funding->n);
+
+	/* The issuer's input: a new issuance (no blinding nonce, no contract)
+	 * of one explicit atom, and a null token count. */
+	for (size_t i = 0; i < tx->wtx->num_inputs; i++) {
+		const struct wally_tx_input *t = &tx->wtx->inputs[i];
+
+		if (t->index == issuer->n
+		    && memeq(t->txhash, sizeof(t->txhash),
+			     &issuer->txid, sizeof(issuer->txid)))
+			in = t;
+	}
+	if (!in)
+		return tal_fmt(ctx, "no input spends the issuer %s",
+			       fmt_bitcoin_outpoint(tmpctx, issuer));
+	if (!(in->features & WALLY_TX_IS_ISSUANCE))
+		return tal_fmt(ctx, "the issuer's input issues nothing");
+	if (!all_zero(in->blinding_nonce, sizeof(in->blinding_nonce))
+	    || !all_zero(in->entropy, sizeof(in->entropy)))
+		return tal_fmt(ctx, "the issuer's input is not a new issuance"
+			       " with no contract");
+	if (!explicit_value(in->issuance_amount, in->issuance_amount_len, &v))
+		return tal_fmt(ctx, "the issuer's input issues a blinded or"
+			       " null amount");
+	if (v != 1)
+		return tal_fmt(ctx, "the issuer's input issues %"PRIu64" atoms,"
+			       " not one", v);
+	if (in->inflation_keys_len > 1
+	    || (in->inflation_keys_len == 1 && in->inflation_keys[0]))
+		return tal_fmt(ctx, "the issuer's input issues a reissuance"
+			       " token");
+
+	/* That one atom pays the seed, explicitly. */
+	sym_marker_id(issuer, marker);
+	for (size_t i = 0; i < tx->wtx->num_outputs; i++) {
+		const struct wally_tx_output *o = &tx->wtx->outputs[i];
+
+		if (o->asset_len != 33 || o->asset[0] != 0x01
+		    || !memeq(o->asset + 1, 32, marker, 32))
+			continue;
+		if (!explicit_value(o->value, o->value_len, &v) || v != 1
+		    || !memeq(o->script, o->script_len, seed_spk,
+			      tal_bytelen(seed_spk)))
+			return tal_fmt(ctx, "output %zu holds the marker but is"
+				       " not the seed", i);
+		seeds++;
+		*seed_outnum = i;
+	}
+	if (seeds != 1)
+		return tal_fmt(ctx, "%zu outputs hold the marker in the clear,"
+			       " not one", seeds);
+	return NULL;
 }
 
 void sym_rebuild_state(const tal_t *ctx, const struct sym_channel *sc, s64 k,

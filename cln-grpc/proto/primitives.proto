@@ -134,6 +134,7 @@ enum ChannelTypeName {
   seq_symmetric_even = 8;
   seq_symmetric_factory_even = 9;
   seq_symmetric_lanes_even = 10;
+  seq_symmetric_clock_even = 11;
 }
 
 enum AutocleanSubsystem {

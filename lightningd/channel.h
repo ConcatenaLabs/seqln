@@ -242,6 +242,9 @@ struct channel {
 	/* A channel of several assets: its other lanes, our balance in each
 	 * and its swaps (lightningd/sym_lanes.h); NULL on every other. */
 	struct sym_lanes_info *sym_lanes;
+	/* A settle-clock channel's issuer and seed (lightningd/sym_clock.h),
+	 * or NULL. */
+	struct sym_clock_funding *sym_clock;
 
 	/* Watch we have on funding output. */
 	struct txowatch *funding_spend_watch;

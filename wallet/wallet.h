@@ -856,6 +856,10 @@ void wallet_sym_factory_load(struct wallet *w, struct channel *channel);
 void wallet_sym_lanes_save(struct wallet *w, const struct channel *channel);
 void wallet_sym_lanes_load(struct wallet *w, struct channel *channel);
 
+/* A settle-clock channel's issuer and seed (lightningd/sym_clock.h). */
+void wallet_sym_clock_save(struct wallet *w, const struct channel *channel);
+void wallet_sym_clock_load(struct wallet *w, struct channel *channel);
+
 /* SEQUENTIA: credit notes (lightningd/credit.h). */
 struct credit_note;
 /* Save @n for channel @chan_dbid, or add its preimage to the one saved. */

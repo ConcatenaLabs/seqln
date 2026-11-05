@@ -362,6 +362,7 @@ static void channel_set_default_asset(struct channel *channel)
 	channel->sym_factory = NULL;
 	channel->sym_factory_ko = NULL;
 	channel->sym_lanes = NULL;
+	channel->sym_clock = NULL;
 	if (chainparams->is_elements && chainparams->fee_asset_tag)
 		memcpy(channel->channel_asset, chainparams->fee_asset_tag,
 		       sizeof(channel->channel_asset));

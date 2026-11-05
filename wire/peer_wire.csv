@@ -129,6 +129,12 @@ tlvdata,open_channel_tlvs,asset_id,asset,byte,...
 # beside the channel's own, as its asset (33 bytes) and amount (u64).
 tlvtype,open_channel_tlvs,seq_lanes,48048
 tlvdata,open_channel_tlvs,seq_lanes,lanes,byte,...
+# SEQUENTIA: on a symmetric channel with the settle clock
+# (common/sym_scripts.h), the opener's input whose issuance in the
+# funding transaction makes the channel's marker.
+tlvtype,open_channel_tlvs,sym_issuer,48045
+tlvdata,open_channel_tlvs,sym_issuer,txid,sha256,
+tlvdata,open_channel_tlvs,sym_issuer,outnum,u32,
 msgtype,accept_channel,33
 msgdata,accept_channel,temporary_channel_id,byte,32
 msgdata,accept_channel,dust_limit_satoshis,u64,
