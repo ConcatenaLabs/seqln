@@ -210,6 +210,9 @@ def test_routehints_in_invoice_asset(node_factory, bitcoind):
     # Unannounced channels into l3, one per asset.
     open_channel(bitcoind, l1, l3, gold)
     open_channel(bitcoind, l2, l3, silv)
+    # Hints are drawn from listincoming, which lists a channel once the
+    # peer's update for it has arrived.
+    wait_for(lambda: len(l3.rpc.listincoming()['incoming']) == 2)
     chans = {c['channel_asset']: c for c in l3.rpc.listpeerchannels()['channels']}
     scids = [c['short_channel_id'] for c in chans.values()]
     # A hint names a channel by its short_channel_id or its alias.
