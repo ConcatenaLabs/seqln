@@ -1706,13 +1706,20 @@ def test_penalty_rbf_normal(node_factory, bitcoind, executor, chainparams, ancho
 
     # FIXME: Some of those RBFs may not be accepted by bitcoind, we don't bother with txid checks
 
-    # Now the non-censoring miners overpower the censoring miners.
-    bitcoind.generate_block(1, wait_for_mempool=2)
+    # Now the non-censoring miners overpower the censoring miners.  Both
+    # penalties are in the mempool by now, unless a block took them first:
+    # the censor goes away while l2 is still broadcasting one round's RBFs,
+    # and the "final RBF" lines then matched can be the rebroadcasts after
+    # that block.  Search the whole log for the resolutions for that reason.
+    def resolved():
+        return (l2.daemon.is_in_log('Resolved THEIR_REVOKED_UNILATERAL/DELAYED_CHEAT_OUTPUT_TO_THEM by our proposal OUR_PENALTY_TX')
+                and l2.daemon.is_in_log('Resolved THEIR_REVOKED_UNILATERAL/THEIR_HTLC by our proposal OUR_PENALTY_TX'))
+    wait_for(lambda: len(bitcoind.rpc.getrawmempool()) >= 2 or resolved())
+    bitcoind.generate_block(1)
     sync_blockheight(bitcoind, [l2])
 
     # And l2 should consider it resolved now.
-    l2.daemon.wait_for_log('Resolved THEIR_REVOKED_UNILATERAL/DELAYED_CHEAT_OUTPUT_TO_THEM by our proposal OUR_PENALTY_TX')
-    l2.daemon.wait_for_log('Resolved THEIR_REVOKED_UNILATERAL/THEIR_HTLC by our proposal OUR_PENALTY_TX')
+    wait_for(resolved)
 
     # And l2 should consider it in its listfunds.
     assert(len(l2.rpc.listfunds()['outputs']) >= 1)

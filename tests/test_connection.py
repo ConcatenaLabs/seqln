@@ -20,6 +20,7 @@ import os
 import pytest
 import random
 import re
+import statistics
 import time
 import unittest
 import websocket
@@ -3900,10 +3901,16 @@ def test_multichan_stress(node_factory, executor, bitcoind):
     # Send a heap of payments, while reconnecting...
     fut = executor.submit(send_many_payments)
 
-    for _ in range(30):
+    # ...until the payments have seen a pass and a fail: on a loaded
+    # machine thirty reconnections can all fall between two payments, and
+    # with the peers connected from then on none would ever fail.
+    reconnects = 0
+    deadline = time.time() + TIMEOUT
+    while (reconnects < 30 or not fut.done()) and time.time() < deadline:
         l3.rpc.disconnect(l2.info['id'], force=True)
         time.sleep(0.1)
         l3.rpc.connect(l2.info['id'], 'localhost', l2.port)
+        reconnects += 1
     fut.result(TIMEOUT)
 
     wait_for(lambda: only_one(l3.rpc.listpeers(l2.info['id'])['peers'])['connected'])
@@ -4671,13 +4678,16 @@ def test_no_delay(node_factory):
     }
 
     def do_round_trips(n):
-        start = time.time()
+        """Each round trip's time, in seconds."""
+        trips = []
         for _ in range(n):
             phash = random.randbytes(32).hex()
+            start = time.time()
             l1.rpc.sendpay([routestep], phash)
             with pytest.raises(RpcError, match="WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS"):
                 l1.rpc.waitsendpay(phash)
-        return time.time() - start
+            trips.append(time.time() - start)
+        return trips
 
     # Probe the actual per-RTT Nagle overhead on this platform with a small
     # sample (10 trips), then scale up for the full run.  Linux's TCP Nagle
@@ -4686,7 +4696,7 @@ def test_no_delay(node_factory):
     probe_nagle = do_round_trips(PROBE)
 
     # Test with nagle (full run)
-    nagle_time = do_round_trips(100)
+    nagle_trips = do_round_trips(100)
 
     del l1.daemon.opts['dev-keep-nagle']
     del l2.daemon.opts['dev-keep-nagle']
@@ -4698,27 +4708,33 @@ def test_no_delay(node_factory):
     probe_normal = do_round_trips(PROBE)
 
     # Test without nagle (full run)
-    normal_time = do_round_trips(100)
+    normal_trips = do_round_trips(100)
 
-    # Estimate the per-RTT Nagle delay from the probe; average delay is half
-    # the timer period.  Use half again as variance margin (same logic as the
-    # original 200ms assumption).  If the platform shows no measurable Nagle
-    # effect (e.g. macOS loopback with a very short timer) the expected saving
-    # rounds down to zero and we only assert directional ordering.
-    per_rtt_delay = max(0.0, (probe_nagle - probe_normal) / PROBE)
-    expected_saving = 100 * per_rtt_delay / 2
+    # Compare the median round trip of each run, not the totals, and expect
+    # the normal one to be at most 80% of the Nagle one.  The runs happen at
+    # different times, and on a loaded machine a stall in one of them moved
+    # its total by seconds (16.1s against 25.3s, short of the 9.5s saving
+    # the probe predicted); a median does not move with a stall.  Load also
+    # slows the normal trips, which wait on the CPU, more than the Nagle
+    # ones, which wait on the timer, so the gap narrows under load (median
+    # ratios measured: 0.22 idle, 0.68 loaded); with Nagle left on it is 1.
+    # If the platform shows no measurable Nagle effect (e.g. macOS loopback
+    # with a very short timer) we only assert directional ordering.
+    per_rtt_delay = max(0.0, statistics.median(probe_nagle) - statistics.median(probe_normal))
+    nagle_median = statistics.median(nagle_trips)
+    normal_median = statistics.median(normal_trips)
 
-    print(f"Nagle probe: {probe_nagle:.3f}s nagle, {probe_normal:.3f}s normal, "
-          f"per-RTT overhead ~{per_rtt_delay * 1000:.1f}ms, "
-          f"expected saving {expected_saving:.2f}s")
+    print(f"Nagle probe: per-RTT overhead ~{per_rtt_delay * 1000:.1f}ms; "
+          f"median trip {nagle_median * 1000:.1f}ms nagle, "
+          f"{normal_median * 1000:.1f}ms normal")
 
-    if expected_saving > 0.5:
-        # Platform shows a meaningful Nagle effect: assert the full saving.
-        assert normal_time < nagle_time - expected_saving
+    if per_rtt_delay > 0.01:
+        # Platform shows a meaningful Nagle effect: assert the saving.
+        assert normal_median < 0.8 * nagle_median
     else:
         # Platform Nagle delay is too small to measure reliably (e.g. macOS);
         # just assert that disabling Nagle is not slower.
-        assert normal_time <= nagle_time + 1.0
+        assert normal_median <= nagle_median + 0.01
 
 
 def test_listpeerchannels_by_scid(node_factory):

@@ -2903,7 +2903,13 @@ def test_zeroconf_withhold(node_factory, bitcoind, stay_withheld, mutual_close):
     assert bitcoind.rpc.getrawmempool() == []
 
     if mutual_close:
+        # On reconnection l2 sends its update for the private channel
+        # again: let it arrive before the close, or it can reach l1 after a
+        # withheld channel is forgotten ("Bad gossip order: could not find
+        # channel").
+        l1.daemon.logsearch_start = len(l1.daemon.logs)
         l1.connect(l2)
+        l1.daemon.wait_for_log(r'updating channel .* with inbound settings')
 
     if not stay_withheld:
         # sendpsbt marks it as no longer withheld.
