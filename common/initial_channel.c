@@ -69,6 +69,7 @@ struct channel *new_initial_channel(const tal_t *ctx,
 	channel->sym_lanes = NULL;
 	channel->sym_lane_bal = NULL;
 	channel->sym_swap = channel->sym_swap_req = NULL;
+	channel->sym_issuer = NULL;
 	channel->config[LOCAL] = *local;
 	channel->config[REMOTE] = *remote;
 	channel->funding_pubkey[LOCAL] = *local_funding_pubkey;

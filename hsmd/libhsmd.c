@@ -131,6 +131,7 @@ bool hsmd_check_client_capabilities(struct hsmd_client *client,
 	case WIRE_HSMD_CREDIT_NOTE:
 	case WIRE_HSMD_SIGN_SYM_KICKOFF:
 	case WIRE_HSMD_SIGN_SYM_STATE:
+	case WIRE_HSMD_SIGN_SYM_CLOCK_STATE:
 	case WIRE_HSMD_SIGN_SYM_LANES_STATE:
 	case WIRE_HSMD_APPROVE_SYM_SWAP:
 		return (client->capabilities & HSM_PERM_SIGN_REMOTE_TX) != 0;
@@ -235,6 +236,7 @@ bool hsmd_check_client_capabilities(struct hsmd_client *client,
 	case WIRE_HSMD_SIGN_CREDIT_NOTE_REPLY:
 	case WIRE_HSMD_CREDIT_NOTE_REPLY:
 	case WIRE_HSMD_SIGN_SYM_STATE_REPLY:
+	case WIRE_HSMD_SIGN_SYM_CLOCK_STATE_REPLY:
 	case WIRE_HSMD_SIGN_SYM_LANES_STATE_REPLY:
 	case WIRE_HSMD_SIGN_MUTUAL_CLOSE_LANES_TX_REPLY:
 	case WIRE_HSMD_APPROVE_SYM_SWAP_REPLY:
@@ -2623,6 +2625,66 @@ static u8 *handle_sign_sym_state(struct hsmd_client *c, const u8 *msg_in)
 	return towire_hsmd_sign_sym_state_reply(NULL, &sig);
 }
 
+/* A settle-clock channel's state (option_seq_symmetric_clock): the same
+ * message over the clock's leaves.  Its marker is the asset @issuer's new
+ * issuance made, and the clock and seed are those of the funding output and
+ * capacity; this signer checks nothing more. */
+static u8 *handle_sign_sym_clock_state(struct hsmd_client *c, const u8 *msg_in)
+{
+	struct bitcoin_outpoint funding, issuer;
+	bool we_opened;
+	struct pubkey remote_update_key, remote_funding_key, our_key;
+	struct pubkey local_funding_key;
+	struct amount_sat funding_sats;
+	u8 asset[33], marker[32];
+	u16 delay;
+	struct sym_state *st;
+	struct hsm_htlc *htlcs;
+	struct secret channel_seed;
+	struct secrets secrets;
+	struct privkey privkey;
+	struct sym_channel sc;
+	struct sym_tree tree;
+	struct sha256 msg;
+	struct bip340sig sig;
+
+	if (!fromwire_hsmd_sign_sym_clock_state(tmpctx, msg_in, &funding,
+						&we_opened, &remote_update_key,
+						asset, &delay, &issuer,
+						&funding_sats,
+						&remote_funding_key, &st,
+						&htlcs))
+		return hsmd_status_malformed_request(c, msg_in);
+	if (tal_count(st->outs) == 0 || st->num < 0)
+		return hsmd_status_bad_request_fmt(c, msg_in, "empty state");
+	for (size_t i = 0; i < tal_count(st->outs); i++)
+		if (st->outs[i].asset)
+			return hsmd_status_bad_request_fmt(c, msg_in,
+							   "a settle-clock state"
+							   " names no asset");
+
+	get_channel_seed(&c->id, c->dbid, &channel_seed);
+	if (!derive_delayed_payment_basepoint(&channel_seed, &our_key,
+					      &privkey.secret))
+		return hsmd_status_bad_request_fmt(c, msg_in,
+						   "cannot derive the update key");
+	derive_basepoints(&channel_seed, &local_funding_key, NULL, &secrets,
+			  NULL);
+	sym_channel_init(&sc, &chainparams->genesis_blockhash, &funding,
+			 we_opened ? &our_key : &remote_update_key,
+			 we_opened ? &remote_update_key : &our_key,
+			 asset, delay);
+	sym_marker_id(&issuer, marker);
+	sym_channel_set_clock(&sc, marker,
+			      bitcoin_redeem_2of2(tmpctx, &local_funding_key,
+						  &remote_funding_key),
+			      funding_sats);
+	sym_state_tree_of(tmpctx, &sc, st, &tree);
+	sym_upd_msg(&sc, &tree, &msg);
+	tap_sign(&msg, &privkey, &sig);
+	return towire_hsmd_sign_sym_clock_state_reply(NULL, &sig);
+}
+
 /* A state of a channel that holds several assets: lane 0 the channel's
  * asset at its funding value, and each further lane its own.  The
  * settlement must pay each lane's asset exactly that lane's value, and no
@@ -2902,6 +2964,8 @@ u8 *hsmd_handle_client_message(const tal_t *ctx, struct hsmd_client *client,
 		return handle_sign_sym_kickoff(client, msg);
 	case WIRE_HSMD_SIGN_SYM_STATE:
 		return handle_sign_sym_state(client, msg);
+	case WIRE_HSMD_SIGN_SYM_CLOCK_STATE:
+		return handle_sign_sym_clock_state(client, msg);
 	case WIRE_HSMD_SIGN_SYM_LANES_STATE:
 		return handle_sign_sym_lanes_state(client, msg);
 	case WIRE_HSMD_SIGN_SYM_HTLC:
@@ -2953,6 +3017,7 @@ u8 *hsmd_handle_client_message(const tal_t *ctx, struct hsmd_client *client,
 	case WIRE_HSMD_SIGN_CREDIT_NOTE_REPLY:
 	case WIRE_HSMD_CREDIT_NOTE_REPLY:
 	case WIRE_HSMD_SIGN_SYM_STATE_REPLY:
+	case WIRE_HSMD_SIGN_SYM_CLOCK_STATE_REPLY:
 	case WIRE_HSMD_SIGN_SYM_LANES_STATE_REPLY:
 	case WIRE_HSMD_SIGN_MUTUAL_CLOSE_LANES_TX_REPLY:
 	case WIRE_HSMD_APPROVE_SYM_SWAP_REPLY:
@@ -3057,6 +3122,7 @@ u8 *hsmd_init(const u8 *secret_data, size_t secret_len, const u64 hsmd_version,
 		WIRE_HSMD_SIGN_TCOV_PAYMENT_TO_US,
 		WIRE_HSMD_SIGN_SYM_KICKOFF,
 		WIRE_HSMD_SIGN_SYM_STATE,
+		WIRE_HSMD_SIGN_SYM_CLOCK_STATE,
 		WIRE_HSMD_SIGN_SYM_HTLC,
 		WIRE_HSMD_SIGN_SYM_LANES_STATE,
 		WIRE_HSMD_SIGN_MUTUAL_CLOSE_LANES_TX,

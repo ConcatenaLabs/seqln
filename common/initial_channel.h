@@ -106,6 +106,10 @@ struct channel {
 	/* The swap in flight, and the one we asked for and wait for the peer
 	 * to send (as it will send it), or NULL. */
 	struct sym_swap *sym_swap, *sym_swap_req;
+
+	/* SEQUENTIA: a settle-clock channel's issuer (common/sym_scripts.h):
+	 * the funding input whose issuance made its marker; NULL else. */
+	struct bitcoin_outpoint *sym_issuer;
 };
 
 /**

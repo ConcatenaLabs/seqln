@@ -23,6 +23,7 @@
 #include <lightningd/notification.h>
 #include <lightningd/peer_fd.h>
 #include <lightningd/peer_htlcs.h>
+#include <lightningd/sym_clock.h>
 #include <lightningd/sym_lanes.h>
 #include <unistd.h>
 
@@ -2137,7 +2138,9 @@ bool peer_start_channeld(struct channel *channel,
 				       cast_const2(const struct inflight **,
 						   inflights),
 				       *channel->alias[LOCAL],
-				       lanes, lane_ours, lane_swap, lane_req);
+				       lanes, lane_ours, lane_swap, lane_req,
+				       channel->sym_clock
+				       ? &channel->sym_clock->issuer : NULL);
 
 	/* We don't expect a response: we are triggered by funding_depth_cb. */
 	subd_send_msg(channel->owner, take(initmsg));

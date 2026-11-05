@@ -31,6 +31,17 @@ void sym_channel_of(const struct channel *channel, struct sym_channel *sc)
 			 &channel->basepoints[opener].delayed_payment,
 			 &channel->basepoints[!opener].delayed_payment,
 			 channel->channel_asset, sym_shared_delay(channel));
+	/* The settle clock: its marker, the funding output and capacity. */
+	if (channel->sym_issuer) {
+		u8 marker[32];
+
+		sym_marker_id(channel->sym_issuer, marker);
+		sym_channel_set_clock(sc, marker,
+				      bitcoin_redeem_2of2(tmpctx,
+							  &channel->funding_pubkey[LOCAL],
+							  &channel->funding_pubkey[REMOTE]),
+				      channel->funding_sats);
+	}
 }
 
 struct sym_state *sym_channel_state(const tal_t *ctx,

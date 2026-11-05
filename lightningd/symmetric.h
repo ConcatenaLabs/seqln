@@ -30,7 +30,8 @@ u16 sym_channel_delay(const struct channel *channel);
  * the kickoff and the update confirm, the shared delay passes, possibly a
  * second time (a peer that withheld its last acknowledgement publishes the
  * state it holds just before the first runs out), the settlement and the
- * claim confirm. */
+ * claim confirm.  With the settle clock the delay runs once, from the
+ * kickoff, whatever state is published when. */
 u32 sym_htlc_margin(const struct channel *channel);
 
 /* The states openingd and channeld report: each takes the state (it becomes
@@ -80,6 +81,8 @@ struct sym_spend_in {
 	/* NULL: input 0's script and witness. */
 	u8 *spk;
 	u8 **witness;
+	/* 0: input 0's. */
+	u32 sequence;
 };
 void sym_spend_start_lanes(struct channel *channel,
 			   const struct bitcoin_outpoint *out,
@@ -88,6 +91,17 @@ void sym_spend_start_lanes(struct channel *channel,
 			   const u8 *spent_spk, u8 **witness TAKES,
 			   const struct sym_state_out *outs,
 			   u32 sequence, u32 minblock, u32 deadline);
+
+/* The same with the transaction's lock time (sym_spend_start_lanes': 0).
+ * A settle-clock channel's update has its floor (common/sym_scripts.h). */
+void sym_spend_start_full(struct channel *channel,
+			  const struct bitcoin_outpoint *out,
+			  struct amount_sat amount, const u8 *asset,
+			  const struct sym_spend_in *extra,
+			  const u8 *spent_spk, u8 **witness TAKES,
+			  const struct sym_state_out *outs,
+			  u32 sequence, u32 locktime, u32 minblock,
+			  u32 deadline);
 
 /* An output of the channel is spent on chain: a spend of ours of it stops
  * and frees its fee coins, and one onchaind proposes later never starts. */

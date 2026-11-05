@@ -41,10 +41,26 @@ void sym_channel_from(const struct channel *channel, struct sym_channel *sc)
 			 channel->opener == LOCAL ? ours : theirs,
 			 channel->opener == LOCAL ? theirs : ours,
 			 channel->channel_asset, sym_channel_delay(channel));
+	/* The settle clock (lightningd/sym_clock.h): its marker, the funding
+	 * output and the capacity. */
+	if (channel->sym_clock) {
+		u8 marker[32];
+
+		sym_marker_id(&channel->sym_clock->issuer, marker);
+		sym_channel_set_clock(sc, marker,
+				      bitcoin_redeem_2of2(tmpctx,
+							  &channel->local_funding_pubkey,
+							  &channel->channel_info.remote_fundingkey),
+				      channel->funding_sats);
+	}
 }
 
 u32 sym_htlc_margin(const struct channel *channel)
 {
+	/* The settle clock runs the delay once, from the kickoff: a late
+	 * update cannot restart it. */
+	if (channel->sym_clock)
+		return (u32)sym_channel_delay(channel) + SYM_SLACK;
 	return 2 * (u32)sym_channel_delay(channel) + SYM_SLACK;
 }
 
@@ -149,7 +165,7 @@ struct sym_spend {
 	 * same script and with the same witness. */
 	u8 *in_asset;
 	struct sym_spend_in *extra;
-	u32 sequence, minblock, deadline_block;
+	u32 sequence, locktime, minblock, deadline_block;
 	/* What the last broadcast paid, in its fee asset, and the wallet
 	 * coins it spent (which it reserved, and may spend again). */
 	struct amount_sat fee;
@@ -300,14 +316,15 @@ static struct wally_psbt *sym_psbt_base(const tal_t *ctx,
 					const struct sym_spend *ss)
 {
 	const u8 *asset = ss->channel->channel_asset;
-	struct wally_psbt *psbt = create_psbt(ctx, 0, 0, 0);
+	struct wally_psbt *psbt = create_psbt(ctx, 0, 0, ss->locktime);
 
 	psbt_append_input(psbt, &ss->out, ss->sequence, NULL, NULL, NULL);
 	psbt_input_set_wit_utxo_asset(psbt, 0, ss->spent_spk, ss->out_sats,
 				      ss->in_asset ? ss->in_asset : asset);
 	for (size_t i = 0; i < tal_count(ss->extra); i++) {
-		psbt_append_input(psbt, &ss->extra[i].out, ss->sequence, NULL,
-				  NULL, NULL);
+		psbt_append_input(psbt, &ss->extra[i].out,
+				  ss->extra[i].sequence ? ss->extra[i].sequence
+				  : ss->sequence, NULL, NULL, NULL);
 		psbt_input_set_wit_utxo_asset(psbt, 1 + i,
 					      ss->extra[i].spk
 					      ? ss->extra[i].spk : ss->spent_spk,
@@ -591,6 +608,19 @@ void sym_spend_start_lanes(struct channel *channel,
 			   const struct sym_state_out *outs,
 			   u32 sequence, u32 minblock, u32 deadline)
 {
+	sym_spend_start_full(channel, out, amount, asset, extra, spent_spk,
+			     witness, outs, sequence, 0, minblock, deadline);
+}
+
+void sym_spend_start_full(struct channel *channel,
+			  const struct bitcoin_outpoint *out,
+			  struct amount_sat amount, const u8 *asset,
+			  const struct sym_spend_in *extra,
+			  const u8 *spent_spk, u8 **witness TAKES,
+			  const struct sym_state_out *outs,
+			  u32 sequence, u32 locktime, u32 minblock,
+			  u32 deadline)
+{
 	struct sym_spend *ss;
 	bool spent = sym_seen_spent(channel, out);
 
@@ -640,6 +670,7 @@ void sym_spend_start_lanes(struct channel *channel,
 		}
 	}
 	ss->sequence = sequence;
+	ss->locktime = locktime;
 	ss->minblock = minblock;
 	ss->deadline_block = deadline;
 	ss->fee = AMOUNT_SAT(0);

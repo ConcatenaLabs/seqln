@@ -87,6 +87,8 @@ msgdata,channeld_init,sym_lanes,sym_lane,num_sym_lanes
 msgdata,channeld_init,sym_lane_local_msat,amount_msat,num_sym_lanes
 msgdata,channeld_init,sym_swap,?sym_swap,
 msgdata,channeld_init,sym_swap_req,?sym_swap,
+# SEQUENTIA: a settle-clock channel's issuer (common/sym_scripts.h).
+msgdata,channeld_init,sym_issuer,?bitcoin_outpoint,
 
 # channeld->lightningd: successfully negotated reestablishment.
 msgtype,channeld_reestablished,1101
