@@ -2445,7 +2445,7 @@ static void defend_sym_lane(const struct spd_sym *s, u16 lane, long tip,
 			outs = tal_arrz(tmpctx, struct sym_state_out, 1 + m);
 			outs[0].amount = k->cur_sats;
 			outs[0].spk = k->cur_spk;
-			outs[0].asset = s->marker;
+			outs[0].asset = (u8 *)s->marker;
 			for (size_t i = 0; i < m; i++) {
 				outs[1 + i] = st->outs[i];
 				outs[1 + i].asset = (u8 *)s->asset;
