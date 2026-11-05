@@ -584,11 +584,16 @@ pub const CHSTORE_MAGIC: [u8; 4] = *b"SQCH";
 /// adds, after that, whether it is `option_seq_symmetric` (1 byte). Version
 /// 13 adds, after that, its further lanes (count(1), then per lane its asset
 /// (33), value (8), funding output flag(1) and index (4) if set, and its
-/// payment tracking as the channel's own).
+/// payment tracking as the channel's own). Version 14 adds, after that, the
+/// settle clock (`option_seq_symmetric_clock` (1), its issuer's flag(1), then
+/// txid(32) and vout(4) if set, and the seed's flag(1), then seed(4) if set).
+/// Version 15 adds, after the close record, the txids of the wallet
+/// transactions whose losses the ledger charged (count(2), then txid(32)
+/// each).
 /// Versions 1 to 9 still import (the fields they lack unknown); each channel of a store older
 /// than version 6, written by a device that validated nothing, predates
 /// validation.
-pub const CHSTORE_VERSION: u8 = 14;
+pub const CHSTORE_VERSION: u8 = 15;
 
 /// The first store version a validating device wrote.
 pub const CHSTORE_FIRST_VALIDATING: u8 = 6;
@@ -786,6 +791,10 @@ pub fn encode_channel_store(store: &ChannelStore) -> Vec<u8> {
     push_ledger(&mut out, &store.ledger);
     out.extend_from_slice(&(store.close_txids.len() as u16).to_le_bytes());
     for t in &store.close_txids {
+        out.extend_from_slice(t);
+    }
+    out.extend_from_slice(&(store.ledger.charged_txids.len() as u16).to_le_bytes());
+    for t in &store.ledger.charged_txids {
         out.extend_from_slice(t);
     }
     out
@@ -1094,7 +1103,7 @@ pub fn decode_channel_store(bytes: &[u8]) -> Result<DecodedStore, String> {
         }
         out.push(((node_id, dbid), st));
     }
-    let ledger = if version >= 5 { r.ledger()? } else { Ledger::default() };
+    let mut ledger = if version >= 5 { r.ledger()? } else { Ledger::default() };
     let mut closes = Vec::new();
     if version >= 7 {
         let n = r.u16()? as usize;
@@ -1103,6 +1112,15 @@ pub fn decode_channel_store(bytes: &[u8]) -> Result<DecodedStore, String> {
         }
         for _ in 0..n {
             closes.push(r.take(32)?.try_into().unwrap());
+        }
+    }
+    if version >= 15 {
+        let n = r.u16()? as usize;
+        if n > crate::payments::MAX_CHARGED_TXIDS {
+            return Err(format!("{n} charged txids in a channel-store blob"));
+        }
+        for _ in 0..n {
+            ledger.charged_txids.push(r.take(32)?.try_into().unwrap());
         }
     }
     if r.o != bytes.len() {

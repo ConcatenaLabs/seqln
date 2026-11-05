@@ -251,7 +251,9 @@ What enforce mode checks:
   outputs) and what the channel's first commitments give the peer (a `push_msat`). For a
   withdrawal it counts against what the payment limit has left for the period, as a payment does,
   and is charged once signed: wallet coins come back to the wallet, so a bound per transaction
-  would let a host spend the wallet on fees through a chain of transfers to itself. An anchor fee
+  would let a host spend the wallet on fees through a chain of transfers to itself. The store
+  keeps the txids it charged, so a transaction signed again (a host asking once more, after a lost
+  link, for a signature it never received) is charged once, across restarts too. An anchor fee
   bump spends its anchor once, so its fee is held to the limit itself. A spend that breaks the
   rule is returned unsigned: the node cannot finalize it (`withdraw` and `sendpsbt` fail with "not
   finalizeable"), sends nothing and keeps running, and the device logs why (native: its log; WASM:

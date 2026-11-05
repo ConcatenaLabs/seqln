@@ -438,6 +438,11 @@ impl Signer {
             // type (a symmetric channel's states are refused until then).
             option_sym: false,
             lanes: Vec::new(),
+            // So is the settle clock; its issuer and seed with the clock's
+            // first state.
+            option_sym_clock: false,
+            clock_issuer: None,
+            clock_seed: None,
         };
         self.inner
             .arm_channel(arr33(node_id, "node_id")?, dbid, st)

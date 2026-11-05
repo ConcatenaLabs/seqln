@@ -69,6 +69,10 @@ fn chan(seed: u8) -> ChannelState {
         }),
         // A symmetric channel's flag rides the round trip too.
         option_sym: seed == 11,
+        lanes: Vec::new(),
+        option_sym_clock: false,
+        clock_issuer: None,
+        clock_seed: None,
     }
 }
 
