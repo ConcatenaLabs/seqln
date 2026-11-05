@@ -211,3 +211,82 @@ def test_node_coins_go_home_to_the_wallet(node_factory, bitcoind, directory):
         if kc.answers(l1, timeout=2):
             l1.stop()
         device.stop()
+
+
+def approve_on_device(device, script, asset, atoms):
+    """The device's user approves, on the device, one spend paying `script`
+    at most `atoms` of `asset` (the binary's approvals file; a browser
+    wallet calls approveSpend from its own confirmation)."""
+    with open(os.path.join(device.dir, 'seqln-signer-approvals'), 'a') as f:
+        f.write('{} {} {}\n'.format(script, asset or 'btc', atoms))
+
+
+@needs_device
+def test_outside_address_needs_the_users_approval(node_factory, bitcoind, directory):
+    """D45: the device signs a spend of the node's coins to an address
+    outside its wallet only when its user approved that address on the
+    device for that spend, at most the amount approved, counted against the
+    asset's payment limit with the fee. The host's word is no approval: the
+    node asks the same way with or without one. An approval pays one spend;
+    a second spend to the same address is refused."""
+    cos.checks_scripts_one_by_one(bitcoind)
+    asset = ks.coin(bitcoind)
+    device, l1 = kc.keyless_node(node_factory, directory, broken_log='.*')
+    try:
+        addr = l1.rpc.newaddr('bech32')['bech32']
+        if SEQ:
+            txid = bitcoind.send_and_mine_block(addr, 10**8, asset)
+        else:
+            txid = bitcoind.rpc.sendtoaddress(addr, 1)
+            bitcoind.generate_block(1, wait_for_mempool=txid)
+        wait_for(lambda: any(o['txid'] == txid and o['status'] == 'confirmed'
+                             for o in l1.rpc.listfunds()['outputs']))
+        outside = bitcoind.rpc.getnewaddress()
+        script = bitcoind.rpc.getaddressinfo(outside)['scriptPubKey']
+        amount = 2_500_000
+
+        def send(what):
+            args = {'destination': outside, 'satoshi': amount, 'feerate': 'normal'}
+            if asset:
+                args['asset'] = asset
+            return l1.rpc.call('withdraw', args)['txid']
+
+        def refused(what, words):
+            before = device.output().count(cos.REFUSED)
+            with pytest.raises(RpcError, match='not finalizeable'):
+                send(what)
+            wait_for(lambda: device.output().count(cos.REFUSED) > before)
+            line = [ln for ln in device.output().splitlines() if cos.REFUSED in ln][-1]
+            print('{}: {}'.format(what, line.split('seqln-signer: ', 1)[-1]))
+            assert words in line, line
+
+        # Not approved: refused.
+        refused('to an outside address, not approved', FOREIGN)
+        # Approved for it: signed, and it confirms paying the address.
+        approve_on_device(device, script, asset, amount)
+        sent = send('approved')
+        assert 'APPROVED on the device' in device.output()
+        raw = bitcoind.rpc.getrawtransaction(sent)
+        into_block(bitcoind, raw, script, '0014' + 'ee' * 20, 'the approved spend, redirected')
+        bitcoind.generate_block(1, wait_for_mempool=sent)
+        tx = bitcoind.rpc.getrawtransaction(sent, True)
+        assert any(i['txid'] == txid for i in tx['vin'])
+        paid = only_one([v for v in tx['vout'] if v['scriptPubKey'].get('hex') == script])
+        if SEQ:
+            assert paid['asset'] == asset
+        assert round(float(paid['value']) * 10**8) == amount
+        print('approved spend {} paid {} atoms to the outside address, confirmed'.format(sent, amount))
+        # Its change is the node's coin again.
+        wait_for(lambda: any(o['txid'] == sent and o['status'] == 'confirmed'
+                             for o in l1.rpc.listfunds()['outputs']))
+        # The approval paid that spend: another to the same address is refused.
+        refused('a second spend on the same approval',
+                "its user's approval on the device paid another spend")
+        # Approved for one atom less than it pays: refused.
+        approve_on_device(device, script, asset, amount - 1)
+        refused('approved for one atom less',
+                'more than the {} its user approved on the device for that spend'.format(amount - 1))
+    finally:
+        if kc.answers(l1, timeout=2):
+            l1.stop()
+        device.stop()

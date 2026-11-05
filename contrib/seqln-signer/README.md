@@ -237,9 +237,22 @@ What enforce mode checks:
   anchor fee bump): every output but the fee pays one of the device's own wallet scripts (P2WPKH or
   BIP-86 P2TR of its wallet keys at indices below 5,000) or a script the wallet holding the
   device's seed named as its own (`approveCloseDestination`, `SEQLN_SIGNER_CLOSE_TO`), unblinded,
-  or is the funding output of a channel this side is opening. So the node's coins outside its
-  channels can go home to that wallet's address. A spend to any other address is refused: the
-  host's word is not the wallet's, and nothing in a frame can name a script. A funding output counts
+  or is the funding output of a channel this side is opening, or, in a withdrawal, pays an address
+  the device's user approved on the device for that spend. So the node's coins outside its
+  channels can go home to that wallet's address, or to an address the user names. A spend to any
+  other address is refused: the host's word is not the wallet's, and nothing in a frame can name a
+  script or give an approval. An approval names the script, the asset and the most it may receive;
+  the spend's outputs to that script in that asset may add up to no more. It pays one spend: the
+  first transaction the device signs with it is the only one it signs with it again, so two
+  transactions on different coins cannot both pay the address. It waits ten minutes for its spend,
+  and is not kept across a restart. In a browser the page's own confirmation gives it
+  (`approveSpend(script, asset, atoms)`, `cancelSpendApprovals()`, the same in the SDK), never a
+  message from the node or the LSP; the native signer takes it from the file
+  `seqln-signer-approvals` in its working directory (or `SEQLN_SIGNER_APPROVALS`), one line per
+  approval, `<scriptPubKey hex> <asset> <atoms>`, the asset `btc` or a display-order asset id,
+  each line taken once. A spend refused for its approval says which: "more than the … its user
+  approved", "approved that address on the device only in …", "its user's approval on the device
+  expired", "paid another spend, …, which this device signed". A funding output counts
   only at the outpoint `setup_channel` named for a channel this side opened, paying exactly that
   channel's 2-of-2 (the device's funding key for it and the peer's), unblinded, its whole funding
   amount in the asset of its commitments, and only once the device holds a commitment of ours for
@@ -248,7 +261,8 @@ What enforce mode checks:
   gives, so a funding from a P2SH-wrapped input, whose txid its scriptSig changes, is refused.
   What leaves the device is the fee (on Sequentia the explicit fee outputs, which the signature
   commits to with every other output; on Bitcoin what the inputs the device signs carry beyond the
-  outputs) and what the channel's first commitments give the peer (a `push_msat`). For a
+  outputs), what it pays an address the user approved, and what the channel's first commitments
+  give the peer (a `push_msat`). For a
   withdrawal it counts against what the payment limit has left for the period, as a payment does,
   and is charged once signed: wallet coins come back to the wallet, so a bound per transaction
   would let a host spend the wallet on fees through a chain of transfers to itself. The store
@@ -427,11 +441,21 @@ non-custodial signer out; no npm dependencies), and `wasm/web/` is a minimal dem
 
 ```bash
 cd contrib/seqln-signer/wasm
-wasm-pack build --target nodejs --out-dir pkg        # for the node test scripts
-wasm-pack build --target web    --out-dir web/pkg    # for the SDK / demo page
+./build.sh nodejs pkg        # for the node test scripts
+./build.sh web web/pkg       # for the SDK / demo page, and the package a wallet vendors
 node test/conformance.mjs <corpus.bin> <hsm_secret> <oracle_replies.bin>
 node test/device_link.mjs <host:port> <hsm_secret> <host_pub_hex> <device_priv_hex> [--enforce]
 ```
+
+`build.sh` builds the same bytes from the same commit on any machine, so whoever serves the WASM
+signer can show it is this source: rustc comes from `wasm/rust-toolchain.toml` (rustup installs
+it), wasm-bindgen from `wasm/Cargo.lock`, and there is no wasm-opt pass. rustc names each crate's
+symbols with a hash of its absolute path, so the script copies the crate's files to one fixed
+directory (`/tmp/seqln-signer-wasm-build`) and builds there, with every other machine path
+remapped out; it prints the package's sha256. secp256k1's C code is compiled by the machine's
+clang, so a different clang major version changes those functions. A package built some other
+way can still be compared section by section: the code and data sections are the compiler's
+output, and the `name` section differs with the build path alone.
 
 ## Status
 

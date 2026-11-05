@@ -18,7 +18,7 @@
 // `seqln-signer: POLICY REJECT: <reason>`. The process serves one link and
 // exits when it closes; the caller restarts it, as a browser reconnects.
 
-import { readFileSync, writeFileSync, renameSync, appendFileSync, existsSync, openSync, fsyncSync, closeSync } from 'node:fs';
+import { readFileSync, writeFileSync, renameSync, appendFileSync, existsSync, openSync, fsyncSync, closeSync, unlinkSync } from 'node:fs';
 import net from 'node:net';
 import { webcrypto } from 'node:crypto';
 import { Signer, NoiseSession } from '../pkg/seqln_signer_wasm.js';
@@ -39,6 +39,11 @@ const [host, port] = addr.split(':');
 const STORE = process.env.SEQLN_SIGNER_STORE || 'seqln-signer-channels';
 const LOG = 'seqln-signer.log';
 const trace = !!process.env.SEQLN_SIGNER_TRACE;
+// The user's approvals of outside addresses, as the binary takes them: the file
+// SEQLN_SIGNER_APPROVALS (default seqln-signer-approvals), each line
+// `<scriptPubKey hex> <asset> <atoms>`, taken with each withdrawal request (a browser
+// wallet calls approveSpend from its own confirmation instead).
+const APPROVALS = process.env.SEQLN_SIGNER_APPROVALS || 'seqln-signer-approvals';
 
 function log(line) {
   try { appendFileSync(LOG, line + '\n'); } catch {}
@@ -46,6 +51,26 @@ function log(line) {
 function say(line) {
   log(line);
   console.error(line);
+}
+
+function takeApprovals() {
+  const taking = `${APPROVALS}.taking`;
+  try { renameSync(APPROVALS, taking); } catch { return; }
+  let text = '';
+  try { text = readFileSync(taking, 'utf8'); } catch { /* nothing to take */ }
+  try { unlinkSync(taking); } catch { /* already gone */ }
+  text.split('\n').forEach((raw, n) => {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) return;
+    const f = line.split(/\s+/);
+    try {
+      if (f.length !== 3 || !/^([0-9a-f]{2})+$/i.test(f[0])) throw new Error('it is not `<scriptPubKey hex> <asset> <atoms>`');
+      signer.approveSpend(Buffer.from(f[0], 'hex'), f[1], Number(f[2]));
+      say(`seqln-signer: APPROVED on the device: one spend paying ${f[0].toLowerCase()} at most ${f[2]} atoms of ${f[1]}`);
+    } catch (e) {
+      say(`seqln-signer: approval on line ${n + 1} of ${APPROVALS} not taken: ${e.message || e}`);
+    }
+  });
 }
 function fatal(msg) {
   say(`seqln-signer: ${msg}`);
@@ -176,6 +201,11 @@ async function main() {
       const dbid = frame.readBigUInt64LE(off);
       const t = frame.length >= off + 16 + 2 ? frame.readUInt16BE(off + 16) : null;
       log(`seqln-signer: TRACE req type=${t === null ? 'None' : `Some(${t})`} is_main=${isMain ? 'true' : 'false'} dbid=${dbid} msglen=${flen - (off + 16 - 4)}`);
+    }
+    // With the withdrawal (SIGN_WITHDRAWAL, 7) it is for, as the binary does.
+    {
+      const off = 4 + 1 + (frame[4] ? 0 : 33) + 16;
+      if (frame.length >= off + 2 && frame.readUInt16BE(off) === 7) takeApprovals();
     }
     let reply;
     try {

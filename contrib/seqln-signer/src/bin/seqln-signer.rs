@@ -33,6 +33,16 @@
 //! beside `hsm_secret` records that); a device that has never made one
 //! creates it, empty, at its first start.
 //!
+//! A payment to an address outside the device's wallet is signed only when
+//! the device's user approved it on the device for that spend. The binary
+//! takes approvals from the file `seqln-signer-approvals` in its working
+//! directory (or the path in `SEQLN_SIGNER_APPROVALS`), written there by the
+//! user: one line each, `<scriptPubKey hex> <asset> <atoms>`, the asset `btc`
+//! or a display-order asset id. With each withdrawal request the signer
+//! takes the file (renames it, reads it, removes it), so each line approves
+//! one spend and is used at most once. The host cannot write it: it is on
+//! the device.
+//!
 //! ============================ SECURITY ====================================
 //! listen mode is fail-closed: it REFUSES to start without both its own static
 //! privkey (SEQLN_SIGNER_PRIVKEY[_FILE]) and the pinned host static pubkey
@@ -544,6 +554,9 @@ fn serve<S: Read + Write>(
     log: &mut Option<File>,
 ) {
     let trace = std::env::var("SEQLN_SIGNER_TRACE").is_ok();
+    let approvals = PathBuf::from(
+        std::env::var("SEQLN_SIGNER_APPROVALS").unwrap_or_else(|_| "seqln-signer-approvals".into()),
+    );
     loop {
         let req = match frame::read_request(stream) {
             Ok(Some(r)) => r,
@@ -573,6 +586,11 @@ fn serve<S: Read + Write>(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs()),
         );
+        // Taken with the withdrawal it is for, so a session that ends
+        // before that request (the signer restarts with each) loses none.
+        if seqln_signer::wire::peektype(&req.hsmd_msg) == Some(seqln_signer::wire::msg::HSMD_SIGN_WITHDRAWAL) {
+            take_approvals(&approvals, signer, log);
+        }
         let reply: Vec<u8> = match signer.handle(&req) {
             Outcome::Reply(bytes) => {
                 // Answered, but not with what was asked for: a withdrawal the
@@ -686,6 +704,57 @@ fn unhex(s: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Best-effort append to the per-process log; never fatal.
+/// Take the approvals the device's user wrote to `path`: each line,
+/// `<scriptPubKey hex> <asset> <atoms>`, approves one spend paying that
+/// script at most that many atoms of that asset (`Signer::approve_spend`).
+/// The file is renamed before it is read, so a line is taken once; a line
+/// that does not parse approves nothing and is logged.
+fn take_approvals(path: &Path, signer: &mut Signer, log: &mut Option<File>) {
+    let taking = path.with_extension("taking");
+    if std::fs::rename(path, &taking).is_err() {
+        return;
+    }
+    let text = std::fs::read_to_string(&taking).unwrap_or_default();
+    let _ = std::fs::remove_file(&taking);
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let parsed = (|| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let [script, asset, atoms] = f[..] else {
+                return Err("it is not `<scriptPubKey hex> <asset> <atoms>`".to_string());
+            };
+            let script = unhex(script)?;
+            let asset = seqln_signer::payments::AssetKey::parse(asset)?;
+            let atoms: u64 = atoms.parse().map_err(|_| format!("{atoms:?} is not a whole number of atoms"))?;
+            if script.is_empty() || atoms == 0 {
+                return Err("it names no script or no atoms".to_string());
+            }
+            Ok((script, asset, atoms))
+        })();
+        let msg = match parsed {
+            Ok((script, asset, atoms)) => {
+                let m = format!(
+                    "seqln-signer: APPROVED on the device: one spend paying {} at most {atoms} atoms of {}",
+                    hex_of(&script),
+                    asset.display()
+                );
+                signer.approve_spend(script, asset, atoms);
+                m
+            }
+            Err(e) => format!("seqln-signer: approval on line {} of {} not taken: {e}", n + 1, path.display()),
+        };
+        logline(log, &msg);
+        eprintln!("{msg}");
+    }
+}
+
+fn hex_of(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
 fn logline(log: &mut Option<File>, line: &str) {
     if let Some(l) = log.as_mut() {
         let _ = writeln!(l, "{line}");

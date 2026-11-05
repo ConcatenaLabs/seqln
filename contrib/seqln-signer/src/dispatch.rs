@@ -125,6 +125,10 @@ pub struct Signer {
     /// (`approve_close_destination`): a close may pay this side's balance to
     /// one of them as to the node's own wallet. Not persisted.
     close_destinations: std::collections::HashSet<Vec<u8>>,
+    /// Payments to addresses outside this wallet that the device's user
+    /// approved on the device, each for one spend (`approve_spend`). Not
+    /// persisted: an approval not used before a restart is given again.
+    spend_approvals: Vec<SpendApproval>,
     /// The swaps this device approved on channels of several assets
     /// (APPROVE_SYM_SWAP), each until a state of each side has applied it.
     /// Not persisted: a swap pending across a restart is refused.
@@ -142,6 +146,32 @@ pub struct Signer {
 
 /// How many approved taproot-covenant claims the signer remembers.
 const TCOV_CLAIMS: usize = 64;
+
+/// A payment to an address outside this wallet that the device's user
+/// approved on the device for one spend ([`Signer::approve_spend`]).
+#[derive(Clone, Debug)]
+struct SpendApproval {
+    script: Vec<u8>,
+    asset: AssetKey,
+    /// The most the spend may pay that script in that asset.
+    atoms: u64,
+    /// When the user gave it, on the device's clock.
+    at: u64,
+    /// The transaction the device signed with it. An approval pays one
+    /// spend: once used it signs only that transaction again.
+    txid: Option<[u8; 32]>,
+}
+
+/// How long an approval of an outside address waits for its spend.
+pub const SPEND_APPROVAL_SECS: u64 = 600;
+/// How many approvals of outside addresses the signer remembers.
+const SPEND_APPROVALS: usize = 64;
+
+/// Whether an approval given at `at` has waited too long at `now` (a clock
+/// left at 0 expires nothing).
+fn approval_expired(at: u64, now: u64) -> bool {
+    now != 0 && now.saturating_sub(at) > SPEND_APPROVAL_SECS
+}
 
 /// What one transaction lets leave this device, in atoms per asset.
 type Losses = std::collections::BTreeMap<AssetKey, u64>;
@@ -182,6 +212,7 @@ impl Signer {
             now: 0,
             refusal: std::cell::RefCell::new(None),
             close_destinations: std::collections::HashSet::new(),
+            spend_approvals: Vec::new(),
             swaps: Vec::new(),
             genesis: None,
             tcov_claims: std::cell::RefCell::new(std::collections::VecDeque::new()),
@@ -201,6 +232,41 @@ impl Signer {
         if !script.is_empty() {
             self.close_destinations.insert(script);
         }
+    }
+
+    /// The device's user approved, on the device, one spend of the node's
+    /// wallet coins paying `script`, an address outside this wallet, at most
+    /// `atoms` of `asset` (D45). A withdrawal (SIGN_WITHDRAWAL) may then pay
+    /// it, and what it pays there counts against the asset's payment limit
+    /// with the fee, as a payment does. The approval pays one spend: the
+    /// first transaction the device signs with it is the only one it signs
+    /// again, so two transactions on different coins cannot both pay the
+    /// address. It waits [`SPEND_APPROVAL_SECS`] for that spend. Only the
+    /// user can give it: the page's own confirmation in a browser, the
+    /// approvals file on the device for the binary; nothing in a frame can,
+    /// so the host's word is never an approval. Not persisted.
+    pub fn approve_spend(&mut self, script: Vec<u8>, asset: AssetKey, atoms: u64) {
+        if script.is_empty() || atoms == 0 {
+            return;
+        }
+        let now = self.now;
+        self.spend_approvals.retain(|a| a.txid.is_some() || !approval_expired(a.at, now));
+        if self.spend_approvals.len() >= SPEND_APPROVALS {
+            self.spend_approvals.remove(0);
+        }
+        self.spend_approvals.push(SpendApproval { script, asset, atoms, at: now, txid: None });
+    }
+
+    /// Withdraw every approval of an outside address not yet used for a
+    /// spend (the user cancelled the payment on the device).
+    pub fn cancel_spend_approvals(&mut self) {
+        self.spend_approvals.retain(|a| a.txid.is_some());
+    }
+
+    /// The approvals of outside addresses the device holds, as (script,
+    /// asset, atoms, used for a spend).
+    pub fn spend_approvals(&self) -> Vec<(Vec<u8>, AssetKey, u64, bool)> {
+        self.spend_approvals.iter().map(|a| (a.script.clone(), a.asset, a.atoms, a.txid.is_some())).collect()
     }
 
     /// The reason the last request was refused, when its reply was not the
@@ -3261,7 +3327,13 @@ impl Signer {
         let (utxos, psbt) = wire::parse_sign_withdrawal(m)?;
         let (out, charge) =
             self.sign_wallet_inputs_into_psbt("SIGN_WITHDRAWAL", &utxos, psbt, Bound::Period, 0)?;
-        if let Some((txid, losses)) = charge {
+        if let Some((txid, losses, used)) = charge {
+            // The approvals of outside addresses it used now belong to it.
+            for i in used {
+                if let Some(a) = self.spend_approvals.get_mut(i) {
+                    a.txid = Some(txid);
+                }
+            }
             // Once per transaction, across restarts (`Ledger::charged_txids`).
             if !self.store.ledger.is_charged_txid(&txid) && losses.values().any(|&v| v > 0) {
                 self.store.ledger.prune(self.now, self.limits.period_secs);
@@ -3302,7 +3374,7 @@ impl Signer {
         psbt: Vec<u8>,
         bound: Bound,
         extra_signed: u64,
-    ) -> Option<(Vec<u8>, Option<([u8; 32], Losses)>)> {
+    ) -> Option<(Vec<u8>, Option<([u8; 32], Losses, Vec<usize>)>)> {
         let network = wire::detect_network(&psbt);
         // The tx being signed comes from the PSBT. On the Bitcoin path lightningd
         // downgrades to a v0 PSBT first, so the whole unsigned tx sits in the
@@ -3361,9 +3433,9 @@ impl Signer {
             let check = txid
                 .ok_or_else(|| "the transaction's txid cannot be computed".to_string())
                 .and_then(|txid| {
-                    let losses = self.check_withdrawal(&tx, &txid, network, signed)?;
+                    let (losses, used) = self.check_withdrawal(&tx, &txid, network, signed, bound)?;
                     self.losses_fit(&txid, &losses, bound)?;
-                    Ok((txid, losses))
+                    Ok((txid, losses, used))
                 });
             match check {
                 Ok(c) => charge = Some(c),
@@ -3530,26 +3602,36 @@ impl Signer {
     /// ([`Self::own_sweep_script_set`]) or a script the wallet holding its
     /// seed named as its own ([`Self::approve_close_destination`]), unblinded,
     /// or is the funding output of a channel this side is opening
-    /// ([`Self::funding_output`]). A spend to any other address is refused:
-    /// the node's word is not the wallet's. What reaches the wallet's script
-    /// stays the user's, so like the node's own scripts it is not counted as
-    /// leaving.
+    /// ([`Self::funding_output`]), or, in a withdrawal ([`Bound::Period`]),
+    /// pays an address outside this wallet that the device's user approved
+    /// on the device for this spend ([`Self::approve_spend`]). A spend to any
+    /// other address is refused: the node's word is not the wallet's. What
+    /// reaches the wallet's script stays the user's, so like the node's own
+    /// scripts it is not counted as leaving; what an approved address gets
+    /// is.
     /// Returns what the transaction lets leave the device, per asset: its
-    /// fee, and for a funding output what the channel's first commitments
-    /// give the peer. On Sequentia the fee is the explicit fee outputs, which
-    /// the signature commits to with every other output; on Bitcoin it is
-    /// what the inputs this device signs carry (`signed`, the amounts its
-    /// signatures commit to) beyond the outputs, every one of which stays
-    /// with this device or goes into the channel.
+    /// fee, what it pays approved outside addresses, and for a funding output
+    /// what the channel's first commitments give the peer. On Sequentia the
+    /// fee is the explicit fee outputs, which the signature commits to with
+    /// every other output; on Bitcoin it is what the inputs this device signs
+    /// carry (`signed`, the amounts its signatures commit to) beyond the
+    /// outputs, every one of which stays with this device, goes into the
+    /// channel or to an approved address. With it, the index in
+    /// `spend_approvals` of each approval the spend uses.
     fn check_withdrawal(
         &self,
         tx: &kernel::ElementsTx,
         txid: &[u8; 32],
         network: kernel::Network,
         signed: u64,
-    ) -> Result<Losses, String> {
+        bound: Bound,
+    ) -> Result<(Losses, Vec<usize>), String> {
         let own = self.own_sweep_script_set();
         let mut losses = Losses::new();
+        // What the spend pays each outside script the user approved, per
+        // asset, with the first output paying it.
+        let mut outside: std::collections::BTreeMap<(Vec<u8>, AssetKey), (u64, usize)> =
+            std::collections::BTreeMap::new();
         let mut add = |asset: AssetKey, v: u64| {
             let f = losses.entry(asset).or_insert(0);
             *f = f.saturating_add(v);
@@ -3599,12 +3681,24 @@ impl Signer {
             match self.funding_output(txid, i, o, network) {
                 Some(Ok((asset, push))) => add(asset, push),
                 Some(Err(reason)) => return Err(format!("output {i}: {reason}")),
+                None if bound == Bound::Period && self.spend_approvals.iter().any(|a| a.script == o.script) => {
+                    let (asset, value) = match network {
+                        kernel::Network::Elements => (
+                            explicit_asset(&o.asset).ok_or_else(|| format!("output {i} is blinded"))?,
+                            explicit_amount(&o.value).ok_or_else(|| format!("output {i} is blinded"))?,
+                        ),
+                        kernel::Network::Bitcoin => (AssetKey::Btc, amount),
+                    };
+                    let e = outside.entry((o.script.clone(), asset)).or_insert((0, i));
+                    e.0 = e.0.saturating_add(value);
+                }
                 None => {
                     return Err(format!(
                         "output {i} pays {}, which is not one of this device's own scripts nor \
                          the funding output of a channel it is opening: it moves coins only to \
-                         its own addresses, to the addresses its wallet named, and into its \
-                         channels",
+                         its own addresses, to the addresses its wallet named, into its \
+                         channels, and to an address its user approved on the device for that \
+                         spend",
                         hexbytes(&o.script)
                     ))
                 }
@@ -3613,7 +3707,73 @@ impl Signer {
         if network == kernel::Network::Bitcoin {
             add(AssetKey::Btc, signed.saturating_sub(paid));
         }
-        Ok(losses)
+        let mut used = Vec::new();
+        for ((script, asset), (value, i)) in &outside {
+            used.push(self.spend_approval_for(txid, script, *asset, *value, *i)?);
+            add(*asset, *value);
+        }
+        Ok((losses, used))
+    }
+
+    /// The approval of an outside address that lets the spend `txid` pay
+    /// `script` `value` atoms of `asset` (its first such output is `i`): one
+    /// already used for this same transaction, or else the smallest that
+    /// covers the value, has not expired and has paid no spend. Otherwise
+    /// why none does.
+    fn spend_approval_for(
+        &self,
+        txid: &[u8; 32],
+        script: &[u8],
+        asset: AssetKey,
+        value: u64,
+        i: usize,
+    ) -> Result<usize, String> {
+        let mine = |a: &SpendApproval| a.script == script && a.asset == asset;
+        if let Some(k) = self.spend_approvals.iter().position(|a| mine(a) && a.txid == Some(*txid)) {
+            return Ok(k);
+        }
+        let open = |a: &SpendApproval| mine(a) && a.txid.is_none() && !approval_expired(a.at, self.now);
+        if let Some((k, _)) = self
+            .spend_approvals
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| open(a) && a.atoms >= value)
+            .min_by_key(|(_, a)| a.atoms)
+        {
+            return Ok(k);
+        }
+        let pays = format!("output {i} pays {value} atoms of {} to {}", asset.display(), hexbytes(script));
+        let ours: Vec<&SpendApproval> = self.spend_approvals.iter().filter(|a| mine(a)).collect();
+        if ours.is_empty() {
+            let other: Vec<String> = self
+                .spend_approvals
+                .iter()
+                .filter(|a| a.script == script)
+                .map(|a| a.asset.display())
+                .collect();
+            return Err(format!(
+                "{pays}, and its user approved that address on the device only in {}",
+                other.join(", ")
+            ));
+        }
+        if let Some(most) = ours.iter().filter(|a| open(a)).map(|a| a.atoms).max() {
+            return Err(format!(
+                "{pays}, more than the {most} its user approved on the device for that spend"
+            ));
+        }
+        if let Some(a) = ours.iter().find(|a| a.txid.is_none()) {
+            return Err(format!(
+                "{pays}, and its user's approval on the device expired: given {} s ago, it \
+                 waits {SPEND_APPROVAL_SECS} s for its spend",
+                self.now.saturating_sub(a.at)
+            ));
+        }
+        let other = ours.iter().find_map(|a| a.txid).unwrap_or_default();
+        Err(format!(
+            "{pays}, and its user's approval on the device paid another spend, {}, which this \
+             device signed: an approval pays one spend",
+            hexbytes(&other.iter().rev().copied().collect::<Vec<u8>>())
+        ))
     }
 
     /// Whether output `i` of the transaction `txid`, about to be signed, is
@@ -3714,9 +3874,10 @@ impl Signer {
                     let left = limit.saturating_sub(spent);
                     if atoms.saturating_mul(1000) > left {
                         return Err(format!(
-                            "what it lets leave this device (its fee, and what a channel it funds \
-                             gives the peer), {atoms} atoms of {}, is over what this device's \
-                             payment limit for that asset has left this period ({} of {} atoms)",
+                            "what it lets leave this device (its fee, what it pays an address its \
+                             user approved, and what a channel it funds gives the peer), {atoms} \
+                             atoms of {}, is over what this device's payment limit for that asset \
+                             has left this period ({} of {} atoms)",
                             asset.display(),
                             left / 1000,
                             limit / 1000
@@ -7568,8 +7729,9 @@ mod close_output_spend_tests {
         assert_eq!(
             s.take_refusal().unwrap(),
             format!(
-                "SIGN_WITHDRAWAL refused: what it lets leave this device (its fee, and what a \
-                 channel it funds gives the peer), 6000 atoms of {}, is over what this \
+                "SIGN_WITHDRAWAL refused: what it lets leave this device (its fee, what it pays \
+                 an address its user approved, and what a channel it funds gives the peer), \
+                 6000 atoms of {}, is over what this \
                  device's payment limit for that asset has left this period (5000 of 5000 \
                  atoms)",
                 AssetKey::Asset(GOLD).display()
@@ -7646,8 +7808,9 @@ mod close_output_spend_tests {
         assert_eq!(reply_psbt(t.handle(&req(withdrawal(&ins, &psbt)))), psbt);
         assert_eq!(
             t.take_refusal().unwrap(),
-            "SIGN_WITHDRAWAL refused: what it lets leave this device (its fee, and what a channel \
-             it funds gives the peer), 1000 atoms of btc, is over what this device's payment \
+            "SIGN_WITHDRAWAL refused: what it lets leave this device (its fee, what it pays an \
+             address its user approved, and what a channel it funds gives the peer), 1000 atoms \
+             of btc, is over what this device's payment \
              limit for that asset has left this period (800 of 800 atoms)"
         );
     }
@@ -7949,6 +8112,125 @@ mod close_output_spend_tests {
         assert_ne!(reply_psbt(t.handle(&req(withdrawal(ins, psbt)))), *psbt);
         assert_eq!(t.take_refusal(), None);
         assert_eq!(t.store.ledger.spent_msat(&gold, 1_000 + 86_400, 86_400), 2_000_000);
+    }
+
+    /// D45's third kind of output: an address outside this wallet that the
+    /// device's user approved on the device for that spend. Refused until
+    /// approved; signed within the approval, which pays one spend, waits a
+    /// while for it, holds to its asset and amount, and is charged to the
+    /// period's limit with the fee.
+    #[test]
+    fn d45_outside_address_needs_the_users_approval() {
+        let mut s = signer(Policy::Enforce);
+        gold_limit(&mut s, 1_000_000);
+        s.set_now(1_000);
+        let gold = AssetKey::Asset(GOLD);
+        let outside = foreign_spk();
+        let own = s.wallet_sweep_script(6, false);
+        let spend = |coin: u8, pay: u64| {
+            let ins = [In { txid: [coin; 32], amount: 1_000_000, spk: own.clone(), keyindex: 6, close: None }];
+            let psbt = pset(&ins, &[(GOLD, pay, outside.clone()), (GOLD, 998_000 - pay, own.clone()), (GOLD, 2_000, vec![])], false);
+            (ins, psbt)
+        };
+        let refused = |s: &mut Signer, ins: &[In], psbt: &[u8]| {
+            assert_eq!(reply_psbt(s.handle(&req(withdrawal(ins, psbt)))), psbt, "returned unsigned");
+            let why = s.take_refusal().expect("a reason");
+            assert!(why.starts_with("SIGN_WITHDRAWAL refused: "), "{why}");
+            why
+        };
+        let signed = |s: &mut Signer, ins: &[In], psbt: &[u8]| {
+            assert_ne!(reply_psbt(s.handle(&req(withdrawal(ins, psbt)))), psbt, "signed");
+            assert_eq!(s.take_refusal(), None);
+        };
+
+        // Not approved: refused, the host's word being no approval.
+        let (ins, psbt) = spend(0x61, 300_000);
+        let why = refused(&mut s, &ins, &psbt);
+        println!("outside address, not approved: {why}");
+        assert!(why.contains("which is not one of this device's own scripts nor the funding output"), "{why}");
+        assert!(why.ends_with("and to an address its user approved on the device for that spend"), "{why}");
+
+        // Approved in another asset: refused.
+        s.approve_spend(outside.clone(), AssetKey::Asset([0x99; 32]), 300_000);
+        let why = refused(&mut s, &ins, &psbt);
+        println!("approved in another asset: {why}");
+        assert!(why.contains(&format!("output 0 pays 300000 atoms of {} to 0014eeee", gold.display())), "{why}");
+        assert!(why.contains(&format!("approved that address on the device only in {}",
+                                      AssetKey::Asset([0x99; 32]).display())), "{why}");
+
+        // Approved for less: refused.
+        s.approve_spend(outside.clone(), gold, 299_999);
+        let why = refused(&mut s, &ins, &psbt);
+        println!("approved for less: {why}");
+        assert!(why.ends_with("more than the 299999 its user approved on the device for that spend"), "{why}");
+
+        // Approved for as much: signed, and what it pays the address is
+        // charged with the fee.
+        s.approve_spend(outside.clone(), gold, 300_000);
+        signed(&mut s, &ins, &psbt);
+        println!("approved for 300000: SIGNED");
+        assert_eq!(s.store.ledger.spent_msat(&gold, 1_000, 86_400), 302_000_000);
+        // The same transaction again: signed, charged once.
+        signed(&mut s, &ins, &psbt);
+        assert_eq!(s.store.ledger.spent_msat(&gold, 1_000, 86_400), 302_000_000);
+
+        // The approval paid that spend: another transaction paying the same
+        // address the same from another coin is refused, so the two cannot
+        // both confirm. (The 299,999 one is still open, and too small.)
+        let (ins2, psbt2) = spend(0x62, 300_000);
+        let why = refused(&mut s, &ins2, &psbt2);
+        assert!(why.ends_with("more than the 299999 its user approved on the device for that spend"), "{why}");
+        s.cancel_spend_approvals();
+        let why = refused(&mut s, &ins2, &psbt2);
+        println!("a second spend on the used approval: {why}");
+        assert!(why.contains("its user's approval on the device paid another spend"), "{why}");
+        assert!(why.ends_with("which this device signed: an approval pays one spend"), "{why}");
+        // The cancelled ones are gone; the used one stays, for its spend.
+        assert_eq!(s.spend_approvals(), vec![(outside.clone(), gold, 300_000, true)]);
+        signed(&mut s, &ins, &psbt);
+
+        // Two outputs to the address count together against the approval.
+        s.approve_spend(outside.clone(), gold, 400_000);
+        let ins3 = [In { txid: [0x63; 32], amount: 1_000_000, spk: own.clone(), keyindex: 6, close: None }];
+        let psbt3 = pset(&ins3, &[(GOLD, 250_000, outside.clone()), (GOLD, 250_000, outside.clone()),
+                                  (GOLD, 498_000, own.clone()), (GOLD, 2_000, vec![])], false);
+        let why = refused(&mut s, &ins3, &psbt3);
+        println!("two outputs, 500000 in all: {why}");
+        assert!(why.contains("output 0 pays 500000 atoms of"), "{why}");
+
+        // An approval waits ten minutes for its spend.
+        s.set_now(1_000 + SPEND_APPROVAL_SECS + 1);
+        let psbt3 = pset(&ins3, &[(GOLD, 200_000, outside.clone()), (GOLD, 200_000, outside.clone()),
+                                  (GOLD, 598_000, own.clone()), (GOLD, 2_000, vec![])], false);
+        let why = refused(&mut s, &ins3, &psbt3);
+        println!("approval expired: {why}");
+        assert!(why.contains(&format!("its user's approval on the device expired: given {} s ago, it waits 600 s",
+                                      SPEND_APPROVAL_SECS + 1)), "{why}");
+        s.approve_spend(outside.clone(), gold, 400_000);
+        signed(&mut s, &ins3, &psbt3);
+        assert_eq!(s.store.ledger.spent_msat(&gold, s.now, 86_400), 704_000_000);
+
+        // Within the approval but over what the limit has left: refused.
+        s.approve_spend(outside.clone(), gold, 500_000);
+        let (ins4, psbt4) = spend(0x64, 295_000);
+        let why = refused(&mut s, &ins4, &psbt4);
+        println!("approved, over the limit: {why}");
+        assert!(why.contains("what it pays an address its user approved"), "{why}");
+        assert!(why.contains("297000 atoms of"), "{why}");
+        assert!(why.ends_with("has left this period (296000 of 1000000 atoms)"), "{why}");
+
+        // Bitcoin: what it pays the address and the fee are charged.
+        let mut b = signer(Policy::Enforce);
+        gold_limit(&mut b, 1_000_000);
+        b.set_now(5_000);
+        let coin = [wallet_coin(&b, [0x65; 32], 5, 100_000)];
+        let psbt = psbt_v0(&coin, &[(90_000, outside.clone())]);
+        let why = refused(&mut b, &coin, &psbt);
+        assert!(why.contains("not one of this device's own scripts"), "{why}");
+        b.approve_spend(outside.clone(), AssetKey::Btc, 90_000);
+        signed(&mut b, &coin, &psbt);
+        assert_eq!(b.store.ledger.spent_msat(&AssetKey::Btc, 5_000, 86_400), 100_000_000);
+        println!("bitcoin, approved 90000: SIGNED, 100000 charged (fee 10000)");
     }
 
     const REMOTE_FUNDING: [u8; 33] = [
