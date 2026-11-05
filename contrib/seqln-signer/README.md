@@ -87,7 +87,13 @@ What enforce mode checks:
   rebuild a commitment it had not already validated; lightningd never needs one, because what it
   signs is the commitment channeld last had validated. A device with no such record (a store
   from before commitments were recorded, or a lost store) signs none of our commitments for
-  broadcast until the channel's next commitment step.
+  broadcast until the channel's next commitment step. A commitment signed for broadcast is a
+  close: the device records the lowest it signed so (store version 16) and never reveals that
+  commitment's secret, nor a later one's ("REVOKE_COMMITMENT_TX refused: commitment n of ours was
+  signed for broadcast, a close"), so a commitment the host holds fully signed is never a revoked
+  one, and the channel steps no further. lightningd asks for this signature only when it drops a
+  channel to chain; the watchtower store keeps no commitment of ours
+  (`doc/seqln-design/seqln-device-broadcast-signature.md`).
 - **Mutual closes** (closingd's request, and the closing transaction lightningd signs again with
   the commitment message when a close completes and whenever it starts with a channel closing):
   one input, the funding output, issuing no asset; every output in one asset, the channel's; at
@@ -314,9 +320,10 @@ the device sees on each side of a channel.
 
 Not checked: whether an HTLC paid to this side was settled. The device never sees a preimage, so
 a commitment that drops an HTLC the peer offered us, without crediting it, looks to it like a
-failed payment. And the device does not protect a user from a host that also runs the channel's
-peer: such a host can broadcast a commitment the device signed for the watchtower's preempt slot
-before the device revoked it, which the peer then takes whole with the revocation secret.
+failed payment. Nor whether the host still holds a commitment that an older device signed for
+broadcast at every step, for a watchtower slot that no longer exists: such a commitment was
+revoked a step later, and a host that also runs the channel's peer can broadcast it for the peer
+to take whole, until the channel closes.
 
 The channel store (each channel's parameters, dust limits and reserves, revocation counters,
 recorded balance, whether the peer has reached its reserve, the unrevoked commitments it validated,

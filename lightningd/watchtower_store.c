@@ -466,8 +466,7 @@ static bool write_state(struct lightningd *ld,
 bool wt_store_put_advance(struct lightningd *ld,
 			  const struct channel *channel,
 			  u64 commit_num,
-			  struct watchtower_blob *const *sweeps,
-			  const struct bitcoin_tx *preempt_tx)
+			  struct watchtower_blob *const *sweeps)
 {
 	char *chandir = channel_store_dir(tmpctx, ld, channel, NULL);
 	struct wt_state *st;
@@ -480,14 +479,12 @@ bool wt_store_put_advance(struct lightningd *ld,
 		tal_free(st->sweeps);
 		st->sweeps = tal_dup_talarr(st, struct watchtower_blob *, sweeps);
 	}
-	if (preempt_tx) {
-		tal_free(st->preempt_tx);
-		st->preempt_tx = clone_bitcoin_tx(st, preempt_tx);
-		st->preempt_commit_num = commit_num;
-		/* A clean advance disarms. */
-		st->armed = false;
-		st->armed_commit_num = 0;
-	}
+	/* No commitment of ours is kept: a slot an earlier build wrote goes at
+	 * the next write, and so does its armed flag. */
+	st->preempt_tx = tal_free(st->preempt_tx);
+	st->preempt_commit_num = 0;
+	st->armed = false;
+	st->armed_commit_num = 0;
 	return write_state(ld, channel, st);
 }
 
@@ -496,32 +493,7 @@ bool wt_store_put_sweeps(struct lightningd *ld,
 			 u64 current_commit_num,
 			 struct watchtower_blob *const *blobs)
 {
-	return wt_store_put_advance(ld, channel, current_commit_num, blobs, NULL);
-}
-
-bool wt_store_put_preempt(struct lightningd *ld,
-			  const struct channel *channel,
-			  u64 commit_num,
-			  const struct bitcoin_tx *signed_commit_tx)
-{
-	return wt_store_put_advance(ld, channel, commit_num, NULL,
-				    signed_commit_tx);
-}
-
-bool wt_store_set_preempt_armed(struct lightningd *ld,
-				const struct channel *channel,
-				bool armed)
-{
-	char *chandir = channel_store_dir(tmpctx, ld, channel, NULL);
-	struct wt_state *st;
-
-	if (!chandir)
-		return false;
-	st = load_state(tmpctx, channel, chandir);
-	st->armed = armed;
-	st->armed_commit_num = armed && channel->next_index[LOCAL]
-		? channel->next_index[LOCAL] - 1 : 0;
-	return write_state(ld, channel, st);
+	return wt_store_put_advance(ld, channel, current_commit_num, blobs);
 }
 
 struct watchtower_blob **wt_store_load_sweeps(const tal_t *ctx,

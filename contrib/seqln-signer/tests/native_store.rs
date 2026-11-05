@@ -154,6 +154,7 @@ fn channel(k: &Kernel) -> ChannelState {
         option_sym_clock: false,
         clock_issuer: None,
         clock_seed: None,
+        broadcast_from: None,
     }
 }
 

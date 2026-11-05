@@ -235,6 +235,11 @@ pub struct ChannelState {
     /// checked that the funding issues one atom of the marker into it
     /// (`CHECK_SYM_CLOCK_FUNDING`). Until then no state may pay this side.
     pub clock_seed: Option<u32>,
+    /// The lowest commitment of ours this device signed for broadcast
+    /// (SIGN_COMMITMENT_TX on a commitment: a close). Its secret, and every
+    /// later commitment's, never leaves the device, so a commitment the host
+    /// was given fully signed can never become a revoked one.
+    pub broadcast_from: Option<u64>,
 }
 
 /// The most further lanes a channel may have (`SYM_MAX_LANES`).
@@ -368,6 +373,11 @@ impl ChannelState {
         if self.clock_seed.is_none() {
             self.clock_seed = old.clock_seed;
         }
+        // A commitment signed for broadcast stays so.
+        self.broadcast_from = match (self.broadcast_from, old.broadcast_from) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
     }
 }
 
@@ -589,11 +599,12 @@ pub const CHSTORE_MAGIC: [u8; 4] = *b"SQCH";
 /// txid(32) and vout(4) if set, and the seed's flag(1), then seed(4) if set).
 /// Version 15 adds, after the close record, the txids of the wallet
 /// transactions whose losses the ledger charged (count(2), then txid(32)
-/// each).
+/// each). Version 16 adds, after each entry's settle clock, the lowest
+/// commitment of ours signed for broadcast (flag(1), then number(8) if set).
 /// Versions 1 to 9 still import (the fields they lack unknown); each channel of a store older
 /// than version 6, written by a device that validated nothing, predates
 /// validation.
-pub const CHSTORE_VERSION: u8 = 15;
+pub const CHSTORE_VERSION: u8 = 16;
 
 /// The first store version a validating device wrote.
 pub const CHSTORE_FIRST_VALIDATING: u8 = 6;
@@ -787,6 +798,13 @@ pub fn encode_channel_store(store: &ChannelStore) -> Vec<u8> {
                 out.extend_from_slice(&n.to_le_bytes());
             }
         }
+        match st.broadcast_from {
+            None => out.push(0),
+            Some(n) => {
+                out.push(1);
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+        }
     }
     push_ledger(&mut out, &store.ledger);
     out.extend_from_slice(&(store.close_txids.len() as u16).to_le_bytes());
@@ -969,6 +987,7 @@ pub fn decode_channel_store(bytes: &[u8]) -> Result<DecodedStore, String> {
             option_sym_clock: false,
             clock_issuer: None,
             clock_seed: None,
+            broadcast_from: None,
         };
         if version >= 2 {
             st.is_outbound = r.opt_bool()?;
@@ -1099,6 +1118,13 @@ pub fn decode_channel_store(bytes: &[u8]) -> Result<DecodedStore, String> {
                 0 => None,
                 1 => Some(u32::from_le_bytes(r.take(4)?.try_into().unwrap())),
                 v => return Err(format!("bad clock seed flag {v} in channel-store blob")),
+            };
+        }
+        if version >= 16 {
+            st.broadcast_from = match r.u8()? {
+                0 => None,
+                1 => Some(r.u64()?),
+                v => return Err(format!("bad broadcast flag {v} in channel-store blob")),
             };
         }
         out.push(((node_id, dbid), st));

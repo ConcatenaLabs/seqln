@@ -158,10 +158,10 @@ strings puts a node in a re-exec loop.
   BOLT11 `a` field show the 32-byte id in display order, the reverse of the tag's bytes.
 
 The Specula watchtower layer (`speculad/`, `channeld/watchtower.*`, `lightningd/watchtower_store.*`,
-`lightningd/onchain_presign.*`, `common/presign_templates.*`, the `penalty_htlcs` table, the
-`setpreemptarmed` RPC) is summarised in `doc/sequentia-fork.md` section 7b. Its design note is not
-yet published in this repository; the header comment of `speculad/speculad.c` is the fullest
-description.
+`lightningd/onchain_presign.*`, `common/presign_templates.*`, the `penalty_htlcs` table) is
+summarised in `doc/sequentia-fork.md` section 7b; the header comment of `speculad/speculad.c` is
+the fullest description. Why the store keeps no commitment of ours, and the device signs one for
+broadcast only to close, is `doc/seqln-design/seqln-device-broadcast-signature.md`.
 
 ## Working in this repo
 
