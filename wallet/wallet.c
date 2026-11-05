@@ -29,6 +29,7 @@
 #include <lightningd/peer_htlcs.h>
 #include <lightningd/runes.h>
 #include <lightningd/sym_lanes.h>
+#include <lightningd/sym_clock.h>
 #include <lightningd/symmetric.h>
 #include <onchaind/onchaind_wiregen.h>
 #include <wallet/datastore.h>
@@ -2272,6 +2273,8 @@ static struct channel *wallet_stmt2channel(struct wallet *w, struct db_stmt *stm
 			wallet_sym_factory_load(w, chan);
 		if (channel_type_has(chan->type, OPT_SEQ_SYMMETRIC_LANES))
 			wallet_sym_lanes_load(w, chan);
+		if (channel_type_has(chan->type, OPT_SEQ_SYMMETRIC_CLOCK))
+			wallet_sym_clock_load(w, chan);
 		if (chan->last_tx && sym_is_kickoff(chan, chan->last_tx))
 			chan->last_sig.sighash_type
 				= SIGHASH_SINGLE | SIGHASH_ANYONECANPAY;
@@ -3805,6 +3808,54 @@ void wallet_sym_lanes_load(struct wallet *w, struct channel *channel)
 	if (!b)
 		fatal("Corrupt lanes of channel %"PRIu64, channel->dbid);
 	channel->sym_lanes = info;
+}
+
+void wallet_sym_clock_save(struct wallet *w, const struct channel *channel)
+{
+	struct db_stmt *stmt;
+
+	stmt = db_prepare_v2(w->db, SQL("DELETE FROM channel_sym_clock"
+					" WHERE channel_id = ?;"));
+	db_bind_u64(stmt, channel->dbid);
+	db_exec_prepared_v2(take(stmt));
+
+	stmt = db_prepare_v2(w->db, SQL("INSERT INTO channel_sym_clock ("
+					"  channel_id, issuer_txid,"
+					"  issuer_outnum, seed_outnum)"
+					" VALUES (?, ?, ?, ?);"));
+	db_bind_u64(stmt, channel->dbid);
+	db_bind_txid(stmt, &channel->sym_clock->issuer.txid);
+	db_bind_int(stmt, channel->sym_clock->issuer.n);
+	if (channel->sym_clock->seed_known)
+		db_bind_int(stmt, channel->sym_clock->seed_outnum);
+	else
+		db_bind_null(stmt);
+	db_exec_prepared_v2(take(stmt));
+}
+
+void wallet_sym_clock_load(struct wallet *w, struct channel *channel)
+{
+	struct db_stmt *stmt;
+
+	stmt = db_prepare_v2(w->db, SQL("SELECT issuer_txid, issuer_outnum,"
+					" seed_outnum"
+					" FROM channel_sym_clock"
+					" WHERE channel_id = ?;"));
+	db_bind_u64(stmt, channel->dbid);
+	db_query_prepared(stmt);
+	if (!db_step(stmt)) {
+		tal_free(stmt);
+		return;
+	}
+	channel->sym_clock = tal(channel, struct sym_clock_funding);
+	db_col_txid(stmt, "issuer_txid", &channel->sym_clock->issuer.txid);
+	channel->sym_clock->issuer.n = db_col_int(stmt, "issuer_outnum");
+	channel->sym_clock->seed_known = !db_col_is_null(stmt, "seed_outnum");
+	if (channel->sym_clock->seed_known)
+		channel->sym_clock->seed_outnum = db_col_int(stmt, "seed_outnum");
+	else
+		db_col_ignore(stmt, "seed_outnum");
+	tal_free(stmt);
 }
 
 void wallet_credit_note_save(struct wallet *w, u64 chan_dbid, bool issued,

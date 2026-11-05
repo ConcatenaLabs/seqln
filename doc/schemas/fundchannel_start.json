@@ -131,6 +131,13 @@
             }
           }
         }
+      },
+      "sym_issuer": {
+        "added": "v26.06",
+        "type": "outpoint",
+        "description": [
+          "On a Sequentia network, the input of the funding transaction that issues the channel's marker, when the channel has the settle clock (*option_seq_symmetric_clock*): the funding must issue one atom of it, with no reissuance token, into the seed (*sym_seed_scriptpubkey*). With no *channel_type*, a symmetric channel has the settle clock when both nodes offer it and this is given. **multifundchannel** gives each such channel an input of the funding of its own."
+        ]
       }
     },
     "pairedWith": [
@@ -209,7 +216,8 @@
                 "seq_credit/even",
                 "seq_symmetric/even",
                 "seq_symmetric_factory/even",
-                "seq_symmetric_lanes/even"
+                "seq_symmetric_lanes/even",
+                "seq_symmetric_clock/even"
               ],
               "description": [
                 "Name of feature bit."
@@ -222,6 +230,27 @@
         "type": "hex",
         "description": [
           "The raw scriptPubkey which mutual close will go to; only present if *close_to* parameter was specified and peer supports `option_upfront_shutdown_script`."
+        ]
+      },
+      "sym_seed_scriptpubkey": {
+        "added": "v26.06",
+        "type": "hex",
+        "description": [
+          "A settle-clock channel's seed: the funding pays it one atom of *sym_marker*, which input *sym_issuer* issues with no reissuance token. **fundchannel_complete** refuses a funding that does not."
+        ]
+      },
+      "sym_marker": {
+        "added": "v26.06",
+        "type": "hex",
+        "description": [
+          "The 32-byte display id of the asset *sym_issuer* issues, the channel's marker."
+        ]
+      },
+      "dev_sym_marker_atoms": {
+        "added": "v26.06",
+        "type": "u32",
+        "description": [
+          "With --dev-symmetric-clock-bad-funding (developer mode only): the atoms of the marker to issue instead of one, to test the peer's refusal."
         ]
       },
       "warning_usage": {

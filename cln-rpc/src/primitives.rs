@@ -83,6 +83,8 @@ pub enum ChannelTypeName {
     SEQ_SYMMETRIC_FACTORY_EVEN = 9,
     #[serde(rename = "seq_symmetric_lanes/even")]
     SEQ_SYMMETRIC_LANES_EVEN = 10,
+    #[serde(rename = "seq_symmetric_clock/even")]
+    SEQ_SYMMETRIC_CLOCK_EVEN = 11,
 }
 
 #[derive(Copy, Clone, Serialize, Deserialize, Debug)]
@@ -514,6 +516,7 @@ impl From<i32> for ChannelTypeName {
             8 => ChannelTypeName::SEQ_SYMMETRIC_EVEN,
             9 => ChannelTypeName::SEQ_SYMMETRIC_FACTORY_EVEN,
             10 => ChannelTypeName::SEQ_SYMMETRIC_LANES_EVEN,
+            11 => ChannelTypeName::SEQ_SYMMETRIC_CLOCK_EVEN,
             o => panic!("Unmapped ChannelTypeName {}", o),
         }
     }
@@ -533,6 +536,7 @@ impl From<ChannelTypeName> for i32 {
             ChannelTypeName::SEQ_SYMMETRIC_EVEN => 8,
             ChannelTypeName::SEQ_SYMMETRIC_FACTORY_EVEN => 9,
             ChannelTypeName::SEQ_SYMMETRIC_LANES_EVEN => 10,
+            ChannelTypeName::SEQ_SYMMETRIC_CLOCK_EVEN => 11,
         }
     }
 }
@@ -553,6 +557,7 @@ impl Display for ChannelTypeName {
             ChannelTypeName::SEQ_SYMMETRIC_EVEN => write!(f, "SEQ_SYMMETRIC_EVEN"),
             ChannelTypeName::SEQ_SYMMETRIC_FACTORY_EVEN => write!(f, "SEQ_SYMMETRIC_FACTORY_EVEN"),
             ChannelTypeName::SEQ_SYMMETRIC_LANES_EVEN => write!(f, "SEQ_SYMMETRIC_LANES_EVEN"),
+            ChannelTypeName::SEQ_SYMMETRIC_CLOCK_EVEN => write!(f, "SEQ_SYMMETRIC_CLOCK_EVEN"),
         }
     }
 }

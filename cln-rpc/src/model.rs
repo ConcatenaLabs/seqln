@@ -2632,6 +2632,8 @@ pub mod requests {
 	    pub push_msat: Option<Amount>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub reserve: Option<Amount>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub sym_issuer: Option<Outpoint>,
 	    #[serde(skip_serializing_if = "crate::is_none_or_empty")]
 	    pub channel_type: Option<Vec<u32>>,
 	    #[serde(skip_serializing_if = "crate::is_none_or_empty")]
@@ -9245,7 +9247,13 @@ pub mod responses {
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub close_to: Option<String>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub dev_sym_marker_atoms: Option<u32>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub mindepth: Option<u32>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub sym_marker: Option<String>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub sym_seed_scriptpubkey: Option<String>,
 	    pub funding_address: String,
 	    pub scriptpubkey: String,
 	    pub warning_usage: String,

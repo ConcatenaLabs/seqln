@@ -125,6 +125,9 @@ struct state {
 	 * peer's signature on each one's kickoff (common/sym_lanes.h). */
 	struct sym_lane *sym_lanes;
 	struct bitcoin_signature *sym_lane_sigs, *sym_lane_local_sigs;
+	/* SEQUENTIA: a settle-clock channel's issuer, the funding input whose
+	 * issuance makes its marker (common/sym_scripts.h). */
+	struct bitcoin_outpoint *sym_issuer;
 
 	/* Channel type we agreed on (even before channel populated) */
 	struct channel_type *channel_type;
@@ -368,6 +371,31 @@ static void factory_ko_program(const struct state *state,
 	sym_tree_program(&ko, program);
 }
 
+/* SEQUENTIA: a settle-clock channel's seed (common/sym_scripts.h), which
+ * the funding pays the marker our issuer makes: KICK over the funding output
+ * @funding_wscript and the capacity, RETIRE over both update keys (each
+ * side's delayed payment basepoint).  We are the opener. */
+static u8 *opener_clock_seed(const tal_t *ctx, const struct state *state,
+			  const u8 *funding_wscript)
+{
+	struct sym_channel sc;
+	struct bitcoin_outpoint unknown;
+	u16 delay = state->localconf.to_self_delay
+		> state->remoteconf.to_self_delay
+		? state->localconf.to_self_delay
+		: state->remoteconf.to_self_delay;
+
+	/* The seed does not depend on the funding outpoint, which the tag
+	 * holds and we do not know yet. */
+	memset(&unknown, 0, sizeof(unknown));
+	sym_channel_init(&sc, &chainparams->genesis_blockhash, &unknown,
+			 &state->our_points.delayed_payment,
+			 &state->their_points.delayed_payment,
+			 state->channel_asset, delay);
+	return sym_clock_seed(ctx, &sc, state->sym_issuer, funding_wscript,
+			      state->funding_sats);
+}
+
 /* There is no kickoff to sign: the split takes no signature. */
 static void factory_zero_sig(struct bitcoin_signature *sig)
 {
@@ -412,6 +440,7 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags,
 	struct tlv_accept_channel_tlvs *accept_tlvs;
 	char *err_reason;
 	u32 their_mindepth;
+	u8 *sym_seed = NULL;
 
 	status_debug("funder_channel_start");
 	if (!setup_channel_funder(state))
@@ -521,6 +550,22 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags,
 		negotiation_aborted(state, "Lanes need the channel type of"
 				    " several assets");
 		return NULL;
+	}
+
+	/* SEQUENTIA: a settle-clock channel names its issuer, from whose
+	 * outpoint the peer derives the marker its kickoff signature commits
+	 * to (common/sym_scripts.h). */
+	if (channel_type_has(state->channel_type, OPT_SEQ_SYMMETRIC_CLOCK)) {
+		if (!state->sym_issuer) {
+			negotiation_aborted(state, "A settle-clock channel needs"
+					    " the funding input that issues"
+					    " its marker");
+			return NULL;
+		}
+		open_tlvs->sym_issuer
+			= tal(open_tlvs, struct tlv_open_channel_tlvs_sym_issuer);
+		open_tlvs->sym_issuer->txid = state->sym_issuer->txid;
+		open_tlvs->sym_issuer->outnum = state->sym_issuer->n;
 	}
 
 	msg = towire_open_channel(NULL,
@@ -722,6 +767,22 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags,
 		return NULL;
 	}
 
+	/* SEQUENTIA: a settle-clock channel's funding also pays its marker to
+	 * the seed, and is mined before the channel locks in: the accepter
+	 * checks the issuance then (common/sym_scripts.h). */
+	if (channel_type_has(state->channel_type, OPT_SEQ_SYMMETRIC_CLOCK)) {
+		if (their_mindepth == 0) {
+			negotiation_failed(state, "A settle-clock channel's"
+					   " funding must be mined before it"
+					   " locks in");
+			return NULL;
+		}
+		sym_seed = opener_clock_seed(tmpctx, state,
+					  bitcoin_redeem_2of2(tmpctx,
+							      &state->our_funding_pubkey,
+							      &state->their_funding_pubkey));
+	}
+
 	/* If we have negotiated `option_zeroconf` then we're allowed
 	 * to send `channel_ready` whenever we want. So ignore their
 	 * `minimum_depth` and use ours instead. Otherwise we use the
@@ -738,6 +799,11 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags,
 	} else {
 		state->minimum_depth = their_mindepth;
 	}
+	/* SEQUENTIA: a settle-clock channel's funding is mined before it
+	 * locks in, on either side (their_mindepth is not zero, above). */
+	if (channel_type_has(state->channel_type, OPT_SEQ_SYMMETRIC_CLOCK)
+	    && state->minimum_depth == 0)
+		state->minimum_depth = their_mindepth;
 
 	/* Update the billboard with our infos */
 	peer_billboard(false,
@@ -750,7 +816,8 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags,
 							  state->our_features,
 							  state->their_features,
 							  OPT_UPFRONT_SHUTDOWN_SCRIPT),
-						  state->channel_type);
+						  state->channel_type,
+						  sym_seed);
 }
 
 /* SEQUENTIA: a symmetric channel (common/sym_scripts.h): our funding key's
@@ -1321,6 +1388,9 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	struct tlv_funding_created_tlvs *fc_tlvs;
 	struct amount_sat *reserve;
 
+	/* SEQUENTIA: nothing of an earlier attempt's settle clock. */
+	state->sym_issuer = tal_free(state->sym_issuer);
+
 	/* BOLT #2:
 	 *
 	 * The receiving node MUST fail the channel if:
@@ -1464,6 +1534,26 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 							   open_tlvs->channel_type));
 			return NULL;
 		}
+	}
+
+	/* SEQUENTIA: a settle-clock channel names its issuer
+	 * (common/sym_scripts.h); its funding is mined before it locks in,
+	 * so lightningd can check the issuance first. */
+	if (channel_type_has(state->channel_type, OPT_SEQ_SYMMETRIC_CLOCK)) {
+		if (!open_tlvs->sym_issuer) {
+			negotiation_failed(state, "A settle-clock channel needs"
+					   " its issuer");
+			return NULL;
+		}
+		if (channel_type_has(state->channel_type, OPT_ZEROCONF)) {
+			negotiation_failed(state, "A settle-clock channel's"
+					   " funding must be mined before it"
+					   " locks in");
+			return NULL;
+		}
+		state->sym_issuer = tal(state, struct bitcoin_outpoint);
+		state->sym_issuer->txid = open_tlvs->sym_issuer->txid;
+		state->sym_issuer->n = open_tlvs->sym_issuer->outnum;
 	}
 
 	/* BOLT #2:
@@ -1619,6 +1709,11 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 		    "You required zeroconf, but you're not on our allowlist");
 		return NULL;
 	}
+
+	/* SEQUENTIA: we check a settle-clock channel's funding once mined,
+	 * before it locks in. */
+	if (state->sym_issuer && state->minimum_depth == 0)
+		state->minimum_depth = 1;
 
 	if (!state->upfront_shutdown_script[LOCAL])
 		state->upfront_shutdown_script[LOCAL]
@@ -1994,7 +2089,8 @@ reply:
 				     state->factory,
 				     state->sym_lanes,
 				     state->sym_lane_sigs,
-				     state->sym_lane_local_sigs);
+				     state->sym_lane_local_sigs,
+				     state->sym_issuer);
 }
 
 /*~ Standard "peer sent a message, handle it" demuxer.  Though it really only
@@ -2078,7 +2174,8 @@ static u8 *handle_master_in(struct state *state)
 						    &ctype,
 						    state->channel_asset,
 						    &state->factory_id,
-						    &state->sym_lanes))
+						    &state->sym_lanes,
+						    &state->sym_issuer))
 			master_badmsg(WIRE_OPENINGD_FUNDER_START, msg);
 		msg = funder_channel_start(state, channel_flags, nonanchor_feerate, anchor_feerate, ctype);
 		tal_free(ctype);
@@ -2194,6 +2291,7 @@ int main(int argc, char *argv[])
 	state->factory = NULL;
 	state->sym_lanes = NULL;
 	state->sym_lane_sigs = state->sym_lane_local_sigs = NULL;
+	state->sym_issuer = NULL;
 
 	/* Default this to zero, we only ever look at the local */
 	state->remoteconf.max_dust_htlc_exposure_msat = AMOUNT_MSAT(0);
