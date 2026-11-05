@@ -4484,9 +4484,12 @@ const char *payment_asset_unsendable(const tal_t *ctx, struct command *cmd,
 		    && (json_tok_streq(buf, state, "CHANNELD_NORMAL")
 			|| json_tok_streq(buf, state, "CHANNELD_AWAITING_SPLICE")))
 			return NULL;
+		/* A channel still being opened has neither id yet. */
 		tal_append_fmt(&looked, "%s%s in %s (%s)",
 			       looked[0] ? "; " : "",
-			       json_strdup(tmpctx, buf, scid ? scid : cid),
+			       scid ? json_strdup(tmpctx, buf, scid)
+			       : cid ? json_strdup(tmpctx, buf, cid)
+			       : "a channel being opened",
 			       fmt_asset_id(tmpctx, tag),
 			       state ? json_strdup(tmpctx, buf, state) : "?");
 	}
