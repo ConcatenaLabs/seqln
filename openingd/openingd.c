@@ -869,6 +869,28 @@ static void sym_sign_state(const struct channel *channel,
 		return;
 	}
 
+	/* A settle-clock channel's states (common/sym_scripts.h). */
+	if (channel->sym_issuer) {
+		msg = towire_hsmd_sign_sym_clock_state(NULL, &channel->funding,
+						       channel->opener == LOCAL,
+						       &channel->basepoints[REMOTE].delayed_payment,
+						       channel->channel_asset,
+						       sym_shared_delay(channel),
+						       channel->sym_issuer,
+						       channel->funding_sats,
+						       &channel->funding_pubkey[REMOTE],
+						       st, NULL);
+		wire_sync_write(HSM_FD, take(msg));
+		msg = wire_sync_read(tmpctx, HSM_FD);
+		if (!fromwire_hsmd_sign_sym_clock_state_reply(msg,
+							      &st->sig[LOCAL]))
+			status_failed(STATUS_FAIL_HSM_IO,
+				      "Bad sign_sym_clock_state reply %s",
+				      tal_hex(tmpctx, msg));
+		st->has_sig[LOCAL] = true;
+		return;
+	}
+
 	msg = towire_hsmd_sign_sym_state(NULL, &channel->funding,
 					 channel->opener == LOCAL,
 					 &channel->basepoints[REMOTE].delayed_payment,
@@ -1071,6 +1093,12 @@ static bool funder_finalize_channel_setup(struct state *state,
 	memcpy(state->channel->channel_asset, state->channel_asset,
 	       sizeof(state->channel->channel_asset));
 	sym_attach_lanes(state);
+	/* SEQUENTIA: a settle-clock channel's kickoff and states are the
+	 * clock's (common/sym_scripts.h). */
+	if (state->sym_issuer)
+		state->channel->sym_issuer
+			= tal_dup(state->channel, struct bitcoin_outpoint,
+				  state->sym_issuer);
 
 	/* BOLT #2:
 	 *
@@ -1883,6 +1911,12 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	 * txs below are built in it (must match the funder's byte-for-byte). */
 	memcpy(state->channel->channel_asset, state->channel_asset,
 	       sizeof(state->channel->channel_asset));
+	/* SEQUENTIA: a settle-clock channel's kickoff and states are the
+	 * clock's (common/sym_scripts.h). */
+	if (state->sym_issuer)
+		state->channel->sym_issuer
+			= tal_dup(state->channel, struct bitcoin_outpoint,
+				  state->sym_issuer);
 
 	/* SEQUENTIA: a channel of several assets: where each other lane's
 	 * funding output is, and the funder's signature on its kickoff. */

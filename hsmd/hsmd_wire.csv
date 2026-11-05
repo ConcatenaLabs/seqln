@@ -663,6 +663,28 @@ msgdata,hsmd_sign_sym_state,htlcs,hsm_htlc,num_htlcs
 msgtype,hsmd_sign_sym_state_reply,170
 msgdata,hsmd_sign_sym_state_reply,sig,bip340sig,
 
+# The same on a settle-clock channel (option_seq_symmetric_clock): UPD then
+# keeps every update's lock time at its floor, SETTLE keeps the marker where
+# it is and pays the settlement from the clock.  The issuer (the funding input
+# that issued the marker), the capacity and the peer's funding key rebuild the
+# clock and the seed, which a signer that holds a balance checks against the
+# kickoff it signed.
+msgtype,hsmd_sign_sym_clock_state,72
+msgdata,hsmd_sign_sym_clock_state,funding,bitcoin_outpoint,
+msgdata,hsmd_sign_sym_clock_state,we_opened,bool,
+msgdata,hsmd_sign_sym_clock_state,remote_update_key,pubkey,
+msgdata,hsmd_sign_sym_clock_state,channel_asset,byte,33
+msgdata,hsmd_sign_sym_clock_state,shared_delay,u16,
+msgdata,hsmd_sign_sym_clock_state,issuer,bitcoin_outpoint,
+msgdata,hsmd_sign_sym_clock_state,funding_sats,amount_sat,
+msgdata,hsmd_sign_sym_clock_state,remote_funding_key,pubkey,
+msgdata,hsmd_sign_sym_clock_state,state,sym_state,
+msgdata,hsmd_sign_sym_clock_state,num_htlcs,u16,
+msgdata,hsmd_sign_sym_clock_state,htlcs,hsm_htlc,num_htlcs
+
+msgtype,hsmd_sign_sym_clock_state_reply,172
+msgdata,hsmd_sign_sym_clock_state_reply,sig,bip340sig,
+
 # The same signature for a channel that holds several assets, one funding
 # output per asset: lane 0 is channel_asset at the channel's funding value,
 # and each further lane its asset and value.  Each settlement output names

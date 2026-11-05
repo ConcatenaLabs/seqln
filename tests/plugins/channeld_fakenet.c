@@ -1121,6 +1121,7 @@ static struct channel *handle_init(struct info *info, const u8 *init_msg)
 	struct sym_lane *sym_lanes;
 	struct amount_msat *sym_lane_local_msat;
 	struct sym_swap *sym_swap, *sym_swap_req;
+	struct bitcoin_outpoint *sym_issuer;
 	struct short_channel_id local_alias;
 	struct channel *channel;
 	const u8 *wscript;
@@ -1185,7 +1186,7 @@ static struct channel *handle_init(struct info *info, const u8 *init_msg)
 				    &inflights,
 				    &local_alias,
 				    &sym_lanes, &sym_lane_local_msat,
-				    &sym_swap, &sym_swap_req))
+				    &sym_swap, &sym_swap_req, &sym_issuer))
 		abort();
 
 	status_debug("Parsed init...");

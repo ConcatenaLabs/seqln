@@ -7487,6 +7487,7 @@ static void init_channel(struct peer *peer)
 	struct sym_lane *sym_lanes;
 	struct amount_msat *sym_lane_local_msat;
 	struct sym_swap *sym_swap, *sym_swap_req;
+	struct bitcoin_outpoint *sym_issuer;
 
 	assert(!(fcntl(MASTER_FD, F_GETFL) & O_NONBLOCK));
 
@@ -7549,7 +7550,8 @@ static void init_channel(struct peer *peer)
 				    &sym_lanes,
 				    &sym_lane_local_msat,
 				    &sym_swap,
-				    &sym_swap_req)) {
+				    &sym_swap_req,
+				    &sym_issuer)) {
 		master_badmsg(WIRE_CHANNELD_INIT, msg);
 	}
 
@@ -7641,6 +7643,9 @@ static void init_channel(struct peer *peer)
 	 * our commitment/close math denominates in it. */
 	memcpy(peer->channel->channel_asset, channel_asset,
 	       sizeof(peer->channel->channel_asset));
+	/* SEQUENTIA: a settle-clock channel's issuer (common/sym_scripts.h). */
+	if (sym_issuer)
+		peer->channel->sym_issuer = tal_steal(peer->channel, sym_issuer);
 
 	/* SEQUENTIA: a channel of several assets (common/sym_lanes.h): its
 	 * other lanes and our balance in each, before the HTLCs and the swap

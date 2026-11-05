@@ -356,13 +356,25 @@ size_t sym_witness_len(const u8 **wit);
 bool sym_parse_update_witness(const u8 **wit, s64 *n, struct sha256 *rest);
 
 /* The kickoff, unsigned: one input, the funding output (@funding_wscript),
- * and output 0 KO; bitcoin_tx_finalize adds Elements' (empty) fee output. */
+ * and output 0 KO; bitcoin_tx_finalize adds Elements' (empty) fee output.
+ * With the settle clock KO holds the marker's one atom and output 1 is the
+ * clock, holding the funds; the seed is input 1 of the kickoff broadcast,
+ * beside the funding, and no signature covers it (sym_seed_witness). */
 struct bitcoin_tx *sym_kickoff_tx(const tal_t *ctx,
 				  const struct chainparams *chainparams,
 				  const struct bitcoin_outpoint *funding,
 				  struct amount_sat funding_sats,
 				  const u8 *funding_wscript,
 				  const struct sym_channel *sc);
+
+/* A settle-clock channel's marker as an output asset (0x01 || id). */
+void sym_clock_marker_asset(const struct sym_channel *sc, u8 asset[33]);
+
+/* The witnesses of the seed's KICK leaf (the kickoff's input 1) and of the
+ * clock's leaf (a settle's input after the state output): leaf and control
+ * block, nothing else. */
+u8 **sym_seed_witness(const tal_t *ctx, const struct sym_channel *sc);
+u8 **sym_clock_witness(const tal_t *ctx, const struct sym_channel *sc);
 
 /* The kickoff's witness from both funding signatures. */
 u8 **sym_kickoff_witness(const tal_t *ctx,

@@ -27,6 +27,7 @@
 #include <lightningd/onchain_control.h>
 #include <lightningd/peer_htlcs.h>
 #include <lightningd/subd.h>
+#include <lightningd/sym_clock.h>
 #include <lightningd/sym_factory.h>
 #include <lightningd/sym_lanes.h>
 #include <lightningd/symmetric.h>
@@ -2516,12 +2517,17 @@ static void handle_onchaind_spend_sym(struct channel *channel, const u8 *msg)
 	u8 *spent_spk;
 	struct onchain_witness_element **welements;
 	struct sym_state *outs;
-	u32 sequence, minblock, deadline;
+	u32 sequence, locktime, minblock, deadline;
+	struct bitcoin_outpoint *clock;
+	struct sym_spend_in *extra = NULL;
+	const u8 *in_asset;
+	u8 marker[33];
 	u8 **wit;
 
 	if (!fromwire_onchaind_spend_sym(tmpctx, msg, &out, &amount,
 					 &spent_spk, &welements, &outs,
-					 &sequence, &minblock, &deadline)) {
+					 &sequence, &locktime, &clock,
+					 &minblock, &deadline)) {
 		channel_internal_error(channel, "Invalid onchaind_spend_sym %s",
 				       tal_hex(tmpctx, msg));
 		return;
@@ -2539,10 +2545,26 @@ static void handle_onchaind_spend_sym(struct channel *channel, const u8 *msg)
 	/* SEQUENTIA: an update keeps its input's asset: on a channel of
 	 * several assets, its lane's, which its one output names
 	 * (lightningd/sym_lanes.h). */
-	sym_spend_start_lanes(channel, &out, amount,
-			      tal_count(outs->outs) == 1 ? outs->outs[0].asset
-			      : NULL, NULL, spent_spk, wit, outs->outs,
-			      sequence, minblock, deadline);
+	in_asset = tal_count(outs->outs) == 1 ? outs->outs[0].asset : NULL;
+	/* A settle-clock channel's state output holds the marker, and its
+	 * settle spends the clock beside it (lightningd/sym_clock.h). */
+	if (channel->sym_clock) {
+		sym_clock_marker_of(channel, marker);
+		in_asset = marker;
+	}
+	if (clock) {
+		if (!channel->sym_clock) {
+			channel_internal_error(channel, "onchaind_spend_sym"
+					       " with a clock on a channel"
+					       " without one");
+			return;
+		}
+		extra = tal_arr(tmpctx, struct sym_spend_in, 1);
+		sym_clock_input(extra, channel, clock, &extra[0]);
+	}
+	sym_spend_start_full(channel, &out, amount, in_asset, extra, spent_spk,
+			     wit, outs->outs, sequence, locktime, minblock,
+			     deadline);
 }
 
 /* SEQUENTIA: the settle of a channel of several assets: every lane's state
@@ -2974,6 +2996,9 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 							      channel_is_sym_factory(channel),
 							      channel_is_sym_lanes(channel)
 							      ? channel->sym_lanes->lanes
+							      : NULL,
+							      channel->sym_clock
+							      ? &channel->sym_clock->issuer
 							      : NULL)));
 		/* SEQUENTIA: the other lanes' kickoffs seen so far
 		 * (lightningd/sym_lanes.h). */

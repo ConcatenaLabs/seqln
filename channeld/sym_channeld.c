@@ -84,6 +84,27 @@ void sym_channeld_sign(const struct channel *channel, struct sym_state *st,
 		return;
 	}
 
+	/* A settle-clock channel's states (common/sym_scripts.h). */
+	if (channel->sym_issuer) {
+		msg = towire_hsmd_sign_sym_clock_state(NULL, &channel->funding,
+						       channel->opener == LOCAL,
+						       &channel->basepoints[REMOTE].delayed_payment,
+						       channel->channel_asset,
+						       sym_shared_delay(channel),
+						       channel->sym_issuer,
+						       channel->funding_sats,
+						       &channel->funding_pubkey[REMOTE],
+						       st, htlcs);
+		msg = hsm_req(tmpctx, take(msg));
+		if (!fromwire_hsmd_sign_sym_clock_state_reply(msg,
+							      &st->sig[LOCAL]))
+			status_failed(STATUS_FAIL_HSM_IO,
+				      "Bad sign_sym_clock_state reply %s",
+				      tal_hex(tmpctx, msg));
+		st->has_sig[LOCAL] = true;
+		return;
+	}
+
 	msg = towire_hsmd_sign_sym_state(NULL, &channel->funding,
 					 channel->opener == LOCAL,
 					 &channel->basepoints[REMOTE].delayed_payment,

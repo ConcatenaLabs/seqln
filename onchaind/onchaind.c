@@ -115,6 +115,10 @@ static bool sym_factory;
 /* A channel of several assets (common/sym_lanes.h): lanes 1 .. n, each a
  * funding output of the same transaction as lane 0's; NULL else. */
 static struct sym_lane *sym_lanes;
+/* A settle-clock channel (common/sym_scripts.h, sym_sc.has_clock): the clock
+ * its kickoff created, and that kickoff's block, once seen. */
+static struct bitcoin_outpoint *sym_clock_out;
+static u32 sym_clock_height;
 
 /* Asset-aware channels: the asset this channel is denominated in (33-byte
  * version+tag); the policy asset for an ordinary channel. All resolution/HTLC
@@ -4412,6 +4416,7 @@ static struct onchain_witness_element **sym_welements(const tal_t *ctx,
 /* Ask lightningd to spend @out with @wit into @st's outputs. */
 static void sym_propose(struct tracked_output *out, u8 **wit,
 			const struct sym_state *outs, u32 sequence,
+			u32 locktime, const struct bitcoin_outpoint *clock,
 			u32 minblock, u32 deadline, enum tx_type tx_type)
 {
 	const u8 *msg;
@@ -4420,7 +4425,8 @@ static void sym_propose(struct tracked_output *out, u8 **wit,
 					out->sym_spk,
 					cast_const2(const struct onchain_witness_element **,
 						    sym_welements(tmpctx, wit)),
-					outs, sequence, minblock, deadline);
+					outs, sequence, locktime, clock,
+					minblock, deadline);
 	propose_resolution_to_master(out, take(msg), minblock, tx_type);
 }
 
@@ -4493,6 +4499,47 @@ static void sym_settle_lanes(struct tracked_output ***outs,
 	propose_resolution_to_master(out, take(msg), minblock, SYM_SETTLE);
 }
 
+/* A settle-clock channel's settle (common/sym_scripts.h): input 0 the
+ * state output, which keeps the marker at output 0, input 1 the clock,
+ * whose shared delay runs from the kickoff; the settlement follows the
+ * marker. */
+static void sym_settle_clock(struct tracked_output *out,
+			     const struct sym_state *st,
+			     const struct sym_tree *tree)
+{
+	struct sym_state *o;
+	size_t m = tal_count(st->outs);
+	u32 minblock;
+
+	if (!sym_clock_out) {
+		status_broken("State %"PRId64" is on chain, and no kickoff"
+			      " made its clock: nothing settles it",
+			      st->num);
+		propose_ignore(out, out->tx_blockheight + 100000, SYM_SETTLE);
+		return;
+	}
+	o = sym_state_new(tmpctx, st->owner, st->commit_num, st->num, NULL);
+	o->outs = tal_arrz(o, struct sym_state_out, 1 + m);
+	o->outs[0].amount = out->sat;
+	o->outs[0].spk = tal_dup_talarr(o->outs, u8, out->sym_spk);
+	o->outs[0].asset = tal_arr(o->outs, u8, 33);
+	sym_clock_marker_asset(&sym_sc, o->outs[0].asset);
+	for (size_t i = 0; i < m; i++) {
+		o->outs[1 + i].amount = st->outs[i].amount;
+		o->outs[1 + i].spk = tal_dup_talarr(o->outs, u8,
+						    st->outs[i].spk);
+		o->outs[1 + i].asset = NULL;
+	}
+	minblock = sym_clock_height + sym_sc.delay;
+	if (minblock < out->tx_blockheight + 1)
+		minblock = out->tx_blockheight + 1;
+	status_info("Settling state %"PRId64" with the clock %s, %u blocks"
+		    " after the kickoff", st->num,
+		    fmt_bitcoin_outpoint(tmpctx, sym_clock_out), sym_sc.delay);
+	sym_propose(out, sym_settle_witness(tmpctx, tree), o, SYM_SEQUENCE, 0,
+		    sym_clock_out, minblock, minblock + 6, SYM_SETTLE);
+}
+
 static void sym_resolve_state(struct tracked_output ***outs,
 			      struct tracked_output *out)
 {
@@ -4524,11 +4571,19 @@ static void sym_resolve_state(struct tracked_output ***outs,
 			? tal_dup_arr(o->outs, u8,
 				      lane_asset_of(out->sym_lane), 33, 0)
 			: NULL;
+		/* The settle clock: the state output holds the marker, and
+		 * UPD wants the lock time floor. */
+		if (sym_sc.has_clock) {
+			o->outs[0].asset = tal_arr(o->outs, u8, 33);
+			sym_clock_marker_asset(&sym_sc, o->outs[0].asset);
+		}
 		status_info("Replacing state %"PRId64" by our state %"PRId64,
 			    out->sym_num, sym_best->num);
 		sym_propose(out, sym_update_witness(tmpctx, sig_op, sig_acc,
 						    &tree, prev_leaf, prev_cb),
-			    o, SYM_SEQUENCE, out->tx_blockheight + 1,
+			    o, SYM_SEQUENCE,
+			    sym_sc.has_clock ? SYM_CLOCK_LOCKTIME_FLOOR : 0,
+			    NULL, out->tx_blockheight + 1,
 			    out->tx_blockheight + 2, SYM_UPDATE);
 		return;
 	}
@@ -4543,11 +4598,16 @@ static void sym_resolve_state(struct tracked_output ***outs,
 			return;
 		}
 		if (memeq(spk, tal_bytelen(spk), out->sym_spk,
+			  tal_bytelen(out->sym_spk)) && sym_sc.has_clock) {
+			sym_settle_clock(out, st, &tree);
+			return;
+		}
+		if (memeq(spk, tal_bytelen(spk), out->sym_spk,
 			  tal_bytelen(out->sym_spk))) {
 			status_info("Settling state %"PRId64" after %u blocks",
 				    st->num, sym_sc.delay);
 			sym_propose(out, sym_settle_witness(tmpctx, &tree), st,
-				    sym_sc.delay,
+				    sym_sc.delay, 0, NULL,
 				    rel_blockheight(out, sym_sc.delay),
 				    rel_blockheight(out, sym_sc.delay) + 6,
 				    SYM_SETTLE);
@@ -4863,6 +4923,22 @@ static void handle_symmetric_close(const struct tx_parts *tx,
 			      "Kickoff %s has no output %u",
 			      fmt_bitcoin_txid(tmpctx, &tx->txid), ko.n);
 	asset = wally_tx_output_get_amount(tx->outputs[ko.n]);
+	/* The settle clock: the kickoff's next output, beside KO and its
+	 * marker (common/sym_scripts.h). */
+	if (sym_sc.has_clock) {
+		if (ko.n + 1 >= tal_count(tx->outputs) || !tx->outputs[ko.n + 1])
+			status_failed(STATUS_FAIL_INTERNAL_ERROR,
+				      "Kickoff %s has no clock",
+				      fmt_bitcoin_txid(tmpctx, &tx->txid));
+		sym_clock_out = notleak(tal(NULL, struct bitcoin_outpoint));
+		sym_clock_out->txid = tx->txid;
+		sym_clock_out->n = ko.n + 1;
+		sym_clock_height = tx_blockheight;
+		status_info("Kickoff %s: the clock is %s, settles from block %u",
+			    fmt_bitcoin_txid(tmpctx, &tx->txid),
+			    fmt_bitcoin_outpoint(tmpctx, sym_clock_out),
+			    sym_clock_height + sym_sc.delay);
+	}
 	status_info("Kickoff %s: our best state is %"PRId64,
 		    fmt_bitcoin_txid(tmpctx, &tx->txid),
 		    sym_best ? sym_best->num : (s64)-1);
@@ -4973,6 +5049,7 @@ int main(int argc, char *argv[])
 	if (option_seq_symmetric) {
 		u16 delay;
 		struct sym_state *l, *r, *rp;
+		struct bitcoin_outpoint *clock_issuer;
 
 		msg = wire_sync_read(tmpctx, REQ_FD);
 		if (!fromwire_onchaind_sym_init(ctx, msg, &sym_funding, &delay,
@@ -4997,8 +5074,22 @@ int main(int argc, char *argv[])
 			sym_best = r;
 		msg = wire_sync_read(tmpctx, REQ_FD);
 		if (!fromwire_onchaind_sym_anchor(ctx, msg, &sym_anchor,
-						  &sym_factory, &sym_lanes))
+						  &sym_factory, &sym_lanes,
+						  &clock_issuer))
 			master_badmsg(WIRE_ONCHAIND_SYM_ANCHOR, msg);
+		/* The settle clock: its marker, the funding output and the
+		 * capacity. */
+		if (clock_issuer) {
+			u8 marker[32];
+
+			sym_marker_id(clock_issuer, marker);
+			sym_channel_set_clock(&sym_sc, marker,
+					      bitcoin_redeem_2of2(tmpctx,
+								  &funding_pubkey[LOCAL],
+								  &funding_pubkey[REMOTE]),
+					      funding_sats);
+			tal_free(clock_issuer);
+		}
 		if (tal_count(sym_lanes) == 0)
 			sym_lanes = tal_free(sym_lanes);
 	}

@@ -310,12 +310,17 @@ msgdata,onchaind_sym_anchor,factory,bool,
 # A channel of several assets (common/sym_lanes.h): its other lanes.
 msgdata,onchaind_sym_anchor,num_lanes,u16,
 msgdata,onchaind_sym_anchor,lanes,sym_lane,num_lanes
+# A settle-clock channel (common/sym_scripts.h): the funding input whose
+# issuance made its marker.
+msgdata,onchaind_sym_anchor,clock_issuer,?bitcoin_outpoint,
 
 # Spend a symmetric channel's output whose input 0 needs no signature of
 # ours: an update (both update signatures in the witness) or a settle (none).
 # Outputs 0 .. m-1 are those of `outs`, in the channel's asset; lightningd
 # adds a fee coin in any asset it accepts for fees, rebuilds it each block
 # until the output is spent, and answers with onchaind_spend_created.
+# On a settle-clock channel input 0 holds the marker, an update has the lock
+# time floor, and a settle spends `clock` as input 1, after the delay.
 msgtype,onchaind_spend_sym,5053
 msgdata,onchaind_spend_sym,outpoint,bitcoin_outpoint,
 msgdata,onchaind_spend_sym,outpoint_amount,amount_sat,
@@ -325,6 +330,8 @@ msgdata,onchaind_spend_sym,num_witness,u16,
 msgdata,onchaind_spend_sym,witness,onchain_witness_element,num_witness
 msgdata,onchaind_spend_sym,outs,sym_state,
 msgdata,onchaind_spend_sym,sequence,u32,
+msgdata,onchaind_spend_sym,locktime,u32,
+msgdata,onchaind_spend_sym,clock,?bitcoin_outpoint,
 msgdata,onchaind_spend_sym,minblock,u32,
 msgdata,onchaind_spend_sym,deadline,u32,
 

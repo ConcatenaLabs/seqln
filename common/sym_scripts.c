@@ -798,18 +798,60 @@ struct bitcoin_tx *sym_kickoff_tx(const tal_t *ctx,
 				  const u8 *funding_wscript,
 				  const struct sym_channel *sc)
 {
-	struct bitcoin_tx *tx = bitcoin_tx(ctx, chainparams, 1, 2, 0);
+	struct bitcoin_tx *tx = bitcoin_tx(ctx, chainparams, 1, 3, 0);
 	struct sym_tree ko;
 
 	sym_kickoff_tree(tmpctx, sc, &ko);
-	bitcoin_tx_set_output_asset(tx, sc->asset);
-	bitcoin_tx_add_output(tx, sym_tree_spk(tmpctx, &ko), NULL,
-			      funding_sats);
+	/* The settle clock: KO holds the marker, the clock the funds. */
+	if (sc->has_clock) {
+		u8 marker[33];
+
+		sym_clock_marker_asset(sc, marker);
+		bitcoin_tx_set_output_asset(tx, marker);
+		bitcoin_tx_add_output(tx, sym_tree_spk(tmpctx, &ko), NULL,
+				      AMOUNT_SAT(1));
+		bitcoin_tx_set_output_asset(tx, sc->asset);
+		bitcoin_tx_add_output(tx, sym_clock_spk(tmpctx, sc, NULL),
+				      NULL, funding_sats);
+	} else {
+		bitcoin_tx_set_output_asset(tx, sc->asset);
+		bitcoin_tx_add_output(tx, sym_tree_spk(tmpctx, &ko), NULL,
+				      funding_sats);
+	}
 	bitcoin_tx_add_input(tx, funding, SYM_SEQUENCE, NULL, funding_sats,
 			     NULL, funding_wscript);
 	bitcoin_tx_finalize(tx);
 	assert(bitcoin_tx_check(tx));
 	return tx;
+}
+
+void sym_clock_marker_asset(const struct sym_channel *sc, u8 asset[33])
+{
+	assert(sc->has_clock);
+	asset[0] = 0x01;
+	memcpy(asset + 1, sc->clock.marker, 32);
+}
+
+u8 **sym_seed_witness(const tal_t *ctx, const struct sym_channel *sc)
+{
+	u8 **wit = tal_arr(ctx, u8 *, 2);
+	u8 *kick_cb;
+
+	sym_seed_spk(tmpctx, sc, &kick_cb, NULL);
+	wit[0] = sym_leaf_kick(wit, sc);
+	wit[1] = tal_steal(wit, kick_cb);
+	return wit;
+}
+
+u8 **sym_clock_witness(const tal_t *ctx, const struct sym_channel *sc)
+{
+	u8 **wit = tal_arr(ctx, u8 *, 2);
+	u8 *cb;
+
+	sym_clock_spk(tmpctx, sc, &cb);
+	wit[0] = sym_leaf_clock(wit, sc);
+	wit[1] = tal_steal(wit, cb);
+	return wit;
 }
 
 u8 **sym_kickoff_witness(const tal_t *ctx,
