@@ -1146,10 +1146,11 @@ host can defend the channel while the device is offline, without ever holding a 
   (its size set by the HTLCs that commitment carried) and one state file per channel. Penalty
   channels need one device signature per revoked state, so a channel's store grows with every
   state it revokes for as long as it is open; lightningd removes the channel's directory when it
-  forgets the closed channel. `wallet/migrations.c` adds the `penalty_htlcs` table;
-  `lightningd/peer_control.c` adds the `setpreemptarmed` RPC (`id`, `armed`), which persists a
-  per-channel flag in that store. `--watchtower-store=auto|on|off` (default `auto`: kept only
-  when hsmd is a signer proxy).
+  forgets the closed channel. `wallet/migrations.c` adds the `penalty_htlcs` table. The store
+  holds no commitment of ours: the device signs one for broadcast only to close and never revokes
+  a commitment it signed so (`doc/seqln-design/seqln-device-broadcast-signature.md`), so the tower
+  defends a channel with the penalty set and the sweeps alone. `--watchtower-store=auto|on|off`
+  (default `auto`: kept only when hsmd is a signer proxy).
 - `speculad/speculad.c` (built as `speculad/speculad`, `speculad/Makefile`): a standalone daemon,
   not a plugin and not spawned by `lightningd`, that loads the store, watches each channel's
   funding output through the node's CLI, and on a revoked commitment confirming broadcasts its

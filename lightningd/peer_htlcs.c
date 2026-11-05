@@ -2753,7 +2753,6 @@ void peer_got_commitsig(struct channel *channel, const u8 *msg)
 	struct pubkey local_per_commit;
 	struct got_commitsig_htlc_info *htlc_infos;
 	struct watchtower_blob **sweeps;
-	struct bitcoin_tx *preempt_tx;
 	struct sym_state *sym_local;
 	struct sym_swap *sym_swap;
 
@@ -2891,34 +2890,19 @@ void peer_got_commitsig(struct channel *channel, const u8 *msg)
 						 &local_per_commit, htlc_infos)
 		: NULL;
 
-	/* Specula Phase F (preemptive close, the JBA barrier): store OUR current
-	 * fully-signed local commitment N into the preempt slot HERE -- after the
-	 * advance to N (last_tx/last_sig now name N) and BEFORE the got_commitsig
-	 * reply below that lets channeld send revoke_and_ack revealing state N-1's
-	 * per-commitment secret.  Because the slot + meta.current_commit_num are
-	 * bumped to N durably before N-1 becomes punishable, the stored preempt
-	 * commitment ALWAYS names a local state whose secret we have NOT revealed
-	 * (never a revoked one) -- the Specula-vs-Vigilia guard.  Fail-soft (B6):
-	 * a device REJECT / store failure is logged, never fatal. */
-	preempt_tx = NULL;
-	/* SEQUENTIA: a symmetric channel's last_tx is its kickoff, whose
-	 * signatures are SIGHASH_SINGLE|ANYONECANPAY, and its store is the
-	 * `sym` record, written as its states advance (lightningd/symmetric.c). */
+	/* The store holds no commitment of ours: the device signs one for
+	 * broadcast only to close, and never reveals the secret of a commitment
+	 * it signed so, so a fully signed commitment of ours is never a revoked
+	 * one (doc/seqln-design/seqln-device-broadcast-signature.md).
+	 * SEQUENTIA: a symmetric channel's store is the `sym` record, written
+	 * as its states advance (lightningd/symmetric.c). */
 	if (wt_store_enabled(ld)
 	    && !channel_type_has(channel->type, OPT_SEQ_SYMMETRIC)
-	    && channel->last_tx && !invalid_last_tx(channel->last_tx))
-		preempt_tx = sign_last_tx(tmpctx, channel, channel->last_tx,
-					  &channel->last_sig);
-	/* The sweeps and the preempt commitment go to disk in ONE write: the
-	 * store's flush count is what a commitment step costs. */
-	if (wt_store_enabled(ld)
-	    && !channel_type_has(channel->type, OPT_SEQ_SYMMETRIC)
-	    && !wt_store_put_advance(ld, channel, commitnum, sweeps, preempt_tx))
+	    && !wt_store_put_advance(ld, channel, commitnum, sweeps))
 		log_broken(channel->log,
 			   "watchtower: failed storing the state advance "
-			   "(sweeps%s, preempt commitment%s) for commit %"PRIu64,
-			   sweeps ? "" : " unchanged",
-			   preempt_tx ? "" : " unavailable", commitnum);
+			   "(sweeps%s) for commit %"PRIu64,
+			   sweeps ? "" : " unchanged", commitnum);
 
 	/* Now append htlc sigs for inflights */
 	i = 0;

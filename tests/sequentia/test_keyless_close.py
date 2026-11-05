@@ -275,9 +275,9 @@ def test_keyless_node_broadcasts_its_validated_commitment(node_factory, bitcoind
                                                           opener):
     """The device signs a commitment of ours for broadcast only when it is a
     transaction the device validated and has not revoked.  lightningd asks
-    for nothing else: the preempt slot at every commitment step, a payment
-    each way, `dev-sign-last-tx`, a unilateral close with the hub gone, and
-    the closing node's restart (which signs the commitment again) are all
+    for it only to close: a payment each way steps the channel with none
+    asked for, and `dev-sign-last-tx`, a unilateral close with the hub gone,
+    and the closing node's restart (which signs the commitment again) are all
     signed, and the commitment confirms."""
     asset = bitcoind.issue_asset(1000)
     bitcoind.set_fee_rates({bitcoind.POLICY_ASSET: PAR, asset: PAR})
@@ -306,11 +306,10 @@ def test_keyless_node_broadcasts_its_validated_commitment(node_factory, bitcoind
         l1.rpc.dev_sign_last_tx(l2.info['id'])
         assert 'POLICY REJECT' not in device.output()
         # VALIDATE_COMMITMENT_TX (35) for commitment 0 and each step after;
-        # SIGN_COMMITMENT_TX (5) for the preempt slot at each step after 0,
-        # and once for dev-sign-last-tx.
+        # SIGN_COMMITMENT_TX (5) once, for dev-sign-last-tx: no step asks.
         validated, signed = device.requests(35), device.requests(5)
         print("validated {}, signed for broadcast {}".format(validated, signed))
-        assert validated >= 5 and signed >= validated
+        assert validated >= 5 and signed == 1
 
         # The hub goes away; the keyless node closes on its own.
         l2.stop()
@@ -338,6 +337,88 @@ def test_keyless_node_broadcasts_its_validated_commitment(node_factory, bitcoind
         wait_for(lambda: channel(l1, l2)['state'] in ('FUNDING_SPEND_SEEN', 'ONCHAIN'))
         spent = bitcoind.rpc.getrawtransaction(commitment, True)
         assert {o['asset'] for o in spent['vout']} == {asset}
+    finally:
+        if answers(l1, timeout=2):
+            l1.stop()
+        device.stop()
+
+
+REVOKE_REFUSED = 'REVOKE_COMMITMENT_TX refused: commitment {} of ours was signed for broadcast, a close'
+
+
+@pytest.mark.skipif(not os.path.exists(SIGNER), reason='needs the seqln-signer binary')
+def test_keyless_node_hands_out_no_revocable_commitment(node_factory, bitcoind, directory):
+    """The host cannot broadcast an old state of a keyless node's channel on
+    its own: it never holds a fully signed commitment the device revoked.
+    Payments step the channel with no broadcast signature asked for.  A host
+    that asks for one anyway (`dev-sign-last-tx`, which signs the current
+    commitment) gets it, and the device then refuses to revoke that
+    commitment, so the channel steps no further and the commitment the host
+    holds stays current.  Broadcast, it is an honest close: the hub has no
+    revocation secret for it and punishes nothing."""
+    asset = bitcoind.issue_asset(1000)
+    bitcoind.set_fee_rates({bitcoind.POLICY_ASSET: PAR, asset: PAR})
+    device, l1 = keyless_node(node_factory, directory, trace=True, may_reconnect=True,
+                              broken_log='.*')
+    try:
+        l2 = node_factory.get_node(may_reconnect=True, broken_log='.*')
+        addr = l2.rpc.newaddr('bech32')['bech32']
+        txid = bitcoind.send_and_mine_block(addr, 2 * 10**8, asset)
+        wait_for(lambda: any(o['txid'] == txid for o in l2.rpc.listfunds()['outputs']))
+        l2.rpc.connect(l1.info['id'], 'localhost', l1.port)
+        res = l2.rpc.call('fundchannel', {'id': l1.info['id'], 'amount': 10**8,
+                                          'asset': asset, 'announce': True})
+        bitcoind.generate_block(1, wait_for_mempool=res['txid'])
+        for a, b in ((l1, l2), (l2, l1)):
+            wait_for(lambda: channel(a, b)['state'] == 'CHANNELD_NORMAL')
+        scid = channel(l1, l2)['short_channel_id']
+
+        def settled():
+            return channel(l1, l2)['htlcs'] == [] and channel(l2, l1)['htlcs'] == []
+        # Payments each way: every step revokes the commitment before it, and
+        # no step asks the device for a broadcast signature.
+        l2.rpc.pay(l1.rpc.invoice(3 * 10**7 * 1000, 'in', 'in')['bolt11'])
+        wait_for(settled)
+        l1.rpc.pay(l2.rpc.invoice(10**7 * 1000, 'out', 'out')['bolt11'])
+        wait_for(settled)
+        print('after {} commitments validated: {} broadcast signatures asked for'
+              .format(device.requests(35), device.requests(5)))
+        assert device.requests(35) >= 5
+        assert device.requests(5) == 0
+
+        # The host asks for one: the current commitment, signed.
+        held = l1.rpc.dev_sign_last_tx(l2.info['id'])['tx']
+        assert device.requests(5) == 1
+        assert 'POLICY REJECT' not in device.output()
+        decoded = bitcoind.rpc.decoderawtransaction(held)
+        print('the host holds commitment {} fully signed'.format(decoded['txid']))
+
+        # The next step needs the device to revoke it: refused.
+        msat = 10**6 * 1000
+        inv = l1.rpc.invoice(msat, 'stuck', 'stuck')
+        final = l2.rpc.decode(inv['bolt11'])['min_final_cltv_expiry']
+        route = [{'id': l1.info['id'], 'channel': scid, 'amount_msat': msat, 'delay': final + 6}]
+        l2.rpc.sendpay(route, inv['payment_hash'], payment_secret=inv['payment_secret'])
+        wait_for(lambda: 'REVOKE_COMMITMENT_TX refused' in device.output())
+        line = only_one(sorted(set(ln.split("POLICY REJECT: ", 1)[1] for ln in device.output().splitlines()
+                                   if "REVOKE_COMMITMENT_TX refused" in ln)))
+        print('the next step: ' + line)
+        n = int(line.split('commitment ', 1)[1].split(' ', 1)[0])
+        assert line.startswith(REVOKE_REFUSED.format(n)), line
+
+        # Broadcast by the host alone, it is the current commitment: an
+        # honest unilateral close, which the hub cannot punish.
+        sent = bitcoind.rpc.sendrawtransaction(held)
+        assert sent == decoded['txid']
+        bitcoind.generate_block(1, wait_for_mempool=sent)
+        l2.daemon.wait_for_log('Their unilateral tx')
+        assert not l2.daemon.is_in_log('Deconstructing revoked unilateral tx')
+        wait_for(lambda: channel(l2, l1)['state'] in ('FUNDING_SPEND_SEEN', 'ONCHAIN'))
+        spent = bitcoind.rpc.getrawtransaction(sent, True)
+        ours = [o for o in spent['vout'] if o['scriptPubKey'].get('type') == 'witness_v0_scripthash']
+        print('the close {} confirmed; the hub saw its peer\'s unilateral close, not a revoked one; '
+              'outputs {}'.format(sent, [(o['scriptPubKey'].get('type'), str(o['value'])) for o in spent['vout']]))
+        assert ours, spent
     finally:
         if answers(l1, timeout=2):
             l1.stop()

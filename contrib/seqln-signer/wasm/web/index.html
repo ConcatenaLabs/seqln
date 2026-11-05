@@ -59,7 +59,8 @@
   <h1>SeqLN device signer &mdash; hosted-node co-signer</h1>
   <p>Your keys stay on this device. This page holds the mnemonic in a wasm signer, connects out over a WebSocket
      to a hosted SeqLN node&rsquo;s Noise_XK responder (through the WS&harr;TCP relay), and co-signs the node&rsquo;s
-     sign requests. The host can never move your funds.</p>
+     sign requests that the device&rsquo;s policy allows: payments within your daily limit, spends to your own
+     addresses or to one you approve on the device, and a commitment for broadcast only when the channel closes.</p>
 </header>
 <main>
   <section class="panel form">

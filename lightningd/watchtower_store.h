@@ -20,22 +20,18 @@
  *                              current-state honest sweeps as a blob set (u64
  *                              set version(=1), u64 count, count blobs), then
  *                              bool has_preempt [u64 preempt_commit_num,
- *                              towire_bitcoin_tx of OUR CURRENT fully-signed
- *                              (2-of-2) local commitment], then bool armed
- *                              [u64 armed_commit_num].
- *                              The funding outpoint is for the preemptive-
- *                              close/funding-watch; remote_to_self_delay gives
+ *                              towire_bitcoin_tx], then bool armed
+ *                              [u64 armed_commit_num]: both written false.
+ *                              They held a fully signed commitment of ours
+ *                              for a tower to broadcast; the store keeps
+ *                              none, since the signing device signs one for
+ *                              broadcast only to close (doc/seqln-design/
+ *                              seqln-device-broadcast-signature.md), and a
+ *                              slot an earlier build wrote goes at the next
+ *                              write.  The funding outpoint is for the
+ *                              funding watch; remote_to_self_delay gives
  *                              speculad the exact RBF deadline window
- *                              (close_height + to_self_delay[REMOTE]).  The
- *                              preempt commitment is rewritten in the SAME
- *                              durable step that bumps current_commit_num, so
- *                              it always names the CURRENT (never a revoked)
- *                              local state; armed is set by lightningd when it
- *                              detects the signer dropped mid-round and cleared
- *                              on the next clean advance / device reconnect --
- *                              speculad only broadcasts the preempt commitment
- *                              while it is set AND preempt_commit_num ==
- *                              current_commit_num.
+ *                              (close_height + to_self_delay[REMOTE]).
  *     justice/<txid_hex>       CLASS A: one blob-set file per REVOKED
  *                              commitment, named by the full 64-char remote-
  *                              commitment txid hex (a stable, self-describing
@@ -149,33 +145,14 @@ struct watchtower_blob **wt_store_load_sweeps(const tal_t *ctx,
 					      const struct channel *channel);
 
 /* A state advance in one durable write: bump current_commit_num to
- * @commit_num and, when given, replace the sweep set and/or store OUR current
- * fully-signed local commitment @preempt_tx keyed to @commit_num.  Storing a
- * preempt commitment also clears the armed flag (a clean advance completed).
- * Because the preempt commitment and current_commit_num move together, the
- * broadcast guard (preempt_commit_num == current_commit_num) can never see a
- * REVOKED local commitment.  Returns false on any I/O failure (fail-soft: the
- * caller logs, never fatal). */
+ * @commit_num and, when given, replace the sweep set.  The state file keeps
+ * no commitment of ours (it writes has_preempt and armed false, and drops a
+ * slot an earlier build stored).  Returns false on any I/O failure
+ * (fail-soft: the caller logs, never fatal). */
 bool wt_store_put_advance(struct lightningd *ld,
 			  const struct channel *channel,
 			  u64 commit_num,
-			  struct watchtower_blob *const *sweeps,
-			  const struct bitcoin_tx *preempt_tx);
-
-/* Phase F preemptive close: wt_store_put_advance with only the preempt
- * commitment. */
-bool wt_store_put_preempt(struct lightningd *ld,
-			  const struct channel *channel,
-			  u64 commit_num,
-			  const struct bitcoin_tx *signed_commit_tx);
-
-/* Phase F: set/clear the preempt "armed" flag (device-down-mid-round signal that
- * tells speculad it may broadcast the stored preempt commitment).  When arming,
- * it records the current local commit_num so a stale arm cannot fire against a
- * newer state (speculad also enforces preempt_commit_num == current_commit_num). */
-bool wt_store_set_preempt_armed(struct lightningd *ld,
-				const struct channel *channel,
-				bool armed);
+			  struct watchtower_blob *const *sweeps);
 
 /* A symmetric channel's record (the `sym` file above): durable on return.
  * False on any I/O failure (the caller logs). */

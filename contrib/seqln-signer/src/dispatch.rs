@@ -867,13 +867,26 @@ impl Signer {
                 return Outcome::Reject(format!("SIGN_COMMITMENT_TX refused: {reason}"));
             }
         }
+        let mut broadcast = None;
         if self.policy.is_enforce() {
-            if let Err(reason) = self.check_own_commitment(&req.hsmd_msg) {
-                return Outcome::Reject(format!("SIGN_COMMITMENT_TX refused: {reason}"));
+            match self.check_own_commitment(&req.hsmd_msg) {
+                Err(reason) => return Outcome::Reject(format!("SIGN_COMMITMENT_TX refused: {reason}")),
+                Ok(n) => broadcast = n,
             }
         }
         let reply = self.h_sign_commitment_tx(&req.hsmd_msg);
         if reply.is_some() {
+            // A commitment of ours, signed for broadcast: the host holds it
+            // fully signed, so its secret never leaves this device (see
+            // `revoke_commitment_tx_checked`). lightningd asks only to close.
+            if let (Some(n), Some((peer, dbid, ..))) = (broadcast, parse_own_commitment(&req.hsmd_msg)) {
+                if let Some(st) = self.store.get_mut(&peer, dbid) {
+                    if st.broadcast_from.map_or(true, |b| n < b) {
+                        st.broadcast_from = Some(n);
+                        self.store_dirty = true;
+                    }
+                }
+            }
             // lightningd signs a completed mutual close with this message
             // too: what it pays this wallet is a close output.
             if let Some((_, _, bt, _, _)) = parse_own_commitment(&req.hsmd_msg) {
@@ -950,6 +963,12 @@ impl Signer {
                 None => Some(self.untracked(&req.node_id, req.dbid)),
                 Some(st) => match (st.revoked_through, st.validated_through) {
                     (Some(r), _) if n <= r => None,
+                    _ if st.broadcast_from.is_some_and(|b| n >= b) => Some(format!(
+                        "commitment {} of ours was signed for broadcast, a close: its secret and \
+                         every later one's stay on this device, so the commitment the host holds \
+                         fully signed is never a revoked one",
+                        st.broadcast_from.unwrap_or(n)
+                    )),
                     (Some(r), _) if n > r.saturating_add(1) => Some(format!(
                         "commitment {n} would skip the revocation of {}", r.saturating_add(1)
                     )),
@@ -1399,7 +1418,7 @@ impl Signer {
     /// policy: lightningd signs the closing transaction it rebroadcasts with
     /// this message. A refusal of either reaches lightningd, which logs it
     /// and sends nothing for that transaction.
-    fn check_own_commitment(&self, m: &[u8]) -> Result<(), String> {
+    fn check_own_commitment(&self, m: &[u8]) -> Result<Option<u64>, String> {
         let (peer_id, dbid, bt, remote_funding, commit_num) =
             parse_own_commitment(m).ok_or_else(|| "malformed request".to_string())?;
         let st = self
@@ -1419,7 +1438,9 @@ impl Signer {
                 policy::validate_mutual_close(
                     st, self.own_sweep_script_set(), own_close.as_deref(), &self.close_destinations, &bt.tx)?;
             }
-            return self.paid_fee_within_limit(st, &bt.tx, Self::close_fee(st, &bt.tx), "the close's fee");
+            return self
+                .paid_fee_within_limit(st, &bt.tx, Self::close_fee(st, &bt.tx), "the close's fee")
+                .map(|()| None);
         }
         let n = policy::commitment_number(self.kernel(), &peer_id, dbid, st, &bt.tx)
             .unwrap_or(commit_num);
@@ -1438,7 +1459,7 @@ impl Signer {
                 display_txid(&bt.txid)
             ));
         }
-        Ok(())
+        Ok(Some(n))
     }
 
     // =================================================================
@@ -4383,6 +4404,7 @@ fn parse_setup_channel(m: &[u8]) -> Option<ChannelState> {
         option_sym_clock: policy::channel_type_has_sym_clock(&features),
         clock_issuer: None,
         clock_seed: None,
+        broadcast_from: None,
     })
 }
 
@@ -5624,7 +5646,7 @@ mod close_and_revocation_tests {
         }
         // The current commitment 2 signs.
         let m = sign_commitment_msg(&s, &c(&s, 2), 2);
-        assert_eq!(s.check_own_commitment(&m), Ok(()));
+        assert_eq!(s.check_own_commitment(&m), Ok(Some(2)));
         assert!(matches!(s.handle(&req(m)), Outcome::Reply(_)));
         // Commitments 0 and 1 are revoked.
         assert!(matches!(revoke(&mut s, 0), Outcome::Reply(_)));
@@ -5640,7 +5662,64 @@ mod close_and_revocation_tests {
         assert!(err.contains("commitment 0 is revoked"), "{err}");
         assert!(matches!(s.handle(&req(m.clone())), Outcome::Reject(_)));
         let m = sign_commitment_msg(&s, &c(&s, 2), 2);
-        assert_eq!(s.check_own_commitment(&m), Ok(()));
+        assert_eq!(s.check_own_commitment(&m), Ok(Some(2)));
+    }
+
+    /// L1.6: a commitment of ours signed for broadcast is a close. The host
+    /// holds it fully signed, so the device never reveals its secret, nor a
+    /// later one's: it can never become a revoked commitment that the peer
+    /// takes whole. Kept across a restart, in the store.
+    #[test]
+    fn broadcast_signed_commitment_is_never_revoked() {
+        let mut s = signer(Policy::Enforce);
+        track(&mut s, true, &[]);
+        let c = |s: &Signer, n: u64| local_commitment(s, n, 600_000, 399_000, 1_000);
+        for n in 0..3 {
+            assert!(matches!(validate(&mut s, n, 600_000, 399_000, 1_000), Outcome::Reply(_)));
+        }
+        assert!(matches!(revoke(&mut s, 0), Outcome::Reply(_)));
+        // Commitment 1 signed for broadcast (lightningd closing, or a host
+        // asking to keep it).
+        assert!(matches!(s.handle(&req(sign_commitment_msg(&s, &c(&s, 1), 1))), Outcome::Reply(_)));
+        assert_eq!(st(&s).broadcast_from, Some(1));
+        let words = "commitment 1 of ours was signed for broadcast, a close: its secret and every \
+                     later one's stay on this device, so the commitment the host holds fully \
+                     signed is never a revoked one";
+        let refused = |o: Outcome| match o {
+            Outcome::Reject(r) => r,
+            _ => panic!("not refused"),
+        };
+        let why = refused(revoke(&mut s, 1));
+        println!("{why}");
+        assert_eq!(why, format!("REVOKE_COMMITMENT_TX refused: {words}"));
+        assert_eq!(refused(revoke(&mut s, 2)), format!("REVOKE_COMMITMENT_TX refused: {words}"));
+        // A revocation already given is given again (channeld re-sends it).
+        assert!(matches!(revoke(&mut s, 0), Outcome::Reply(_)));
+        // Signing the later one for broadcast too moves nothing back.
+        assert!(matches!(s.handle(&req(sign_commitment_msg(&s, &c(&s, 2), 2))), Outcome::Reply(_)));
+        assert_eq!(st(&s).broadcast_from, Some(1));
+        // Both stay broadcastable: neither is ever revoked.
+        assert!(matches!(s.handle(&req(sign_commitment_msg(&s, &c(&s, 1), 1))), Outcome::Reply(_)));
+        // The record survives the store's round trip, and setup_channel's
+        // re-send at every start.
+        let blob = s.export_channels();
+        let mut t = signer(Policy::Enforce);
+        t.import_channels(&blob).unwrap();
+        track(&mut t, true, &[]);
+        assert_eq!(st(&t).broadcast_from, Some(1));
+        assert_eq!(refused(revoke(&mut t, 1)), format!("REVOKE_COMMITMENT_TX refused: {words}"));
+        // A close (not commitment-shaped) signed with the same message
+        // records nothing: a fresh channel still revokes.
+        let mut u = signer(Policy::Enforce);
+        track(&mut u, true, &[]);
+        for n in 0..2 {
+            assert!(matches!(validate(&mut u, n, 500_000, 499_000, 1_000), Outcome::Reply(_)));
+        }
+        let ours = u.wallet_sweep_script(4, false);
+        let closing = close(FUNDING_TXID, &[(ours, 500_000), (peer_script(), 499_000), (Vec::new(), 1_000)]);
+        assert!(matches!(u.handle(&req(sign_commitment_msg(&u, &closing, 7))), Outcome::Reply(_)));
+        assert_eq!(st(&u).broadcast_from, None);
+        assert!(matches!(revoke(&mut u, 0), Outcome::Reply(_)));
     }
 
     #[test]
@@ -5652,7 +5731,7 @@ mod close_and_revocation_tests {
         let good = close(FUNDING_TXID, &[(ours.clone(), 500_000), (peer_script(), 499_000), (Vec::new(), 1_000)]);
         // As msg 5 (lightningd's rebroadcast at closing complete and at start).
         let m = sign_commitment_msg(&s, &good, 7);
-        assert_eq!(s.check_own_commitment(&m), Ok(()));
+        assert_eq!(s.check_own_commitment(&m), Ok(None));
         assert!(matches!(s.handle(&req(m)), Outcome::Reply(_)));
         // The same outputs in a commitment's shape are not a close: they are
         // a commitment this device never validated.
@@ -5679,7 +5758,7 @@ mod close_and_revocation_tests {
         let mut s = signer(Policy::Enforce);
         track(&mut s, true, &peer_script());
         assert!(matches!(validate(&mut s, 0, 500_000, 499_000, 1_000), Outcome::Reply(_)));
-        assert_eq!(s.check_own_commitment(&sign_commitment_msg(&s, &good, 7)), Ok(()));
+        assert_eq!(s.check_own_commitment(&sign_commitment_msg(&s, &good, 7)), Ok(None));
         refuse(&s, close(FUNDING_TXID, &[(ours.clone(), 500_000), ([0x51u8].to_vec(), 499_000)]), "recorded");
         // closingd's own request is held to the same policy.
         let mut w = Writer::new(msg::HSMD_SIGN_MUTUAL_CLOSE_TX);
@@ -5721,9 +5800,19 @@ mod close_and_revocation_tests {
         assert!(s.store.record_close([0x99; 32]));
         assert!(!s.store.record_close([0x99; 32]));
         s.store.ledger.mark_charged_txid([0x77; 32]);
-        let v15 = policy::encode_channel_store(&s.store);
-        assert_eq!(v15[4], 15);
-        let (_, l15, _) = policy::decode_channel_store(&v15).unwrap();
+        let v16 = policy::encode_channel_store(&s.store);
+        assert_eq!(v16[4], 16);
+        // A version-15 payload: the same, without the entry's broadcast flag
+        // (the byte before the ledger, the close record and the charged
+        // txids; nothing signed for broadcast).
+        let l = &s.store.ledger;
+        let at16 = v16.len() - (2 + 32 * l.charged_txids.len()) - (2 + 32)
+            - (2 + 40 * l.approvals.len() + 2 + 49 * l.spends.len()) - 1;
+        assert_eq!(v16[at16], 0);
+        let mut v15 = [&v16[..at16], &v16[at16 + 1..]].concat();
+        v15[4] = 15;
+        let (back, l15, _) = policy::decode_channel_store(&v15).unwrap();
+        assert_eq!(back[0].1.broadcast_from, None);
         assert_eq!(l15.charged_txids, vec![[0x77; 32]]);
         // A version-14 payload: the same, without the charged txids (the
         // record after the close record).
@@ -6347,11 +6436,11 @@ mod close_and_revocation_tests {
         assert_eq!(st(&s).validated_through, Some(1));
     }
 
-    /// The device reveals the secret of a commitment it has already signed
-    /// for broadcast: the keyless node's preempt slot asks for exactly that
-    /// signature at every commitment step, before channeld revokes the
-    /// commitment it replaces. The host then holds a fully signed, revoked
-    /// commitment, which the peer can take whole once it is broadcast.
+    /// R2 H2: the device revealed the secret of a commitment it had already
+    /// signed for broadcast (the keyless node's preempt slot asked for that
+    /// signature at every commitment step), so the host held a fully signed,
+    /// revoked commitment the peer could take whole. It no longer does: a
+    /// commitment signed for broadcast is a close, and its secret stays.
     #[test]
     fn r2_reveal_after_sign_for_broadcast() {
         let mut s = signer(Policy::Enforce);
@@ -6370,11 +6459,14 @@ mod close_and_revocation_tests {
         let rev = revoke(&mut s, 2);
         println!("R2 REVOKE 2 after SIGN_COMMITMENT_TX 2: {}",
                  match &rev { Outcome::Reply(_) => "REVEALED", Outcome::Reject(r) => r.as_str(), _ => "other" });
-        assert!(matches!(rev, Outcome::Reply(_)));
-        assert_eq!(st(&s).revoked_through, Some(2));
-        // From then on commitment 2 is never signed again.
-        let err = s.check_own_commitment(&sign_commitment_msg(&s, &c2, 2)).unwrap_err();
-        assert!(err.contains("commitment 2 is revoked"), "{err}");
+        match rev {
+            Outcome::Reject(r) => assert!(r.starts_with(
+                "REVOKE_COMMITMENT_TX refused: commitment 2 of ours was signed for broadcast, a close"), "{r}"),
+            _ => panic!("the secret of a commitment signed for broadcast left the device"),
+        }
+        assert_eq!(st(&s).revoked_through, Some(1));
+        // Commitment 2 stays one the device signs: it is the close.
+        assert_eq!(s.check_own_commitment(&sign_commitment_msg(&s, &c2, 2)), Ok(Some(2)));
     }
 
     /// R2 F4: a device with no revocation record must not reveal a commitment
@@ -7435,12 +7527,12 @@ mod close_and_revocation_tests {
             assert!(matches!(validate(&mut s, n, 300_000, 699_000, 1_000), Outcome::Reply(_)));
         }
         let v15 = policy::encode_channel_store(&s.store);
-        // Version 15 less its record of charged txids (none, two bytes) is
-        // version 14; less the entry's ten flags, its lane count and the
-        // close record, version 6.
+        // Version 16 less its record of charged txids (none, two bytes) is
+        // version 15 without it; less the entry's eleven flags, its lane
+        // count and the close record, version 6.
         assert_eq!(&v15[v15.len() - 2..], &[0, 0]);
         let full = &v15[..v15.len() - 2];
-        let mut payload = [&full[..full.len() - 2 - 4 - 11], &full[full.len() - 2 - 4..full.len() - 2]].concat();
+        let mut payload = [&full[..full.len() - 2 - 4 - 12], &full[full.len() - 2 - 4..full.len() - 2]].concat();
         payload[4] = 6;
         let mac = s.chstore_mac(&payload);
         payload.extend_from_slice(&mac);
@@ -8502,6 +8594,7 @@ mod close_output_spend_tests {
             option_sym_clock: false,
             clock_issuer: None,
             clock_seed: None,
+            broadcast_from: None,
             credit: None,
         }
     }
@@ -8586,6 +8679,7 @@ mod tcov_tests {
             option_sym_clock: false,
             clock_issuer: None,
             clock_seed: None,
+            broadcast_from: None,
             credit: None,
         }
     }

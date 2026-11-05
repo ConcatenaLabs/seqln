@@ -470,6 +470,7 @@ impl Signer {
             option_sym_clock: false,
             clock_issuer: None,
             clock_seed: None,
+            broadcast_from: None,
         };
         self.inner
             .arm_channel(arr33(node_id, "node_id")?, dbid, st)

@@ -74,6 +74,8 @@ fn chan(seed: u8) -> ChannelState {
         option_sym_clock: seed == 11,
         clock_issuer: (seed == 11).then_some(([seed.wrapping_add(14); 32], 1)),
         clock_seed: (seed == 11).then_some(2),
+        // And the commitment it signed for broadcast.
+        broadcast_from: (seed == 11).then_some(seed as u64 * 7 + 1),
     }
 }
 
