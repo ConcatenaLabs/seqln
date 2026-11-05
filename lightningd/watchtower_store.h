@@ -55,9 +55,9 @@
  *     sym                      a SYMMETRIC channel's whole record (common/
  *                              sym_scripts.h), in place of the files above:
  *                              nothing is ever punished, so nothing is kept
- *                              per old state.  u64 version (1, or 2 for a
- *                              factory channel), u64
- *                              channel_dbid, bitcoin_blkid genesis,
+ *                              per old state.  u64 version (1; 2 for a
+ *                              factory channel, 3 for several assets, 4 for
+ *                              a settle clock), u64 channel_dbid, bitcoin_blkid genesis,
  *                              bitcoin_outpoint funding, u32 funding_height
  *                              (0 before lock-in), amount_sat funding_sats,
  *                              u8 asset[33], u16 shared_delay, pubkey
@@ -67,19 +67,23 @@
  *                              update signatures], then bool has_pending
  *                              [sym_state pending: the peer's newest, signed
  *                              by this node only], each towire_sym_state,
- *                              then (version 2 only) bool is_factory [the
+ *                              then (version 2 and up) bool is_factory [the
  *                              channel's factory, towire_sym_factory
  *                              (common/sym_factory.h): `funding` is then the
  *                              channel's id in the factory, and its output
  *                              on chain the factory output until the split,
- *                              its KO after it], then (version 3 only) bool
+ *                              its KO after it], then (version 3 and up) bool
  *                              has_lanes [a channel of several assets
  *                              (lightningd/sym_lanes.h): u16 count, then
  *                              each other lane, towire_sym_lane: its asset,
  *                              its funding output's index in the funding
- *                              transaction, its amount].  A plain channel's
- *                              record is version 1, as an older tower reads
- *                              it.  Rewritten whenever either state
+ *                              transaction, its amount], then (version 4
+ *                              only) bool has_clock [a settle-clock channel
+ *                              (lightningd/sym_clock.h): bitcoin_outpoint
+ *                              issuer, the funding input whose issuance made
+ *                              its marker, then both funding pubkeys].  A
+ *                              plain channel's record is version 1, as an
+ *                              older tower reads it.  Rewritten whenever either state
  *                              changes, before channeld goes on
  *                              (wt_store_put_sym).
  *
@@ -109,6 +113,7 @@ bool wt_store_enabled(const struct lightningd *ld);
 #define WT_BLOB_SET_FILE "blobs"
 #define WT_SYM_VERSION 2
 #define WT_SYM_VERSION_LANES 3
+#define WT_SYM_VERSION_CLOCK 4
 #define WT_SYM_FILE "sym"
 
 struct lightningd;

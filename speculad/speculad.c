@@ -145,6 +145,9 @@ struct spd_sym {
 	/* A channel of several assets' other lanes (common/sym_lanes.h), or
 	 * NULL: each its own funding output, walked as lane 0's is. */
 	struct sym_lane *lanes;
+	/* A settle-clock channel (common/sym_scripts.h): s->sc.has_clock, and
+	 * its marker as an output asset. */
+	u8 marker[33];
 };
 
 /* The output the walk starts from: the funding, or the factory output. */
@@ -1817,6 +1820,11 @@ struct sym_cursor {
 	u32 cur_height;
 	/* Spent by a settle or by something that is not a kickoff. */
 	bool done;
+	/* A settle-clock channel: the clock its kickoff made, and that
+	 * kickoff's height, once followed. */
+	bool clock_known;
+	struct bitcoin_outpoint clock;
+	u32 clock_height;
 	/* Tip height of our last broadcast over cur: one per block. */
 	long bcast_tip;
 	/* Last thing said, so a round says it once. */
@@ -1825,10 +1833,11 @@ struct sym_cursor {
 static struct sym_cursor **g_sym_cursors;
 
 #define SYM_FUNDING_NUM ((s64)-2)
-/* Version 2 appends the factory, version 3 the lanes; version 1 records
- * still read. */
+/* Version 2 appends the factory, version 3 the lanes, version 4 the settle
+ * clock; version 1 records still read. */
 #define WT_SYM_VERSION 2
 #define WT_SYM_VERSION_LANES 3
+#define WT_SYM_VERSION_CLOCK 4
 
 static struct spd_sym *read_sym(const tal_t *ctx, const char *chandir)
 {
@@ -1846,7 +1855,8 @@ static struct spd_sym *read_sym(const tal_t *ctx, const char *chandir)
 	s = tal(ctx, struct spd_sym);
 	version = fromwire_u64(&cursor, &max);
 	if (version != 1 && version != WT_SYM_VERSION
-	    && version != WT_SYM_VERSION_LANES) {
+	    && version != WT_SYM_VERSION_LANES
+	    && version != WT_SYM_VERSION_CLOCK) {
 		fprintf(stderr, "speculad: %s: unknown version %"PRIu64"\n",
 			path, version);
 		return tal_free(s);
@@ -1885,13 +1895,34 @@ static struct spd_sym *read_sym(const tal_t *ctx, const char *chandir)
 				fromwire_sym_lane(&cursor, &max, &s->lanes[i]);
 		}
 	}
+	sym_channel_init(&s->sc, &s->genesis, &s->funding,
+			 &s->key[SYM_OPENER], &s->key[SYM_ACCEPTER],
+			 s->asset, s->delay);
+	/* A settle-clock channel: its marker and its clock, from the issuer
+	 * and both funding keys. */
+	if (version >= WT_SYM_VERSION_CLOCK && fromwire_bool(&cursor, &max)) {
+		struct bitcoin_outpoint issuer;
+		struct pubkey fk[2];
+		u8 marker[32];
+
+		fromwire_bitcoin_outpoint(&cursor, &max, &issuer);
+		fromwire_pubkey(&cursor, &max, &fk[0]);
+		fromwire_pubkey(&cursor, &max, &fk[1]);
+		if (s->factory || s->lanes)
+			fromwire_fail(&cursor, &max);
+		else if (cursor) {
+			sym_marker_id(&issuer, marker);
+			sym_channel_set_clock(&s->sc, marker,
+					      bitcoin_redeem_2of2(tmpctx, &fk[0],
+								  &fk[1]),
+					      s->funding_sats);
+			sym_clock_marker_asset(&s->sc, s->marker);
+		}
+	}
 	if (!cursor) {
 		fprintf(stderr, "speculad: %s does not decode\n", path);
 		return tal_free(s);
 	}
-	sym_channel_init(&s->sc, &s->genesis, &s->funding,
-			 &s->key[SYM_OPENER], &s->key[SYM_ACCEPTER],
-			 s->asset, s->delay);
 	return s;
 }
 
@@ -1921,6 +1952,7 @@ static void sym_cursor_reset(struct sym_cursor *k)
 	k->cur_spk = tal_free(k->cur_spk);
 	k->cur_height = 0;
 	k->done = false;
+	k->clock_known = false;
 	k->bcast_tip = -1;
 }
 
@@ -1944,6 +1976,9 @@ static struct sym_cursor *sym_cursor_get(const struct spd_sym *s, u16 lane)
 	k->lane = lane;
 	memcpy(k->asset, lane ? s->lanes[lane - 1].asset : s->asset,
 	       sizeof(k->asset));
+	/* A settle-clock channel's KO and states hold the marker. */
+	if (s->sc.has_clock)
+		memcpy(k->asset, s->marker, sizeof(k->asset));
 	k->cur_spk = NULL;
 	k->said = NULL;
 	sym_cursor_reset(k);
@@ -2043,6 +2078,27 @@ static void sym_follow(const struct spd_sym *s, struct sym_cursor *k,
 			k->done = true;
 			return;
 		}
+		/* The settle clock: the kickoff's next output (KICK makes it
+		 * so), whose delay runs from this block. */
+		if (s->sc.has_clock) {
+			u8 *cspk = sym_clock_spk(tmpctx, &s->sc, NULL);
+			const struct wally_tx_output *co
+				= i + 1 < tx->wtx->num_outputs
+				? &tx->wtx->outputs[i + 1] : NULL;
+
+			if (!co || !memeq(co->script, co->script_len, cspk,
+					  tal_bytelen(cspk))) {
+				sym_say(k, "kickoff %s has no clock beside KO:"
+					" nothing to watch",
+					fmt_bitcoin_txid(tmpctx, txid));
+				k->done = true;
+				return;
+			}
+			k->clock.txid = *txid;
+			k->clock.n = i + 1;
+			k->clock_height = height;
+			k->clock_known = true;
+		}
 		n = -1;
 	} else if (sym_witness_len((const u8 **)wit) == 2) {
 		/* A settle (an annex, which whoever mined it may have added,
@@ -2140,9 +2196,10 @@ static const struct sym_state *sym_stored(const struct spd_sym *s, s64 num)
  * the fee wallet, input 0's witness restored after. */
 static char *sym_fund(const tal_t *ctx, const struct spd_sym *s,
 		      const struct sym_cursor *k, struct justice_state *st,
-		      u8 **witness, u32 sequence,
+		      u8 **witness, u32 sequence, u32 locktime, bool with_clock,
 		      const struct sym_state_out *outs, u32 feerate_perkw)
 {
+	size_t nin = with_clock ? 2 : 1;
 	struct bitcoin_tx *tx, *stx;
 	struct amount_sat feeamt, minfee, maxfee, changeamt;
 	int change_idx, fee_idx = -1;
@@ -2176,13 +2233,24 @@ static char *sym_fund(const tal_t *ctx, const struct spd_sym *s,
 	}
 	rate = asset_rate(st->fee_asset_hex);
 
-	tx = bitcoin_tx(ctx, chainparams, 2, tal_count(outs) + 2, 0);
-	bitcoin_tx_set_output_asset(tx, k->asset);
+	tx = bitcoin_tx(ctx, chainparams, nin + 1, tal_count(outs) + 2,
+			locktime);
 	bitcoin_tx_add_input(tx, &k->cur, sequence, NULL, k->cur_sats,
 			     k->cur_spk, NULL);
 	bitcoin_tx_input_set_witness(tx, 0, witness);
-	for (size_t i = 0; i < tal_count(outs); i++)
+	/* A settle-clock channel's settle: the clock, after the delay. */
+	if (with_clock) {
+		bitcoin_tx_add_input(tx, &k->clock, s->delay, NULL,
+				     s->funding_sats,
+				     sym_clock_spk(tmpctx, &s->sc, NULL), NULL);
+		bitcoin_tx_input_set_witness(tx, 1,
+					     sym_clock_witness(tmpctx, &s->sc));
+	}
+	for (size_t i = 0; i < tal_count(outs); i++) {
+		bitcoin_tx_set_output_asset(tx, outs[i].asset ? outs[i].asset
+					    : k->asset);
 		bitcoin_tx_add_output(tx, outs[i].spk, NULL, outs[i].amount);
+	}
 	bitcoin_tx_set_output_asset(tx, st->fee_asset33);
 	bitcoin_tx_add_input(tx, &st->feeutxo, SPD_RBF_SEQUENCE, NULL,
 			     amount_sat(st->feeutxo_val), st->feeutxo_spk, NULL);
@@ -2217,11 +2285,12 @@ static char *sym_fund(const tal_t *ctx, const struct spd_sym *s,
 	signed_hex = json_find_string(tmpctx, res, "hex");
 	if (!signed_hex)
 		return NULL;
-	/* The wallet strips the witness of the input it does not own. */
+	/* The wallet strips the witness of the inputs it does not own. */
 	stx = bitcoin_tx_from_hex(tmpctx, signed_hex, strlen(signed_hex));
 	if (!stx)
 		return NULL;
-	bitcoin_tx_input_copy_witness(stx, 0, tx, 0);
+	for (size_t i = 0; i < nin; i++)
+		bitcoin_tx_input_copy_witness(stx, i, tx, i);
 	/* NON-CUSTODY GUARD: what the state pays, and nothing else, in
 	 * outputs 0 .. m-1. */
 	for (size_t i = 0; i < tal_count(outs); i++) {
@@ -2230,7 +2299,8 @@ static char *sym_fund(const tal_t *ctx, const struct spd_sym *s,
 
 		if (!memeq(got->script, got->script_len, outs[i].spk,
 			   tal_bytelen(outs[i].spk))
-		    || !amount_asset_is(&a, k->asset)
+		    || !amount_asset_is(&a, outs[i].asset ? outs[i].asset
+					: k->asset)
 		    || a.value != outs[i].amount.satoshis) { /* Raw: compare */
 			fprintf(stderr, "speculad: REFUSING -- output %zu is not"
 				" the state's\n", i);
@@ -2273,8 +2343,8 @@ static void defend_sym_lane(const struct spd_sym *s, u16 lane, long tip,
 	struct sym_tree tree;
 	struct sym_state_out *outs;
 	u8 **witness;
-	u32 sequence, feerate;
-	bool update;
+	u32 sequence, locktime = 0, feerate;
+	bool update, with_clock = false;
 	struct justice_state *js;
 	const char **extra;
 	char *hex, *res;
@@ -2325,6 +2395,9 @@ static void defend_sym_lane(const struct spd_sym *s, u16 lane, long tip,
 		outs[0].amount = k->cur_sats;
 		outs[0].spk = sym_tree_spk(outs, &tree);
 		sequence = SYM_SEQUENCE;
+		/* The settle clock: UPD wants the lock time floor. */
+		if (s->sc.has_clock)
+			locktime = SYM_CLOCK_LOCKTIME_FLOOR;
 		sym_say(k, "%s %"PRId64" stands: replacing it by state %"PRId64,
 			k->num == -1 ? "KO" : "state", k->num, s->best->num);
 	} else {
@@ -2352,15 +2425,44 @@ static void defend_sym_lane(const struct spd_sym *s, u16 lane, long tip,
 				" settlement than the one stored", k->num);
 			return;
 		}
-		/* CSV: the settle may be mined at cur_height + delay. */
-		if (tip + 1 < (long)k->cur_height + s->delay) {
+		/* The settle clock: the state output keeps the marker at
+		 * output 0, and the clock beside it may be spent once the
+		 * delay since the kickoff has passed. */
+		if (s->sc.has_clock) {
+			size_t m = tal_count(st->outs);
+
+			if (!k->clock_known) {
+				sym_say(k, "state %"PRId64" stands, and no"
+					" kickoff made its clock", k->num);
+				return;
+			}
+			if (tip + 1 < (long)k->clock_height + s->delay) {
+				sym_say(k, "state %"PRId64" stands: settling it"
+					" with the clock at height %u", k->num,
+					k->clock_height + s->delay);
+				return;
+			}
+			outs = tal_arrz(tmpctx, struct sym_state_out, 1 + m);
+			outs[0].amount = k->cur_sats;
+			outs[0].spk = k->cur_spk;
+			outs[0].asset = s->marker;
+			for (size_t i = 0; i < m; i++) {
+				outs[1 + i] = st->outs[i];
+				outs[1 + i].asset = (u8 *)s->asset;
+			}
+			witness = sym_settle_witness(tmpctx, &tree);
+			sequence = SYM_SEQUENCE;
+			with_clock = true;
+		} else if (tip + 1 < (long)k->cur_height + s->delay) {
+			/* CSV: the settle may be mined at cur_height + delay. */
 			sym_say(k, "state %"PRId64" stands: settling it at height"
 				" %u", k->num, k->cur_height + s->delay);
 			return;
+		} else {
+			witness = sym_settle_witness(tmpctx, &tree);
+			outs = st->outs;
+			sequence = s->delay;
 		}
-		witness = sym_settle_witness(tmpctx, &tree);
-		outs = st->outs;
-		sequence = s->delay;
 	}
 	if (!may_broadcast || k->bcast_tip == tip)
 		return;
@@ -2368,10 +2470,14 @@ static void defend_sym_lane(const struct spd_sym *s, u16 lane, long tip,
 	js = spd_get_state(tal_fmt(tmpctx, "sym:%"PRIu64":%s:%u:%s", s->dbid,
 				   fmt_bitcoin_txid(tmpctx, &k->cur.txid),
 				   k->cur.n, update ? "update" : "settle"));
+	/* The deadline: the delay after the state stood, or with the settle
+	 * clock after the kickoff. */
 	feerate = update
-		? sym_feerate(tip - k->cur_height + 1, s->delay, js->rung)
+		? sym_feerate(tip - (s->sc.has_clock ? k->clock_height
+				     : k->cur_height) + 1, s->delay, js->rung)
 		: sym_feerate(0, 0, js->rung);
-	hex = sym_fund(tmpctx, s, k, js, witness, sequence, outs, feerate);
+	hex = sym_fund(tmpctx, s, k, js, witness, sequence, locktime,
+		       with_clock, outs, feerate);
 	if (!hex)
 		return;
 	extra = tal_arr(tmpctx, const char *, 1);
