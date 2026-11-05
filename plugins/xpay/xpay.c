@@ -2511,13 +2511,19 @@ static struct payment *new_payment(const tal_t *ctx,
 	return payment;
 }
 
-bool attempt_ongoing(struct plugin *plugin, const struct sha256 *payment_hash)
+bool attempt_ongoing(struct plugin *plugin, const struct sha256 *payment_hash,
+		     u64 groupid)
 {
 	struct xpay *xpay = xpay_of(plugin);
 	const struct payment *payment;
 
+	/* A payment stays on the list after its command returned, until its
+	 * last request is answered: it is over by then, succeeded or
+	 * failed, and listpays says so. */
 	list_for_each(&xpay->payments, payment, list) {
-		if (sha256_eq(&payment->payment_hash, payment_hash))
+		if (sha256_eq(&payment->payment_hash, payment_hash) &&
+		    payment->group_id == groupid &&
+		    payment->cmd != NULL)
 			return true;
 	}
 	return false;
