@@ -16,7 +16,8 @@ struct sym_state_out {
 	struct amount_sat amount;
 	u8 *spk;
 	/* Its asset (0x01 || 32-byte id), or NULL: the channel's.  Only a
-	 * channel that holds several assets names one. */
+	 * channel that holds several assets names one in a state; a
+	 * settle-clock channel's spends name its marker. */
 	u8 *asset;
 };
 

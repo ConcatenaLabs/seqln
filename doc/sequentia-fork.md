@@ -722,8 +722,9 @@ clock the capacity. onchaind publishes its best state over KO or over an older o
 marker, at the lock time floor; once the delay has passed since the kickoff it settles whichever
 state is on chain, if it knows its settlement: the state output and the clock in, the clock's
 sequence the delay and the lock time 0, the marker back to the state's script at output 0 and
-the settlement after it. A mutual close leaves the seed and its marker atom where they are, and
-`speculad` and the device signer (section 7b) do not take settle-clock channels.
+the settlement after it. A mutual close leaves the seed and its marker atom where they are.
+`speculad` watches a settle-clock channel from its store record (section 7b); the device signer
+does not take settle-clock channels.
 
 **Developers.** `dev-sym-snapshot id` freezes the best state a node holds; its next unilateral
 close then publishes that one as though it held nothing newer, which is how the tests make a
@@ -1177,7 +1178,11 @@ starts from the factory output: the split that spends it pays the channel's KO a
 numbered as its slot, and from there the walk is a plain channel's. A channel of several
 assets' record (section 5g) also carries its other lanes: the tower walks from each lane's
 funding output and replaces a stale state on each in that lane's asset, and leaves the settle,
-which spends every lane at once, to the node.
+which spends every lane at once, to the node. A settle-clock channel's record (section 5e) also
+carries the issuer of its marker and both funding keys: the tower rebuilds the marker and the
+clock, notes the clock beside KO when it follows the kickoff, replaces an older state holding the
+marker at the lock time floor, and settles with the clock as input 1 once the delay since the
+kickoff has passed.
 
 The Specula design note is not yet published in this repository; the header comment of
 `speculad/speculad.c` is the fullest description of the model.
