@@ -5260,6 +5260,33 @@ def test_listpays_with_filter_by_status(node_factory, bitcoind):
     assert len(l2.rpc.listpays()['pays']) == 1
 
 
+def test_listpays_finished_xpay(node_factory, bitcoind):
+    """`listpays` reports an xpay as soon as its command returns: a failed
+    one `failed` and, once another xpay of the same invoice succeeds, the
+    earlier ones still `failed`, while xpay is still tidying up after each
+    (here held for seconds, by delaying its last call)."""
+    plugin = os.path.join(os.getcwd(), 'tests/plugins/hold_layer_removal.py')
+    l1, l2, l3 = node_factory.line_graph(3, wait_for_announce=True,
+                                         opts=[{'plugin': plugin},
+                                               {'may_reconnect': True},
+                                               {'may_reconnect': True}])
+    wait_for(lambda: len(l1.rpc.listnodes()['nodes']) == 3)
+    inv = l3.rpc.invoice(amount_msat='any', label='lbl', description='desc')['bolt11']
+    l3.stop()
+
+    for amount in ('100002msat', '100001msat'):
+        with pytest.raises(RpcError, match=r'Failed after 1 attempts'):
+            l1.rpc.xpay(inv, amount_msat=amount)
+        assert [p['status'] for p in l1.rpc.listpays()['pays']][-1] == 'failed'
+
+    l3.start()
+    wait_for(lambda: only_one(l3.rpc.listpeers()['peers'])['connected'] is True)
+    scid = l3.rpc.listpeerchannels()['channels'][0]['short_channel_id']
+    wait_for(lambda: [c['active'] for c in l1.rpc.listchannels(scid)['channels']] == [True, True])
+    l1.rpc.xpay(inv, amount_msat='10000msat')
+    assert [p['status'] for p in l1.rpc.listpays()['pays']] == ['failed', 'failed', 'complete']
+
+
 def test_sendpay_grouping(node_factory, bitcoind):
     """`listpays` should be smart enough to group repeated `pay` calls.
 
