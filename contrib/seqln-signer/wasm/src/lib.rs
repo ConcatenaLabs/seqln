@@ -212,6 +212,33 @@ impl Signer {
         self.inner.approve_close_destination(script.to_vec());
     }
 
+    /// The user approved, on this page, one spend of the node's wallet
+    /// coins paying `script` (an address outside this wallet) at most
+    /// `atoms` of `asset` (`btc` or a display-order asset id). The node may
+    /// then have that spend signed; what it pays there counts against the
+    /// asset's payment limit with the fee. Call it only from the page's own
+    /// confirmation, which the host cannot give: the host's word is never an
+    /// approval. It pays one spend and waits ten minutes for it; not kept
+    /// across a restart.
+    #[wasm_bindgen(js_name = approveSpend)]
+    pub fn approve_spend(&mut self, script: &[u8], asset: String, atoms: f64) -> Result<(), JsError> {
+        let key = AssetKey::parse(&asset).map_err(|e| JsError::new(&e))?;
+        let atoms = whole(atoms, "atoms")?;
+        if script.is_empty() || atoms == 0 {
+            return Err(JsError::new("an approval names a script and at least one atom"));
+        }
+        self.inner.set_now((date_now() / 1000.0) as u64);
+        self.inner.approve_spend(script.to_vec(), key, atoms);
+        Ok(())
+    }
+
+    /// Withdraw every approval of an outside address not yet used for a
+    /// spend (the user cancelled the payment).
+    #[wasm_bindgen(js_name = cancelSpendApprovals)]
+    pub fn cancel_spend_approvals(&mut self) {
+        self.inner.cancel_spend_approvals();
+    }
+
     #[wasm_bindgen(js_name = processFrame)]
     pub fn process_frame(&mut self, frame_bytes: &[u8]) -> Result<Vec<u8>, JsError> {
         self.inner.set_now((date_now() / 1000.0) as u64);

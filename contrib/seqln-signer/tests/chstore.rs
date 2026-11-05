@@ -67,12 +67,13 @@ fn chan(seed: u8) -> ChannelState {
             sig: [seed.wrapping_add(12); 64],
             preimage: Some([seed.wrapping_add(13); 32]),
         }),
-        // A symmetric channel's flag rides the round trip too.
+        // A symmetric channel's flag rides the round trip too, and the settle
+        // clock's issuer and seed.
         option_sym: seed == 11,
         lanes: Vec::new(),
-        option_sym_clock: false,
-        clock_issuer: None,
-        clock_seed: None,
+        option_sym_clock: seed == 11,
+        clock_issuer: (seed == 11).then_some(([seed.wrapping_add(14); 32], 1)),
+        clock_seed: (seed == 11).then_some(2),
     }
 }
 

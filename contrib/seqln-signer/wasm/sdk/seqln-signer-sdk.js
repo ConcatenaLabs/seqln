@@ -189,6 +189,23 @@ export class SeqlnSigner {
     return this;
   }
 
+  // The user approved, in this page's own confirmation, one spend of the
+  // node's on-chain coins paying `script` (hex or bytes: an address outside
+  // this wallet) at most `atoms` of `asset` ('btc' or a display-order asset
+  // id). What it pays there counts against the asset's payment limit with the
+  // fee. Never call it on the node's or the LSP's word: that is what the
+  // approval exists to refuse. It pays one spend, waits ten minutes for it and
+  // is not kept across a restart.
+  approveSpend(script, asset, atoms) {
+    this._inner.approveSpend(typeof script === 'string' ? hexToBytes(script) : script, asset, Number(atoms));
+    return this;
+  }
+  // Withdraw the approvals not yet used (the user cancelled the payment).
+  cancelSpendApprovals() {
+    this._inner.cancelSpendApprovals();
+    return this;
+  }
+
   // Build from a BIP-39 mnemonic (no passphrase). `opts.wasm` overrides the wasm
   // source (Node: pass the .wasm bytes; browser: omit).
   static async fromMnemonic(mnemonic, opts = {}) {

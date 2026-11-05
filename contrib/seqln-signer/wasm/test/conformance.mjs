@@ -1,6 +1,6 @@
 // WASM byte-exact conformance harness (SeqLN Tier-2 device signer).
 //
-// Loads the wasm module (built by `wasm-pack build --target nodejs`), feeds it
+// Loads the wasm module (built by `wasm/build.sh nodejs pkg`), feeds it
 // the SAME real-channel request corpus that the native harness replays, and
 // byte-compares every reply against libhsmd's own replies (dumped by the native
 // `conformance` binary with SEQLN_DUMP_REPLIES).

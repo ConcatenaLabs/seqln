@@ -4,7 +4,7 @@
 // return the secret of commitment n - 2: a host that re-initialised the device
 // at version 4 could read the secret of a commitment the device has not revoked.
 //
-// Usage: node test/version_floor.mjs   (after `wasm-pack build --target nodejs --out-dir pkg`)
+// Usage: node test/version_floor.mjs   (after `./build.sh nodejs pkg` in wasm/)
 
 import { Signer } from '../pkg/seqln_signer_wasm.js';
 
